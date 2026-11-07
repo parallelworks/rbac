@@ -268,6 +268,20 @@ func keysSQL(tenant, identity, now string) string {
 	)`, tenant, identity, now)
 }
 
+// lapseSQL is SQL, in a statement after keysSQL and decidedSQL, for the earliest time after the one
+// decided that the identity's membership in the tenant, or a place in a group of the identity or of
+// a group it is in, ends, null for never: until then, keysSQL defines the same keys, those binding
+// it and exempting it included, at any time. tenant and identity are SQL for the tenant and the
+// identity's key. Each is looked up by its principal, under OFFSET 0: as a plain aggregate of a
+// table, its least expiry would be planned as a walk of every tenant's expiries from the earliest.
+func lapseSQL(tenant, identity string) string {
+	return fmt.Sprintf(`(SELECT min(e) FROM (
+		  SELECT expires_at FROM rbac_memberships WHERE tenant = %[1]s AND principal = (SELECT %[2]s)
+		  UNION ALL
+		  SELECT expires_at FROM rbac_members WHERE tenant = %[1]s AND principal = ANY(ARRAY(SELECT k FROM bound))
+		  OFFSET 0) l(e) WHERE e > %[3]s)`, tenant, identity, decidedAt)
+}
+
 // decidedSQL is SQL defining, in a WITH, decided(at, expired): the time a statement reading an
 // actor or a subject decides at, given now, SQL for the call's time, and the latest time
 // DeleteExpired deleted by that its snapshot sees, as rbac_expired records it, null for none. It
@@ -275,9 +289,10 @@ func keysSQL(tenant, identity, now string) string {
 // of its own, places in groups before memberships, passing over what a change holds, so a read by an
 // earlier time could find a later-ending row removed and an earlier-ending one left, a state no
 // moment held: as the place a deny binds the subject by gone, and the membership or place its power
-// comes through still there. It records the time before it removes anything, so a snapshot seeing
-// any of its removals sees it; and every row it removed or passed over has ended by it. The caller
-// has the call decide at it too (callClock.passed). As of a time, it is that time.
+// comes through still there. It records with each batch, in its transaction, the latest time a row
+// the batch removes ended at, so a snapshot seeing any of its removals sees a time each had ended
+// by, and a read deciding no earlier finds what it removed ended. The caller has the call decide at
+// it too (callClock.passed). As of a time, it is that time.
 func (a *Authorizer) decidedSQL(now string) string {
 	if a.asOf {
 		return `decided(at, expired) AS (SELECT ` + now + `::timestamptz, NULL::timestamptz)`
@@ -303,9 +318,10 @@ func (a *Authorizer) readingNow() (time.Time, bool) {
 // snapshot sees, as decidedSQL has a read of an actor or a subject (callClock.passed): for a read
 // of many principals in one snapshot, as Holders', whose first statement it is, so every statement
 // of it decides at one time; and as the last statement of a change's transaction that read its
-// actor, where a run by a later time committing after that read, which the statements after it
-// read, as whether what the change gives breaks an exclusive dimension, has it tried again, rather
-// than decide them at the earlier time by what the run left. As of a time, it is that time.
+// actor, where a run committing after that read removed a row that ended after the change's time,
+// which the statements after it could find removed, as whether what the change gives breaks an
+// exclusive dimension, has it tried again, rather than decide them at the earlier time by what the
+// run left. As of a time, it is that time.
 func (a *Authorizer) expiredBy(ctx context.Context, q DB) error {
 	if a.asOf || a.clock == nil {
 		return nil
@@ -1047,10 +1063,11 @@ type Config struct {
 	// it once more in its transaction, under its locks, where it decides again, the ends of what it
 	// writes included. A call a hook makes, as a constraint's of GroupsOf, is a call of its own and
 	// reads it apart, so what the hook decides by is of its own moment, not the asking call's. A call
-	// decides no earlier than the latest time DeleteExpired deleted by, its Config.Now, or the
-	// database's clock where that is earlier: keep every host's clock synchronized with the
-	// database's, as one running behind has calls after another's DeleteExpired decide later than it
-	// reads, and some changes tried again.
+	// decides no earlier than the latest time a row DeleteExpired removed ended at, which ended by
+	// that run's Config.Now and the database's clock both: keep every host's clock synchronized with
+	// the database's, as one running behind has calls after another's DeleteExpired, where it removed
+	// a row that ended after the host's clock, decide later than it reads, and some changes tried
+	// again.
 	Now func() time.Time
 }
 
@@ -1361,9 +1378,9 @@ func (c *callClock) earlier() time.Time {
 // what it grants to stands, or one after it could have, as its last statement finds (expiredBy),
 // the change is tried again instead. Tried again, a change finds the time in the read of its actor
 // before its transaction, and from then on reads the host's clock as no earlier (reading), so it
-// decides at it in its transaction too, and is refused so again only where a run by a later time
-// still commits while it runs. first is whether the read was the first of its phase to read the
-// time.
+// decides at it in its transaction too, and is refused so again only where a run still commits
+// while it runs, removing a row that ended after that time. first is whether the read was the first
+// of its phase to read the time.
 func (c *callClock) passed(expired time.Time, first bool) error {
 	if c == nil || !expired.After(c.expired) {
 		return nil
@@ -1373,7 +1390,7 @@ func (c *callClock) passed(expired time.Time, first bool) error {
 		return nil
 	}
 	if c.changing && !first {
-		return fmt.Errorf("%w: DeleteExpired, by a later time than this change's, removed what had ended while the change decided; try again", ErrConflict)
+		return fmt.Errorf("%w: DeleteExpired removed, while this change decided, what ended after the time it decided at; try again", ErrConflict)
 	}
 	c.at = expired
 	return nil

@@ -101,8 +101,11 @@ condition as keeping as many as of a table of one type: listing a type from a ta
 a column of the type too, whose statistics count them, and index it after the tenant and before what
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
-the subject's label holding and what the constraints answered, so build one for each query. It
-compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
+the subject's label holding and what the constraints answered, so build one for each query; the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, and with the
+label column keeps no row once that is as late as a time the subject's membership, or a place in a
+group of its own or of a group it is in, ended after `Filter` read the holding. It compares the
+tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
 past 128 on containers and the tenant, as one holding a grant on everything it created does, each of
@@ -1216,33 +1219,38 @@ can leave the application's role without it. The administrator's and history's r
   `DeleteExpired` removes what has ended in transactions of its own, places in groups before
   memberships, passing over what a change holds, by its own clock: a read by an earlier clock could
   find the place a deny binds the actor by, which ended later, removed, and the membership or place
-  its power comes through, which ended sooner, still there, a state no moment held. So each run
-  records the time it deletes by before it removes anything, in `rbac_expired`: its `Config.Now`,
-  or the database's clock where that is earlier, which its batches delete by, so a host whose clock
-  runs ahead, or a `Config.Now` set wrong, can't have every later call decide past the database's
-  clock, for good, as the latest time only moves on. A read of an actor's or a subject's grants,
-  groups and the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`,
-  `Holding`, `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter`
-  gives the host, decides no earlier than the latest time recorded that its snapshot sees: every row
-  any run it sees removed or passed over has ended by then. The call decides at that time from then
-  on, its conditions' `request.time` and its statements after the read too. A change is tried
-  again instead (`rbac.ErrConflict`) where its transaction read the time before that read, as for
-  whether what it grants to stands, or where, as its last statement finds, a run by a later time
-  committed after that read, which a statement after it, as the check of an exclusive dimension,
-  could have read some of the removals of. Tried again, it finds the time before its transaction,
-  and decides there no earlier, so it is refused again only where yet another run by a later time
-  commits while it runs: with `DeleteExpired` every 50 ms beside four sessions changing grants
-  without pause, about 2% of changes were tried again, about one for every four runs, so at a run a
-  minute, about one change in 60,000. `Filter`'s condition with the label column keeps no row
-  where the query sees a later time than `Filter` decided the subject's label holding at, which
-  isn't read in the query: build it again. `Members`, `GroupsOf`, `Memberships`, `MembershipsOf`
-  and `Conflicts` read by the call's time: what each lists only grows with the rows in force, so
-  each element it lists was in force at that time, and each it leaves out had ended by it or by a
-  run's time. Runs never wait for each other, and a run by an earlier clock leaves the latest time
-  as it is. Keep the hosts' clocks synchronized with the database's: a host whose clock runs behind
-  has every call after another's run decide later than it reads, and changes in flight as a run
-  records tried again. An activation still ends its duration after the time `Activate` read once it
-  held the places it rests on, never later. As of a time, a read decides at that time.
+  its power comes through, which ended sooner, still there, a state no moment held. So each batch
+  records in `rbac_expired`, in its own transaction, the latest time a row it removes ended at,
+  which ended by the run's `Config.Now` and the database's clock both: a host whose clock runs
+  ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
+  a run that removes nothing records nothing. A read of an actor's or a subject's grants, groups and
+  the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
+  `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
+  host, decides no earlier than the latest time recorded that its snapshot sees: every row it finds
+  removed had ended by then, as it commits with the time. The call decides at that time from then
+  on, its conditions' `request.time` and its statements after the read too. So a call decides later
+  than its own clock only where a run removed a row that ended after it. A change is tried again
+  instead (`rbac.ErrConflict`) where its transaction read the time before that read, as for whether
+  what it grants to stands, or where, as its last statement finds, a run that committed after that
+  read removed a row that ended after the change's time, which a statement after it, as the check
+  of an exclusive dimension, could have found removed. Tried again, it finds the time before its
+  transaction, and decides there no earlier, so it is refused again only where yet another run
+  removes so while it runs: with `DeleteExpired` every 50 ms beside four sessions granting, without
+  pause, roles that end 200 ms on, none of about 1,650 changes was tried again. `Filter`'s condition
+  with the label column, whose holding the query doesn't read, keeps no row where the query sees a
+  time as late as the earliest that the subject's membership, or a place in a group of its own or of
+  a group it is in, ended after `Filter` read the holding: build it again. Before then, the subject's
+  keys and the denies binding it are those of `Filter`'s time, and the grants in force no more, so
+  each row the query keeps the subject could read at `Filter`'s time; a run by an earlier time, as
+  every one is for a subject whose membership and places don't end, leaves them as they were.
+  `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
+  what each lists only grows with the rows in force, so each element it lists was in force at that
+  time, and each it leaves out had ended by it or by a run's time. Runs never wait for each other,
+  and a run removing what ended sooner leaves the latest time as it is. Keep the hosts' clocks
+  synchronized with the database's: a host whose clock runs behind has a call after another's run
+  that removed a row ending after its clock decide later than it reads. An activation still ends
+  its duration after the time `Activate` read once it held the places it rests on, never later. As
+  of a time, a read decides at that time.
   `SetMemberships` doesn't wait for the places in groups of a membership that ended while it took
   its locks, which another transaction holds, as a group's deletion: it is tried again
   (`rbac.ErrConflict`), as is a change whose host's clock goes back between the two readings.

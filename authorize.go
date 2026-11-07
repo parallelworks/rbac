@@ -1403,9 +1403,10 @@ type Predicate struct {
 // keeps rows Authorize then refuses, as once a grant it counted has expired, and leaves out what a
 // custom role first granted to them since gives, or one granted to the members gives a subject
 // that has since become one. The query decides no earlier than the latest time DeleteExpired
-// deleted by that it sees, as a check does; with the label column, where that is later than the
-// time Filter decided the holding at, it keeps no row, so a query run once DeleteExpired has run
-// since Filter can come back empty. Build one for each query. The host's query must reach this package's
+// deleted by that it sees, as a check does; with the label column, where that is as late as a time
+// the subject's membership, or a place in a group of its own or of a group it is in, ended after
+// the holding was read, it keeps no row, so a query run once DeleteExpired has deleted by such a
+// time since Filter comes back empty. Build one for each query. The host's query must reach this package's
 // tables and call its function rbac_tenant_keys (they are in the pool's schema), and column names
 // are trusted host code; every value is an argument. It counts only unconditional grants, and
 // leaves out every resource a deny covers, conditional ones included, so it never keeps one
@@ -1502,10 +1503,12 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	}
 	// The label, against the holding read now, as conditions of label grants can be evaluated only
 	// here, not in the statement: read first, as its read can have the call decide later
-	// (callClock.passed), so the statement decides no earlier than the holding was decided at.
+	// (callClock.passed), so the statement decides no earlier than the holding was decided at; with
+	// when the subject's keys lapse (filterHolding).
 	var h Holding
+	var held grantsRead
 	if cols.Labels != "" {
-		if h, _, err = a.holding(ctx, tenant, s); err != nil {
+		if h, _, held, err = a.holdingRead(ctx, a.db, s, a.constrain(ctx, s, tenantResource(tenant)), alsoRead{lapse: !a.asOf}); err != nil {
 			return Predicate{}, err
 		}
 		if h.excludes(p) {
@@ -1556,7 +1559,9 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		return pred, nil
 	}
 	labels, args := a.listedBy(h, p, resourceType).labelColumn(cols.Labels, arg, len(pred.Args))
-	pred.SQL = "(" + pred.SQL + " AND " + labels + a.filterHolding(arg) + ")"
+	pred.Args = append(pred.Args, args...)
+	lapsed, args := a.filterHolding(arg, len(pred.Args), held.lapses)
+	pred.SQL = "(" + pred.SQL + " AND " + labels + lapsed + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
 }
@@ -1736,17 +1741,23 @@ func (a *Authorizer) filterAt(arg func(int) string) string {
 	return "greatest(" + arg(4) + "::timestamptz, (SELECT max(until) FROM rbac_expired))"
 }
 
-// filterHolding is SQL, after the label's test, keeping a row only where Filter's statement decides
-// at the call's time, at which Filter decided the subject's label holding, which isn't read in the
-// statement: where a DeleteExpired by a later time committed before the statement, which then
-// decides later (filterAt), it keeps none, rather than a row its label kept by the holding of one
-// moment and its grants and denies of another, as a deny binding the subject no longer, and a value
-// only it held until then. Build the condition again. As of a time, it decides at that time.
-func (a *Authorizer) filterHolding(arg func(int) string) string {
-	if a.asOf {
-		return ""
+// filterHolding is SQL, after the label's test, and its argument, numbered from arg's first, keeping
+// a row only where Filter's statement decides before lapses, the earliest time after Filter's that
+// the subject's membership, or a place in a group of its own or of a group it is in, ended
+// (alsoRead.lapse); zero is never. The holding is Filter's, which the statement doesn't read. Before
+// then, the subject's keys, and the denies binding and exempting it by them, are at the time the
+// statement decides at (filterAt) what they were at Filter's, and the grants in force then are no
+// more than at Filter's: so a row it keeps, the subject could do p to at Filter's time by the
+// holding and by the grants and denies the statement reads, with what DeleteExpired removed since,
+// which had all ended by then. From then on, as once DeleteExpired has removed the place a deny
+// binds it by and passed over the one that gave it a value, it keeps none, rather than a row its
+// label kept by the holding of one moment and its grants and denies of another: build the
+// condition again. As of a time, it decides at that time.
+func (a *Authorizer) filterHolding(arg func(int) string, first int, lapses time.Time) (string, []any) {
+	if a.asOf || lapses.IsZero() {
+		return "", nil
 	}
-	return " AND (SELECT coalesce(max(until) <= " + arg(4) + "::timestamptz, true) FROM rbac_expired)"
+	return " AND (SELECT coalesce(max(until) < " + arg(first) + "::timestamptz, true) FROM rbac_expired)", []any{lapses}
 }
 
 // filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject
@@ -1875,6 +1886,10 @@ type alsoRead struct {
 	// exempts it only until a time (belowSQL), so a change to a custom role decides whether one may
 	// stop it by what bound it as it held its grants. With ending, whose paths it reads.
 	below bool
+	// lapse is the earliest time after the read's that the subject's membership, or a place in a
+	// group of those it is in, ends (lapseSQL): until then its keys, and the denies binding and
+	// exempting it by them, are as read, whatever later time a statement decides at.
+	lapse bool
 }
 
 // grantsRead is what readHeld reads.
@@ -1893,6 +1908,8 @@ type grantsRead struct {
 	// bound and exemptUntil are, with alsoRead.below, whether a deny below the tenant binds the
 	// subject, and whether one exempts it only until a time.
 	bound, exemptUntil bool
+	// lapses is, with alsoRead.lapse, when its keys first change by time alone, zero for never.
+	lapses time.Time
 }
 
 // valuesRead is what a subject's label values are decided by: its grants on its tenant, and the
@@ -1992,6 +2009,11 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		UNION ALL
 		SELECT 6, '', '', '', '', NULL, ` + belowSQL(false) + `, NULL, '', NULL, ` + belowSQL(true) + `, false, NULL, '', '', false`
 	}
+	if with.lapse {
+		changes += `
+		UNION ALL
+		SELECT 8, '', '', '', '', ` + lapseSQL("$1", "$2::text") + `, false, NULL, '', NULL, false, false, NULL, '', '', false`
+	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are, as are the denies binding it that
 	// exempt it only until a time, read with when, by the paths to the keys exempting it, in the read
@@ -2021,10 +2043,10 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	}
 	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
 	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
-	// Grants, denies, roles, keys, the powers to change grants denied, the denies below and the time
-	// DeleteExpired deleted by in that order; grants by principal, scope, role and id, denies by id and
-	// scope, as deniesOn.
-	const deny, role, end, key, changing, below, expiry = 1, 2, 3, 4, 5, 6, 7
+	// Grants, denies, roles, keys, the powers to change grants denied, the denies below, the time
+	// DeleteExpired deleted by and when the keys lapse in that order; grants by principal, scope, role
+	// and id, denies by id and scope, as deniesOn.
+	const deny, role, end, key, changing, below, expiry, lapse = 1, 2, 3, 4, 5, 6, 7, 8
 	var expired *time.Time
 	var custom []RoleDefinition
 	placeEnds := map[string]time.Time{}
@@ -2075,6 +2097,10 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 				if expires != nil {
 					t := *expires
 					expired = &t
+				}
+			case lapse:
+				if expires != nil {
+					got.lapses = *expires
 				}
 			default:
 				h := holding{Binding: Binding{ID: id, Principal: parsePrincipal(principal), Role: Role(roleID)}, scope: scope, conditional: conditional}

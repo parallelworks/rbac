@@ -1108,13 +1108,13 @@ flowchart TB
   there, as it hadn't reached it or passed over it: by its own time, the actor held the power and
   escaped the deny, a state no moment held. With no skew, `Apply` granting, `SetEligibility`,
   `Activate`'s check of its approver and a change to members read the time before the actor; with
-  `DeleteExpired`'s clock ahead, every change and check could. So each run first records the time
-  it deletes by in `rbac_expired`, on a pool committed in a transaction of its own before any batch
-  begins, under `WithTx` in the host's with them: a snapshot seeing any row it removed sees it. A
-  read of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and
-  the latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
-  row a run it sees removed, or passed over, or hasn't reached, ended by that run's time, so it reads
-  the state of that moment. The condition `Filter` gives the host decides so in the host's own
+  `DeleteExpired`'s clock ahead, every change and check could. So each batch records in
+  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), the latest time one of
+  them ended at, which commits with them: a snapshot seeing any row a batch removed sees it. A read
+  of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and the
+  latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
+  row it finds removed had ended by then, and the rows still there it decides by their ends, so it
+  reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
   statement (`filterAt`), which runs later than `Filter` read the time. The call then decides at that
   time (`callClock.passed`): the conditions it evaluates, the label values the read decides and its
   statements after it read it as their time, `Explain` building what conditions read only once it
@@ -1130,24 +1130,36 @@ flowchart TB
   would find a value an identity held until then removed, and pass a value the actor gave it by a
   power that had ended by then. The call reads the host's clock as no earlier than the latest time
   it found (`callClock.reading`), so the change's next try, which finds it before its transaction,
-  decides there at it, and is refused again only where another run by a later time commits while it
-  runs. What a change reads before its transaction only decides whether it goes on, which its
-  transaction decides again, so there the call decides later where it finds a later time. The
-  condition `Filter` gives with the label column keeps no row where the query decides later than
-  `Filter` decided the subject's label holding at, which isn't read in the query (`filterHolding`).
+  decides there at it, and is refused again only where another run, while it runs, removes a row
+  that ended after its time. What a change reads before its transaction only decides whether it
+  goes on, which its transaction decides again, so there the call decides later where it finds a
+  later time. The condition `Filter` gives with the label column holds the subject's label holding,
+  which the query doesn't read, decided at `Filter`'s time. `Filter` reads with it when the
+  subject's keys first change by time alone, the earliest end after then of its membership, or of a
+  place in a group of its own or of a group it is in (`lapseSQL`), and the condition keeps no row
+  where the query decides at that time or later (`filterHolding`): by then a run can have removed
+  the place a deny binds it by and passed over the one its value came through. Before then its
+  keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
+  grants in force at the query's time are no more than at `Filter`'s, so each row kept the subject
+  could read at `Filter`'s time by the holding, with what runs removed since, which had all ended by
+  then. Keeping no row at any later time, a run between `Filter` and the query would have emptied
+  the result for any subject, though it removed nothing the subject held anything through.
   `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
   each lists what only grows with the rows in force, so an element listed was in force then, and
-  one left out had ended by then or by a run's time. A run adds its own time and deletes those no later
-  that no other run is deleting (`SKIP LOCKED`), which only `DeleteExpired` writes, so runs never
-  wait for each other, a run in a host's transaction left open too, the latest time stays, and a
-  run by an earlier clock leaves it as it is. One time for every tenant: a run removes what has ended
-  in every tenant, and recording a time for each would read them all first. The time is the run's
-  `Config.Now`, or the database's clock as it records it where that is earlier, and its batches
-  delete by it: a decision time of the database's clock alone would mix its clock with the hosts'
-  and the tests', and one past it, as a host's clock set a year ahead records, would have every
-  later call of every host decide a year on, for good, as the latest time only moves on, though no
-  batch removes anything ended after the database's clock. A host whose clock runs behind the
-  database's has every call after another's run decide later than it reads. `Activate`
+  one left out had ended by then or by a run's time. A batch adds its own time and deletes those no
+  later that no other run is deleting (`SKIP LOCKED`), which only `DeleteExpired` writes, so runs
+  never wait for each other, a run in a host's transaction left open too, the latest time stays,
+  and a batch removing what ended sooner leaves it as it is. One time for every tenant: a run
+  removes what has ended in every tenant, and recording a time for each would read them all first.
+  The time is what the batch removed, not the run's clock: its rows ended by the run's `Config.Now`
+  and by the database's clock both, so a host's clock set a year ahead can't have every later call
+  of every host decide a year on, for good, as the latest time only moves on; and a call decides
+  later than its own clock only where a run removed a row that ended after it. Recorded as the
+  run's clock, every run, removing nothing or only what ended long before, had every call of a host
+  whose clock is behind the run's decide later than it reads, and every change in flight as it
+  committed tried again: with a run every 50 ms beside four sessions granting roles that end 200 ms
+  on, 3.5% of changes, and none so. A place removed with its membership may end later, or never, but
+  gives nothing once the membership has ended, which it records. `Activate`
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
   doesn't record the time, and `AsOf` doesn't read it: as of a time, a read decides at that time.
