@@ -2697,7 +2697,7 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // empty maps 108 ms; and each JSON text and slice of bytes was charged one and a tenth of its
 // length, though converting a text made a json.Decoder and a copy keeps each slice apart, so a
 // check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy 150,000 slices of a
-// byte. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy, whatever holds
+// byte. Timed, a unit now takes 20 to 145 ns to convert and 25 to 360 ns to copy, whatever holds
 // it, where reading one in a condition takes 70 to 145. What each allocates stands in for the time
 // here, as -race and a slower machine change neither: no unit charged allocates more
 // than a few times what one of a string does, by count or by bytes. Converting an empty map made

@@ -118,7 +118,7 @@ import (
 // bytes, but for what building a value costs more: 8 for each map, Struct or JSON object, 4 for
 // each list, ListValue or JSON array, each pointer, but to a message, and each other message, 3 for
 // each slice of bytes and JSON text, and a map's entry at least 1 for each 24 bytes its value holds
-// in place, which reading it moves. So a unit converted costs about what one read does, 20 to 115
+// in place, which reading it moves. So a unit converted costs about what one read does, 20 to 145
 // ns, and a check converts no more than its conditions may spend reading, about 20 ms, where
 // charged one each, as a number is, 160,000 empty maps took 93 ms, and charged one and a tenth of
 // its length, 79,000 JSON texts of a byte 80 ms. Each kind is converted whole, whether it can be
@@ -217,8 +217,9 @@ const maxConverted = 2 * maxCheckCost
 // Counted one, as a number is, 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to
 // copy, where as many ints took 12 ms and 6 ms, and counted one and a tenth of their length,
 // 150,000 slices of a byte took a hook 76 ms to copy, and 79,000 JSON texts of a byte a check 80 ms
-// to convert; so weighed, a unit takes 20 to 115 ns to convert and 25 to 200 ns to copy, whatever
-// holds it, a copied message the most.
+// to convert; so weighed, a unit takes 20 to 145 ns to convert and 25 to 360 ns to copy, whatever
+// holds it, a copied message the most, but for a message of the host's own type whose reflection
+// panics, which a copy asks of each (itself), and which took a microsecond a unit.
 const (
 	mapCost     = 8
 	listCost    = 4
