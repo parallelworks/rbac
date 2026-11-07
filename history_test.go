@@ -1142,8 +1142,10 @@ func TestAsOfSaysToDropOnlyTheViewsOfHistoryStandingInAnotherSchema(t *testing.T
 	if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), `DROP SCHEMA IF EXISTS `+quoted(other)) {
 		t.Fatalf("AsOf where views of history stand only in another schema: %v", err)
 	}
-	for _, sql := range []string{`DROP VIEW ` + other + `.rbac_grants`, `DROP SCHEMA IF EXISTS ` + views + ` CASCADE`,
-		`CREATE SCHEMA ` + views + ` AUTHORIZATION ` + r.admin, `ALTER FUNCTION ` + r.schema + `.rbac_as_of_views() OWNER TO ` + r.admin} {
+	for _, sql := range []string{
+		`DROP VIEW ` + other + `.rbac_grants`, `DROP SCHEMA IF EXISTS ` + views + ` CASCADE`,
+		`CREATE SCHEMA ` + views + ` AUTHORIZATION ` + r.admin, `ALTER FUNCTION ` + r.schema + `.rbac_as_of_views() OWNER TO ` + r.admin,
+	} {
 		if _, err := r.super.Exec(ctx, sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
 		}
