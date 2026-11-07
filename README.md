@@ -671,9 +671,9 @@ than as a record of its own, and each record holds the cluster that wrote it (`R
 its actor and the call that made it (`Record.How`), and what the host attaches with
 `rbac.WithAudit`: on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
 one, made by no one, and so is each time it records in `rbac_expired` that every check and change
-decides no earlier than, as the entity `expired`, in no tenant, keyed by the time as JSON writes it
-in UTC (see Expiry). Triggers write it, so a write that bypasses the package is recorded too, as no
-one's. That context is what the session that wrote it says; the database role is what the database
+decides no earlier than, as the entity `expired`, in no tenant, keyed by its row's id, as two rows
+can hold one time (see Expiry). Triggers write it, so a write that bypasses the package is recorded
+too, as no one's. That context is what the session that wrote it says; the database role is what the database
 knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
 a deny's principals and exemptions and an eligibility's approvers, which they count to
 `rbac.MaxID` characters rather than bytes, so a write around the package can store those at up
@@ -1001,7 +1001,8 @@ have the server load a library or run a program of its choosing; and:
    `DeleteExpired` records the times it deleted by, and which no role has unless it is granted;
    only `SELECT` on `rbac_expired`, which every check and change reads, so that role can neither
    record a time past the database's clock nor move back the latest, as only that function writes
-   it; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
+   it, and nothing on its id's sequence, with which `setval` could fail every run of
+   `DeleteExpired`; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
    id sequence, which a grant on all the schema's sequences can give: `setval` could number a change
    below the one before it, and `AsOf` would read the row as it was before the change. Never
    `TRIGGER`, which `ALL` includes: a trigger runs its function as whoever writes the table, and one
@@ -1293,30 +1294,32 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   code from before it reads the places by statistics alone, every place in the table by those from
   when it was nearly empty. Code from before it and after it run beside each other, applied or not.
   `0032_expired_writes` has history record every write to `rbac_expired`, as the entity `expired` in
-  no tenant, replacing `rbac_record`, which keeps its owner and who may execute it, and widening
-  history's check of entities, which reads no record but locks history against reads and writes
-  until migrating commits, so every change, as each writes history, and every read of history, as
-  `AsOf` and an export, waits for it. It records each time the table holds as its baseline, brings
-  one past the database's clock back to it, recorded as a `delete` of that time and a `create` of
-  the clock's, as the time is the record's key, and from then on refuses one past the clock,
-  whoever writes it, by a trigger, `rbac_expired_until`, which no role but its owner may execute. It
-  takes from every role but the table's owner every privilege on it but `SELECT`, on the table and
-  on its column, `TRIGGER` too, which would run a role's function as whoever writes the table, and
-  gives `EXECUTE` on `rbac_expired_through`, which it makes, to each that held `INSERT` on either,
-  as `0030_expired_through` gave the application's role of step 3, and to no other, so a deployment
-  that gave its roles their privileges before migrating runs `DeleteExpired` with no step of its
-  own; grant it to a role you give its privileges only after migrating. The function runs as the
-  table's owner, which it is given where another role migrates, and is SQL bound to the table as it
-  is made, so nothing a session names changes what it writes. A trigger already on `rbac_expired`
-  that runs a function a role other than the table's owner or a superuser owns, as a role that held
-  `TRIGGER` on it, which step 3 never gives, could have made, would run that role's code as the
-  table's owner whenever the function writes the table: migrating refuses it with SQLSTATE 42501,
-  having changed nothing; drop it, and migrate again. Writes to `rbac_expired` wait for migrating;
-  checks, which only read it, don't. Code before it runs `DeleteExpired` by writing the table,
-  which the application's role of step 3 may no longer, and fails with SQLSTATE 42501, and code
-  after it, before it is applied, by the function, which doesn't exist yet, and fails as
-  `rbac.ErrInvalid`, saying so: run `DeleteExpired` only from code after it once it is applied.
-  Their checks, searches and changes run beside each other, applied or not.
+  no tenant, keyed by an id it gives each row, as two can hold one time, replacing `rbac_record`,
+  which keeps its owner and who may execute it, and widening history's check of entities, which
+  reads no record but locks history against reads and writes until migrating commits, so every
+  change, as each writes history, and every read of history, as `AsOf` and an export, waits for it.
+  Adding the id locks `rbac_expired` against reads and writes until migrating commits too, so every
+  check waits for it as well, for as long as `Migrate` waits for a lock and then runs. It records
+  each row the table holds as its baseline, brings a time past the database's clock back to it,
+  recorded as an `update`, and from then on refuses one past the clock, whoever writes it, by a
+  trigger, `rbac_expired_until`, which no role but its owner may execute. It takes from every role
+  but the table's owner every privilege on it but `SELECT`, on the table and on its column,
+  `TRIGGER` too, which would run a role's function as whoever writes the table, and every privilege
+  on the id's sequence, which the schema's default privileges can grant as it is made. It gives
+  `EXECUTE` on `rbac_expired_through`, which it makes, to each role that held `INSERT` on the table
+  or its column, as `0030_expired_through` gave the application's role of step 3, and to no other,
+  so a deployment that gave its roles their privileges before migrating runs `DeleteExpired` with no
+  step of its own; grant it to a role you give its privileges only after migrating. The function
+  runs as the table's owner, which it is given where another role migrates, and is SQL bound to the
+  table as it is made, so nothing a session names changes what it writes. A trigger already on
+  `rbac_expired` that runs a function a role other than the table's owner or a superuser owns, as a
+  role that held `TRIGGER` on it, which step 3 never gives, could have made, would run that role's
+  code as the table's owner whenever the function writes the table: migrating refuses it with
+  SQLSTATE 42501, having changed nothing; drop it, and migrate again. Code before it runs
+  `DeleteExpired` by writing the table, which the application's role of step 3 may no longer, and
+  fails with SQLSTATE 42501, and code after it, before it is applied, by the function, which doesn't
+  exist yet, and fails as `rbac.ErrInvalid`, saying so: run `DeleteExpired` only from code after it
+  once it is applied. Their checks, searches and changes run beside each other, applied or not.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

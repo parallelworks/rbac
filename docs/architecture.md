@@ -1325,10 +1325,11 @@ flowchart LR
   later, as in a procedure that commits as it goes, and an expiry when it expired, but never before
   the row's last record. A write that bypassed the package is recorded too, with no actor. So is
   each time `DeleteExpired` records in `rbac_expired`, as the entity `expired`, in no tenant, keyed
-  by the time, which its row holds too, so the chain covers it. The tables bound its row as the
-  package bounds what it writes, but for the ids in a deny's or an eligibility's lists of
-  principals, which they count in characters rather than bytes. A row of more than 1 MiB as jsonb,
-  or a context of more than 1 MiB, fails its write, so no record is one `History` can't return. A
+  by its row's id, as two rows can hold one time; its row holds the time, so the chain covers it.
+  The tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
+  eligibility's lists of principals, which they count in characters rather than bytes. A row of
+  more than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
+  `History` can't return. A
   row written before history was installed has one record from migrating, its baseline, dated when
   it was created, or at the epoch where that was before year 1 or at its first instant.
 - **Commit records.** No other session sees a change before its transaction commits, which a host's

@@ -12,15 +12,17 @@
 -- began, before it commits and so before a snapshot that sees it is taken. And here:
 --
 -- History records every write to the table, as it does to the package's other tables: rbac_record
--- records its rows as the entity 'expired', in no tenant, keyed by the time as JSON writes it in
--- UTC, which the record's row holds too, so the chain covers it as every other field. A row there
--- before is recorded as migrating finds it, its baseline, dated at its time, as it was written no
--- earlier, or at the clock where that is earlier; one past the clock is then brought back to it,
--- recorded as the delete of its time and the create of the clock's, as the time is its key, so
--- neither the row nor the bound it broke is lost to an auditor. Two rows of one time, which two runs
--- can each add, share a key. Widening history's check of entities reads no record, but locks
--- history against reads and writes until migrating commits, as 0027's did: every change, as each
--- writes history, waits for it, and every read of history, as AsOf and an export.
+-- records its rows as the entity 'expired', in no tenant, keyed by an id each row is given here, as
+-- the other tables' rows are keyed by theirs, and the record's row holds its time, so the chain
+-- covers it as every other field. Not by the time: two rows can hold one, as two runs can each add
+-- it and bringing several back to the clock below gives them one, and a prune would take the delete
+-- of one for the end of both, and delete every record of the one still there. A row there before is
+-- recorded as migrating finds it, its baseline, dated at its time, as it was written no earlier, or
+-- at the clock where that is earlier; one past the clock is then brought back to it, recorded as an
+-- update, from its time to the clock's, so neither the row nor the bound it broke is lost to an
+-- auditor. Widening history's check of entities reads no record, but locks history against reads
+-- and writes until migrating commits, as 0027's did: every change, as each writes history, waits
+-- for it, and every read of history, as AsOf and an export.
 --
 -- A trigger refuses a time past the database's clock as its statement began, whoever writes it, as
 -- a check can't read the clock. It reads no table, so it runs as whoever writes, its search_path
@@ -31,7 +33,9 @@
 --
 -- No role but the table's owner may write it, nor hold TRIGGER on it: a trigger runs as whoever
 -- writes the table, which below is its owner. INSERT and UPDATE on its column are taken too, from a
--- role holding them there alone, which a revoke from the roles holding the table's passes over. A
+-- role holding them there alone, which a revoke from the roles holding the table's passes over, and
+-- every privilege on its id's sequence, which the schema's default privileges can grant as the id
+-- is added: setval could have each later row take an id a row holds, or none, failing every run. A
 -- trigger already there, as a role holding TRIGGER could have made, whose function a role other
 -- than the owner or a superuser owns, is refused before anything writes the table: it would run
 -- that role's code as the owner, from the update below on, whenever a role writes through
@@ -48,12 +52,14 @@
 -- itself, so its DeleteExpired fails on such a role, which may no longer (SQLSTATE 42501); its
 -- checks and changes, which only read it, run as before.
 --
--- Writes to the table wait for migrating, so none goes unrecorded between the baseline and the
--- triggers; checks, which only read it, don't. The table is locked before history: a batch of
+-- Adding the id locks the table against reads and writes until migrating commits: every write
+-- waits for it, so none goes unrecorded between the baseline and the triggers, and so does every
+-- check and change, as each reads the table. The table is locked before history: a batch of
 -- DeleteExpired of the code before this locks the table as its statement begins and writes history
--- only as it ends, as the triggers recording what it removes fire, so taking history first
--- deadlocked with a batch in flight. A run in a host's transaction that changed the tables before it
--- takes history first, and gives way to migrating, or migrating to it, by lock_timeout.
+-- only as it ends, as the triggers recording what it removes fire, and a change reads the table
+-- before it writes, so taking history first would deadlock with either in flight. A host's
+-- transaction that changed the tables before it reads or writes this one takes history first, and
+-- gives way to migrating, or migrating to it, by lock_timeout.
 
 -- As 0029 wrote it, recording rbac_expired's rows too. Replacing it keeps its owner and who may
 -- execute it, but not its settings, so they are set here, as 0029 set them. It takes no lock on the
@@ -117,10 +123,10 @@ BEGIN
               WHEN 'rbac_expired' THEN 'expired' END;
     key := CASE entity WHEN 'deny' THEN (r->>'scope') || ' ' || (r->>'id') WHEN 'membership' THEN r->>'principal'
            WHEN 'member' THEN pg_catalog.jsonb_build_array(r->>'group_id', r->>'principal', r->>'source')::text
-           WHEN 'expired' THEN r->>'until' ELSE r->>'id' END;
+           ELSE r->>'id' END;
     was_key := CASE entity WHEN 'deny' THEN (was->>'scope') || ' ' || (was->>'id') WHEN 'membership' THEN was->>'principal'
                WHEN 'member' THEN pg_catalog.jsonb_build_array(was->>'group_id', was->>'principal', was->>'source')::text
-               WHEN 'expired' THEN was->>'until' ELSE was->>'id' END;
+               ELSE was->>'id' END;
     -- When the change took effect, but for an expiry: when its statement began, or its transaction,
     -- where that began later, and never before the row's last record, as a change can have moved
     -- its expiry back to before then. The last a write's snapshot holds: at READ COMMITTED, as the
@@ -176,7 +182,8 @@ BEGIN
     RETURN NULL;
 END $$;
 
-LOCK TABLE rbac_expired IN SHARE ROW EXCLUSIVE MODE;
+-- Locking the table against reads and writes, before history (see above).
+ALTER TABLE rbac_expired ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY;
 
 ALTER TABLE rbac_history DROP CONSTRAINT rbac_history_entity_check,
     ADD CONSTRAINT rbac_history_entity_check
@@ -209,10 +216,10 @@ DECLARE
 BEGIN
     PERFORM pg_catalog.set_config('TimeZone', 'UTC', true);
     INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, bytes, how, cluster)
-    SELECT least(e.until, pg_catalog.statement_timestamp()), '', 'expired', pg_catalog.to_jsonb(e)->>'until', 'baseline',
+    SELECT least(e.until, pg_catalog.statement_timestamp()), '', 'expired', pg_catalog.to_jsonb(e)->>'id', 'baseline',
       pg_catalog.to_jsonb(e), pg_catalog.octet_length(pg_catalog.to_jsonb(e)::text), 'Migrate',
       (pg_catalog.pg_control_system()).system_identifier
-    FROM rbac_expired e ORDER BY e.until;
+    FROM rbac_expired e ORDER BY e.id;
     PERFORM pg_catalog.set_config('TimeZone', zone, true);
 END $$;
 
@@ -239,7 +246,7 @@ SELECT pg_catalog.set_config('rbac.change', '', true);
 CREATE FUNCTION rbac_expired_through(through timestamptz) RETURNS void LANGUAGE sql SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp
 BEGIN ATOMIC
-    DELETE FROM rbac_expired WHERE ctid = ANY (ARRAY(SELECT ctid FROM rbac_expired WHERE until <= through FOR UPDATE SKIP LOCKED));
+    DELETE FROM rbac_expired WHERE id = ANY (ARRAY(SELECT id FROM rbac_expired WHERE until <= through FOR UPDATE SKIP LOCKED));
     INSERT INTO rbac_expired (until) VALUES (through);
 END;
 
@@ -251,6 +258,7 @@ DECLARE
     through pg_catalog.regprocedure := (here || '.rbac_expired_through(timestamptz)')::pg_catalog.regprocedure;
     refusing pg_catalog.regprocedure := (here || '.rbac_expired_until()')::pg_catalog.regprocedure;
     owner   pg_catalog.oid := (SELECT c.relowner FROM pg_catalog.pg_class c WHERE c.oid = expired);
+    ids     pg_catalog.regclass := pg_catalog.pg_get_serial_sequence(here || '.rbac_expired', 'id')::pg_catalog.regclass;
     g       record;
 BEGIN
     IF owner <> (SELECT p.proowner FROM pg_catalog.pg_proc p WHERE p.oid = through) THEN
@@ -277,5 +285,11 @@ BEGIN
           pg_catalog.aclexplode(l.acl) a
         WHERE a.privilege_type <> 'SELECT' AND a.grantee <> owner ORDER BY 2, 1 LOOP
         EXECUTE pg_catalog.format('REVOKE %s ON %s FROM %s CASCADE', g.privilege, expired, g.grantee);
+    END LOOP;
+    -- The id's sequence, which the schema's default privileges can grant a role as it is made.
+    FOR g IN SELECT DISTINCT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE a.grantee::pg_catalog.regrole::pg_catalog.text END AS grantee
+        FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
+        WHERE c.oid = ids AND a.grantee <> owner ORDER BY 1 LOOP
+        EXECUTE pg_catalog.format('REVOKE ALL ON SEQUENCE %s FROM %s CASCADE', ids, g.grantee);
     END LOOP;
 END $$;

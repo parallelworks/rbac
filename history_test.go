@@ -517,17 +517,27 @@ func (r *readmeRoles) harden(t *testing.T) {
 	}
 }
 
-// expiredRecords is history's records of rbac_expired's rows, in the order written: each one's key,
-// op, how, and the database role that wrote it.
-func expiredRecords(t *testing.T, q rbac.DB) [][4]string {
+// expiredRecord is a record of a row of rbac_expired's: its key, the row's time, as JSON writes it
+// in UTC, as the row became or, where it was deleted, as it was, its op, how, and the database role
+// that wrote it.
+type expiredRecord struct{ key, until, op, how, dbUser string }
+
+// expiredRecords is history's records of rbac_expired's rows, in the order written, each of which
+// is in no tenant and keyed by its row's id.
+func expiredRecords(t *testing.T, q rbac.DB) []expiredRecord {
 	t.Helper()
-	rows, err := q.Query(t.Context(), `SELECT key, op, how, db_user FROM rbac_history WHERE entity = 'expired' AND tenant = '' ORDER BY id`)
+	rows, err := q.Query(t.Context(), `SELECT tenant, coalesce(after, before)->>'id', key, coalesce(after, before)->>'until', op, how, db_user
+		FROM rbac_history WHERE entity = 'expired' ORDER BY id`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got [][4]string
-	var r [4]string
-	if _, err := pgx.ForEachRow(rows, []any{&r[0], &r[1], &r[2], &r[3]}, func() error {
+	var got []expiredRecord
+	var r expiredRecord
+	var tenant, id string
+	if _, err := pgx.ForEachRow(rows, []any{&tenant, &id, &r.key, &r.until, &r.op, &r.how, &r.dbUser}, func() error {
+		if tenant != "" || r.key != id {
+			t.Errorf("history records rbac_expired's row %s in tenant %q, keyed by %q", id, tenant, r.key)
+		}
 		got = append(got, r)
 		return nil
 	}); err != nil {
@@ -536,9 +546,18 @@ func expiredRecords(t *testing.T, q rbac.DB) [][4]string {
 	return got
 }
 
-// expiredKey is the key history records a time of rbac_expired's by: the time as JSON writes it, in
-// UTC.
-func expiredKey(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.999999-07:00") }
+// expiredTime is a time of rbac_expired's as JSON writes it, in UTC, as history's records hold it.
+func expiredTime(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.999999-07:00") }
+
+// expiredID is the id of the row of rbac_expired holding until, of which there must be one.
+func expiredID(t *testing.T, q rbac.DB, until time.Time) string {
+	t.Helper()
+	var ids []string
+	if err := q.QueryRow(t.Context(), `SELECT array_agg(id::text) FROM rbac_expired WHERE until = $1`, until).Scan(&ids); err != nil || len(ids) != 1 {
+		t.Fatalf("rbac_expired holds %v rows of %v: %v", ids, until, err)
+	}
+	return ids[0]
+}
 
 // Under the README's roles, DeleteExpired, on the application's role, records the time it deleted
 // by, which that role otherwise writes only through rbac_expired_through, as DeleteExpired does: it
@@ -584,9 +603,10 @@ func TestTheApplicationsRoleWritesExpiredOnlyAsDeleteExpiredDoes(t *testing.T) {
 	if err := r.appPool.QueryRow(ctx, `SELECT max(until) FROM rbac_expired`).Scan(&latest); err != nil || !latest.Equal(base.Add(-30*time.Minute)) {
 		t.Errorf("the latest time DeleteExpired deleted by is %v: %v", latest, err)
 	}
-	want := [][4]string{
-		{expiredKey(base.Add(-30 * time.Minute)), "create", "DeleteExpired", r.app},
-		{expiredKey(base.Add(-time.Hour)), "create", "", r.app},
+	recorded, written := base.Add(-30*time.Minute), base.Add(-time.Hour)
+	want := []expiredRecord{
+		{expiredID(t, r.appPool, recorded), expiredTime(recorded), "create", "DeleteExpired", r.app},
+		{expiredID(t, r.appPool, written), expiredTime(written), "create", "", r.app},
 	}
 	if got := expiredRecords(t, r.appPool); !slices.Equal(got, want) {
 		t.Errorf("history records rbac_expired's writes as %q, want %q", got, want)

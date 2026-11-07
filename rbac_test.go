@@ -10194,10 +10194,11 @@ func TestExpiredRefusesATimePastTheDatabasesClock(t *testing.T) {
 	}
 }
 
-// History records every write to rbac_expired, as the entity expired in no tenant, keyed by its time:
-// the time each of DeleteExpired's batches adds, the times it deletes as later ones supersede them,
-// and a write around the package, as no one's. Here DeleteExpired by a clock an hour on removes y's
-// grant, which ended half an hour on, and by one two hours on z's, which ended an hour and a half on.
+// History records every write to rbac_expired, as the entity expired in no tenant, keyed by its
+// row's id: the time each of DeleteExpired's batches adds, the times it deletes as later ones
+// supersede them, and a write around the package, as no one's. Here DeleteExpired by a clock an hour
+// on removes y's grant, which ended half an hour on, and by one two hours on z's, which ended an hour
+// and a half on.
 func TestHistoryRecordsEveryWriteToExpired(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -10217,28 +10218,95 @@ func TestHistoryRecordsEveryWriteToExpired(t *testing.T) {
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1)`, base.Add(10*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	key := func(d time.Duration) string { return base.Add(d).UTC().Format("2006-01-02T15:04:05-07:00") }
-	type record struct{ tenant, key, op, how, until string }
-	want := []record{
-		{"", key(30 * time.Minute), "create", "DeleteExpired", key(30 * time.Minute)},
-		{"", key(30 * time.Minute), "delete", "DeleteExpired", key(30 * time.Minute)},
-		{"", key(90 * time.Minute), "create", "DeleteExpired", key(90 * time.Minute)},
-		{"", key(10 * time.Minute), "create", "", key(10 * time.Minute)},
-	}
-	rows, err := h.pool.Query(ctx, `SELECT tenant, key, op, how, coalesce(after, before)->>'until' FROM rbac_history WHERE entity = 'expired' ORDER BY id`)
-	if err != nil {
+	var user string
+	if err := h.pool.QueryRow(ctx, `SELECT current_user`).Scan(&user); err != nil {
 		t.Fatal(err)
 	}
-	var got []record
-	var r record
-	if _, err := pgx.ForEachRow(rows, []any{&r.tenant, &r.key, &r.op, &r.how, &r.until}, func() error {
-		got = append(got, r)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	at := func(d time.Duration) string { return expiredTime(base.Add(d)) }
+	got := expiredRecords(t, h.pool)
+	if len(got) != 4 {
+		t.Fatalf("history records rbac_expired's writes as %+v", got)
+	}
+	// The first, which the second run deleted, has no row left to read its id from.
+	want := []expiredRecord{
+		{got[0].key, at(30 * time.Minute), "create", "DeleteExpired", user},
+		{got[0].key, at(30 * time.Minute), "delete", "DeleteExpired", user},
+		{expiredID(t, h.pool, base.Add(90*time.Minute)), at(90 * time.Minute), "create", "DeleteExpired", user},
+		{expiredID(t, h.pool, base.Add(10*time.Minute)), at(10 * time.Minute), "create", "", user},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("history records rbac_expired's writes as %+v, want %+v", got, want)
+	}
+}
+
+// Each row of rbac_expired is recorded, and pruned, on its own, by its id, as two can hold one
+// time: here two runs beside each other each add it, as neither sees the other's, and a later run
+// deletes one, passing over the other, which another transaction holds, so it stays. A prune past
+// all of it deletes every record of the one deleted, and keeps the one still there's. Keyed by the
+// time, the delete of one read as the end of both, and the prune deleted the record of the one
+// still there.
+func TestHistoryRecordsAndPrunesEachRowOfExpiredOnItsOwn(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	at := dbNow(t, h).Add(-time.Hour)
+	var runs []pgx.Tx
+	for range 2 {
+		run, err := h.pool.Begin(bounded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = run.Rollback(context.WithoutCancel(ctx)) }()
+		if _, err := run.Exec(bounded, `SELECT rbac_expired_through($1)`, at); err != nil {
+			t.Fatal(err)
+		}
+		runs = append(runs, run)
+	}
+	for _, run := range runs {
+		if err := run.Commit(bounded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ids []string
+	if err := h.pool.QueryRow(bounded, `SELECT array_agg(id::text ORDER BY id) FROM rbac_expired WHERE until = $1`, at).Scan(&ids); err != nil || len(ids) != 2 {
+		t.Fatalf("two runs beside each other left %v rows of their time: %v", ids, err)
+	}
+	deleted, kept := ids[0], ids[1]
+	holder, err := h.pool.Begin(bounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := holder.Exec(bounded, `SELECT FROM rbac_expired WHERE id = $1 FOR UPDATE`, kept); err != nil {
+		t.Fatal(err)
+	}
+	later := at.Add(30 * time.Minute)
+	if _, err := h.pool.Exec(bounded, `SELECT rbac_expired_through($1)`, later); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Rollback(bounded); err != nil {
+		t.Fatal(err)
+	}
+	var user string
+	if err := h.pool.QueryRow(ctx, `SELECT current_user`).Scan(&user); err != nil {
+		t.Fatal(err)
+	}
+	latest := expiredID(t, h.pool, later)
+	want := []expiredRecord{
+		{deleted, expiredTime(at), "create", "", user},
+		{kept, expiredTime(at), "create", "", user},
+		{deleted, expiredTime(at), "delete", "", user},
+		{latest, expiredTime(later), "create", "", user},
+	}
+	if got := expiredRecords(t, h.pool); !slices.Equal(got, want) {
+		t.Fatalf("history records rbac_expired's writes as %+v, want %+v", got, want)
+	}
+	if _, err := rbac.PruneHistory(ctx, h.pool, dbNow(t, h), exported(t, h)); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := expiredRecords(t, h.pool), []expiredRecord{want[1], want[3]}; !slices.Equal(got, want) {
+		t.Errorf("once pruned, history records rbac_expired's writes as %+v, want %+v", got, want)
 	}
 }
 

@@ -272,11 +272,13 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 	}
 }
 
-// Migrating to 0032 records what rbac_expired holds, as its baseline, brings a time there past the
-// database's clock back to it, recorded too, and leaves each role that could write the table only
-// SELECT on it, and rbac_expired_through in its place: the application's role, hardened as the README
-// said before, runs DeleteExpired as before with no step of its own, and the latest time it wrote
-// stands no later than the database's clock.
+// Migrating to 0032 records what rbac_expired holds, as its baseline, each row by the id it gives
+// it, brings a time there past the database's clock back to it, recorded as an update, and leaves
+// each role that could write the table only SELECT on it, and rbac_expired_through in its place,
+// and no role any privilege on the id's sequence, which the schema's default privileges grant the
+// application's role as it is made: the application's role, hardened as the README said before,
+// runs DeleteExpired as before with no step of its own, and the latest time it wrote stands no
+// later than the database's clock.
 func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
@@ -293,6 +295,9 @@ func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
 	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1), ($2)`, past, future); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := r.adminPool.Exec(ctx, `ALTER DEFAULT PRIVILEGES IN SCHEMA `+r.schema+` GRANT ALL ON SEQUENCES TO `+r.app); err != nil {
+		t.Fatal(err)
+	}
 	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
 		t.Fatal(err)
 	}
@@ -307,25 +312,27 @@ func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
 	if len(times) != 2 || !times[0].Equal(past) || times[1].Before(before) || times[1].After(after) {
 		t.Fatalf("rbac_expired holds %v once migrated, not %v and the time it migrated at", times, past)
 	}
-	want := [][4]string{
-		{expiredKey(past), "baseline", "Migrate", r.admin},
-		{expiredKey(future), "baseline", "Migrate", r.admin},
-		{expiredKey(future), "delete", "Migrate", r.admin},
-		{expiredKey(times[1]), "create", "Migrate", r.admin},
+	kept, brought := expiredID(t, r.appPool, past), expiredID(t, r.appPool, times[1])
+	want := []expiredRecord{
+		{kept, expiredTime(past), "baseline", "Migrate", r.admin},
+		{brought, expiredTime(future), "baseline", "Migrate", r.admin},
+		{brought, expiredTime(times[1]), "update", "Migrate", r.admin},
 	}
 	if got := expiredRecords(t, r.appPool); !slices.Equal(got, want) {
 		t.Errorf("history records rbac_expired as %q, want %q", got, want)
 	}
-	var writes, reads, executes, public bool
+	var writes, reads, executes, public, numbers bool
 	if err := r.super.QueryRow(ctx, `SELECT has_table_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER'),
 		has_table_privilege($1, $2 || '.rbac_expired', 'SELECT'),
 		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
-		has_function_privilege('public', $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE')`, r.app, r.schema).Scan(&writes, &reads, &executes, &public); err != nil {
+		has_function_privilege('public', $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
+		has_sequence_privilege($1, pg_get_serial_sequence($2 || '.rbac_expired', 'id'), 'USAGE, SELECT, UPDATE')`,
+		r.app, r.schema).Scan(&writes, &reads, &executes, &public, &numbers); err != nil {
 		t.Fatal(err)
 	}
-	if writes || !reads || !executes || public {
-		t.Errorf("once migrated, the application's role writes rbac_expired %t, reads it %t and executes rbac_expired_through %t, and every role %t",
-			writes, reads, executes, public)
+	if writes || !reads || !executes || public || numbers {
+		t.Errorf("once migrated, the application's role writes rbac_expired %t, reads it %t and executes rbac_expired_through %t, every role executes it %t, and the application's role uses the id's sequence %t",
+			writes, reads, executes, public, numbers)
 	}
 	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	authz, err := rbac.New(r.appPool, rbac.Config{
