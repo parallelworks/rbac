@@ -46,8 +46,9 @@
 -- transactions, nor a connection a deferred trigger of the host's opens after the commit record's
 -- event; and a role that may create in the extension's schema can make a call of the function
 -- ambiguous, failing every commit, as revoking it would. So the README's roles give the
--- application's role no USAGE on any foreign-data wrapper or foreign server, and no privilege on a
--- foreign table.
+-- application's role no USAGE on any foreign-data wrapper or foreign server, no privilege on a
+-- foreign table, nor pg_read_all_data, which reads every one, and no privilege on a view or a
+-- function that reaches one as its owner, through the owner's user mapping.
 CREATE OR REPLACE FUNCTION rbac_history_commit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp SET plan_cache_mode = force_generic_plan SET enable_seqscan = off AS $$
 DECLARE

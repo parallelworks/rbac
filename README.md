@@ -816,11 +816,14 @@ check waits for a row another session holds there, which `lock_timeout`, the loc
 doesn't bound: in a test, a commit 1.5 s past its record, for as long as the remote lock was held. A
 role with `USAGE` on a postgres_fdw server and a user mapping, or a privilege on a foreign table
 and a mapping another made, can do this, and one with `USAGE` on the wrapper can make a server of
-its own. The commit record doesn't refuse a transaction that used a foreign connection, which
-PostgreSQL 18's `postgres_fdw_get_connections()` could tell it: no check of postgres_fdw's sees
-another extension's callbacks, as another foreign-data wrapper's that commits its own remote
-transactions, nor a connection a deferred trigger of the host's opens after the commit record, so
-the roles below give the application's role none of these. `pg_stat_activity` lists a session
+its own. So can one with none of these that may read or write a view, or call a function that runs
+as its owner, that reaches a foreign table, through the owner's mapping; and `pg_read_all_data` is
+a privilege on every foreign table. The commit record doesn't refuse a
+transaction that used a foreign connection, which PostgreSQL 18's `postgres_fdw_get_connections()`
+could tell it: no check of postgres_fdw's sees another extension's callbacks, as another
+foreign-data wrapper's that commits its own remote transactions, nor a connection a deferred
+trigger of the host's opens after the commit record, so the roles below give the application's role
+none of these. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
@@ -854,8 +857,9 @@ settings of synchronous replication and prepared transactions, for as long as th
 given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
 or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
 deferrable trigger, against which the check is best-effort; and a role given `USAGE` on a
-foreign-data wrapper or a foreign server, or a privilege on a foreign table, by a remote
-transaction's commit, for as long as the remote server has it wait.
+foreign-data wrapper or a foreign server, or a privilege on a foreign table, or on a view or a
+function that reaches one as its owner, by a remote transaction's commit, for as long as the remote
+server has it wait.
 With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
 keeps it, shows when the transaction's commit was written, which an auditor can compare with its
 `CommittedAt`.
@@ -1075,9 +1079,13 @@ default. A transaction that reads or writes a foreign table through postgres_fdw
 transaction after its commit record is written, and waits for the remote server for as long as that
 has it wait, which nothing the package sets bounds (see above): `USAGE` on a server lets a role map
 itself to it, `USAGE` on a wrapper lets it make a server, and a privilege on a foreign table lets it
-read or write through a mapping for it, or for `PUBLIC`, without either. Nor let it reach any other
-extension that does work it can start, and wait on, in a pre-commit callback. No call of the
-package's uses foreign data, so none of the roles needs any.
+read or write through a mapping for it, or for `PUBLIC`, without either. Nor grant it
+`pg_read_all_data`, which reads every foreign table as one it may read, nor a privilege on a view,
+or `EXECUTE` on a function that runs as its owner (`SECURITY DEFINER`), that reads or writes a
+foreign table: through either, the owner's mapping, or one for `PUBLIC`, opens the remote
+transaction, with no privilege of the role's own on the table, server or wrapper. Nor let it reach
+any other extension that does work it can start, and wait on, in a pre-commit callback. No call of
+the package's uses foreign data, so none of the roles needs any.
 
 ## Running it
 

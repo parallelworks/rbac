@@ -1360,11 +1360,13 @@ flowchart LR
   transaction, everything until `COMMIT PREPARED`. The commit record doesn't refuse a transaction
   that used a foreign connection: no check of postgres_fdw's connections sees another extension's
   callbacks, or a connection a deferred trigger opens after the commit record, so the README's roles
-  give the application's role no `USAGE` on a foreign-data wrapper or server, and no privilege on a
-  foreign table. A transaction that committed before
-  `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
-  commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
-  covers as every other field; a prune deletes it with the last of its transaction's other records.
+  give the application's role no `USAGE` on a foreign-data wrapper or server, no privilege on a
+  foreign table, nor `pg_read_all_data`, which reads every one, and no privilege on a view or a
+  function that reaches one as its owner, through the owner's mapping. A transaction that
+  committed before `0027_commit_dates` has none, and its changes count from their own dates.
+  `History` returns no commit record, but each record with its transaction's (`Record.CommittedAt`),
+  which the chain covers as every other field; a prune deletes it with the last of its
+  transaction's other records.
   What AsOf reads of a time is final once every transaction whose commit record is dated by then is
   seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
@@ -1565,8 +1567,9 @@ it: not `pg_write_all_data` or `pg_create_subscription`, through which it could 
 and write and read files as the server; before PostgreSQL 16 it has no `CREATEROLE`, which makes it
 a member of any role but a superuser; it has no `REPLICATION` attribute, which reads every data
 file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set; and it has no `USAGE` on
-a foreign-data wrapper or server, nor a privilege on a foreign table, whose remote transactions
-commit after the commit record. The README's
+a foreign-data wrapper or server, nor a privilege on a foreign table, or on a view or function that
+reaches one as its owner, nor `pg_read_all_data`, which reads every one, as their remote
+transactions commit after the commit record. The README's
 [History](../README.md#history) section has the exact grants.
 
 ```mermaid
