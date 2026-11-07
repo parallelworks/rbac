@@ -8,6 +8,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -500,27 +501,462 @@ func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 	}
 }
 
-// HistoryAltered names the last migration that alters history's table, as PostgreSQL refuses in a
-// transaction holding events of its deferred triggers (SQLSTATE 55006): ALTER TABLE, CREATE INDEX,
-// CLUSTER, VACUUM, REINDEX, TRUNCATE or DROP TABLE of it, or DROP TRIGGER on it, whose events
-// pending would then fail the commit, as a statement or as dynamic SQL, outside the migration's
-// comments. A migration that does so fails this until HistoryAltered names it, before Migrate on a
-// host's transaction lets a change in it through to fail the migration; and HistoryAltered naming
-// one that doesn't fails it too, before Migrate refuses a transaction no pending migration would.
+// HistoryAltered names the last migration that may alter history's table, as PostgreSQL refuses in
+// a transaction holding events of its deferred triggers (SQLSTATE 55006), as alteringHistory finds
+// them. A migration that does so fails this until HistoryAltered names it, before Migrate on a host's
+// transaction lets a change in it through to fail the migration; and HistoryAltered naming one that
+// doesn't fails it too, before Migrate refuses a transaction no pending migration would.
 func TestHistoryAlteredNamesTheLastMigrationAlteringHistory(t *testing.T) {
-	// TRUNCATE alone by the table it names, not as an event, as CREATE TRIGGER names it.
-	altering := regexp.MustCompile(`(?i)\b(?:(?:ALTER\s+TABLE|CREATE\s+(?:UNIQUE\s+)?INDEX|CLUSTER|VACUUM|REINDEX|DROP\s+(?:TABLE|TRIGGER))\b[^;]*|TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?\S*)\brbac_history\b`)
-	comment := regexp.MustCompile(`--[^\n]*`)
 	sqls := migrationSQL(t)
+	names := slices.Sorted(maps.Keys(sqls))
+	texts := make([]string, len(names))
+	for i, name := range names {
+		texts[i] = sqls[name]
+	}
 	last := ""
-	for _, name := range slices.Sorted(maps.Keys(sqls)) {
-		if altering.MatchString(comment.ReplaceAllString(sqls[name], "")) {
-			last = name
+	for i, alters := range alteringHistory(texts) {
+		if alters {
+			last = names[i]
 		}
 	}
 	var version int
 	if _, err := fmt.Sscanf(last, "%04d_", &version); err != nil || version != rbac.HistoryAltered {
 		t.Errorf("the last migration altering history is %s, not the %d HistoryAltered names: %v", last, rbac.HistoryAltered, err)
+	}
+}
+
+// alteringHistory finds history's table altered however a migration writes it: in any case, quoted
+// or qualified, in dynamic SQL, in a DO block, or in a function a later migration calls; and not in
+// a comment, a message, or history's column named cluster.
+func TestAlteringHistoryIsFoundHoweverAMigrationWritesIt(t *testing.T) {
+	const alters = `CREATE FUNCTION rbac_alter() RETURNS void LANGUAGE plpgsql AS $$
+		BEGIN EXECUTE pg_catalog.format('ALTER TABLE %I.%I VALIDATE CONSTRAINT c', pg_catalog.current_schema(), 'rbac_history'); END $$;`
+	for _, c := range []struct {
+		sqls []string
+		want []bool
+	}{
+		{[]string{`alter table RBAC_HISTORY add column x int;`}, []bool{true}},
+		{[]string{`ALTER TABLE IF EXISTS ONLY "s"."rbac_history" SET (fillfactor = 90);`}, []bool{true}},
+		{[]string{`/* ALTER TABLE rbac_grants */ CREATE UNIQUE INDEX i ON ONLY public.rbac_history (id);`}, []bool{true}},
+		{[]string{`CREATE CONSTRAINT TRIGGER t AFTER INSERT ON rbac_history DEFERRABLE FOR EACH ROW EXECUTE FUNCTION f();`}, []bool{true}},
+		{[]string{`DROP TRIGGER t ON rbac_history;`, `DROP TABLE rbac_grants, rbac_history;`}, []bool{true, true}},
+		{[]string{`TRUNCATE rbac_grants, rbac_history;`, `TRUNCATE TABLE ONLY %s;`}, []bool{true, true}},
+		{[]string{`CLUSTER VERBOSE rbac_history USING rbac_history_pkey;`, `REINDEX INDEX rbac_history_entity;`}, []bool{true, true}},
+		{[]string{`DROP FUNCTION rbac_history_commit() CASCADE;`, `DROP SCHEMA s CASCADE;`}, []bool{true, true}},
+		// Its name a placeholder, or built where it runs.
+		{[]string{`DO $do$ DECLARE history text := format('%I.rbac_history', current_schema());
+			BEGIN EXECUTE format('ALTER TABLE %s SET (fillfactor = 90)', history); END $do$;`}, []bool{true}},
+		{[]string{`DO $$ BEGIN EXECUTE 'ALTER ' || 'TABLE ' || quote_ident('rbac_' || 'history') || ' SET (fillfactor = 90)'; END $$;`}, []bool{true}},
+		{[]string{`DO $$ DECLARE s text; BEGIN SELECT q INTO s FROM queued; EXECUTE s; END $$;`}, []bool{true}},
+		{[]string{`DO $$ BEGIN EXECUTE format(CASE WHEN true THEN 'ALTER TABLE x' END); END $$;`}, []bool{true}},
+		// A -- in a string hides nothing after it.
+		{[]string{`DO $$ BEGIN EXECUTE 'COMMENT ON TABLE rbac_grants IS ''--'''; ALTER TABLE rbac_history SET (fillfactor = 90); END $$;`}, []bool{true}},
+		// By a function a migration made, and one that calls it.
+		{[]string{alters, `SELECT 1;`, `SELECT rbac_alter();`}, []bool{true, false, true}},
+		{[]string{alters, `CREATE PROCEDURE rbac_both() LANGUAGE sql AS 'SELECT rbac_alter()';`, `CALL rbac_both();`}, []bool{true, true, true}},
+		{[]string{
+			`-- ALTER TABLE rbac_history
+			/* ALTER TABLE rbac_history /* nested */ TRUNCATE rbac_history */ SELECT 1;`,
+			`SELECT h.cluster FROM rbac_history h WHERE h.cluster IS NOT NULL;`,
+			`CREATE FUNCTION f() RETURNS bigint LANGUAGE sql AS $$ SELECT CASE WHEN true THEN cluster END FROM rbac_history $$;`,
+			`DO $$ BEGIN RAISE EXCEPTION 'cannot alter history' USING HINT = 'Drop or disable the trigger.'; END $$;`,
+			`ALTER TABLE rbac_grants ADD COLUMN x int; CREATE INDEX i ON rbac_grants (x); TRUNCATE rbac_grants; CLUSTER rbac_grants;`,
+			`CREATE TRIGGER t BEFORE TRUNCATE ON rbac_grants FOR EACH STATEMENT EXECUTE FUNCTION rbac_no_truncate();`,
+			`INSERT INTO rbac_history (op) VALUES ('create'), ('truncate'); SELECT has_function_privilege('f()', 'EXECUTE');`,
+			`DO $$ BEGIN EXECUTE format('GRANT SELECT ON %s TO %s', 'rbac_history', 'r'); EXECUTE 'SELECT 1' || 'FROM rbac_history'; END $$;`,
+			`LOCK TABLE rbac_history IN SHARE MODE; ANALYZE rbac_history; DROP INDEX rbac_history_entity CASCADE;`,
+		}, []bool{false, false, false, false, false, false, false, false, false}},
+	} {
+		if got := alteringHistory(c.sqls); !slices.Equal(got, c.want) {
+			t.Errorf("%q: %v, not %v", c.sqls, got, c.want)
+		}
+	}
+}
+
+// alteringHistory reports, for each of sqls, migrations in order, whether it may alter history's
+// table, as altersHistory reads a statement: by a statement of its own, of dynamic SQL in it, or of
+// the body of a function or procedure a migration made, which it, or one it calls, calls by name.
+func alteringHistory(sqls []string) []bool {
+	type migration struct {
+		statements []sqlStatement
+		owners     []string
+	}
+	ms := make([]migration, len(sqls))
+	for i, sql := range sqls {
+		words := sqlWords(sql, 0)
+		ms[i] = migration{sqlStatements(words), sqlBodies(words)}
+	}
+	functions := map[string]bool{}
+	altering := make([]bool, len(sqls))
+	for found := true; found; {
+		found = false
+		for i, m := range ms {
+			for _, s := range m.statements {
+				if !altersHistory(s) && !s.calls(functions) {
+					continue
+				}
+				altering[i] = true
+				if f := m.owners[s.at]; f != "" && !functions[f] {
+					functions[f], found = true, true
+				}
+			}
+		}
+	}
+	return altering
+}
+
+// sqlBoundary stands among sqlWords where the text of a string or a dollar-quoted body begins or
+// ends.
+const sqlBoundary = "\x00"
+
+// sqlWord is a token of SQL, and how many strings and bodies deep it stands.
+type sqlWord struct {
+	text  string
+	depth int
+}
+
+var (
+	dollarQuote = regexp.MustCompile(`^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$`)
+	placeholder = regexp.MustCompile(`^%(?:[0-9]+\$)?-?(?:[0-9]+|\*(?:[0-9]+\$)?)?[sIL]`)
+)
+
+// sqlWords splits sql into tokens, leaving out its comments: words, lowercased unless quoted;
+// numbers; format()'s placeholders, as %I and %1$s; || and each other character of punctuation; and
+// the text of each string and dollar-quoted body, split so in turn, as dynamic SQL runs it, between
+// two sqlBoundary.
+func sqlWords(sql string, depth int) []sqlWord {
+	var out []sqlWord
+	add := func(text string) { out = append(out, sqlWord{text, depth}) }
+	quoted := func(text string) {
+		add(sqlBoundary)
+		out = append(out, sqlWords(text, depth+1)...)
+		add(sqlBoundary)
+	}
+	// The text up to the quote that ends it, which two of it stand for in it, and how much of sql
+	// that takes.
+	until := func(i int, quote byte) (string, int) {
+		var b strings.Builder
+		j := i + 1
+		for ; j < len(sql); j++ {
+			if sql[j] == quote {
+				if j+1 < len(sql) && sql[j+1] == quote {
+					b.WriteByte(quote)
+					j++
+					continue
+				}
+				break
+			}
+			b.WriteByte(sql[j])
+		}
+		return b.String(), j + 1
+	}
+	for i := 0; i < len(sql); {
+		rest, c := sql[i:], sql[i]
+		switch {
+		case strings.HasPrefix(rest, "--"):
+			if n := strings.IndexByte(rest, '\n'); n >= 0 {
+				i += n
+			} else {
+				i = len(sql)
+			}
+		case strings.HasPrefix(rest, "/*"):
+			nested, j := 1, i+2
+			for j < len(sql) && nested > 0 {
+				switch {
+				case strings.HasPrefix(sql[j:], "/*"):
+					nested, j = nested+1, j+2
+				case strings.HasPrefix(sql[j:], "*/"):
+					nested, j = nested-1, j+2
+				default:
+					j++
+				}
+			}
+			i = j
+		case c == '\'':
+			var text string
+			text, i = until(i, '\'')
+			quoted(text)
+		case c == '"':
+			var text string
+			text, i = until(i, '"')
+			add(text)
+		case c == '$' && dollarQuote.MatchString(rest):
+			tag := dollarQuote.FindString(rest)
+			body := rest[len(tag):]
+			if n := strings.Index(body, tag); n >= 0 {
+				body, i = body[:n], i+2*len(tag)+n
+			} else {
+				i = len(sql)
+			}
+			quoted(body)
+		case c == '%' && placeholder.MatchString(rest):
+			p := placeholder.FindString(rest)
+			add(p)
+			i += len(p)
+		case wordByte(c, true), c >= '0' && c <= '9':
+			j := i + 1
+			for j < len(sql) && wordByte(sql[j], false) {
+				j++
+			}
+			add(strings.ToLower(sql[i:j]))
+			i = j
+		case strings.HasPrefix(rest, "||"):
+			add("||")
+			i += 2
+		case c <= ' ':
+			i++
+		default:
+			add(string(c))
+			i++
+		}
+	}
+	return out
+}
+
+// wordByte reports whether c, first or not, belongs to a word as PostgreSQL reads an identifier.
+func wordByte(c byte, first bool) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80 ||
+		!first && (c >= '0' && c <= '9' || c == '$')
+}
+
+// isWord reports whether a token is a word, a name or a keyword.
+func isWord(token string) bool {
+	return token != "" && wordByte(token[0], true)
+}
+
+// sqlStatement is a statement among sqlWords, its words from at on, and whether || joins it to what
+// stands beside it, as a string of dynamic SQL built in parts.
+type sqlStatement struct {
+	words  []string
+	at     int
+	joined bool
+}
+
+// calls reports whether s calls one of functions by name.
+func (s sqlStatement) calls(functions map[string]bool) bool {
+	for i, word := range s.words {
+		if functions[word] && i+1 < len(s.words) && s.words[i+1] == "(" {
+			return true
+		}
+	}
+	return false
+}
+
+// sqlStatements splits words at each semicolon and sqlBoundary, and after each keyword after which
+// PL/pgSQL begins a statement, so that each starts with what it does.
+func sqlStatements(words []sqlWord) []sqlStatement {
+	var out []sqlStatement
+	start := 0
+	end := func(i int) {
+		if i > start {
+			s := sqlStatement{at: start}
+			for _, w := range words[start:i] {
+				s.words = append(s.words, w.text)
+			}
+			s.joined = start >= 2 && words[start-1].text == sqlBoundary && words[start-2].text == "||" ||
+				i+1 < len(words) && words[i].text == sqlBoundary && words[i+1].text == "||"
+			out = append(out, s)
+		}
+		start = i + 1
+	}
+	for i, w := range words {
+		switch w.text {
+		case ";", sqlBoundary, "begin", "then", "else", "loop", "declare":
+			end(i)
+		}
+	}
+	end(len(words))
+	return out
+}
+
+// sqlBodies is, for each of words, the name of the function or procedure a CREATE statement makes
+// whose body it stands in, or "".
+func sqlBodies(words []sqlWord) []string {
+	owners := make([]string, len(words))
+	for i, w := range words {
+		if w.text != "create" {
+			continue
+		}
+		j := i + 1
+		for j < len(words) && (words[j].text == "or" || words[j].text == "replace") {
+			j++
+		}
+		if j >= len(words) || words[j].text != "function" && words[j].text != "procedure" {
+			continue
+		}
+		// Named last before its arguments; its body the string or dollar-quoted body after AS.
+		name := ""
+		for j++; j < len(words) && words[j].text != "("; j++ {
+			if isWord(words[j].text) {
+				name = words[j].text
+			}
+		}
+		for j < len(words) && (words[j].depth != w.depth || words[j].text != "as" && words[j].text != ";") {
+			j++
+		}
+		if j+1 >= len(words) || words[j].text != "as" || words[j+1].text != sqlBoundary {
+			continue
+		}
+		for j += 2; j < len(words) && words[j].depth > w.depth; j++ {
+			owners[j] = name
+		}
+	}
+	return owners
+}
+
+// altersHistory reports whether s may alter history's table, as PostgreSQL refuses while events of
+// its deferred triggers are pending: ALTER TABLE, CREATE INDEX, CLUSTER, VACUUM, REINDEX, TRUNCATE or
+// DROP TABLE of it, or a trigger, rule or policy made or dropped on it, by a statement that names it;
+// DROP SCHEMA, DROP OWNED, or another DROP ... CASCADE, which can reach it or its triggers; or one
+// that doesn't write out the table it alters, as a format() placeholder or a name built where it
+// runs, or dynamic SQL run from a variable, as it can't be told not to.
+func altersHistory(s sqlStatement) bool {
+	w := s.words
+	for i, word := range w {
+		if word == "execute" && hidden(w[i+1:]) {
+			return true
+		}
+	}
+	verbs := []string{"alter", "create", "drop", "truncate", "cluster", "reindex", "vacuum"}
+	if len(w) == 0 || !slices.Contains(verbs, w[0]) {
+		return false
+	}
+	if len(w) == 1 {
+		// Alone, a word in a string, as an op history records, unless the rest is built onto it.
+		return s.joined
+	}
+	names := slices.Contains(w, "rbac_history")
+	skip := func(i int, words ...string) int {
+		for i < len(w) && slices.Contains(words, w[i]) {
+			i++
+		}
+		return i
+	}
+	on := func(i int) int {
+		if j := slices.Index(w[i:], "on"); j >= 0 {
+			return skip(i+j+1, "only")
+		}
+		return len(w)
+	}
+	switch w[0] {
+	case "alter":
+		if w[1] == "table" {
+			i := skip(2, "if", "exists", "only")
+			return names || i < len(w) && w[i] == "all" || mayBeHistory(w, i)
+		}
+		return !isWord(w[1])
+	case "create":
+		i := skip(1, "or", "replace", "unique", "constraint", "temporary", "temp", "unlogged")
+		if i >= len(w) || !isWord(w[i]) {
+			return true
+		}
+		switch w[i] {
+		case "index", "trigger", "rule", "policy":
+			return names || mayBeHistory(w, on(i))
+		case "table":
+			return names
+		}
+		return false
+	case "drop":
+		switch w[1] {
+		case "table":
+			return names || anyMayBeHistory(w, skip(2, "if", "exists"))
+		case "trigger", "rule", "policy":
+			return names || mayBeHistory(w, on(2))
+		case "schema", "owned":
+			return true
+		case "index", "view", "materialized":
+			return false
+		}
+		return !isWord(w[1]) || slices.Contains(w, "cascade")
+	case "truncate":
+		return names || anyMayBeHistory(w, skip(1, "table", "only"))
+	case "cluster":
+		i := skip(1, "verbose")
+		if j := slices.Index(w[i:], ")"); i < len(w) && w[i] == "(" && j >= 0 {
+			i += j + 1
+		}
+		if i < len(w) && !isWord(w[i]) && !strings.HasPrefix(w[i], "%") {
+			// History's column named cluster.
+			return false
+		}
+		if j := i + 1; j < len(w) && w[j] == "on" {
+			i = j + 1
+		}
+		return mayBeHistory(w, i)
+	case "reindex":
+		i := 1
+		if w[1] == "(" {
+			i += slices.Index(w[1:], ")") + 1
+		}
+		if i >= len(w) {
+			return true
+		}
+		switch kind, j := w[i], skip(i+1, "concurrently"); kind {
+		case "table":
+			return names || mayBeHistory(w, j)
+		case "index":
+			name, _, ok := relation(w, j)
+			return !ok || strings.HasPrefix(name, "rbac_history")
+		}
+		return true
+	}
+	// VACUUM, which no migration runs, as it can't run in a transaction.
+	return true
+}
+
+// hidden reports whether EXECUTE, followed by rest, runs SQL whose text isn't written there: from a
+// variable, or format() of a format that isn't a literal. Not EXECUTE FUNCTION or PROCEDURE, nor the
+// privilege, nor the word alone in a string.
+func hidden(rest []string) bool {
+	if len(rest) >= 2 && rest[0] == "pg_catalog" && rest[1] == "." {
+		rest = rest[2:]
+	}
+	if len(rest) == 0 {
+		return false
+	}
+	switch rest[0] {
+	case "function", "procedure", "on":
+		return false
+	case "format":
+		return len(rest) != 2 || rest[1] != "("
+	}
+	return true
+}
+
+// relation is the name of the table named from w[i] on, qualified or not, and where its name ends,
+// unless its name isn't written out, as a placeholder.
+func relation(w []string, i int) (name string, end int, ok bool) {
+	for i+1 < len(w) && w[i+1] == "." && (isWord(w[i]) || strings.HasPrefix(w[i], "%")) {
+		i += 2
+	}
+	if i < len(w) && isWord(w[i]) {
+		return w[i], i + 1, true
+	}
+	return "", i, false
+}
+
+// mayBeHistory reports whether the table named from w[i] on is history, or isn't written out.
+func mayBeHistory(w []string, i int) bool {
+	name, _, ok := relation(w, i)
+	return !ok || name == "rbac_history"
+}
+
+// anyMayBeHistory is mayBeHistory of each table in the list from w[i] on, as TRUNCATE and DROP
+// TABLE take one.
+func anyMayBeHistory(w []string, i int) bool {
+	for {
+		name, end, ok := relation(w, i)
+		if !ok || name == "rbac_history" {
+			return true
+		}
+		if end < len(w) && w[end] == "*" {
+			end++
+		}
+		if end >= len(w) || w[end] != "," {
+			return false
+		}
+		i = end + 1
 	}
 }
 
