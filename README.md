@@ -447,9 +447,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
   for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
   converts. Attributes holding a lock of the host's own that isn't a struct, as an integer a pointer
-  to which locks and unlocks, were read by its kind and now can't be, failing every condition
-  reading their kind, as no hook can be given them either, below, nor can ones holding an empty
-  slice or map of them, or a nil pointer to one, read as `[]`, `{}` or `null`; and a `Value`
+  to which locks and unlocks, were read by its kind, or as bytes in an array or a slice of ones that
+  are bytes, and now can't be, failing every condition reading their kind, as no hook can be given
+  them either, below, nor can ones holding an empty slice or map of them, or a nil pointer to one,
+  read as `[]`, `{}` or `null`, while an empty array of ones that are bytes, read as empty bytes,
+  is now read as `[]`, as an empty array of any other lock is; and a `Value`
   holding a nil `Struct` or `ListValue`, read as null, is now read as an empty map or list, as CEL
   reads it, so a condition comparing it with `null`, as a grant's `request.attributes.v == null`,
   no longer holds, and one reading its size does; but attributes holding a nil `Struct`,
@@ -541,35 +543,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `Permissions` does for each permission and a check of a labeled resource for each value its label
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
-  `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
-  more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
-  condition reads, along any path, wherever a value reached twice is reached first, nor a value
-  holding itself, as a graph of objects with links back can, that reaches 20,000 maps, lists,
-  pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
-  deep a path around the cycle nests turns on where the copy enters it, which the order a map's
-  entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
-  of them, were copied on one call and refused on the next. Nor does it hold what can't be copied
-  as a value: a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
-  value holds, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
-  wherever it lies, alone or in an array, a slice, a map or a struct, which no condition reads
-  either, an unsafe pointer, as a `reflect.Value` holds, or a struct's unexported field, which
-  a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
-  keep their state in; nor what it would share with the host, a channel or a func, wherever it
-  lies, as a constraint sending on its copy's channel sent on the host's, and calling its copy's
-  func ran the host's closure; nor a map keyed by a pointer, or by a value holding one, in place or
-  in an interface, however deep in the key, which no condition reads either: a key is given as it
-  is, as the copy finds an entry only by the host's own key, so a constraint writing through a
-  pointer key wrote to the host's, and an interface in a struct or an array key gave it the host's
-  channel, or a lock; a host's type that is its own reflection by a generated message's
-  it embeds is given holding the reflection of a copy of the message. Where the attributes hold
-  more, nest
-  deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be
-  given part of them,
-  and the call is refused as any other, a `DeniedError` of the permission on the resource
-  asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
-  users can write what takes attributes past it, as a resource's tags, and the message named the
-  constraint. What one removes from an actor the actor can't hand on, but for a
-  role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
+  `ValidateGrant` is given its copy of the actor's attributes once for a call too, and neither is
+  given what a copy can't hold (see What a hook's copy holds). What one removes from an actor the
+  actor can't hand on, but for a role a role it holds lists in `GrantableRoles`, which it grants
+  without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
   revoking there, and so it stops any change taking access away there, whatever the actor's grants,
@@ -609,6 +586,36 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   member's own membership takes that member's lock alone, so one committing after the change reads
   them again isn't seen: a host whose policy rests on a group's members checks the group's grants
   when it changes a membership, as `SetMemberships` says.
+- **What a hook's copy holds:** what the host passed, its maps, lists, pointers and messages its
+  own, a host's type that is its own reflection by a generated message's it embeds holding the
+  reflection of a copy of the message, and none of what follows. Where what a hook would be given
+  holds any of it, the hook can't be asked, rather than be given part of it, and the call is
+  refused as any other, a `DeniedError` of the permission on the resource asked about, or the
+  tenant, whose `Reason` names the hook and whose message doesn't: a tenant's users can write what
+  takes attributes past it, as a resource's tags, and the message named the constraint.
+  - **Size:** more than a check converts, counted alike.
+  - **Depth:** what nests past 20,000 deep, twice what a condition reads, along any path, wherever
+    a value reached twice is reached first.
+  - **Cycles:** a value holding itself, as a graph of objects with links back can, that reaches
+    20,000 maps, lists, pointers, structs, arrays and messages, counting each time it reaches one,
+    however shallow: how deep a path around the cycle nests turns on where the copy enters it,
+    which the order a map's entries come in picks, so two links each holding the other, beside a
+    chain of 9,998 links to one of them, were copied on one call and refused on the next.
+  - **Locks:** a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
+    value holds, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
+    wherever it lies, alone or in an array, a slice, a map or a struct, which can't be copied as a
+    value, and which no condition reads either.
+  - **Unsafe pointers:** as a `reflect.Value` holds, which can't be copied as a value either.
+  - **Another package's state:** a struct's unexported field, which a copy can't set, holding a
+    pointer, a slice, a map or an interface, as another package's types keep their state in.
+  - **Channels and funcs:** wherever they lie, which a copy could only share with the host: a
+    constraint sending on its copy's channel sent on the host's, and calling its copy's func ran
+    the host's closure.
+  - **Maps keyed by pointers:** a map keyed by a pointer, or by a value holding one, in place or in
+    an interface, however deep in the key: a copy gives a key as it is, as it finds an entry only by
+    the host's own key, so a constraint writing through a pointer key wrote to the host's, and an
+    interface in a struct or an array key gave it the host's channel, or a lock. No condition reads
+    such a map either, as CEL keys are bools, ints, uints and strings.
 
 ## Principals
 
