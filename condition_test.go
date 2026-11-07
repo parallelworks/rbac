@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/runtime/protoimpl"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -203,6 +204,33 @@ func (d hostDouble) Compare(other ref.Val) ref.Val    { return types.Double(d).C
 func (d hostDouble) Type() ref.Type                   { return types.DoubleType }
 func (d hostDouble) Value() any                       { return float64(d) }
 
+// wideDouble is a host's own type CEL reads as a double, which holds 8 KiB in place.
+type wideDouble [1 << 10]float64
+
+func (d wideDouble) ConvertToNative(t reflect.Type) (any, error) {
+	return types.Double(d[0]).ConvertToNative(t)
+}
+func (d wideDouble) ConvertToType(t ref.Type) ref.Val { return types.Double(d[0]).ConvertToType(t) }
+func (d wideDouble) Equal(other ref.Val) ref.Val      { return types.Double(d[0]).Equal(other) }
+func (d wideDouble) Type() ref.Type                   { return types.DoubleType }
+func (d wideDouble) Value() any                       { return d[0] }
+
+// intByte is a host's own byte type CEL reads as an int, a slice or an array of which is bytes.
+type intByte byte
+
+func (b intByte) ConvertToNative(t reflect.Type) (any, error) {
+	return types.Int(b).ConvertToNative(t)
+}
+func (b intByte) ConvertToType(t ref.Type) ref.Val { return types.Int(b).ConvertToType(t) }
+func (b intByte) Equal(other ref.Val) ref.Val      { return types.Int(b).Equal(other) }
+func (b intByte) Type() ref.Type                   { return types.IntType }
+func (b intByte) Value() any                       { return int64(b) }
+
+// intMessage is a host's own message that isn't a struct.
+type intMessage int32
+
+func (m *intMessage) ProtoReflect() protoreflect.Message { return nil }
+
 // hostString is a host's own type CEL reads as a string, which compares as CEL's own does.
 type hostString string
 
@@ -331,6 +359,79 @@ func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T
 	for _, expr := range []string{`!([[0.0 / 0.0]] in [[[0.5]]])`, `!(dyn("a") in [[0.0 / 0.0]])`, `{[0.0 / 0.0]: 1} != {[0.5]: 1}`} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, nil); err != nil || evaluated {
 			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+}
+
+// A map of structs, which no condition reads, is refused unread, and so is one holding none, as a
+// map keyed by a double is: read as {}, it left a kind readable until the map held a struct, and
+// converting made room for one of its values, so 19,000 empty maps of a struct of 64 KiB took a
+// check 1.4 GB. An empty map of times, or of arrays holding no struct, is read.
+func TestAMapOfStructsFailsItsConditionsEmptyToo(t *testing.T) {
+	type tag struct{ Name string }
+	for name, m := range map[string]any{
+		"one": map[string]tag{"a": {"a"}}, "none": map[string]tag{}, "nil": map[string]tag(nil),
+		"arrays of one": map[string][1]tag{}, "none keyed by an interface": map[any]tag{},
+	} {
+		for _, expr := range []string{
+			`request.attributes.m != 1`, `request.attributes.m == {}`, `size(request.attributes.m) == 0`,
+			`has(request.attributes.m.a)`, `request.attributes.ok == true`,
+		} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "ok": true}); err != nil || evaluated {
+				t.Errorf("%s of a map of structs holding %s: evaluated %t, %v", expr, name, evaluated, err)
+			}
+		}
+	}
+	for name, m := range map[string]any{
+		"times": map[string]time.Time{}, "CEL's timestamps": map[string]types.Timestamp{},
+		"CEL's durations": map[string]types.Duration{}, "arrays of no struct": map[string][0]tag{},
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.m == {}`, map[string]any{"m": m}); err != nil || !held {
+			t.Errorf("an empty map of %s: held %t, %v", name, held, err)
+		}
+	}
+}
+
+// A slice, an array, a pointer or a map of values no condition reads, as structs, channels, funcs,
+// complex numbers, a host's own ref.Val or another message, is refused by its type, empty or nil
+// too, as a map of structs is: read as [], {} or null, an empty slice of structs, or a nil pointer
+// to one, left a kind readable until it held one. A slice or an array of a byte type is bytes,
+// whatever its type's methods, an array of none holds none whatever its value, and a type holding
+// itself, as `type list []list`, holds nothing else: each is read.
+func TestAListOrAPointerOfValuesNoConditionReadsFailsItsConditionsEmptyToo(t *testing.T) {
+	type tag struct{ Name string }
+	type list []list
+	for name, v := range map[string]any{
+		"an empty slice of structs": []tag{}, "a nil slice of structs": []tag(nil), "a nil pointer to a struct": (*tag)(nil),
+		"a nil pointer to an array of structs": (*[2]tag)(nil), "an empty slice of slices of structs": [][]tag{},
+		"an empty slice of arrays of a struct": [][1]tag{}, "an array of nil slices of structs": [1][]tag{},
+		"an empty slice of pointers to structs": []*tag{}, "a slice of nil pointers to structs": []*tag{nil},
+		"an empty map of pointers to structs": map[string]*tag{}, "an empty slice of maps of structs": []map[string]tag{},
+		"an empty slice of funcs": []func(){}, "an empty map of channels": map[string]chan int{},
+		"an empty slice of complex numbers": []complex128{}, "an empty slice of uintptrs": []uintptr{},
+		"an empty map of a host's doubles": map[string]hostDouble{}, "a nil pointer to a host's double": (*hostDouble)(nil),
+		"a nil message of another type": (*emptypb.Empty)(nil), "an empty slice of messages of another type": []*emptypb.Empty{},
+		"an empty slice of maps keyed by doubles": []map[float64]int{}, "an empty slice of messages of an int": []*intMessage{},
+	} {
+		for _, expr := range []string{`request.attributes.v != 1`, `request.attributes.ok == true`} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v, "ok": true}); err != nil || evaluated {
+				t.Errorf("%s of %s: evaluated %t, %v", expr, name, evaluated, err)
+			}
+		}
+	}
+	for name, v := range map[string]any{
+		"an array of no structs": [0]tag{}, "an empty slice of arrays of no structs": [][0]tag{},
+		"an empty slice of bytes saying they are ints": []intByte{}, "an empty slice of arrays of them": [][2]intByte{},
+		"an empty map of slices of them": map[string][]intByte{}, "a nil pointer to a slice of them": (*[]intByte)(nil),
+		"an empty slice of times": []time.Time{}, "an empty slice of CEL's strings": []types.String{},
+		"a nil pointer to CEL's timestamp": (*types.Timestamp)(nil), "a nil Struct": (*structpb.Struct)(nil),
+		"an empty slice of Values": []*structpb.Value{}, "a nil pointer to an int": (*int)(nil),
+		"an empty slice of interfaces": []any{}, "an empty slice of maps keyed by an interface": []map[any]int{},
+		"a nil list holding lists": list(nil), "an empty list holding lists": list{},
+	} {
+		expr := `request.attributes.v != 1 && request.attributes.ok`
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v, "ok": true}); err != nil || !held {
+			t.Errorf("%s: held %t, %v", name, held, err)
 		}
 	}
 }
@@ -1149,6 +1250,34 @@ type reflecting struct{ *dynamicpb.Message }
 func (m *reflecting) Interface() protoreflect.ProtoMessage { return m }
 func (m *reflecting) ProtoReflect() protoreflect.Message   { return m }
 
+// typedReflecting is a reflecting whose type makes its own, though it promotes New from the dynamic
+// message it embeds.
+type typedReflecting struct{ *dynamicpb.Message }
+
+func (m *typedReflecting) Interface() protoreflect.ProtoMessage { return m }
+func (m *typedReflecting) ProtoReflect() protoreflect.Message   { return m }
+func (m *typedReflecting) Type() protoreflect.MessageType {
+	return typedReflectingType{m.Message.Type()}
+}
+
+type typedReflectingType struct{ protoreflect.MessageType }
+
+func (t typedReflectingType) New() protoreflect.Message {
+	made, _ := t.MessageType.New().(*dynamicpb.Message)
+	return &typedReflecting{made}
+}
+
+func (t typedReflectingType) Zero() protoreflect.Message {
+	made, _ := t.MessageType.Zero().(*dynamicpb.Message)
+	return &typedReflecting{made}
+}
+
+// reflected is a host's type that is its own reflection by a generated message's it embeds.
+type reflected struct{ protoreflect.Message }
+
+func (m *reflected) Interface() protoreflect.ProtoMessage { return m }
+func (m *reflected) ProtoReflect() protoreflect.Message   { return m }
+
 // hostListValue is a host's type embedding a ListValue.
 type hostListValue struct{ *structpb.ListValue }
 
@@ -1372,6 +1501,47 @@ var registeringHostType = sync.OnceValue(func() error {
 	}
 	return protoregistry.GlobalTypes.RegisterMessage(hostMessageType{dynamicpb.NewMessageType(file.Messages().Get(0))})
 })
+
+// wideMessage is a message of the host's own type holding 8 KiB in place, as one of a few hundred
+// fields does, and wideMessages one holding a list of them.
+type (
+	wideMessage  struct{ _ [8 << 10]byte }
+	wideMessages struct {
+		Items []*wideMessage `protobuf:"bytes,1,rep,name=items"`
+	}
+)
+
+func (m *wideMessage) ProtoReflect() protoreflect.Message  { return wideTypes()[0].MessageOf(m) }
+func (m *wideMessages) ProtoReflect() protoreflect.Message { return wideTypes()[1].MessageOf(m) }
+
+// wideTypes are wideMessage's and wideMessages' types, as generated code makes a message's.
+var wideTypes = sync.OnceValue(func() [2]*protoimpl.MessageInfo {
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name: proto.String("rbac_test/wide.proto"), Package: proto.String("rbac_test"), Syntax: proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("Wide")}, {
+			Name: proto.String("Wides"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name: proto.String("items"), Number: proto.Int32(1), JsonName: proto.String("items"),
+				Label: descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(),
+				Type:  descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(), TypeName: proto.String(".rbac_test.Wide"),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+	return [2]*protoimpl.MessageInfo{
+		{GoReflectType: reflect.TypeFor[*wideMessage](), Desc: file.Messages().Get(0)},
+		{GoReflectType: reflect.TypeFor[*wideMessages](), Desc: file.Messages().Get(1)},
+	}
+})
+
+// wideReflecting is a host's type that is its own reflection by a wideMessage's it embeds, so it
+// makes a wideMessage.
+type wideReflecting struct{ protoreflect.Message }
+
+func (m *wideReflecting) Interface() protoreflect.ProtoMessage { return m }
+func (m *wideReflecting) ProtoReflect() protoreflect.Message   { return m }
 
 // An Any packing a message of another type than those a condition reads was unpacked through the
 // registry, which ran the host's own code for it, its type's New, or a message's own Unmarshal of
@@ -2525,7 +2695,9 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // empty maps 108 ms. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy,
 // whatever holds it, where reading one in a condition takes 70 to 145. What each allocates stands in
 // for the time here, as -race and a slower machine change neither: no unit charged allocates more
-// than a few times what one of a string does, by count or by bytes.
+// than a few times what one of a string does, by count or by bytes. Converting an empty map made
+// room for one of its values, charged 8, so 19,000 empty maps of a type of 64 KiB took 1.4 GB and
+// 270 ms to convert, where as many maps of ints took 10 MB and 15 ms.
 func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	const n = 2000
 	listed := func(made func(i int) any) map[string]any {
@@ -2558,12 +2730,13 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	strs := least(rbac.ConvertingWork, listed(func(i int) any { return strconv.Itoa(i) }))
 	allocations, bytes := float64(strs.Allocations)/float64(strs.Charged), float64(strs.Bytes)/float64(strs.Charged)
 	for name, attributes := range map[string]map[string]any{
-		"ints":        listed(func(i int) any { return i + 1000 }),
-		"lists":       listed(func(i int) any { return []any{i} }),
-		"empty lists": listed(func(int) any { return make([]any, 0, 1) }),
-		"maps":        listed(func(i int) any { return map[string]any{"a": i} }),
-		"empty maps":  listed(func(int) any { return map[string]any{} }),
-		"pointers":    listed(func(i int) any { return &i }),
+		"ints":                             listed(func(i int) any { return i + 1000 }),
+		"lists":                            listed(func(i int) any { return []any{i} }),
+		"empty lists":                      listed(func(int) any { return make([]any, 0, 1) }),
+		"maps":                             listed(func(i int) any { return map[string]any{"a": i} }),
+		"empty maps":                       listed(func(int) any { return map[string]any{} }),
+		"empty maps of an array of 64 KiB": listed(func(int) any { return map[string][8 << 10]int64{} }),
+		"pointers":                         listed(func(i int) any { return &i }),
 		"Structs": listed(func(i int) any {
 			return &structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewNumberValue(float64(i))}}
 		}),
@@ -2596,7 +2769,11 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	// before copying it: converting a map of 2,000 structs of 64 KiB took 7 ms, charged 4,017, and
 	// copying a slice of 2,000 holding a map and 64 KiB took 38 ms, charged 4,013. Converting refuses
 	// a map of them unread, and copying charges a struct the bytes it moves, as it charges one holding
-	// no map, so neither allocates more for each unit charged than for a string.
+	// no map, so neither allocates more for each unit charged than for a string. Converting made room
+	// for a value of a map's type in an empty map too, and copied each value of the host's own
+	// saying it is one of CEL's, which it refuses, charged one: it makes no room in an empty map,
+	// refuses those by their type, unread, and charges each of a map's entries at least what its
+	// value holds in place, which reading the entry moves.
 	type hidden struct {
 		M map[string]int
 		_ [64 << 10]byte
@@ -2612,8 +2789,26 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		k[0], k[1] = byte(i), byte(i>>8)
 		arrayKeyed[k] = i
 	}
+	// Maps whose values lie past what a condition reads, each moved to be found so.
+	deep := listed(func(int) any { return map[string][1 << 10]float64{"a": {}} })["l"]
+	for range 10_000 - 2 {
+		deep = []any{deep}
+	}
+	// A dynamic message's field holds the host's own reflections, each of whose types makes a
+	// message of 8 KiB, which a copy makes in its place: charged by the host's type, of 16 bytes,
+	// copying them allocated 2 KB for each unit charged.
+	reflections := dynamicpb.NewMessage(wideTypes()[1].Desc)
+	items := reflections.Mutable(reflections.Descriptor().Fields().ByName("items")).List()
+	for range n {
+		items.Append(protoreflect.ValueOfMessage(&wideReflecting{(&wideMessage{}).ProtoReflect()}))
+	}
 	for name, attributes := range map[string]map[string]any{
+		"a dynamic message holding the host's own reflections":   {"m": reflections},
 		"maps of a struct of 64 KiB":                             listed(func(int) any { return map[string]wide{"a": {}} }),
+		"empty maps of a struct of 64 KiB":                       listed(func(int) any { return map[string]wide{} }),
+		"arrays of 8 KiB of the host's saying they are doubles":  {"l": make([]wideDouble, n)},
+		"maps of an array of 8 KiB of the host's":                listed(func(int) any { return map[string]wideDouble{"a": {}} }),
+		"maps of an array of 8 KiB nested past 10,000 deep":      {"l": deep},
 		"a map of structs of 64 KiB":                             {"m": widely},
 		"maps of a struct holding a map and 64 KiB":              listed(func(int) any { return map[string]hidden{"a": {}} }),
 		"structs holding a map and 64 KiB":                       listed(func(int) any { return hidden{} }),
@@ -2623,6 +2818,9 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		"slices of arrays of two holding a map and 64 KiB":       listed(func(int) any { return [][2]hidden{{}} }),
 		"maps of arrays of two structs holding a map and 64 KiB": listed(func(int) any { return map[string][2]hidden{"a": {}} }),
 		"a map keyed by arrays of 4 KiB":                         {"m": arrayKeyed},
+		"messages of the host's of 8 KiB":                        listed(func(int) any { return &wideMessage{} }),
+		"a message of the host's holding nil ones of 8 KiB":      {"m": &wideMessages{Items: make([]*wideMessage, n)}},
+		"the host's own reflections making messages of 8 KiB":    listed(func(int) any { return &wideReflecting{(&wideMessage{}).ProtoReflect()} }),
 	} {
 		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
 			w := least(work, attributes)
@@ -2636,18 +2834,266 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	// charges what they hold in place first: one holding a struct of 4 MiB, past what a copy holds,
 	// moved it only to find so, and one holding an array of 4 MiB allocated 12 MB; and it moves a
 	// slice's elements before it copies each, so 2,000 arrays of 4,096 interfaces, 125 MiB, past what
-	// a copy holds, allocated 133 MB.
+	// a copy holds, allocated 133 MB. Nor does it make room for what a pointer points to, or an array
+	// whole, before it finds what they hold in place fits, nor make the zero value of one it finds
+	// past what a copy holds to set in its place: a pointer to an array of 128 MiB allocated 268 MB,
+	// an array of two structs each holding a map beside 64 MiB 335 MB, and a struct holding a map
+	// beside 4 MiB 4 MB, each only to be found past it.
 	type huge struct{ X [4 << 20]byte }
+	type heavy struct {
+		M map[string]int
+		_ [4 << 20]byte
+	}
 	for name, attributes := range map[string]map[string]any{
-		"a map holding a struct of 4 MiB":            {"m": map[string]huge{"a": {}}},
-		"a map holding an array of 4 MiB":            {"m": map[string][4 << 20]byte{"a": {}}},
-		"a map holding an array of 4 MiB of any":     {"m": map[string][256 << 10]any{"a": {}}},
-		"a list of 2,000 arrays of 4,096 interfaces": {"l": make([][4 << 10]any, 2000)},
+		"a map holding a struct of 4 MiB":                         {"m": map[string]huge{"a": {}}},
+		"a map holding an array of 4 MiB":                         {"m": map[string][4 << 20]byte{"a": {}}},
+		"a map holding an array of 4 MiB of any":                  {"m": map[string][256 << 10]any{"a": {}}},
+		"a list of 2,000 arrays of 4,096 interfaces":              {"l": make([][4 << 10]any, 2000)},
+		"a pointer to an array of 4 MiB":                          {"p": new([4 << 20]byte)},
+		"a struct holding a map beside 4 MiB":                     {"s": heavy{}},
+		"an array of two structs each holding a map beside 4 MiB": {"a": [2]heavy{}},
 	} {
 		if w := rbac.CopyingWork(attributes); w.Done || w.Bytes > 1<<20 {
 			t.Errorf("copying %s copied it %t, allocating %d bytes", name, w.Done, w.Bytes)
 		}
 	}
+	// Nor does it read a map's entry where what the entries before it held left less than its value
+	// holds in place: one of two arrays of 100,000 interfaces, past what a copy holds once the other
+	// was copied, was read, 1.6 MB, only to be found so. The other is read, copied and set, three
+	// times its bytes.
+	type wideAny [100_000]any
+	if w := rbac.CopyingWork(map[string]any{"m": map[string]wideAny{"a": {}, "b": {}}}); w.Done || w.Bytes > 7*uint64(reflect.TypeFor[wideAny]().Size())/2 {
+		t.Errorf("copying a map of two arrays of 100,000 interfaces copied it %t, allocating %d bytes", w.Done, w.Bytes)
+	}
+	// A copy charges a struct's padding too, which moving it moves, so it reserves for a value no more
+	// than copying the value costs: uncounted, an array of 60,000 structs of a bool, each padded to 16
+	// bytes, cost 6,000, where 40,000 were reserved for a pointer to it, so a copy reaching it after a
+	// string past 30,000 was refused, and one reaching it first wasn't.
+	type padded struct {
+		A bool
+		_ [0]int64
+	}
+	spaced, long := &struct{ X [60_000]padded }{}, strings.Repeat("s", 1_300_000)
+	_, first := rbac.CopyingCharge(map[string]any{"l": []any{spaced, long}})
+	if _, after := rbac.CopyingCharge(map[string]any{"l": []any{long, spaced}}); first != after {
+		t.Errorf("a copy reaching an array of padded structs first copied it %t, and after a long string %t", first, after)
+	}
+	// Converting reads a map's entries into one value it makes room for, which reading each moves
+	// whole, so it makes none where what the map's values hold in place costs more than is left: it
+	// checked one for each, and a map holding an array of 4 MiB allocated 4 MB.
+	for name, attributes := range map[string]map[string]any{
+		"a map holding an array of 4 MiB":        {"m": map[string][4 << 20]byte{"a": {}}},
+		"a map holding an array of 4 MiB of any": {"m": map[string][256 << 10]any{"a": {}}},
+	} {
+		if w := rbac.ConvertingWork(attributes); w.Done || w.Bytes > 1<<20 {
+			t.Errorf("converting %s read it %t, allocating %d bytes", name, w.Done, w.Bytes)
+		}
+	}
+}
+
+// Converting a value, or copying it for a hook, allocates no more for each unit it charges than a
+// few times what converting a string does, whatever types the host passes: nothing is made, read or
+// moved whole before what it holds in place is charged, nor made once either is past what it may
+// spend. Values of types drawn by reflection, arrays narrow and wide, structs, pointers, slices and
+// maps of them, interfaces holding them, and the host's own types and messages, nested in one
+// another, many of one type, empty, nil or full, and some of a mebibyte or more, each allocate
+// within that. JSON text and slices of bytes, each charged as one value and a tenth of its length,
+// aren't drawn: parsing a short text, and keeping a short slice a copy makes, each allocate several
+// hundred bytes.
+func TestConvertingOrCopyingAValueOfAnyTypeAllocatesWhatItCharges(t *testing.T) {
+	l := make([]any, 2000)
+	for i := range l {
+		l[i] = strconv.Itoa(i)
+	}
+	// The least of a few, as another goroutine can allocate meanwhile.
+	least := func(work func(map[string]any) rbac.Work, attributes map[string]any) rbac.Work {
+		w := work(attributes)
+		for range 2 {
+			if again := work(attributes); again.Bytes < w.Bytes {
+				w = again
+			}
+		}
+		return w
+	}
+	strs := least(rbac.ConvertingWork, map[string]any{"l": l})
+	bytes := float64(strs.Bytes) / float64(strs.Charged)
+	for seed := range uint64(160) {
+		d := &typeDraw{rng: rand.New(rand.NewPCG(seed, 127)), empty: int(seed % 4), most: 64 << 10, all: 4 << 20}
+		if seed%8 == 7 {
+			d.most, d.all = 48<<20, 48<<20
+		}
+		attributes, of := d.attributes()
+		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
+			// A few kibibytes a kind, made whatever it holds.
+			if w := least(work, attributes); float64(w.Bytes) > 5*bytes*float64(w.Charged)+(16<<10) {
+				t.Errorf("seed %d: %s %s allocated %d bytes, charged %d, %.0f for each unit, where converting strings allocates %.0f",
+					seed, doing, of, w.Bytes, w.Charged, float64(w.Bytes)/float64(w.Charged), bytes)
+			}
+		}
+	}
+}
+
+// typeDraw draws types a host may pass, by reflection, and values of them: Go's and the host's own
+// scalars, times, interfaces, the host's own messages and the well-known ones, and arrays, structs,
+// pointers, slices and maps of them, nested.
+type typeDraw struct {
+	rng *rand.Rand
+	// empty is how often, in sixths, a map, slice, pointer or interface drawn holds nothing.
+	empty int
+	// most is the most a type drawn holds in place, all about the most the values attributes draws
+	// hold together, past which what they hold is empty, and held what those drawn hold, in bytes.
+	most, all, held uintptr
+}
+
+var drawnTypes = []reflect.Type{
+	reflect.TypeFor[int64](), reflect.TypeFor[string](), reflect.TypeFor[bool](), reflect.TypeFor[float64](),
+	reflect.TypeFor[uint8](), reflect.TypeFor[int32](), reflect.TypeFor[time.Time](), reflect.TypeFor[any](),
+	reflect.TypeFor[hostDouble](), reflect.TypeFor[wideDouble](), reflect.TypeFor[hostString](), reflect.TypeFor[intByte](),
+	reflect.TypeFor[types.String](), reflect.TypeFor[*structpb.Struct](),
+	reflect.TypeFor[*timestamppb.Timestamp](), reflect.TypeFor[*descriptorpb.FileOptions](), reflect.TypeFor[*wideMessage](),
+}
+
+// attributes are many values of one type drawn, in a list, a slice or a map of their type, or a few
+// where it is wide, and what they are.
+func (d *typeDraw) attributes() (map[string]any, string) {
+	t := d.typ(3)
+	n := min(d.rng.IntN(2000)+1, int(d.all/max(t.Size(), 1)))
+	switch d.rng.IntN(3) {
+	case 0:
+		l := make([]any, n)
+		for i := range l {
+			l[i] = d.value(t, 3).Interface()
+		}
+		return map[string]any{"l": l}, fmt.Sprintf("a list of %d %v", n, t)
+	case 1:
+		l := reflect.MakeSlice(reflect.SliceOf(t), n, n)
+		for i := range n {
+			l.Index(i).Set(d.value(t, 3))
+		}
+		return map[string]any{"l": l.Interface()}, fmt.Sprintf("a slice of %d %v", n, t)
+	default:
+		m := reflect.MakeMapWithSize(reflect.MapOf(reflect.TypeFor[string](), t), n)
+		for i := range n {
+			m.SetMapIndex(reflect.ValueOf(strconv.Itoa(i)), d.value(t, 3))
+		}
+		return map[string]any{"m": m.Interface()}, fmt.Sprintf("a map of %d %v", n, t)
+	}
+}
+
+// typ is a type nesting no more than depth deep, holding no more than d.most in place, and no
+// slice of bytes.
+func (d *typeDraw) typ(depth int) reflect.Type {
+	for {
+		if t := d.draw(depth); t.Size() <= d.most && (t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8) {
+			return t
+		}
+	}
+}
+
+func (d *typeDraw) draw(depth int) reflect.Type {
+	if depth <= 0 {
+		return drawnTypes[d.rng.IntN(len(drawnTypes))]
+	}
+	switch d.rng.IntN(14) {
+	case 0, 1:
+		return drawnTypes[d.rng.IntN(len(drawnTypes))]
+	case 2:
+		return reflect.ArrayOf([]int{0, 1, 2, 16}[d.rng.IntN(4)], d.typ(depth-1))
+	case 3, 12, 13:
+		// Wide, of anything but bytes, or of bytes.
+		e := []reflect.Type{drawnTypes[d.rng.IntN(len(drawnTypes))], reflect.TypeFor[uint8]()}[d.rng.IntN(2)]
+		return reflect.ArrayOf(d.rng.IntN(int(d.most/max(e.Size(), 1))+1), e)
+	case 4, 5:
+		fields := make([]reflect.StructField, d.rng.IntN(3)+1)
+		for i := range fields {
+			fields[i] = reflect.StructField{Name: fmt.Sprint("F", i), Type: d.typ(depth - 1)}
+		}
+		return reflect.StructOf(fields)
+	case 6, 7:
+		return reflect.PointerTo(d.typ(depth - 1))
+	case 8, 9:
+		return reflect.SliceOf(d.typ(depth - 1))
+	default:
+		key := []reflect.Type{reflect.TypeFor[string](), reflect.TypeFor[int64](), reflect.TypeFor[any]()}[d.rng.IntN(3)]
+		return reflect.MapOf(key, d.typ(depth-1))
+	}
+}
+
+// value is a value of t, holding values nested no more than depth deep.
+func (d *typeDraw) value(t reflect.Type, depth int) reflect.Value {
+	v := reflect.New(t).Elem()
+	d.held += t.Size()
+	empty := d.rng.IntN(6) < d.empty || depth <= 0 || d.held > d.all
+	switch t.Kind() {
+	case reflect.Bool:
+		v.SetBool(d.rng.IntN(2) == 0)
+	case reflect.Int32, reflect.Int64:
+		v.SetInt(int64(d.rng.IntN(1000)))
+	case reflect.Uint8:
+		v.SetUint(uint64(d.rng.IntN(256)))
+	case reflect.Float64:
+		v.SetFloat(d.rng.Float64())
+	case reflect.String:
+		v.SetString(strings.Repeat("s", d.rng.IntN(100)))
+	case reflect.Interface:
+		// One a host's type implements holds none, as the types drawn may not.
+		if !empty && t.NumMethod() == 0 {
+			v.Set(d.value(d.typ(depth-1), depth-1))
+		}
+	case reflect.Struct:
+		if t == reflect.TypeFor[time.Time]() {
+			v.Set(reflect.ValueOf(time.Unix(int64(d.rng.IntN(1000)), 0)))
+			break
+		}
+		for i := range t.NumField() {
+			if f := v.Field(i); f.CanSet() {
+				f.Set(d.value(t.Field(i).Type, depth-1))
+			}
+		}
+	case reflect.Array:
+		for range min(t.Len(), 4) {
+			v.Index(d.rng.IntN(t.Len())).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Pointer:
+		if !empty {
+			v.Set(reflect.New(t.Elem()))
+			v.Elem().Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Slice:
+		if d.rng.IntN(2) == 0 && empty {
+			break
+		}
+		n := 0
+		if !empty {
+			n = d.rng.IntN(4) + 1
+		}
+		v.Set(reflect.MakeSlice(t, n, n))
+		for i := range n {
+			v.Index(i).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Map:
+		if d.rng.IntN(2) == 0 && empty {
+			break
+		}
+		v.Set(reflect.MakeMap(t))
+		for i := range d.rng.IntN(4) + 1 {
+			if empty {
+				break
+			}
+			key := reflect.New(t.Key()).Elem()
+			switch t.Key().Kind() {
+			case reflect.String:
+				key.SetString(strconv.Itoa(i))
+			case reflect.Int64:
+				key.SetInt(int64(i))
+			default:
+				key.Set(reflect.ValueOf(strconv.Itoa(i)))
+			}
+			v.SetMapIndex(key, d.value(t.Elem(), depth-1))
+		}
+	default:
+	}
+	return v
 }
 
 // A copy sets each of a map's keys in a map of its own, which hashes the key whole: the strings an

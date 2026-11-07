@@ -530,7 +530,14 @@ sequenceDiagram
   while its elements are copied, before a longer length outgrew that copy, a slice of its own, whose
   elements are copied too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
-  the interface. A call keeps what the host passed with each copy until it returns, so where it
+  the interface. A copy copies each value in place before what it holds, as setting it does, so it
+  copies none holding a lock or an unsafe pointer there, nor a struct whose unexported field, which
+  it can't set, holds a pointer, a slice, a map or an interface (`copyable`): the hook can't be
+  asked. Such a value is another package's state, as protobuf's reflection of a generated message
+  is, whose methods find the message by where it lies, so a hook reading a copy of it alone, as a
+  host's type that is its own reflection by one held, read past it; or it holds the host's, which
+  the copy shared. A message's reflection is copied as that of a copy of the message (`pointer`),
+  and refused where that isn't of its type. A call keeps what the host passed with each copy until it returns, so where it
   points is no other value's meanwhile: known only by where it points, a value dropped and collected
   during the call would leave its place to one made after, which would be given the first one's
   copy.
@@ -581,7 +588,18 @@ sequenceDiagram
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
   failing closed. A map of structs, which no condition reads, is refused unread at 2 for each entry
   (`refusedWhole`), as reading an entry copies it whole: a map of 2,000 structs of 64 KiB took 7 ms,
-  charged as much. Nothing else turns on map order, nor on the order of the kinds, whether a hook
+  charged as much. An empty or nil one is refused too, as a map keyed by a double is, and so is a
+  slice, a pointer or a map of any value refused by its type, as a struct, a channel, a func or
+  another message, or an array holding one, so whether its kind can be read doesn't turn on whether
+  it held one at the time: an empty slice of structs was read as `[]`, and a nil pointer to one as
+  null. Converting reads each of a
+  map's entries into one value it makes room for (`dict`), moving it whole, so it makes none for an
+  empty map, nor where what the entries hold in place, at least one for each 24 bytes
+  (`leastCopied`), costs more than is left, and charges an entry at least that where converting its
+  value costs less, as one nested past `maxNested`, or a host's own array saying it is a double,
+  which `of` refuses by its type before reading it: room made for each empty map, charged 8, took
+  19,000 of a type of 64 KiB 1.4 GB and 270 ms to convert. Nothing else turns on map order, nor on
+  the order of the kinds, whether a hook
   can be given a copy included (below), and a loop gives a map's keys in an order of its own
   (`stepping.order`, below): JSON text
   whose values may cost more than `maxConverted`, by its brackets, braces, commas and colons, each
@@ -603,9 +621,22 @@ sequenceDiagram
   (`payHashed`): charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms,
   and of 2,000 entries keyed by arrays of 4 KiB 8 ms, and charged their bytes in place alone, of 50
   keyed by structs each holding a string of 1 MiB 1.4 ms, for 167. Nor does it move a slice's
-  elements or a map's values where what they hold in place, at least one for each 24 bytes, costs
-  more than is left (`leastCopied`): a map holding an array of 4 MiB allocated 12 MB, and 2,000
-  arrays of 4,096 interfaces 133 MB, before being found past what a copy holds. A copy holds
+  elements or a map's values, or make room for what a pointer points to or for an array, where what
+  they hold in place, at least one for each 24 bytes, costs more than is left (`leastCopied`), as
+  copying any value costs, a struct's padding counted too, nor make anything more once it is past
+  what a copy holds, as what it made is dropped (`copy` and `message` return none), where it made
+  the zero value of each value it found so, to set in its place: a map holding an array of 4 MiB
+  allocated 12 MB, 2,000 arrays of 4,096 interfaces 133 MB, a pointer to an array of 128 MiB 268 MB,
+  and an array of two structs each holding a map beside 64 MiB 335 MB, before being found past what
+  a copy holds. A map's entry is read only where what is left holds its value, which the entries
+  before it can have spent. A message of the host's own type, which a copy makes whole, set or not,
+  costs what the message its type makes holds in place where that is more than a message costs
+  (`making`), which its type's empty message tells (`makes`, as `itself` reads it), and is made by
+  its type: charged a message's 4, copying 2,000 of a type of 8 KiB allocated 50 MB, and one making
+  another to tell 8 KiB each; charged by what it held in place, a dynamic message holding 2,000 of a
+  host's type reflecting one of 8 KiB, which its type makes, 17 MB; and made by its own `New`, one of
+  a host's type making its own but promoting `New` from a message it embeds was copied as that
+  message, which no list, field or map of the host's type could hold. A copy holds
   nothing nesting past `maxCopied`: it is
   refused there (`overflow`), where it held the zero value, or the copy of a value reached less
   deep before, as map order decided, so a constraint was given a value on one call and its zero

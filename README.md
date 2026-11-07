@@ -277,7 +277,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
   named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
-  of bytes; slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
+  of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
+  reads, below; maps of these keyed by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
@@ -299,10 +300,13 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
   struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
-  array, a map holding two keys read as the same value, as `1` and `1u`, and so JSON text naming a
-  member of an object twice, once unescaped, or an `Any` packing a message that sets a field twice,
-  as a `Struct` with two entries of `role`: each is read as the last, where a host reading the first
-  reads another. A `Struct` the host passes holds each key once, as a Go map does. So do invalid
+  array, and a slice, a pointer or a map of any of these, or an array holding one, holding none
+  too, as an empty slice of structs or a nil pointer to one, read as `[]` or `null`, left a kind
+  readable until it held one, a map holding two keys read as the same value, as `1`
+  and `1u`, and so JSON text naming a member of an object twice, once unescaped, or an `Any`
+  packing a message that sets a field twice, as a `Struct` with two entries of `role`: each is read
+  as the last, where a host reading the first reads another. A `Struct` the host passes holds each
+  key once, as a Go map does. So do invalid
   JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which `encoding/json` reads as
   U+FFFD, a `json.Number` that isn't a number as JSON writes one, as `0x1p4` or `Inf`, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
@@ -316,8 +320,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
   but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
   for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
-  a map of structs, which none reads and reading copies whole, is refused unread at 2 for each
-  entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms. That is about a map of
+  a map of values none reads, as structs, which reading copies whole, is refused unread at 2 for
+  each entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
+  another costs at least 1 for each 24 bytes its value holds in place, which reading it moves,
+  where 19,000 empty maps of a type of 64 KiB, charged 8 each, took 1.4 GB and 270 ms making room
+  for a value they didn't hold. That is about a map of
   50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
   may reading, about 20 ms: each map charged one, as a number is, a
@@ -425,18 +432,29 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
-  reading their kind. Attributes holding maps, lists, pointers or messages are charged what building
+  reading their kind, and so are ones holding an empty or nil slice, map or pointer of values no
+  condition reads, as structs, channels, funcs or messages of other types, read as `[]`, `{}` or
+  `null` where one holding such a value couldn't be read; and a map's values no condition reads,
+  as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
+  for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
+  converts. Attributes
+  holding maps, lists, pointers or messages are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
-  interface, which a hook's copy sets whole and is now charged their bytes, as it charged a struct
-  holding none, or maps keyed by arrays or structs, or by interfaces holding them, whose keys it is
+  interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
+  it charged a struct holding none, or messages of the host's own types, which a copy makes whole
+  and is now charged what the messages their types make hold in place, set or not, as 1 for each
+  24 bytes, or maps keyed by
+  arrays or structs, or by interfaces holding them, whose keys it is
   now charged the bytes of, and of the strings they hold and what their interfaces hold, as hashing
   them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as
   its zero value, and ones holding themselves that reach 20,000 maps, lists, pointers, structs,
   arrays and messages, counting each time one is reached, however shallow, which were copied
-  whole; and a condition building a list or a map holding attributes no condition can
+  whole, and ones holding a lock, an unsafe pointer or a struct's unexported field holding a
+  pointer, a slice, a map or an interface, which a hook was given copied whole, sharing what the
+  field held with the host; and a condition building a list or a map holding attributes no condition can
   read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
@@ -501,8 +519,14 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
   deep a path around the cycle nests turns on where the copy enters it, which the order a map's
   entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
-  of them, were copied on one call and refused on the next. Where the attributes hold more, nest
-  deeper or hold themselves so, the hook can't be asked, rather than be given part of them,
+  of them, were copied on one call and refused on the next. Nor does it hold what can't be copied
+  as a value: a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
+  value holds, an unsafe pointer, as a `reflect.Value` holds, or a struct's unexported field, which
+  a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
+  keep their state in; a host's type that is its own reflection by a generated message's it embeds
+  is given holding the reflection of a copy of the message. Where the attributes hold more, nest
+  deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be
+  given part of them,
   and the call is refused as any other, a `DeniedError` of the permission on the resource
   asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
   users can write what takes attributes past it, as a resource's tags, and the message named the

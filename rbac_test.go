@@ -22,8 +22,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"cel.dev/cel-go/common/types"
 	"github.com/jackc/pgx/v5"
@@ -2871,9 +2873,9 @@ func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 
 // copyDraw draws values a check converts and a hook is given a copy of: every scalar, time, bytes
 // and number Attributes names, CEL's own scalars, lists, arrays, maps keyed by each kind they may
-// be, pointers, nil ones of each, and every well-known message, through a pointer too, some holding
-// fields they don't know. With decoded, JSON text and packed messages, and with sharing, values it
-// drew before.
+// be, some of values holding more in place than one unit covers, pointers, nil ones of each, and
+// every well-known message, through a pointer too, some holding fields they don't know. With
+// decoded, JSON text and packed messages, and with sharing, values it drew before.
 type copyDraw struct {
 	rng              *mathrand.Rand
 	decoded, sharing bool
@@ -3018,7 +3020,7 @@ func (d *copyDraw) value(depth int) any {
 	case 17:
 		v = []*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0)), nil}
 	case 18:
-		v = map[string]time.Time{d.text(): time.Unix(1, 0)}
+		v = []any{map[string]time.Time{d.text(): time.Unix(1, 0)}, map[string][64]int64{d.text(): {}}, map[string][64]int64{}}[d.rng.IntN(3)]
 	case 19:
 		v = [][]byte{make([]byte, d.rng.IntN(45))}
 	case 20, 21:
@@ -3245,6 +3247,168 @@ func TestCopyingAMessageThatIsItsOwnReflectionKeepsItsType(t *testing.T) {
 	held := d.Get(d.Descriptor().Fields().ByName("fields")).Map().Get(protoreflect.ValueOfString("m").MapKey()).Message()
 	if c := held.Get(held.Descriptor().Fields().ByName("struct_value")).Message(); !c.IsValid() || c.Interface() == m || c.Interface() == one {
 		t.Errorf("a dynamic message holding a %T holds a copy %#v", m, c.Interface())
+	}
+}
+
+// A message of a host's type whose type makes its own, though it promotes New from the dynamic
+// message it embeds, was copied for a hook as the message New made: a hook given one in an any read
+// a dynamic message, and a list, a field or a map of the host's type couldn't hold the copy, which
+// panicked. It is copied as the message its type makes, once however it is reached, and an empty
+// one a dynamic message's list holds as one of its type too.
+func TestCopyingAMessageWhoseTypeMakesItsOwnKeepsItsType(t *testing.T) {
+	type holder struct{ M *typedReflecting }
+	m := &typedReflecting{dynamicStruct()}
+	listed := dynamicpb.NewMessage((&structpb.ListValue{}).ProtoReflect().Descriptor())
+	empty, _ := dynamicpb.NewMessageType((&structpb.Value{}).ProtoReflect().Descriptor()).Zero().(*dynamicpb.Message)
+	listed.Mutable(listed.Descriptor().Fields().ByName("values")).List().Append(protoreflect.ValueOfMessage(&typedReflecting{empty}))
+	var copied map[string]any
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("copying a %T panicked: %v", m, r)
+			}
+		}()
+		copied = rbac.DeepCopy(map[string]any{
+			"one": m, "many": []*typedReflecting{m}, "field": holder{m}, "keyed": map[string]*typedReflecting{"m": m}, "listed": listed,
+		})
+	}()
+	one, _ := copied["one"].(*typedReflecting)
+	many, _ := copied["many"].([]*typedReflecting)
+	field, _ := copied["field"].(holder)
+	keyed, _ := copied["keyed"].(map[string]*typedReflecting)
+	if one == nil || one == m || one.Message == nil || one.Message == m.Message || len(many) != 1 || many[0] != one || field.M != one || keyed["m"] != one {
+		t.Errorf("a %T was copied as %#v, %#v, %#v and %#v", m, copied["one"], many, field, keyed)
+	}
+	if l, _ := copied["listed"].(*dynamicpb.Message); l == nil || l == listed {
+		t.Errorf("a dynamic message holding an empty %T was copied as %#v", m, copied["listed"])
+	} else if values := l.Get(l.Descriptor().Fields().ByName("values")).List(); values.Len() != 1 {
+		t.Errorf("a dynamic message holding an empty %T was copied holding %d", m, values.Len())
+	} else if c, ok := values.Get(0).Message().Interface().(*typedReflecting); !ok || c.Message == empty {
+		t.Errorf("an empty %T a dynamic message holds was copied as %#v", m, values.Get(0).Message().Interface())
+	}
+}
+
+// A hook's copy of a host's type that is its own reflection by a generated message's it embeds
+// copied protobuf's state of the message as any other value, apart from the message it lay in, so a
+// hook reading the copy read past it; and one reflecting a message of a type keeping no such state
+// shared the host's message, so a hook's write reached the host. Each reflection is copied as the
+// reflection of a copy of the message it reflects, once however it is reached, read as the host's
+// was and written apart from it.
+func TestCopyingAHostTypeReflectingAGeneratedMessageCopiesTheMessage(t *testing.T) {
+	at := &timestamppb.Timestamp{Seconds: 12345, Nanos: 6}
+	seconds := at.ProtoReflect().Descriptor().Fields().ByName("seconds")
+	wides := &wideMessages{Items: []*wideMessage{{}}}
+	items := wides.ProtoReflect().Descriptor().Fields().ByName("items")
+	m, w := &reflected{at.ProtoReflect()}, &reflected{wides.ProtoReflect()}
+	copied := rbac.DeepCopy(map[string]any{"m": m, "many": []*reflected{m, w}, "reflection": at.ProtoReflect()})
+	c, _ := copied["m"].(*reflected)
+	many, _ := copied["many"].([]*reflected)
+	if c == nil || c == m || c.Message == m.Message || len(many) != 2 || many[0] != c || many[1] == w || many[1].Message == w.Message {
+		t.Fatalf("a %T reflecting a generated message was copied as %#v and %#v", m, copied["m"], copied["many"])
+	}
+	if got := c.Get(seconds).Int(); got != 12345 {
+		t.Errorf("the copy of a %T reflecting a timestamp of 12,345 seconds reads %d", m, got)
+	}
+	if r, _ := copied["reflection"].(protoreflect.Message); r == nil || r == at.ProtoReflect() || r.Interface() != c.Message.Interface() {
+		t.Errorf("a timestamp's reflection held beside a %T reflecting it was copied as %#v", m, copied["reflection"])
+	}
+	c.Set(seconds, protoreflect.ValueOfInt64(1))
+	if l := many[1].Mutable(items).List(); l.Len() == 1 {
+		l.Append(protoreflect.ValueOfMessage((&wideMessage{}).ProtoReflect()))
+	} else {
+		t.Errorf("the copy of a %T reflecting a message holding one item holds %d", w, l.Len())
+	}
+	if at.Seconds != 12345 || len(wides.Items) != 1 {
+		t.Errorf("a write to the copies reached the host's messages: %v, %d items", at, len(wides.Items))
+	}
+}
+
+// A constraint is given a host's type that is its own reflection by a generated message's it embeds
+// as a copy of its own, which reads as the host's does, and which it writes to apart from the host.
+func TestAConstraintIsGivenAHostTypeReflectingAGeneratedMessage(t *testing.T) {
+	at := &timestamppb.Timestamp{Seconds: 12345}
+	seconds := at.ProtoReflect().Descriptor().Fields().ByName("seconds")
+	var read []int64
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "frozen", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Subject == nil {
+				return false, nil
+			}
+			r, ok := in.Subject.Attributes["session"].(*reflected)
+			if ok {
+				read = append(read, r.Get(seconds).Int())
+				r.Set(seconds, protoreflect.ValueOfInt64(1))
+			}
+			return ok, nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	u := h.as(t, "u")
+	u.Attributes = map[string]any{"session": &reflected{at.ProtoReflect()}}
+	if allowed(t, h, u, login, cluster) {
+		t.Error("a constraint denying a subject holding the host's type didn't deny")
+	}
+	if len(read) != 1 || read[0] != 12345 || at.Seconds != 12345 {
+		t.Errorf("a constraint given a timestamp of 12,345 seconds read %v, and the host's holds %d", read, at.Seconds)
+	}
+}
+
+// A hook's copy copies each value in place before what it holds, as setting a value does, so one
+// holding a lock, as a mutex, a WaitGroup, an atomic value or protobuf's own state does, or an
+// unsafe pointer, as a reflect.Value does, or holding in a field it can't set more than setting it
+// whole copies, as a pointer, a slice or another package's state, was copied so: a copy of a lock or
+// of another package's state, or one sharing the host's. Each is refused, and the call with it, but
+// a struct's unexported fields holding no more than setting them copies, a time among them, and the
+// fields of an unexported struct it embeds, which are copied in turn.
+func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
+	x := 1
+	type locked struct {
+		Mu sync.Mutex
+		M  map[string]int
+	}
+	type marked struct {
+		A int
+		_ [0]sync.Mutex
+	}
+	type keyed struct {
+		Mu sync.Mutex
+		K  string
+	}
+	for name, v := range map[string]any{
+		"a struct holding a mutex beside a map": locked{}, "a pointer to a mutex": &sync.Mutex{}, "a mutex": sync.Mutex{},
+		"a slice of mutexes": []sync.Mutex{{}}, "an array of a struct holding a WaitGroup": [1]struct{ W sync.WaitGroup }{},
+		"an atomic int": &atomic.Int64{}, "a struct marked never to be copied": marked{A: 1},
+		"a map keyed by a struct holding a mutex": map[keyed]int{{K: "a"}: 1}, "a message held by value": []structpb.Value{{}},
+		"a reflect.Value": reflect.ValueOf(1), "an unsafe pointer": unsafe.Pointer(&x),
+		"a map keyed by a struct holding an unsafe pointer": map[struct{ P unsafe.Pointer }]int{{unsafe.Pointer(&x)}: 1},
+		"a struct holding a slice it can't set":             struct{ tags []string }{[]string{"a"}},
+		"a struct embedding a pointer it can't set":         struct{ *claims }{&claims{Roles: []string{"a"}}},
+		"a nil message's reflection":                        struct{ R protoreflect.Message }{(*timestamppb.Timestamp)(nil).ProtoReflect()},
+	} {
+		if rbac.Copies(map[string]any{"v": v}) {
+			t.Errorf("%s was copied", name)
+		}
+	}
+	type padded struct {
+		A int
+		_ [8]byte
+	}
+	type unexported struct {
+		n    int
+		at   time.Time
+		Tags []string
+	}
+	for name, v := range map[string]any{
+		"a struct of unexported scalars and a time": unexported{n: 1, at: time.Unix(1, 0), Tags: []string{"a"}},
+		"a padded struct":                                padded{A: 1},
+		"a struct embedding an unexported one":           account{claims: claims{Roles: []string{"a"}}, Name: "n"},
+		"a time":                                         time.Unix(1, 0),
+		"a lock's interface holding none":                struct{ L sync.Locker }{},
+		"empty arrays of mutexes, which conditions read": [][0]sync.Mutex{{}}, "an array of empty arrays of mutexes": [2][0]sync.Mutex{},
+	} {
+		if !rbac.Copies(map[string]any{"v": v}) {
+			t.Errorf("%s wasn't copied", name)
+		}
 	}
 }
 
