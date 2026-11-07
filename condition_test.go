@@ -2854,6 +2854,211 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	}
 }
 
+// Converting a value, or copying it for a hook, allocates no more for each unit it charges than a
+// few times what converting a string does, whatever types the host passes: nothing is made, read or
+// moved whole before what it holds in place is charged, nor made once either is past what it may
+// spend. Values of types drawn by reflection, arrays narrow and wide, structs, pointers, slices and
+// maps of them, interfaces holding them, and the host's own types and messages, nested in one
+// another, many of one type, empty, nil or full, and some of a mebibyte or more, each allocate
+// within that. JSON text and slices of bytes, each charged as one value and a tenth of its length,
+// aren't drawn: parsing a short text, and keeping a short slice a copy makes, each allocate several
+// hundred bytes.
+func TestConvertingOrCopyingAValueOfAnyTypeAllocatesWhatItCharges(t *testing.T) {
+	l := make([]any, 2000)
+	for i := range l {
+		l[i] = strconv.Itoa(i)
+	}
+	// The least of a few, as another goroutine can allocate meanwhile.
+	least := func(work func(map[string]any) rbac.Work, attributes map[string]any) rbac.Work {
+		w := work(attributes)
+		for range 2 {
+			if again := work(attributes); again.Bytes < w.Bytes {
+				w = again
+			}
+		}
+		return w
+	}
+	strs := least(rbac.ConvertingWork, map[string]any{"l": l})
+	bytes := float64(strs.Bytes) / float64(strs.Charged)
+	for seed := range uint64(160) {
+		d := &typeDraw{rng: rand.New(rand.NewPCG(seed, 127)), empty: int(seed % 4), most: 64 << 10, all: 4 << 20}
+		if seed%8 == 7 {
+			d.most, d.all = 48<<20, 48<<20
+		}
+		attributes, of := d.attributes()
+		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
+			// A few kibibytes a kind, made whatever it holds.
+			if w := least(work, attributes); float64(w.Bytes) > 5*bytes*float64(w.Charged)+(16<<10) {
+				t.Errorf("seed %d: %s %s allocated %d bytes, charged %d, %.0f for each unit, where converting strings allocates %.0f",
+					seed, doing, of, w.Bytes, w.Charged, float64(w.Bytes)/float64(w.Charged), bytes)
+			}
+		}
+	}
+}
+
+// typeDraw draws types a host may pass, by reflection, and values of them: Go's and the host's own
+// scalars, times, interfaces, the host's own messages and the well-known ones, and arrays, structs,
+// pointers, slices and maps of them, nested.
+type typeDraw struct {
+	rng *rand.Rand
+	// empty is how often, in sixths, a map, slice, pointer or interface drawn holds nothing.
+	empty int
+	// most is the most a type drawn holds in place, all about the most the values attributes draws
+	// hold together, past which what they hold is empty, and held what those drawn hold, in bytes.
+	most, all, held uintptr
+}
+
+var drawnTypes = []reflect.Type{
+	reflect.TypeFor[int64](), reflect.TypeFor[string](), reflect.TypeFor[bool](), reflect.TypeFor[float64](),
+	reflect.TypeFor[uint8](), reflect.TypeFor[int32](), reflect.TypeFor[time.Time](), reflect.TypeFor[any](),
+	reflect.TypeFor[hostDouble](), reflect.TypeFor[wideDouble](), reflect.TypeFor[hostString](), reflect.TypeFor[intByte](),
+	reflect.TypeFor[types.String](), reflect.TypeFor[*structpb.Struct](),
+	reflect.TypeFor[*timestamppb.Timestamp](), reflect.TypeFor[*descriptorpb.FileOptions](), reflect.TypeFor[*wideMessage](),
+}
+
+// attributes are many values of one type drawn, in a list, a slice or a map of their type, or a few
+// where it is wide, and what they are.
+func (d *typeDraw) attributes() (map[string]any, string) {
+	t := d.typ(3)
+	n := min(d.rng.IntN(2000)+1, int(d.all/max(t.Size(), 1)))
+	switch d.rng.IntN(3) {
+	case 0:
+		l := make([]any, n)
+		for i := range l {
+			l[i] = d.value(t, 3).Interface()
+		}
+		return map[string]any{"l": l}, fmt.Sprintf("a list of %d %v", n, t)
+	case 1:
+		l := reflect.MakeSlice(reflect.SliceOf(t), n, n)
+		for i := range n {
+			l.Index(i).Set(d.value(t, 3))
+		}
+		return map[string]any{"l": l.Interface()}, fmt.Sprintf("a slice of %d %v", n, t)
+	default:
+		m := reflect.MakeMapWithSize(reflect.MapOf(reflect.TypeFor[string](), t), n)
+		for i := range n {
+			m.SetMapIndex(reflect.ValueOf(strconv.Itoa(i)), d.value(t, 3))
+		}
+		return map[string]any{"m": m.Interface()}, fmt.Sprintf("a map of %d %v", n, t)
+	}
+}
+
+// typ is a type nesting no more than depth deep, holding no more than d.most in place, and no
+// slice of bytes.
+func (d *typeDraw) typ(depth int) reflect.Type {
+	for {
+		if t := d.draw(depth); t.Size() <= d.most && (t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8) {
+			return t
+		}
+	}
+}
+
+func (d *typeDraw) draw(depth int) reflect.Type {
+	if depth <= 0 {
+		return drawnTypes[d.rng.IntN(len(drawnTypes))]
+	}
+	switch d.rng.IntN(14) {
+	case 0, 1:
+		return drawnTypes[d.rng.IntN(len(drawnTypes))]
+	case 2:
+		return reflect.ArrayOf([]int{0, 1, 2, 16}[d.rng.IntN(4)], d.typ(depth-1))
+	case 3, 12, 13:
+		// Wide, of anything but bytes, or of bytes.
+		e := []reflect.Type{drawnTypes[d.rng.IntN(len(drawnTypes))], reflect.TypeFor[uint8]()}[d.rng.IntN(2)]
+		return reflect.ArrayOf(d.rng.IntN(int(d.most/max(e.Size(), 1))+1), e)
+	case 4, 5:
+		fields := make([]reflect.StructField, d.rng.IntN(3)+1)
+		for i := range fields {
+			fields[i] = reflect.StructField{Name: fmt.Sprint("F", i), Type: d.typ(depth - 1)}
+		}
+		return reflect.StructOf(fields)
+	case 6, 7:
+		return reflect.PointerTo(d.typ(depth - 1))
+	case 8, 9:
+		return reflect.SliceOf(d.typ(depth - 1))
+	default:
+		key := []reflect.Type{reflect.TypeFor[string](), reflect.TypeFor[int64](), reflect.TypeFor[any]()}[d.rng.IntN(3)]
+		return reflect.MapOf(key, d.typ(depth-1))
+	}
+}
+
+// value is a value of t, holding values nested no more than depth deep.
+func (d *typeDraw) value(t reflect.Type, depth int) reflect.Value {
+	v := reflect.New(t).Elem()
+	d.held += t.Size()
+	empty := d.rng.IntN(6) < d.empty || depth <= 0 || d.held > d.all
+	switch t.Kind() {
+	case reflect.Bool:
+		v.SetBool(d.rng.IntN(2) == 0)
+	case reflect.Int32, reflect.Int64:
+		v.SetInt(int64(d.rng.IntN(1000)))
+	case reflect.Uint8:
+		v.SetUint(uint64(d.rng.IntN(256)))
+	case reflect.Float64:
+		v.SetFloat(d.rng.Float64())
+	case reflect.String:
+		v.SetString(strings.Repeat("s", d.rng.IntN(100)))
+	case reflect.Interface:
+		// One a host's type implements holds none, as the types drawn may not.
+		if !empty && t.NumMethod() == 0 {
+			v.Set(d.value(d.typ(depth-1), depth-1))
+		}
+	case reflect.Struct:
+		if t == reflect.TypeFor[time.Time]() {
+			v.Set(reflect.ValueOf(time.Unix(int64(d.rng.IntN(1000)), 0)))
+			break
+		}
+		for i := range t.NumField() {
+			if f := v.Field(i); f.CanSet() {
+				f.Set(d.value(t.Field(i).Type, depth-1))
+			}
+		}
+	case reflect.Array:
+		for range min(t.Len(), 4) {
+			v.Index(d.rng.IntN(t.Len())).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Pointer:
+		if !empty {
+			v.Set(reflect.New(t.Elem()))
+			v.Elem().Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Slice:
+		if d.rng.IntN(2) == 0 && empty {
+			break
+		}
+		n := 0
+		if !empty {
+			n = d.rng.IntN(4) + 1
+		}
+		v.Set(reflect.MakeSlice(t, n, n))
+		for i := range n {
+			v.Index(i).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Map:
+		if d.rng.IntN(2) == 0 && empty {
+			break
+		}
+		v.Set(reflect.MakeMap(t))
+		for i := range d.rng.IntN(4) + 1 {
+			if empty {
+				break
+			}
+			key := reflect.New(t.Key()).Elem()
+			switch t.Key().Kind() {
+			case reflect.String:
+				key.SetString(strconv.Itoa(i))
+			case reflect.Int64:
+				key.SetInt(int64(i))
+			default:
+				key.Set(reflect.ValueOf(strconv.Itoa(i)))
+			}
+			v.SetMapIndex(key, d.value(t.Elem(), depth-1))
+		}
+	default:
+	}
+	return v
+}
+
 // A copy sets each of a map's keys in a map of its own, which hashes the key whole: the strings an
 // array or a struct key holds, and what the interfaces it holds hold, as well as its bytes in place.
 // Charged those bytes alone, 50 entries keyed by structs each holding a string of 1 MiB took 1.4 ms
