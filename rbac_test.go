@@ -2910,7 +2910,7 @@ func (d *copyDraw) protoValue(depth int) *structpb.Value {
 	case k == 5 && depth > 0:
 		return structpb.NewListValue(d.protoList(depth - 1))
 	case k == 6:
-		return &structpb.Value{Kind: &structpb.Value_StructValue{}}
+		return []*structpb.Value{{Kind: &structpb.Value_StructValue{}}, {Kind: &structpb.Value_ListValue{}}}[d.rng.IntN(2)]
 	default:
 		return &structpb.Value{}
 	}
@@ -3405,9 +3405,130 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		"a time":                                         time.Unix(1, 0),
 		"a lock's interface holding none":                struct{ L sync.Locker }{},
 		"empty arrays of mutexes, which conditions read": [][0]sync.Mutex{{}}, "an array of empty arrays of mutexes": [2][0]sync.Mutex{},
+		// An empty array of funcs, which holds none, marks a struct only never to be compared.
+		"a struct marked never to be compared": struct {
+			A int
+			_ [0]func()
+		}{A: 1},
 	} {
 		if !rbac.Copies(map[string]any{"v": v}) {
 			t.Errorf("%s wasn't copied", name)
+		}
+	}
+}
+
+// A copy finds what copying a struct or an array costs, whether it shares one, whether it can hold
+// one and whether hashing one reads more than it holds in place by walking its type, once for each
+// type, and none of the types an empty array would hold, as it holds none: each found for each value,
+// and along each path through such arrays, copying 100 values of a type nesting two empty arrays of
+// the type before it 20 deep took 19.6 s, and walking the type alone 640 ms. Copying values of a
+// type nesting an empty array of the one before it 32 deep, in a slice, a map and a map's key, and
+// a map of empty arrays of a type nesting arrays of one 32 deep, walks a few types, of those holding
+// them, not the 32 the arrays would hold.
+func TestACopyWalksNoTypeAnEmptyArrayWouldHold(t *testing.T) {
+	n := freshTypes.Add(1)
+	nested, deep := reflect.StructOf([]reflect.StructField{{Name: fmt.Sprint("A", n), Type: reflect.TypeFor[int]()}}), reflect.TypeFor[int]()
+	var empty reflect.Type
+	for range 32 {
+		empty = reflect.ArrayOf(0, nested)
+		nested = reflect.StructOf([]reflect.StructField{{Name: fmt.Sprint("A", n), Type: empty}, {Name: "B", Type: reflect.TypeFor[int]()}})
+		deep = reflect.StructOf([]reflect.StructField{{Name: fmt.Sprint("A", n), Type: reflect.ArrayOf(1, deep)}})
+	}
+	key := reflect.StructOf([]reflect.StructField{{Name: "K", Type: reflect.TypeFor[int]()}, {Name: "E", Type: empty}})
+	keyed := reflect.MakeMap(reflect.MapOf(key, reflect.TypeFor[int]()))
+	keyed.SetMapIndex(reflect.New(key).Elem(), reflect.ValueOf(1))
+	attributes := map[string]any{"l": reflect.MakeSlice(reflect.SliceOf(nested), 2, 2).Interface(), "k": keyed.Interface()}
+	for name, of := range map[string]reflect.Type{"m": empty, "d": reflect.ArrayOf(0, deep)} {
+		m := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), of))
+		m.SetMapIndex(reflect.ValueOf("a"), reflect.New(of).Elem())
+		attributes[name] = m.Interface()
+	}
+	walked := rbac.CountTypesWalked(t)
+	if copied := rbac.Copies(attributes); !copied || *walked > 16 {
+		t.Errorf("copied %t, walking %d types", copied, *walked)
+	}
+}
+
+// freshTypes numbers the types a test makes that no copy has walked, each run.
+var freshTypes atomic.Int64
+
+// spinLock is a lock of the host's own: a pointer to it locks and unlocks, as one to a mutex does.
+type spinLock uint32
+
+func (*spinLock) Lock()   {}
+func (*spinLock) Unlock() {}
+
+// A hook's copy shared a channel or a func with the host where it held one but in a struct's
+// unexported field: a constraint sending on its copy's channel sent on the host's, and calling its
+// func ran the host's closure. And a lock of the host's own, as an integer a pointer to which spins,
+// was copied alone, in an array, a slice of arrays or a map of arrays, and refused in an array of
+// arrays, so every constrained call was refused, though conditions read it wherever it lay. Each,
+// and an unsafe pointer, is refused wherever it lies, nil too, alone, in an array, a slice, a map's
+// value or key, a struct's field, or what a pointer or an interface holds, and conditions read none
+// of them, as no hook can be given them; an empty array holds none of them, and is read and copied,
+// and so is the host's own integer that isn't a lock, wherever it lies, but where no condition reads
+// what holds it.
+func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing.T) {
+	ch, x := make(chan int, 1), 1
+	type count uint32
+	// held are values holding v, each as what it is held by.
+	held := func(v any) map[string]any {
+		e := reflect.ValueOf(v)
+		of := func(t reflect.Type) reflect.Value { return reflect.New(t).Elem() }
+		array, arrays := of(reflect.ArrayOf(2, e.Type())), of(reflect.ArrayOf(2, reflect.ArrayOf(2, e.Type())))
+		array.Index(1).Set(e)
+		arrays.Index(1).Set(array)
+		pointer, field := reflect.New(e.Type()), of(reflect.StructOf([]reflect.StructField{{Name: "V", Type: e.Type()}}))
+		pointer.Elem().Set(e)
+		field.Field(0).Set(e)
+		slice := reflect.Append(of(reflect.SliceOf(e.Type())), e)
+		valued := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), e.Type()))
+		valued.SetMapIndex(reflect.ValueOf("a"), e)
+		arrayed := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), array.Type()))
+		arrayed.SetMapIndex(reflect.ValueOf("a"), array)
+		holders := map[string]any{
+			"alone": v, "in an array": array.Interface(), "in an array of arrays": arrays.Interface(), "in a slice": slice.Interface(),
+			"in a map": valued.Interface(), "in a map of arrays": arrayed.Interface(), "behind a pointer": pointer.Interface(),
+			"in a struct": field.Interface(), "in an interface in a list": []any{v},
+		}
+		if e.Type().Comparable() {
+			for by, key := range map[string]reflect.Value{"as a map's key": e, "in an array as a map's key": array, "in a struct as a map's key": field} {
+				keyed := reflect.MakeMap(reflect.MapOf(key.Type(), reflect.TypeFor[int]()))
+				keyed.SetMapIndex(key, reflect.ValueOf(1))
+				holders[by] = keyed.Interface()
+			}
+			holders["as a key an interface holds"] = map[any]int{v: 1}
+		}
+		return holders
+	}
+	for name, v := range map[string]any{
+		"a channel": ch, "a nil channel": (chan int)(nil), "a func": func() { x++ }, "a nil func": (func())(nil),
+		"a lock of the host's own": spinLock(1), "an unsafe pointer": unsafe.Pointer(&x),
+	} {
+		for by, attribute := range held(v) {
+			attributes := map[string]any{"v": attribute, "ok": true}
+			if _, evaluated := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); evaluated {
+				t.Errorf("%s %s: a condition read its kind", name, by)
+			}
+			if rbac.Copies(attributes) {
+				t.Errorf("%s %s: a hook was given a copy", name, by)
+			}
+		}
+		empty := reflect.New(reflect.ArrayOf(0, reflect.TypeOf(v))).Elem().Interface()
+		attributes := map[string]any{"v": empty, "ok": true}
+		if held, _ := rbac.EvaluateConditionOf(t, `request.attributes.v == [] && request.attributes.ok`, nil, nil, attributes); !held || !rbac.Copies(attributes) {
+			t.Errorf("an empty array of %s: read %t, copied %t", name, held, rbac.Copies(attributes))
+		}
+	}
+	// No condition reads a struct, nor a map keyed by an array or a struct, whatever they hold.
+	unread := map[string]bool{"in a struct": true, "in an array as a map's key": true, "in a struct as a map's key": true}
+	for by, attribute := range held(count(1)) {
+		attributes := map[string]any{"v": attribute, "ok": true}
+		if held, _ := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); !held && !unread[by] {
+			t.Errorf("the host's own integer %s: a condition couldn't read its kind", by)
+		}
+		if !rbac.Copies(attributes) {
+			t.Errorf("the host's own integer %s: no hook was given a copy", by)
 		}
 	}
 }

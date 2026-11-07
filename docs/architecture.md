@@ -536,8 +536,18 @@ sequenceDiagram
   asked. Such a value is another package's state, as protobuf's reflection of a generated message
   is, whose methods find the message by where it lies, so a hook reading a copy of it alone, as a
   host's type that is its own reflection by one held, read past it; or it holds the host's, which
-  the copy shared. A message's reflection is copied as that of a copy of the message (`pointer`),
-  and refused where that isn't of its type. A call keeps what the host passed with each copy until it returns, so where it
+  the copy shared. Nor does it copy a channel or a func, which it can only share, wherever it lies,
+  a map's key an interface holds too: set as they were, a constraint sending on its copy's channel
+  sent on the host's, and calling its copy's func ran the host's closure. A lock is refused
+  wherever it lies too, a lock of the host's own that isn't a struct, as an integer a pointer to
+  which locks and unlocks, among them, which a converter refuses too (`hostLock`), as conditions
+  read it by its kind: asked only where a value was held in place, a copy copied one alone and in an
+  array, and refused one in an array of arrays, so every constrained call was refused for a value
+  conditions read. An empty array holds none of these, and marks a struct never to be copied only
+  where it is of a lock (`marks`), as protobuf's own state's of a mutex is, as one of a func marks a
+  struct never to be compared, and what it would hold isn't walked. A message's reflection is
+  copied as that of a copy of the message (`pointer`), and refused where that isn't of its type. A
+  call keeps what the host passed with each copy until it returns, so where it
   points is no other value's meanwhile: known only by where it points, a value dropped and collected
   during the call would leave its place to one made after, which would be given the first one's
   copy.
@@ -547,11 +557,14 @@ sequenceDiagram
   CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
   strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
   slices, arrays, pointers, maps
-  keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.
+  keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types,
+  a `Value` holding a nil `Struct` or `ListValue` read as an empty one, as CEL reads it and
+  protobuf writes it: read as null, `request.attributes.v == null` held where CEL found it false.
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
-  host's own, a list, map or optional of CEL's a host makes, a struct, another message, a map keyed
-  by a double or holding two keys read as the same value, and so JSON text naming a member twice
+  host's own, a list, map or optional of CEL's a host makes, a struct, a lock of the host's own, as
+  no hook can be given it (`hostLock`), another message, a map keyed by a double or a lock or
+  holding two keys read as the same value, and so JSON text naming a member twice
   once unescaped, read through `json.Decoder`'s tokens (`parseJSON`), or a packed message setting a
   field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the
   last where a reader of the first reads another, JSON text that isn't UTF-8 or escapes half a
@@ -613,9 +626,14 @@ sequenceDiagram
   array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
   times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
   as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
-  for a hook, whatever held it, a copy charging a struct a tenth of the bytes it sets whole, and a
-  slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
-  before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a
+  for a hook, whatever held it, a copy charging a struct a tenth of the bytes it sets whole, and
+  each of its fields at least a tenth, as finding what it costs and whether it shares it walks each,
+  found once for each type (`typeFact`), and none of the types an empty array would hold: walked for
+  each value, and along each path through such arrays, a copy of 10,000 structs of 4,000 empty
+  fields, charged 10,013, took 2.3 s, and of 100 values of a type nesting two empty arrays of the
+  type before it 20 deep 19.6 s, charged 113. It charges a slice's elements, and a map's values, a
+  tenth of the structs they hold in place, which it moves before copying each (`inlineTenths`),
+  and a map's keys a tenth of the bytes of an array or a
   struct, which reading an entry moves and setting it hashes (`keyTenths`), each before it moves
   them, and of the strings such a key holds and what its interfaces hold, which hashing reads too
   (`payHashed`): charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms,
