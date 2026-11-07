@@ -251,9 +251,12 @@ erDiagram
   for each tenant. Whom denies exempt and eligibilities name as approvers, which no index finds
   across tenants, it reads in the same statement, by a range of every row's `ctid`, which reads each
   table a page at a time, in its order, as a sequential scan does, and which the setting doesn't
-  plan away: with it off, each table was read through a whole index, in its order. Read in a
-  statement of their own, the tenants were of two moments, and a change between them naming the
-  identity where it stopped approving had that tenant found by neither. A plan made while a table fit
+  plan away: with it off and no such range, each table was read through a whole index, in its order,
+  as it was with TID scans off too, which a host's session can have, so `indexed` turns them on, as
+  every statement finding rows by where they are stored needs: a removal of places in groups, which
+  have no id, read every place with both off. Read in a statement of their own, the tenants were of
+  two moments, and a change between them naming the identity where it stopped approving had that
+  tenant found by neither. A plan made while a table fit
   in a page reads it whole whatever the statement's shape, so only the setting pins it; and the
   shapes pin what a plan reads with it off, as statistics from a near-empty table count every value
   as distinct: a key's rows are read in the order of the index leading to it where another leads to

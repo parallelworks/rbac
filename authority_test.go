@@ -6499,79 +6499,85 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 // beside a few. With sequential scans on, as it sent the read, the plan read every row of each.
 // Whom eligibilities name as approvers and denies exempt, which no index finds across tenants, it
 // reads a page of each table at a time, in its order: with sequential scans off, a plan read each
-// through a whole index, in its order, ten times as many pages as the table holds.
+// through a whole index, in its order, ten times as many pages as the table holds. So it does where
+// the host's sessions turn TID scans off: with them off too, a plan read each so, and every place in
+// groups to remove the identity's, which it finds by where they are stored.
 func TestDeletePrincipalEverywhereFindsItsTenantsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
-	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), func(c *rbac.Config) { c.OnChange = nil })
-	ctx := t.Context()
-	tables := []string{"rbac_grants", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies"}
-	for _, table := range tables {
-		if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	h.groups(t, "team")
-	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "w"))
-	h.as(t, "w", "team")
-	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")); err != nil {
-		t.Fatal(err)
-	}
-	deleting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeletePrincipalEverywhere(ctx, host, identity("w")) }
-	// Not the eligibilities and denies, whose approvers and exemptions it reads, every row of them.
-	scansWhole(ctx, t, h.pool, "DeletePrincipalEverywhere", deleting, tables[:3]...)
-	// The pages of each table the read of its tenants reads, made once before, so its plan is made and
-	// cached, in a transaction it rolls back.
-	read := func() map[string]int64 {
-		t.Helper()
-		pages := map[string]int64{}
-		for range 2 {
-			func() {
-				tx, err := h.pool.Begin(ctx)
-				if err != nil {
+	for _, session := range []struct{ name, params string }{{"as set", ""}, {"TID scans off", "&enable_tidscan=off"}} {
+		t.Run(session.name, func(t *testing.T) {
+			h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"+session.params), func(c *rbac.Config) { c.OnChange = nil })
+			ctx := t.Context()
+			tables := []string{"rbac_grants", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies"}
+			for _, table := range tables {
+				if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = tx.Rollback(ctx) }()
-				counting := countingPages(t, tx, tables...)
-				if err := deleting(counting); err != nil {
+			}
+			h.groups(t, "team")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "w"))
+			h.as(t, "w", "team")
+			if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")); err != nil {
+				t.Fatal(err)
+			}
+			deleting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeletePrincipalEverywhere(ctx, host, identity("w")) }
+			// Not the eligibilities and denies, whose approvers and exemptions it reads, every row of them.
+			scansWhole(ctx, t, h.pool, "DeletePrincipalEverywhere", deleting, tables[:3]...)
+			// The pages of each table the read of its tenants reads, made once before, so its plan is made and
+			// cached, in a transaction it rolls back.
+			read := func() map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for range 2 {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						counting := countingPages(t, tx, tables...)
+						if err := deleting(counting); err != nil {
+							t.Fatal(err)
+						}
+						counting.end(ctx)
+						for _, table := range tables {
+							pages[table] = counting.starting("SELECT tenant FROM rbac_grants WHERE principal = $1", table)
+						}
+					}()
+				}
+				return pages
+			}
+			few := read()
+			for _, q := range []string{
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.login' FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'user', 'o' || i FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_groups (tenant, id) SELECT 's' || i, 'team' FROM generate_series(1, 2000) i`,
+				`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			 SELECT CASE WHEN i % 10 = 0 THEN 't1' ELSE 's' || (i % 2000 + 1) END, 'team', 'user', 'o' || i FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.sudo', 3600, ARRAY['user:a' || i]
+			 FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['user:o' || i], ARRAY['user:a' || i], '{cluster:login}'
+			 FROM generate_series(1, 20000) i`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
 					t.Fatal(err)
 				}
-				counting.end(ctx)
-				for _, table := range tables {
-					pages[table] = counting.starting("SELECT tenant FROM rbac_grants WHERE principal = $1", table)
+			}
+			held := relationPages(t, h, currentSchema(t, h))
+			for table, many := range read() {
+				n, most := few[table], 3*few[table]+deeper
+				// Of those whose every row it reads, each page once.
+				if table == "rbac_eligibilities" || table == "rbac_denies" {
+					most += held[table]
 				}
-			}()
-		}
-		return pages
-	}
-	few := read()
-	for _, q := range []string{
-		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
-		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.login' FROM generate_series(1, 20000) i`,
-		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
-		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'user', 'o' || i FROM generate_series(1, 20000) i`,
-		`INSERT INTO rbac_groups (tenant, id) SELECT 's' || i, 'team' FROM generate_series(1, 2000) i`,
-		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
-		 SELECT CASE WHEN i % 10 = 0 THEN 't1' ELSE 's' || (i % 2000 + 1) END, 'team', 'user', 'o' || i FROM generate_series(1, 20000) i`,
-		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
-		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.sudo', 3600, ARRAY['user:a' || i]
-		 FROM generate_series(1, 20000) i`,
-		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
-		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['user:o' || i], ARRAY['user:a' || i], '{cluster:login}'
-		 FROM generate_series(1, 20000) i`,
-	} {
-		if _, err := h.pool.Exec(ctx, q); err != nil {
-			t.Fatal(err)
-		}
-	}
-	held := relationPages(t, h, currentSchema(t, h))
-	for table, many := range read() {
-		n, most := few[table], 3*few[table]+deeper
-		// Of those whose every row it reads, each page once.
-		if table == "rbac_eligibilities" || table == "rbac_denies" {
-			most += held[table]
-		}
-		if many > most {
-			t.Errorf("finding the tenants an identity is in read %d pages of %s, and %d once the tables grew under a plan made while they were small", n, table, many)
-		}
+				if many > most {
+					t.Errorf("finding the tenants an identity is in read %d pages of %s, and %d once the tables grew under a plan made while they were small", n, table, many)
+				}
+			}
+		})
 	}
 }
 

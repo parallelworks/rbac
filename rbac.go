@@ -1581,12 +1581,15 @@ var (
 	// reads each table by an index, a GIN index through a bitmap, whatever the table held when its
 	// session planned it: one planned generically while a table was small, or by statistics from
 	// then, read every row of it until the plan was invalidated, and for a list read a key at a time
-	// (byKey), every row once for each key.
-	indexed = []setting{{"enable_seqscan", "off"}}
+	// (byKey), every row once for each key. It turns TID scans on, as a host's session may have them
+	// off: rows are found by where they are stored too, places in groups, which have no id, and the
+	// approvers and exemptions DeletePrincipalEverywhere reads by a range of every ctid, which with
+	// them off too a plan read through the whole table, or through a whole index in its order.
+	indexed = []setting{{"enable_seqscan", "off"}, {"enable_tidscan", "on"}}
 )
 
-// unjitted is withoutJIT, with sequential scans off too as indexed has them, but as of a time, as
-// readIndexed.
+// unjitted is withoutJIT, with sequential scans off and TID scans on too as indexed has them, but as
+// of a time, as readIndexed.
 func (a *Authorizer) unjitted() []setting {
 	if a.history != "" {
 		return withoutJIT

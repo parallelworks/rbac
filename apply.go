@@ -3029,9 +3029,10 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 			// by equality one skipped through the index leading to the tenant, a descent for each tenant.
 			// What names it an approver or exempts it no index finds across tenants, so every row is read,
 			// in the table's order, by a range of every ctid, which sequential scans being off doesn't
-			// plan away: with them off, each table was read through a whole index, in its order. In one
-			// statement, so the tenants are of one moment: read apart, a change between the reads naming
-			// it where it stopped approving had that tenant found by neither, and its grant there kept.
+			// plan away, as TID scans are on too (indexed): with no such range, or with TID scans off,
+			// each table was read through a whole index, in its order. In one statement, so the tenants
+			// are of one moment: read apart, a change between the reads naming it where it stopped
+			// approving had that tenant found by neither, and its grant there kept.
 			rows, err := queryByIndexes(ctx, tx, `SELECT tenant FROM rbac_grants WHERE principal = $1
 				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1
 				UNION SELECT tenant FROM rbac_memberships WHERE principal = $1
