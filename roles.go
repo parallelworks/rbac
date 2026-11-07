@@ -1721,22 +1721,25 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 // of them looks each up by its key.
 const everyCustomRole = "rbac_roles WHERE tenant = $1"
 
-// listingSQL is SQL for the WITH entries listing, of roleColumns, of the custom roles in the tenant
-// $1 in the text array named and those their GrantableRoles name, through others too, and listed,
-// those with the custom roles the WITH entry held's grants hold, each read by its key (byKey): every
-// role a decision of whether an actor may grant those named reads, as holdsRole walks the roles each
-// lists, while of the roles a held one lists it reads only their ids (powerOf). A tenant's other
-// roles, however many or large, cost it nothing: those the actor's roles list too, as an admin's
-// role listing every role.
+// listingSQL is SQL for the WITH entries listing, the ids of the custom roles in the text array
+// named and those their GrantableRoles name in the tenant $1, through others too, and listed, of
+// roleColumns, those with the custom roles the WITH entry held's grants hold: every role a decision
+// of whether an actor may grant those named reads, as holdsRole walks the roles each lists, while of
+// the roles a held one lists it reads only their ids (powerOf). The walk carries ids alone, so the
+// UNION passes over a role reached again before reading it: each role reached costs a seek by its
+// key for its list and one for its row (byKey), which alone reads its permissions, and a listing
+// only its id, however many list the role. Carrying whole rows, the UNION read, detoasted and hashed
+// a role's every permission once for each listing reaching it. A tenant's other roles, however many
+// or large, cost it nothing: those the actor's roles list too, as an admin's role listing every role.
+// The ids it starts from are collated as the column is, as both terms of a recursive query must be.
 func listingSQL(named string) string {
 	return `listing AS (
-		  ` + byKey(named, "rbac_roles", "id", roleColumns, "tenant = $1") + `
+		  SELECT k COLLATE "C" AS id FROM unnest(` + named + `::text[]) AS keyed(k)
 		  UNION
-		  SELECT r.* FROM listing l CROSS JOIN LATERAL (` + byKey("l.grantable_roles", "rbac_roles", "id", roleColumns, "tenant = $1") + `) r
+		  SELECT g.k FROM listing l CROSS JOIN LATERAL (
+		    SELECT unnest(grantable_roles) AS k FROM rbac_roles WHERE tenant = $1 AND id = l.id OFFSET 0) g
 		), listed AS (
-		  SELECT * FROM listing
-		  UNION ALL
-		  ` + byKey(namedCustom("SELECT role FROM held EXCEPT SELECT id FROM listing"), "rbac_roles", "id", roleColumns, "tenant = $1") + `
+		  ` + byKey(namedCustom("SELECT id AS role FROM listing UNION ALL SELECT role FROM held"), "rbac_roles", "id", roleColumns, "tenant = $1") + `
 		)`
 }
 
