@@ -489,7 +489,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   empty fields are, while a struct holding an empty array of funcs, which marks it only never to be
   compared, or of a struct holding a lock that isn't itself one, was refused and is now copied, as
   are ones holding a slice reached at one length with several capacities, as three-index slices of
-  one array are, which a copy charged for each, past what converting them costs; and
+  one array are, which a copy charged for each, past what converting them costs; and a hook's copy
+  of a time in a zone of the host's own, as `time.FixedZone` and `time.LoadLocation` make, which
+  shared that zone with the host, so a constraint writing through `Location()` wrote the host's, is
+  now in a copy of the zone, which `==` tells from the host's, though `Equal` doesn't; and
   a condition building a list or a map
   holding attributes no condition can read, or reading the `subject`, the `resource` or the
   `request` holding them whole, as one
@@ -594,7 +597,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   when it changes a membership, as `SetMemberships` says.
 - **What a hook's copy holds:** what the host passed, its maps, lists, pointers and messages its
   own, a host's type that is its own reflection by a generated message's it embeds holding the
-  reflection of a copy of the message, and none of what follows. Where what a hook would be given
+  reflection of a copy of the message, a time in a zone of the host's own, as `time.FixedZone` and
+  `time.LoadLocation` make, in a copy of the zone, one for each copy, wherever it lies, an
+  unexported field or a map's key too, and none of what follows. A zone's methods write none of it,
+  but assigning through `Location()` writes it whole: shared, a constraint writing
+  `*t.Location() = *time.UTC` wrote the host's zone, and every time in it. A time in UTC or the
+  local zone, which any code can reach, is as the host passed it. Where what a hook would be given
   holds any of it, the hook can't be asked, rather than be given part of it, and the call is
   refused as any other, a `DeniedError` of the permission on the resource asked about, or the
   tenant, whose `Reason` names the hook and whose message doesn't: a tenant's users can write what

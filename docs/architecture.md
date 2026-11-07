@@ -531,15 +531,21 @@ sequenceDiagram
   elements are copied, before a longer length outgrew that copy, a slice of its own, whose elements
   are copied too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
-  the interface. A copy copies each value in place before what it holds, as setting it does, so it
-  copies none holding a lock or an unsafe pointer there, nor a struct whose unexported field, which
-  it can't set, holds a pointer, a slice, a map or an interface (`copyable`): the hook can't be
-  asked. Such a value is another package's state, as protobuf's reflection of a generated message
-  is, whose methods find the message by where it lies, so a hook reading a copy of it alone, as a
-  host's type that is its own reflection by one held, read past it; or it holds the host's, which
-  the copy shared. Nor does it copy a channel or a func, which it can only share, wherever it lies,
-  a map's key an interface holds too: set as they were, a constraint sending on its copy's channel
-  sent on the host's, and calling its copy's func ran the host's closure. Nor does it copy a map
+  the interface. A time is shared so too, in UTC or the local zone, which any code can reach, but
+  in a zone of the host's own is moved to a copy of the zone, one for each copy (`zone`), wherever
+  it lies, an unexported field, which reflection reaches in the copy's struct (`rezone`), and a
+  map's key, set anew (`ownKey`), among them: a zone's methods write none of it, but assigning
+  through `Location()` writes it whole, so a constraint writing `*t.Location() = *time.UTC` wrote
+  the host's zone, and every time in it. A copy copies each value in place before what it holds,
+  as setting it does, so it copies none holding a lock or an unsafe pointer there, nor a struct
+  whose unexported field, which it can't set, holds a pointer, a slice, a map or an interface
+  (`copyable`): the hook can't be asked. Such a value is another package's state, as protobuf's
+  reflection of a generated message is, whose methods find the message by where it lies, so a hook
+  reading a copy of it alone, as a host's type that is its own reflection by one held, read past
+  it; or it holds the host's, which the copy shared. Nor does it copy a channel or a func, which it
+  can only share, wherever it lies, a map's key an interface holds too: set as they were, a
+  constraint sending on its copy's channel sent on the host's, and calling its copy's func ran the
+  host's closure. Nor does it copy a map
   keyed by what it wouldn't share whole (`sharedKey`): a pointer, or a value holding one, in place
   or in an interface, however deep in the key. It sets each key as it is, as a copied key would be
   another key, under which the copy would find nothing the host passed: so what a pointer key

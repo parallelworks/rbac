@@ -644,7 +644,10 @@ type Constraint struct {
 // copy sets a map's keys as they are, as a copied key would be another key. Nor can a message, or a
 // message's reflection, whose copying panics, as the host's own reflection's methods can, or makes
 // a message of another type. Where the attributes hold one, the constraint can't be asked, and the
-// call is refused as above.
+// call is refused as above. A time in a zone of the host's own, as time.FixedZone and
+// time.LoadLocation make, is copied in a copy of the zone, one for each copy, a map's key too: a
+// zone's methods write none of it, but assigning through Location writes it whole, so a constraint
+// doing so wrote the host's. So a copy's time is == to none of the host's, though Equal to it.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string

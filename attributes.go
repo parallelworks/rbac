@@ -1493,27 +1493,29 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // own, a protobuf message among them copied field by field, as cloning it would, but for one of a
 // host's type that makes messages of another, copied as any other pointer (itself), and a value
 // reached twice copied once, a message too, so a cycle ends. A slice is copied once for where it
-// starts, however many lengths and capacities it is reached with, each a slice of the one copy,
-// as each is of the host's, but for one reached while its elements are copied, before a longer
-// length outgrew that copy, which is a slice of a copy of its own: copied for each length, the
-// prefixes of one slice of 3,000 maps took half a second. A value holding no map, slice or pointer,
-// as an array of bytes, is copied whole, and shared where an interface holds it, as nothing writes
-// through one: copied element by element for each interface holding it, a hundred holding one array
-// of 100 KB took 170 ms. So is a time, whose fields are unexported. A struct's fields an unexported
-// struct it embeds promotes are its own too, and its other unexported fields are copied whole, as
-// setting it copies them, so it copies none holding more than that copies, as a pointer, a slice or
-// another package's state, which reflection can't set, nor a value holding an unsafe pointer in
-// place, nor a lock, a channel or a func wherever it lies, as it would copy a lock and share the
-// others (copyable), and a message's reflection only as that of a copy of the message (pointer),
-// and none whose copying panics, as the host's own reflection can, or makes another type
-// (reflected). A map's keys are set as they are, as a copied key would be another key, under which
-// the copy would find nothing the host passed, so it copies no map keyed by what it wouldn't share,
-// as a pointer, a struct holding one, or an interface holding one, however deep in the key
-// (sharedKey). It copies at most what a check converts (maxConverted), counted as converting counts
-// it, whatever it shares or copies whole (mapCost), and no value nesting past maxCopied deep, nor
-// one holding itself that reaches as many values holding others (copier.around), past which, or
-// where v holds what it can't copy, it reports false, and the copy is v's zero value: copying
-// recurses as far as v reaches, as a check's converting does, which stops there.
+// starts, however many lengths and capacities it is reached with, each a slice of the one copy, as
+// each is of the host's, but for one reached while its elements are copied, before a longer length
+// outgrew that copy, which is a slice of a copy of its own: copied for each length, the prefixes of
+// one slice of 3,000 maps took half a second. A value holding no map, slice or pointer, as an array
+// of bytes, is copied whole, and shared where an interface holds it, as nothing writes through one:
+// copied element by element for each interface holding it, a hundred holding one array of 100 KB
+// took 170 ms. So is a time, whose fields are unexported, but in a zone of the copy's own where the
+// host's is its own (zone), wherever it lies, a map's key too, set anew (ownKey). A struct's fields
+// an unexported struct it embeds promotes are its own too, and its other unexported fields are
+// copied whole, as setting it copies them, so it copies none holding more than that copies, as a
+// pointer, a slice or another package's state, which reflection can't set, nor a value holding an
+// unsafe pointer in place, nor a lock, a channel or a func wherever it lies, as it would copy a
+// lock and share the others (copyable), and a message's reflection only as that of a copy of the
+// message (pointer), and none whose copying panics, as the host's own reflection can, or makes
+// another type (reflected). A map's keys are set as they are, but for a time's zone (ownKey), as a
+// copied key would be another key, under which the copy would find nothing the host passed, so it
+// copies no map keyed by what it wouldn't share, as a pointer, a struct holding one, or an
+// interface holding one, however deep in the key (sharedKey). It copies at most what a check
+// converts (maxConverted), counted as converting counts it, whatever it shares or copies whole
+// (mapCost), and no value nesting past maxCopied deep, nor one holding itself that reaches as many
+// values holding others (copier.around), past which, or where v holds what it can't copy, it
+// reports false, and the copy is v's zero value: copying recurses as far as v reaches, as a check's
+// converting does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
@@ -1569,6 +1571,8 @@ type copier struct {
 	// reached one it was still copying (around).
 	holders int
 	cycled  bool
+	// zones are the copy's own of each time zone of the host's own it reached (zone).
+	zones map[*time.Location]*time.Location
 }
 
 // kept is the copy of a map, pointer or message, and once it is copied whole, how much deeper than
@@ -1658,9 +1662,15 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		}
 	}
 	if shared(v.Type()) {
-		// Set whole where the copy holds it.
+		// Set whole where the copy holds it, a time in a zone of the copy's own.
 		if !c.payWhole(v) {
 			return reflect.Value{}
+		}
+		if zoned(v.Type()) && !global(zoneOf(v)) {
+			out := reflect.New(v.Type()).Elem()
+			out.Set(v)
+			c.rezone(out)
+			return out
 		}
 		return v
 	}
@@ -1764,6 +1774,7 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 	// each struct it held only to drop it.
 	kt := v.Type().Key()
 	moved, hashed := (keyTenths(kt)+inlineTenths(v.Type().Elem()))/10, kt.Kind() != reflect.String && hashesHeld(kt)
+	zonedKeys := zonesHeld(kt)
 	for it := v.MapRange(); it.Next() && c.pay(moved); {
 		key := it.Key()
 		// What the entries before it held can leave less than its value holds in place, as one of two
@@ -1772,6 +1783,9 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 			break
 		}
 		if held := c.copy(it.Value(), depth); !c.over {
+			if zonedKeys {
+				key = c.ownKey(key)
+			}
 			out.SetMapIndex(key, held)
 		}
 	}
@@ -2070,13 +2084,17 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 	default:
 		s.out = s.out.Slice(0, n)
 	}
-	// Each hook is given its own, so elements no write could reach through are copied at once.
+	// Each hook is given its own, so elements no write could reach through are copied at once, a
+	// time in a zone of the copy's own (zone).
 	if s.filled == 0 {
 		reflect.Copy(s.out, v)
 	} else {
 		reflect.Copy(s.out.Slice(s.filled, n), v.Slice(s.filled, n))
 	}
 	if shared(elem) {
+		for i := s.filled; i < n && zoned(elem); i++ {
+			c.rezone(s.out.Index(i))
+		}
 		s.filled, s.measured = n, n
 	}
 	return s
@@ -2290,6 +2308,9 @@ func (c *copier) fields(out, v reflect.Value, depth int) {
 			if held := c.copy(v.Field(i), depth); !c.over {
 				f.Set(held)
 			}
+		case zoned(f.Type()):
+			// Set whole, in the host's zone, which the type's methods could write through.
+			c.rezone(f)
 		case v.Type().Field(i).Anonymous && f.Kind() == reflect.Struct:
 			c.fields(f, v.Field(i), depth)
 		}
@@ -2309,8 +2330,137 @@ func unreachable(v reflect.Value) bool {
 		// directly: shared, an interface holding a nil lock was copied where an array of it wasn't.
 		return e.IsNil() && copyable(e.Type())
 	default:
-		return shared(e.Type())
+		// A time in a zone of the host's own is given in one of the copy's (zone).
+		return shared(e.Type()) && (!zoned(e.Type()) || global(zoneOf(e)))
 	}
+}
+
+// zoned reports whether a value of type t is a time, which a copy holds in a zone of its own
+// (zone): a time.Time, or one of CEL's timestamps.
+func zoned(t reflect.Type) bool { return t == timeType || t == celTimestampType }
+
+// global reports whether at is UTC or the local zone, which any code can reach, and a time in
+// which a copy holds as it is.
+func global(at *time.Location) bool { return at == time.UTC || at == time.Local }
+
+// zoneOf is the zone of v, a time (zoned), read in place where v is addressable, as reading it
+// otherwise copies it, and as an unexported field of a copy's struct can only be read.
+func zoneOf(v reflect.Value) *time.Location {
+	if v.Type() == celTimestampType {
+		v = v.Field(0)
+	}
+	if v.CanAddr() {
+		at, _ := reflect.NewAt(timeType, v.Addr().UnsafePointer()).Interface().(*time.Time)
+		return at.Location()
+	}
+	at, _ := v.Interface().(time.Time)
+	return at.Location()
+}
+
+// zone is t, a time of the host's, in a zone of the copy's own, one for each zone of the host's own
+// a copy reaches, so its times compare with one another as the host's do. A zone's methods write
+// none of it, but assigning through t.Location() writes it whole, so a constraint writing
+// `*t.Location() = *time.UTC` to its copy wrote the host's zone, and every time in it, the host's
+// and other hooks' alike. UTC and the local zone are the process's, which any code can write
+// anyway, and a time in them, which can hold a monotonic reading moving it drops, is kept as it is.
+func (c *copier) zone(t time.Time) time.Time {
+	at := t.Location()
+	if global(at) {
+		return t
+	}
+	own, ok := c.zones[at]
+	if !ok {
+		// Its name loads the local zone where at is it, which reading it whole doesn't.
+		_ = at.String()
+		copied := *at
+		own = &copied
+		if c.zones == nil {
+			c.zones = map[*time.Location]*time.Location{}
+		}
+		c.zones[at] = own
+	}
+	return t.In(own)
+}
+
+// rezone moves v, an addressable time (zoned) of the copy's, set as the host's was, to a zone of
+// the copy's own (zone): in place, as v can be an unexported field of a struct of the copy's, which
+// a hook reaches through the type's methods and reflection can't set.
+func (c *copier) rezone(v reflect.Value) {
+	if v.Type() == celTimestampType {
+		v = v.Field(0)
+	}
+	if at, ok := reflect.NewAt(timeType, v.Addr().UnsafePointer()).Interface().(*time.Time); ok {
+		*at = c.zone(*at)
+	}
+}
+
+// ownKey is key, a map's key whose type holds a time in place or an interface (zonesHeld), with
+// each time it holds in a zone of the copy's own (zone): a key is set as it is, so this one is set
+// anew. The copy's zones are one for each of the host's, so keys the host holds apart are apart in
+// the copy, and so are none it holds as one.
+func (c *copier) ownKey(key reflect.Value) reflect.Value {
+	if key.Kind() == reflect.Interface && (key.IsNil() || !zonesHeld(key.Elem().Type())) {
+		return key
+	}
+	out := reflect.New(key.Type()).Elem()
+	if key.Kind() == reflect.Interface {
+		out.Set(c.ownKey(key.Elem()))
+		return out
+	}
+	out.Set(key)
+	c.rezoneIn(out)
+	return out
+}
+
+// rezoneIn moves each time v, an addressable value of a key's type a copy sets anew (ownKey), holds
+// in place or in an interface to a zone of the copy's own.
+func (c *copier) rezoneIn(v reflect.Value) {
+	switch {
+	case zoned(v.Type()):
+		c.rezone(v)
+	case v.Kind() == reflect.Interface:
+		if !v.IsNil() && zonesHeld(v.Elem().Type()) {
+			reflect.NewAt(v.Type(), v.Addr().UnsafePointer()).Elem().Set(c.ownKey(v.Elem()))
+		}
+	case v.Kind() == reflect.Array:
+		for i := 0; i < v.Len() && zonesHeld(v.Type().Elem()); i++ {
+			c.rezoneIn(v.Index(i))
+		}
+	case v.Kind() == reflect.Struct:
+		for i := range v.NumField() {
+			if zonesHeld(v.Type().Field(i).Type) {
+				c.rezoneIn(v.Field(i))
+			}
+		}
+	default:
+	}
+}
+
+// zonesHeld reports whether a value of type t, a map's key, can hold a time (zoned), in place or in
+// an interface, which ownKey sets anew. An array's or a struct's is found once for each type
+// (typeFact).
+func zonesHeld(t reflect.Type) bool {
+	switch {
+	case zoned(t), t.Kind() == reflect.Interface:
+		return true
+	case t.Kind() == reflect.Array && t.Len() > 0, t.Kind() == reflect.Struct:
+		return typeFact(&zoneTypes, t, zonesWithin)
+	default:
+		return false
+	}
+}
+
+// zonesWithin is zonesHeld of t, an array or a struct, by what it holds in place.
+func zonesWithin(t reflect.Type) bool {
+	if t.Kind() == reflect.Array {
+		return zonesHeld(t.Elem())
+	}
+	for i := range t.NumField() {
+		if zonesHeld(t.Field(i).Type) {
+			return true
+		}
+	}
+	return false
 }
 
 // payHeld pays for v, an interface no write could reach through (unreachable), as converting what
@@ -2576,7 +2726,8 @@ func sharedKeyWithin(t reflect.Type) bool {
 // shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
 // one holding no map, slice, pointer or interface a copy would share (flat), nor what no copy can
 // hold (copyable), and a time, whose fields are unexported, which no hook can write to but by
-// replacing it whole.
+// replacing it whole, or through its zone, which a copy holds a copy of where it is the host's own
+// (zone).
 func shared(t reflect.Type) bool {
 	return t == timeType || t == celTimestampType || flat(t) && copyable(t)
 }
@@ -2685,9 +2836,9 @@ func flatWithin(t reflect.Type) bool {
 	return true
 }
 
-// What flat, tenths, hashesHeld and sharedKey found of each array and struct type they were asked
-// about.
-var flatTypes, tenthsTypes, hashingTypes, keyTypes sync.Map
+// What flat, tenths, hashesHeld, sharedKey and zonesHeld found of each array and struct type they
+// were asked about.
+var flatTypes, tenthsTypes, hashingTypes, keyTypes, zoneTypes sync.Map
 
 // typeFact is what find finds of t, kept in known, so it is found once for each type: finding it
 // walks each type t holds in place, and copying asks it of each value it copies. Walked for each, a

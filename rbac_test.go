@@ -3593,7 +3593,8 @@ func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing
 // interface held a pointer or a channel, in a struct or an array, gave it the host's too. No
 // condition reads a map keyed by any of them, as CEL keys are bools, ints, uints and strings, and
 // no hook is given one, empty too where its key's type holds a pointer in place. A key holding a
-// string, a time, or an interface holding one, reaches nothing a hook could write to, and is copied.
+// string, a time in UTC or the local zone, or an interface holding one, reaches nothing a hook
+// could write to, and is copied as it is.
 func TestAHookIsGivenNoMapKeyedByWhatReachesTheHost(t *testing.T) {
 	x, ch := 1, make(chan int)
 	type pointing struct{ P *int }
@@ -3623,6 +3624,117 @@ func TestAHookIsGivenNoMapKeyedByWhatReachesTheHost(t *testing.T) {
 		if copied := rbac.DeepCopy(attributes); !reflect.DeepEqual(copied, attributes) {
 			t.Errorf("a map keyed by %s: a hook was given %#v", name, copied)
 		}
+	}
+}
+
+// zonesOf calls each with the zone of each time v reaches, as Location gives it, but nil for UTC.
+func zonesOf(v reflect.Value, each func(*time.Location)) {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			zonesOf(v.Elem(), each)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := range v.Len() {
+			zonesOf(v.Index(i), each)
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			zonesOf(it.Key(), each)
+			zonesOf(it.Value(), each)
+		}
+	case reflect.Struct:
+		if v.Type() == reflect.TypeFor[time.Time]() {
+			each((*time.Location)(v.FieldByName("loc").UnsafePointer()))
+			return
+		}
+		for i := range v.NumField() {
+			zonesOf(v.Field(i), each)
+		}
+	default:
+	}
+}
+
+// A hook's copy of a time held the time's zone, which the zone's methods never write, but which
+// assigning through Location writes whole: a constraint writing `*t.Location() = *time.UTC` to its
+// copy wrote the zone of the host's time, and so of every time in it, the host's and those in other
+// hooks' copies. A time in a zone of the host's own is given in a copy of the zone, wherever it
+// lies, an unexported field and a map's key too, each copy's its own, and its times keep the
+// instant and the zone the host passed.
+func TestAHookWritingTheZoneOfItsTimeWritesNoneOfTheHosts(t *testing.T) {
+	type unexported struct{ at time.Time }
+	type embedding struct{ unexported }
+	for name, holding := range map[string]func(time.Time) any{
+		"alone":                     func(at time.Time) any { return at },
+		"in a list":                 func(at time.Time) any { return []time.Time{at} },
+		"behind a pointer":          func(at time.Time) any { return &at },
+		"in an interface in a list": func(at time.Time) any { return []any{at} },
+		"in a map":                  func(at time.Time) any { return map[string]time.Time{"a": at} },
+		"in a struct":               func(at time.Time) any { return struct{ T time.Time }{at} },
+		"in an unexported field":    func(at time.Time) any { return unexported{at} },
+		"in one of an unexported struct a struct embeds": func(at time.Time) any { return embedding{unexported{at}} },
+		"as a map's key":                      func(at time.Time) any { return map[time.Time]int{at: 1} },
+		"in a struct as a map's key":          func(at time.Time) any { return map[unexported]int{{at}: 1} },
+		"as a key an interface holds":         func(at time.Time) any { return map[any]int{at: 1} },
+		"in an array a key's interface holds": func(at time.Time) any { return map[any]int{[1]any{at}: 1} },
+		"a CEL timestamp":                     func(at time.Time) any { return types.Timestamp{Time: at} },
+		"CEL timestamps in a list":            func(at time.Time) any { return []types.Timestamp{{Time: at}, {Time: at}} },
+	} {
+		zone := time.FixedZone("host", 3600)
+		at := time.Date(2026, 1, 2, 3, 4, 5, 0, zone)
+		attributes := map[string]any{"v": holding(at)}
+		one, other := rbac.DeepCopy(attributes), rbac.DeepCopy(attributes)
+		if one == nil {
+			t.Errorf("%s wasn't copied", name)
+			continue
+		}
+		var held []*time.Location
+		zonesOf(reflect.ValueOf(one), func(z *time.Location) { held = append(held, z) })
+		for _, z := range held {
+			if z != held[0] || z.String() != "host" {
+				t.Errorf("%s: a copy's times are in %d zones, as %q", name, len(slices.Compact(slices.Clone(held))), z)
+			}
+		}
+		if len(held) == 0 {
+			t.Fatalf("%s: a copy holds no time", name)
+		}
+		*held[0] = *time.UTC
+		zonesOf(reflect.ValueOf(other), func(z *time.Location) {
+			if z.String() != "host" {
+				t.Errorf("%s: writing a copy's zone wrote another copy's", name)
+			}
+		})
+		if zone.String() != "host" || at.Format(time.RFC3339) != "2026-01-02T03:04:05+01:00" {
+			t.Errorf("%s: writing a copy's zone wrote the host's, so its time reads %s", name, at.Format(time.RFC3339))
+		}
+	}
+	// A time in UTC or the local zone is as the host passed it, monotonic reading and all.
+	now := time.Now()
+	for _, v := range []time.Time{now, now.UTC()} {
+		if copied, _ := rbac.DeepCopy(map[string]any{"v": v})["v"].(time.Time); copied != v {
+			t.Errorf("a time in %s was copied as %#v", v.Location(), copied)
+		}
+	}
+}
+
+// A time in the local zone the process started in, where the host has since set time.Local to
+// another, is in a zone of the host's own, which a copy copies, loading it first: copied as it lay,
+// before anything had loaded it, it read as UTC where the host's read as the zone the process
+// started in. It runs in a child process, in which nothing has loaded the zone yet.
+func TestACopyOfATimeInTheLocalZoneTheHostSetAsideReadsAsTheHostsDoes(t *testing.T) {
+	if os.Getenv("RBAC_COPY_LOCAL_ZONE") != "" {
+		at := time.Unix(1, 0)
+		time.Local = time.FixedZone("elsewhere", 7200)
+		copied, _ := rbac.DeepCopy(map[string]any{"v": at})["v"].(time.Time)
+		if copied.Format(time.RFC3339) != at.Format(time.RFC3339) {
+			t.Errorf("a time the host reads as %s was copied as %s", at.Format(time.RFC3339), copied.Format(time.RFC3339))
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestACopyOfATimeInTheLocalZoneTheHostSetAsideReadsAsTheHostsDoes$")
+	cmd.Env = append(os.Environ(), "RBAC_COPY_LOCAL_ZONE=1", "TZ=Asia/Tokyo")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("%v\n%.2000s", err, out)
 	}
 }
 
