@@ -1491,9 +1491,9 @@ func EvaluateDeclared(t *testing.T, declares Attributes, expr string, subject ma
 // MaxConverted is the most a check converts of what the host passes.
 const MaxConverted = maxConverted
 
-// MapCost, ListCost, PointerCost and MessageCost are what converting, or copying for a hook, each
-// map, list, pointer and other message costs.
-const MapCost, ListCost, PointerCost, MessageCost = mapCost, listCost, pointerCost, messageCost
+// MapCost, ListCost, PointerCost, MessageCost and BytesCost are what converting, or copying for a
+// hook, each map, list, pointer, other message and slice of bytes or JSON text costs.
+const MapCost, ListCost, PointerCost, MessageCost, BytesCost = mapCost, listCost, pointerCost, messageCost, bytesCost
 
 // Work is what converting a kind's attributes, or copying them for a hook, charged, and the
 // allocations and bytes it made, and whether it could: for converting, whether it read them.
@@ -1541,6 +1541,9 @@ func CopyingCharge(attributes map[string]any) (uint64, bool) {
 	c.copy(reflect.ValueOf(&v).Elem(), 0)
 	return maxConverted - c.left, !c.over
 }
+
+// ParseJSON is JSON text as converting reads it, and whether a condition can read it.
+func ParseJSON(text []byte) (any, bool) { return parseJSON(text) }
 
 // Converting is what converting attributes as a check does allocates, and whether they were more
 // than a check converts.
