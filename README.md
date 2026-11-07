@@ -479,7 +479,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   which a hook was given alone, in an array, or in a slice or a map of arrays, and not in an array
   of arrays, and ones holding a map keyed by a pointer, or by a value holding one, in place or in an
   interface, or by a struct or an array whose interface held a channel or a lock, which a hook was
-  given holding the host's pointer or channel, or the lock; and ones holding structs whose fields
+  given holding the host's pointer or channel, or the lock, and ones holding a message, or a
+  message's reflection, whose copying panics, as that of a struct of the host's embedding a nil
+  reflection or of a dynamic message made without its type does, which panicked every call asking a
+  hook about them, or makes a message of another type, which a hook was given as that type, or
+  which panicked such a call in a list of its own; and ones holding structs whose fields
   hold nothing in place, as empty structs or empty arrays, which a copy charged nothing for them and
   now charges a tenth for each, can be past what a hook's copy holds, as 1,000 structs of 4,000
   empty fields are, while a struct holding an empty array of funcs, which marks it only never to be
@@ -616,6 +620,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
     the host's own key, so a constraint writing through a pointer key wrote to the host's, and an
     interface in a struct or an array key gave it the host's channel, or a lock. No condition reads
     such a map either, as CEL keys are bools, ints, uints and strings.
+  - **Reflections that fail:** a message, or a message's reflection, whose copying panics, as the
+    methods of the host's own reflection can, a struct embedding a nil one, or a dynamic message
+    made without its type, or makes a message of another type than the host passed: each panicked
+    every call asking a hook about it.
 
 ## Principals
 

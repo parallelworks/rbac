@@ -3989,6 +3989,62 @@ func TestAConstraintIsGivenAMessageThatIsItsOwnReflectionAsTheHostsType(t *testi
 	}
 }
 
+// A hook's copy of a message's reflection, or of a message as itself, calls the reflection's
+// methods, which are the host's own where its type is: a struct embedding a nil reflection panicked
+// on the first, and so did a dynamic message made without its type, and a copy of a type saying it
+// makes its own and making another panicked set in a list of the host's type, each panicking every
+// call asking a hook about it. No condition reads any of them, and no hook is given a copy of one,
+// so the call is refused.
+func TestAHookIsGivenNoCopyOfAMessageWhoseReflectionPanics(t *testing.T) {
+	another := &mistyped{dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())}
+	values := map[string]any{
+		"a struct embedding a nil reflection": &reflectionOf{}, "such a struct in a list": []any{&reflectionOf{}},
+		"a dynamic message made without its type": &dynamicpb.Message{},
+		"a message of a type making another":      another, "such a message in a list of its type": []*mistyped{another},
+	}
+	refused := func(name string, call func()) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("%s: panicked: %v", name, r)
+			}
+		}()
+		call()
+	}
+	for name, v := range values {
+		attributes := map[string]any{"v": v, "ok": true}
+		if _, evaluated := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); evaluated {
+			t.Errorf("%s: a condition read its kind", name)
+		}
+		refused(name, func() {
+			if rbac.Copies(attributes) {
+				t.Errorf("%s: a hook was given a copy", name)
+			}
+		})
+	}
+	asked := false
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "asked", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+			asked = true
+			return false, nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "alice"))
+	alice := h.as(t, "alice")
+	for name, v := range values {
+		r := cluster
+		r.Attributes = map[string]any{"v": v}
+		refused(name, func() {
+			if allowed(t, h, alice, login, r) {
+				t.Errorf("%s: a check its constraint can't be asked about was allowed", name)
+			}
+		})
+	}
+	if asked {
+		t.Error("a constraint was asked about a copy")
+	}
+}
+
 // A hook is given copies of what the host passes, which copying recursed into as deep as it nests: a
 // list nested three million deep overflowed the stack, which no recover catches, ending the process
 // wherever a hook was asked about it, though no condition reads it past 10,000 deep. A copy is its

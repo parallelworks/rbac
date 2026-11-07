@@ -1504,15 +1504,16 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // setting it copies them, so it copies none holding more than that copies, as a pointer, a slice or
 // another package's state, which reflection can't set, nor a value holding an unsafe pointer in
 // place, nor a lock, a channel or a func wherever it lies, as it would copy a lock and share the
-// others (copyable), and a message's reflection only as that of a copy of the message (pointer). A
-// map's keys are set as they are, as a copied key would be another key, under which the copy would
-// find nothing the host passed, so it copies no map keyed by what it wouldn't share, as a pointer,
-// a struct holding one, or an interface holding one, however deep in the key (sharedKey). It copies
-// at most what a check converts (maxConverted), counted as converting counts it, whatever it shares
-// or copies whole (mapCost), and no value nesting past maxCopied deep, nor one holding itself that
-// reaches as many values holding others (copier.around), past which, or where v holds what it can't
-// copy, it reports false, and the copy is v's zero value: copying recurses as far as v reaches, as a
-// check's converting does, which stops there.
+// others (copyable), and a message's reflection only as that of a copy of the message (pointer),
+// and none whose copying panics, as the host's own reflection can, or makes another type
+// (reflected). A map's keys are set as they are, as a copied key would be another key, under which
+// the copy would find nothing the host passed, so it copies no map keyed by what it wouldn't share,
+// as a pointer, a struct holding one, or an interface holding one, however deep in the key
+// (sharedKey). It copies at most what a check converts (maxConverted), counted as converting counts
+// it, whatever it shares or copies whole (mapCost), and no value nesting past maxCopied deep, nor
+// one holding itself that reaches as many values holding others (copier.around), past which, or
+// where v holds what it can't copy, it reports false, and the copy is v's zero value: copying
+// recurses as far as v reaches, as a check's converting does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
@@ -1792,28 +1793,19 @@ func (c *copier) pointer(v reflect.Value, at, depth int) reflect.Value {
 	switch m := v.Interface().(type) {
 	case proto.Message:
 		if itself(m) {
-			c.hold()
-			copied := c.message(m.ProtoReflect(), depth)
-			if c.over {
-				return reflect.Value{}
-			}
-			return reflect.ValueOf(copied.Interface())
+			return c.reflected(v, func() any {
+				if copied := c.message(m.ProtoReflect(), depth); copied != nil {
+					return copied.Interface()
+				}
+				return nil
+			})
 		}
 	case protoreflect.Message:
 		// A message's reflection, as a host's type that is its own reflection by a generated message's
 		// embeds, is protobuf's own state, which its methods find the message by where it lies: copied
 		// as any other pointer, a copy of that state alone read past where it lay. It is copied as the
 		// reflection of a copy of the message it reflects, and refused where that isn't of its type.
-		c.hold()
-		copied := c.message(m, depth)
-		if c.over {
-			return reflect.Value{}
-		}
-		if reflect.TypeOf(copied) != v.Type() {
-			c.overflow()
-			return reflect.Value{}
-		}
-		return reflect.ValueOf(copied)
+		return c.reflected(v, func() any { return c.message(m, depth) })
 	}
 	// What it points to costs at least what it holds in place (leastCopied), so no room is made for
 	// it where that is more than is left: a pointer to an array of 128 MiB allocated 268 MB before
@@ -1828,6 +1820,32 @@ func (c *copier) pointer(v reflect.Value, at, depth int) reflect.Value {
 		out.Elem().Set(held)
 	}
 	c.ascendFrom(k, at, outer)
+	return out
+}
+
+// reflected is copied, the copy of v, a pointer to a message or to a message's reflection, which
+// copying it by its reflection makes (message), or none where that panics or isn't of v's type.
+// Copying it calls methods of v's type, which are the host's own where the type is: a struct of the
+// host's embedding a nil reflection panicked on the first, a dynamic message made without its type
+// on its descriptor, and a copy of a type saying it makes its own (itself) and making another
+// panicked where it was set in place of v, each panicking every call asking a hook about it. Each
+// is refused as what can't be copied, as converting refuses it unread.
+func (c *copier) reflected(v reflect.Value, copied func() any) (out reflect.Value) {
+	defer func() {
+		if recover() != nil {
+			c.overflow()
+			out = reflect.Value{}
+		}
+	}()
+	c.hold()
+	out = reflect.ValueOf(copied())
+	if c.over {
+		return reflect.Value{}
+	}
+	if !out.IsValid() || out.Type() != v.Type() {
+		c.overflow()
+		return reflect.Value{}
+	}
 	return out
 }
 

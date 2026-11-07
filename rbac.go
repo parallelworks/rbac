@@ -641,8 +641,10 @@ type Constraint struct {
 // can't set, whole, so one holding there a pointer, a slice, a map or an interface, which the copy
 // would share, can't be copied. Nor can a channel, a func, a lock or an unsafe pointer, wherever it
 // lies, nor a map keyed by a pointer, or by a value holding one, in place or in an interface: a
-// copy sets a map's keys as they are, as a copied key would be another key. Where the attributes
-// hold one, the constraint can't be asked, and the call is refused as above.
+// copy sets a map's keys as they are, as a copied key would be another key. Nor can a message, or a
+// message's reflection, whose copying panics, as the host's own reflection's methods can, or makes
+// a message of another type. Where the attributes hold one, the constraint can't be asked, and the
+// call is refused as above.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string

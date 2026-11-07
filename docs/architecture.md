@@ -555,7 +555,9 @@ sequenceDiagram
   to be copied only
   where it is of a lock (`marks`), as protobuf's own state's of a mutex is, as one of a func marks a
   struct never to be compared, and what it would hold isn't walked. A message's reflection is
-  copied as that of a copy of the message (`pointer`), and refused where that isn't of its type. A
+  copied as that of a copy of the message (`pointer`), and refused where that isn't of its type,
+  as a message copied as itself is, or where copying it panics, as the methods of the host's own
+  reflection can (`reflected`): either panicked every call asking a hook about it. A
   call keeps what the host passed with each copy until it returns, so where it
   points is no other value's meanwhile: known only by where it points, a value dropped and collected
   during the call would leave its place to one made after, which would be given the first one's

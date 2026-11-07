@@ -1312,6 +1312,25 @@ type reflected struct{ protoreflect.Message }
 func (m *reflected) Interface() protoreflect.ProtoMessage { return m }
 func (m *reflected) ProtoReflect() protoreflect.Message   { return m }
 
+// reflectionOf is a host's type that is a message's reflection by the one it embeds, nil in its zero
+// value, whose methods then panic.
+type reflectionOf struct{ protoreflect.Message }
+
+// mistyped is a reflecting whose type says, by its empty message, that it makes its own, and makes
+// dynamic messages.
+type mistyped struct{ *dynamicpb.Message }
+
+func (m *mistyped) Interface() protoreflect.ProtoMessage { return m }
+func (m *mistyped) ProtoReflect() protoreflect.Message   { return m }
+func (m *mistyped) Type() protoreflect.MessageType       { return mistypedType{m.Message.Type()} }
+
+type mistypedType struct{ protoreflect.MessageType }
+
+func (t mistypedType) Zero() protoreflect.Message {
+	made, _ := t.MessageType.Zero().(*dynamicpb.Message)
+	return &mistyped{made}
+}
+
 // hostListValue is a host's type embedding a ListValue.
 type hostListValue struct{ *structpb.ListValue }
 
