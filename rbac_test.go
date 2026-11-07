@@ -5358,6 +5358,109 @@ func TestDeletingGroupsAndWhatTheyReachAtOnceNeverDeadlocks(t *testing.T) {
 	}
 }
 
+// DeletePrincipal takes an identity out of the approvers and exemptions it locked alone: an
+// eligibility or a deny naming it that commits while the removal waits for those, which no lock of
+// the identity's keeps out, is left naming it for a later removal, rather than locked out of order.
+// So removing two identities that a row committed so names both, as the other removal holds it,
+// doesn't deadlock.
+func TestRemovingIdentitiesARowNamesBothNeverDeadlocks(t *testing.T) {
+	early, late := rbac.Scope{Type: "cluster", ID: "a"}, rbac.Scope{Type: "cluster", ID: "b"}
+	for name, c := range map[string]struct {
+		// held is a row u's removal waits for, and committed one sorting before it that commits
+		// meanwhile, each naming u and v; names reads whom the row on a scope names.
+		held, committed heldRow
+		names           string
+	}{
+		"eligibilities both approve": {
+			held:      eligibilityRow(late, identity("q"), "cluster.sudo", "user:u", "user:v"),
+			committed: eligibilityRow(early, identity("q"), "cluster.sudo", "user:u", "user:v"),
+			names:     `SELECT approvers FROM rbac_eligibilities WHERE tenant = 't1' AND scope = $1`,
+		},
+		"denies exempting both": {
+			held:      denyRow(late, "d", []string{"public:"}, []string{"user:u", "user:v"}, "cluster:login"),
+			committed: denyRow(early, "d", []string{"public:"}, []string{"user:u", "user:v"}, "cluster:login"),
+			names:     `SELECT exempt FROM rbac_denies WHERE tenant = 't1' AND scope = $1`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := setup(t)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			h.as(t, "u")
+			h.as(t, "v")
+			if _, err := h.pool.Exec(ctx, c.held.seed, c.held.seedArgs...); err != nil {
+				t.Fatal(err)
+			}
+			hold, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = hold.Rollback(context.WithoutCancel(ctx)) }()
+			var pid int
+			if err := hold.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := hold.Exec(ctx, c.held.hold, c.held.holdArgs...); err != nil {
+				t.Fatal(err)
+			}
+			errs := make(chan error, 2)
+			// Until n sessions wait on the hold, through others too.
+			waiting := func(n int) {
+				t.Helper()
+				for blocked := 0; blocked < n; {
+					select {
+					case err := <-errs:
+						t.Fatalf("a removal returned while the row was held: %v", err)
+					default:
+					}
+					if err := h.pool.QueryRow(ctx, `WITH RECURSIVE waiting(pid) AS (
+						SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+						UNION SELECT a.pid FROM pg_stat_activity a JOIN waiting w ON w.pid = ANY(pg_blocking_pids(a.pid)))
+						SELECT count(*) FROM waiting`, pid).Scan(&blocked); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			go func() { errs <- h.authz.DeletePrincipal(ctx, host, "t1", identity("u")) }()
+			waiting(1)
+			if _, err := h.pool.Exec(ctx, c.committed.seed, c.committed.seedArgs...); err != nil {
+				t.Fatal(err)
+			}
+			// v's removal locks the row committed, and waits for the one held behind u's.
+			go func() { errs <- h.authz.DeletePrincipal(ctx, host, "t1", identity("v")) }()
+			waiting(2)
+			if err := hold.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if err := <-errs; err != nil {
+					t.Errorf("removing two identities a row committed meanwhile names: %v", err)
+				}
+			}
+			names := func(s rbac.Scope) []string {
+				t.Helper()
+				var ks []string
+				if err := h.pool.QueryRow(ctx, c.names, s.Key()).Scan(&ks); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatal(err)
+				}
+				return ks
+			}
+			if got := names(late); len(got) > 0 {
+				t.Errorf("the row both removals held names %v", got)
+			}
+			if got := names(early); !slices.Equal(got, []string{"user:u"}) {
+				t.Errorf("the row committed while u's removal waited names %v, want u alone, left for a later removal", got)
+			}
+			if err := h.authz.DeletePrincipal(ctx, host, "t1", identity("u")); err != nil {
+				t.Fatal(err)
+			}
+			if got := names(early); len(got) > 0 {
+				t.Errorf("removing u again leaves the row committed naming %v", got)
+			}
+		})
+	}
+}
+
 // heldRow is a row a test writes with seed and holds alone with hold, each run with its args.
 type heldRow struct {
 	name               string
@@ -11740,6 +11843,86 @@ func TestADeepPathsConditionalDeniesAreEvaluatedWhole(t *testing.T) {
 	}
 	if !allowed(t, h, h.as(t, "contractor-1-0007"), view, deep) || allowed(t, h, h.as(t, "contractor-1-0007"), login, deep) {
 		t.Fatal("a deny should bind whom its condition names")
+	}
+}
+
+// Permissions reads each deny's list once for all the permissions it decides, each decided by the
+// denies listing it or its wildcard alone, as Authorize decides it: compared with every deny's list
+// for each, 300 permissions beside 400 denies of 256 other entries took 300 ms, each comparison
+// making the permission's wildcard anew.
+func TestPermissionsReadEachDenysListOnce(t *testing.T) {
+	var held, others []rbac.Permission
+	for i := range 300 {
+		held = append(held, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	for i := range rbac.MaxDenyEntries {
+		others = append(others, rbac.Permission(fmt.Sprintf("cluster:o%03d", i)))
+	}
+	const few = 30
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "many", Permissions: held, ResourceTypes: []string{"cluster"}},
+			rbac.RoleDefinition{ID: "few", Permissions: held[:few], ResourceTypes: []string{"cluster"}},
+		)
+	})
+	ctx := rbac.WithRequest(t.Context(), map[string]any{"mfa": true, "all": false})
+	h.seed(t, grant(cluster.Scope(), "many", rbac.User, "m"), grant(cluster.Scope(), "few", rbac.User, "f"), grant(cluster.Scope(), "many", rbac.User, "x"))
+	m, f, x := h.as(t, "m"), h.as(t, "f"), h.as(t, "x")
+	deny := func(s rbac.Scope, id string, principal string, perms []rbac.Permission, condition string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions, condition)
+			VALUES ('t1', $1, $2, $3, ARRAY[$4], $5::text[], $6)`, s.Type, s.ID, id, principal, perms, condition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// On each scope of the path, denies binding everyone of permissions no one holds, half of them
+	// conditional.
+	n := 0
+	for _, s := range append([]rbac.Scope{cluster.Scope(), rbac.TenantRoot("t1")}, cluster.Ancestors...) {
+		for i := range rbac.MaxDenies - 4 {
+			deny(s, fmt.Sprint("o", i), "public:", others, []string{"", "request.attributes.mfa != true"}[i%2])
+			n++
+		}
+	}
+	// And on the cluster, denies binding x alone of what it holds, of each request: one listing a
+	// permission twice, as a row written around the package can, and some every permission on a type,
+	// one of them a permission too.
+	deny(cluster.Scope(), "a", "user:x", []rbac.Permission{"cluster:*"}, "request.attributes.all == true")
+	deny(cluster.Scope(), "b", "user:x", []rbac.Permission{held[4], "cluster:*"}, "request.attributes.all == true")
+	deny(cluster.Scope(), "p001", "user:x", held[1:2], "")
+	deny(cluster.Scope(), "p002", "user:x", []rbac.Permission{held[2], held[2]}, "request.attributes.mfa == true")
+	deny(cluster.Scope(), "p003", "user:x", []rbac.Permission{"workspace:*", held[3]}, "request.attributes.mfa == false")
+	for _, r := range []struct {
+		mfa, all bool
+		want     []rbac.Permission
+	}{{true, false, []rbac.Permission{held[0], held[3], held[4]}}, {false, false, []rbac.Permission{held[0], held[2], held[4]}}, {true, true, nil}} {
+		c := rbac.WithRequest(t.Context(), map[string]any{"mfa": r.mfa, "all": r.all})
+		perms, err := h.authz.Permissions(c, x, cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range held[:5] {
+			err := h.authz.Authorize(c, x, p, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			if listed := slices.Contains(perms, p); listed != slices.Contains(r.want, p) || listed != (err == nil) {
+				t.Errorf("with mfa %v and all %v, Permissions lists %s: %v, Authorize: %v", r.mfa, r.all, p, listed, err)
+			}
+		}
+	}
+	allocs := func(s rbac.Subject, want int) float64 {
+		t.Helper()
+		return testing.AllocsPerRun(3, func() {
+			if perms, err := h.authz.Permissions(ctx, s, cluster); err != nil || len(perms) != want {
+				t.Fatalf("Permissions = %d permissions, %v", len(perms), err)
+			}
+		})
+	}
+	// Reading the denies allocates alike for both, and each permission decided more allocates no more
+	// as the denies grow: compared with each deny's list, it allocated twice for each.
+	if more := (allocs(m, len(held)) - allocs(f, few)) / float64(len(held)-few); more > float64(n)/4 {
+		t.Errorf("Permissions allocates %.0f times more for each permission beside %d denies", more, n)
 	}
 }
 

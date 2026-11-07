@@ -296,8 +296,10 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		return Grant{}, &InvalidError{Binding: b, Reason: fmt.Sprintf("an activation lasts more than nothing and at most %s, and has a justification of at most %d characters", MaxActivation, MaxNote)}
 	}
 	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
-	// Whether any allows it, before asking the host: which, under the locks.
-	keys, _, err := a.keysAt(ctx, a.db, on.Tenant, s, b.ExpiresAt, false)
+	// Whether any allows it, before asking the host: which, under the locks. By the keys it holds at
+	// the last moment it would be in force, a microsecond before it ends, as times are stored to the
+	// microsecond: it may end as the membership or place it rests on does.
+	keys, _, err := a.keysAt(ctx, a.db, on.Tenant, s, b.ExpiresAt.Add(-time.Microsecond), false)
 	if err != nil {
 		return Grant{}, err
 	}
@@ -458,19 +460,22 @@ var holdingPlaces = func() func() { return func() {} }
 // of places in groups to it, each as the soonest of the membership and the places on it.
 type paths map[string]time.Time
 
-// outlasting is p without the paths that end by until.
+// outlasting is p without the paths that end before until: an activation may end as its path does,
+// as it may end as its eligibility does, and as Apply hands a grant on until the end of what it
+// holds (holding.lasts).
 func (p paths) outlasting(until time.Time) paths {
-	maps.DeleteFunc(p, func(_ string, ends time.Time) bool { return !ends.IsZero() && !ends.After(until) })
+	maps.DeleteFunc(p, func(_ string, ends time.Time) bool { return !ends.IsZero() && ends.Before(until) })
 	return p
 }
 
-// holdSQL is holdPlaces' statement: tenant $1, the identity's key $2, now $3, until $4. A path lasts
-// as long as the soonest of the membership and the places on it, so of the paths one step up
-// reaches a group by, only the latest can lead anywhere later: each step walks on from that one
-// alone, found by a window, as a recursive query can't aggregate, and a key's latest is that of all
-// the steps reach it by. Walking on from every end instead, each group past groups that converge
-// and fan out again is walked once for every end converging before it: in layers of a few hundred
-// groups, millions of rows.
+// holdSQL is holdPlaces' statement: tenant $1, the identity's key $2, now $3, until $4, which the
+// paths it returns last until, ending then or later, as outlasting keeps them. A path lasts as long
+// as the soonest of the membership and the places on it, so of the paths one step up reaches a
+// group by, only the latest can lead anywhere later: each step walks on from that one alone, found
+// by a window, as a recursive query can't aggregate, and a key's latest is that of all the steps
+// reach it by. Walking on from every end instead, each group past groups that converge and fan out
+// again is walked once for every end converging before it: in layers of a few hundred groups,
+// millions of rows.
 var holdSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$3") + `, held AS MATERIALIZED (
 	  SELECT m.* FROM (SELECT * FROM (` + byKey("ARRAY(SELECT k FROM keys)", "rbac_members", "principal", "group_id, principal, source",
 	"tenant = $1 AND (expires_at IS NULL OR expires_at > $3)") + `) p ORDER BY ` + placeOrder + `) p CROSS JOIN LATERAL (
@@ -478,14 +483,14 @@ var holdSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$3") + `, hel
 	      AND source = p.source AND (expires_at IS NULL OR expires_at > $3) FOR SHARE) m
 	), standing AS (
 	  SELECT coalesce(expires_at, 'infinity') AS ends FROM rbac_memberships WHERE tenant = $1 AND principal = $2 AND NOT suspended
-	    AND (expires_at IS NULL OR expires_at > $4)
+	    AND (expires_at IS NULL OR expires_at >= $4)
 	), up(id, ends) AS (
 	  SELECT h.group_id, max(least(s.ends, h.expires_at)) FROM standing s
-	  JOIN held h ON h.principal = $2 AND (h.expires_at IS NULL OR h.expires_at > $4)
+	  JOIN held h ON h.principal = $2 AND (h.expires_at IS NULL OR h.expires_at >= $4)
 	  GROUP BY h.group_id
 	  UNION
 	  SELECT DISTINCT h.group_id, max(least(u.ends, h.expires_at)) OVER (PARTITION BY h.group_id)
-	  FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at > $4)
+	  FROM up u JOIN held h ON h.principal = 'group:' || u.id AND (h.expires_at IS NULL OR h.expires_at >= $4)
 	), reached(k, ends) AS (
 	  SELECT $2 COLLATE "C", ends FROM standing UNION ALL SELECT 'group:' || id, ends FROM up
 	)
@@ -495,12 +500,12 @@ var holdSQL = `WITH RECURSIVE ` + keysSQL("$1::text", "$2::text", "$3") + `, hel
 // tenant at now, its identity's and its groups', through those they are in, each key's found on its
 // own (byKey) and each held by its key, in the order changes hold them: a change ending one sooner
 // holds it before reading the activations resting on it, so it waits for the activation and finds
-// it. In the same statement it returns the paths s holds at until through the places it held alone,
-// and its identity's while its membership is in force then and not suspended: a later statement
-// would read a place nested meanwhile, which no change removing it would wait for. Each is held as
-// it is when held, a place updated meanwhile in its new version. Walking up from s reads every place
-// held, so each is held before the keys are returned; where s isn't standing it reads none, and
-// activates nothing.
+// it. In the same statement it returns the paths s holds until until through the places it held
+// alone, and its identity's while its membership lasts until then and isn't suspended: a later
+// statement would read a place nested meanwhile, which no change removing it would wait for. Each
+// is held as it is when held, a place updated meanwhile in its new version. Walking up from s reads
+// every place held, so each is held before the keys are returned; where s isn't standing it reads
+// none, and activates nothing.
 func holdPlaces(ctx context.Context, tx pgx.Tx, tenant string, s Subject, now, until time.Time) (paths, error) {
 	rows, err := queryByIndexes(ctx, tx, holdSQL, tenant, s.identityKey(), now, until)
 	if err != nil {

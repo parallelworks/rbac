@@ -2961,7 +2961,9 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 // to the public, as when a tenant stops allowing public access. An identity or group leaves the
 // denies that exempt it and the approvers of the eligibilities it approves, as DeleteGroups takes
 // groups out of them: an eligibility only it approves goes too, rather than activate without
-// approval. A deny naming it still binds it, as it would if it joined again.
+// approval. A deny or eligibility naming an identity that commits while it runs, as SetDeny and
+// SetEligibility take no lock of the identities they name, is left naming it, as if set after it,
+// for a later removal. A deny naming it still binds it, as it would if it joined again.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeletePrincipal")
@@ -3176,17 +3178,22 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	var first []statement
 	// Those it approves with its own, in one order, as removeGroups locks them; those it approves by
 	// its key (naming), as no other index finds them. Only a principal's removal names one, by its key.
+	// It is taken out of those alone, and out of the denies exempting it that it locks below alone, in
+	// the next round trip, by their ids and the versions locked: SetEligibility and SetDeny take no
+	// lock of an identity they name, so one naming it can commit in between, which, matched by its key
+	// again, would be locked out of order, and two removals of identities it names both would
+	// deadlock. One committed so is left naming it, for a later removal, as one committed after.
+	var approving []int64
+	var exempting []pgtype.TID
 	if del.named != "" {
-		first = append(first, stmt(nil, lockedInOrder("rbac_eligibilities", "id", bindingOrder,
-			byKeys("rbac_eligibilities", "id", bindingOrder, del.by, "$2"),
-			"SELECT "+keyCols(bindingOrder, "id")+" FROM rbac_eligibilities WHERE "+naming("approvers", "$3")), tenant, del.keys, named))
+		first = append(first, stmt(collecting(&approving, func(rows pgx.Rows) ([]int64, error) { return pgx.CollectRows(rows, pgx.RowTo[int64]) }),
+			lockedInOrder("rbac_eligibilities", "id", bindingOrder,
+				byKeys("rbac_eligibilities", "id", bindingOrder, del.by, "$2"),
+				"SELECT "+keyCols(bindingOrder, "id")+" FROM rbac_eligibilities WHERE "+naming("approvers", "$3")), tenant, del.keys, named))
 	}
 	eligible, eligibleArgs := picked("rbac_eligibilities", "id", bindingOrder, del.where)
 	var ineligible, unapproved []Eligibility
 	first = append(first, removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ineligible, eligible, eligibleArgs...))
-	if del.named != "" {
-		first = append(first, a.unapproving(tenant, named, &unapproved, &e.Eligible)...)
-	}
 	if del.roles {
 		first = append(first, stmt(collecting(&e.DeletedRoles, func(rows pgx.Rows) ([]Role, error) { return pgx.CollectRows(rows, pgx.RowTo[Role]) }),
 			`DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant))
@@ -3201,8 +3208,8 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			slices.Concat([]any{tenant}, args)...))
 	}
 	if del.named != "" {
-		first = append(first, stmt(nil, lockedDenies("SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("exempt", "$2")), tenant, named),
-			unexempting(tenant, actor, named, false, &e.Denies))
+		first = append(first, stmt(collecting(&exempting, func(rows pgx.Rows) ([]pgtype.TID, error) { return pgx.CollectRows(rows, pgx.RowTo[pgtype.TID]) }),
+			lockedDeniesSelecting("d.ctid", "SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("exempt", "$2")), tenant, named))
 	}
 	// Memberships before the members they reach, as DeleteExpired takes them, so the two never
 	// deadlock.
@@ -3213,9 +3220,14 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	if err := byIndexes(ctx, tx, first...); err != nil {
 		return ChangeEvent{}, err
 	}
-	e.Ineligible = slices.Concat(ineligible, unapproved)
 	var r resting
 	var then []statement
+	if len(approving) > 0 {
+		then = append(then, a.unapproving(tenant, named, approving, &unapproved, &e.Eligible)...)
+	}
+	if len(exempting) > 0 {
+		then = append(then, unexempting(tenant, actor, named, false, exempting, &e.Denies))
+	}
 	if del.members != "" {
 		// A group in none ends no place its members' activations rest on. Only a group's removal
 		// names one, by its key.
@@ -3245,6 +3257,7 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	if err := byIndexes(ctx, tx, then...); err != nil {
 		return ChangeEvent{}, err
 	}
+	e.Ineligible = slices.Concat(ineligible, unapproved)
 	if del.group == "" {
 		return e, nil
 	}
@@ -3258,34 +3271,43 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 // unapproving is the statements deleting the eligibilities in a tenant that only principals, by key,
 // approve, which without them would need no approval, and taking them out of the others' approvers,
 // keeping their order, collecting those it deleted into ended and those it changed into changed.
-// The change locks them in order first.
-func (a *Authorizer) unapproving(tenant string, keys []string, ended, changed *[]Eligibility) []statement {
+// The change locks them in order first, and changes only those of held, by id, where it isn't nil,
+// as the principals' locks don't keep one naming them from committing meanwhile (deleteIn).
+func (a *Authorizer) unapproving(tenant string, keys []string, held []int64, ended, changed *[]Eligibility) []statement {
 	// Each found by the keys it names (naming), so it names one of them: none of them is empty.
+	where, args := naming("approvers", "$2"), []any{tenant, keys}
+	if held != nil {
+		where, args = "id = ANY($3::bigint[]) AND "+where, append(args, held)
+	}
 	return []statement{
-		removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, ended,
-			naming("approvers", "$2")+" AND approvers <@ $2::text[]", tenant, keys),
+		removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, ended, where+" AND approvers <@ $2::text[]", args...),
 		stmt(collecting(changed, collectEligibilities), `UPDATE rbac_eligibilities SET
 		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
-		WHERE `+naming("approvers", "$2")+`
-		RETURNING `+eligibilityColumns, tenant, keys),
+		WHERE `+where+`
+		RETURNING `+eligibilityColumns, args...),
 	}
 }
 
 // unexempting is the statement taking principals, by key, out of the exemptions of a tenant's
 // denies, and with named out of the principals they name too, keeping each list's order, as actor,
-// collecting the denies it changed into changed. The change locks them in order first.
-func unexempting(tenant string, actor Principal, keys []string, named bool, changed *[]Deny) statement {
+// collecting the denies it changed into changed. The change locks them in order first, and changes
+// only those of held, by the versions it locked, where it isn't nil, as unapproving does.
+func unexempting(tenant string, actor Principal, keys []string, named bool, held []pgtype.TID, changed *[]Deny) statement {
 	// Each found by the keys it names (naming).
 	principals, where := "principals", naming("exempt", "$2")
 	if named {
 		principals = "array(SELECT k FROM unnest(principals) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)"
 		where = naming("principals", "$2") + " OR " + where
 	}
+	args := []any{tenant, keys, actorKey(actor)}
+	if held != nil {
+		where, args = "ctid = ANY($4::tid[]) AND ("+where+")", append(args, held)
+	}
 	return stmt(collecting(changed, collectDenies), `UPDATE rbac_denies SET principals = `+principals+`,
 		  exempt = array(SELECT k FROM unnest(exempt) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  updated_by = $3, updated_at = now()
 		WHERE `+where+`
-		RETURNING `+denyColumns, tenant, keys, actorKey(actor))
+		RETURNING `+denyColumns, args...)
 }
 
 // collecting is a read collecting rows into got.

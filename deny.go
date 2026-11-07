@@ -65,7 +65,108 @@ func matchable(p Permission) (perm, wildcard string, ok bool) {
 // denies reports whether a permission a deny lists covers p.
 func denies(listed []Permission, p Permission) bool {
 	perm, wildcard, ok := matchable(p)
-	return ok && (slices.Contains(listed, Permission(perm)) || slices.Contains(listed, Permission(wildcard)))
+	return ok && lists(listed, perm, wildcard)
+}
+
+// lists reports whether listed holds perm or wildcard, as matchable gives them.
+func lists(listed []Permission, perm, wildcard string) bool {
+	return slices.Contains(listed, Permission(perm)) || slices.Contains(listed, Permission(wildcard))
+}
+
+// listedDenies is the denies a decision of many permissions reads, indexed by the permissions it
+// asks about: each is decided by the denies listing it or its wildcard alone, found by two lookups,
+// and each deny's list is read once for them all, each entry looked up among those asked about.
+// Compared with every deny's list for each permission instead, 300 permissions beside 400 denies of
+// 256 entries took 300 ms. Looking an entry up costs what comparing it with about four permissions
+// does, whatever the denies hold, so a decision of fewer compares them (listedFrom): indexed, one
+// permission beside 100 such denies took a third of a millisecond, and compared, a tenth at most.
+type listedDenies struct {
+	ds []denial
+	// listed is, for each permission asked about, the positions of the denies listing it, and wild,
+	// for each of their types, of those listing its wildcard, each in the order of ds.
+	listed map[Permission][]int
+	wild   map[string][]int
+}
+
+// listedFrom is how many permissions a decision asks about from which it indexes the denies.
+const listedFrom = 4
+
+// listDenies is ds for a decision of the permissions asked.
+func listDenies(ds []denial, asked map[Permission]bool) listedDenies {
+	if len(asked) < listedFrom {
+		return listedDenies{ds: ds}
+	}
+	l := listedDenies{ds: ds, listed: make(map[Permission][]int, len(asked)), wild: map[string][]int{}}
+	for p := range asked {
+		if !undeniable(p) {
+			t, _ := p.parts()
+			l.listed[p], l.wild[t] = nil, nil
+		}
+	}
+	// A list written around the package can hold one twice.
+	add := func(at []int, i int) []int {
+		if len(at) > 0 && at[len(at)-1] == i {
+			return at
+		}
+		return append(at, i)
+	}
+	for i, d := range ds {
+		for _, p := range d.permissions {
+			if t, verb := p.parts(); verb == "*" {
+				if at, ok := l.wild[t]; ok {
+					l.wild[t] = add(at, i)
+				}
+			} else if at, ok := l.listed[p]; ok {
+				l.listed[p] = add(at, i)
+			}
+		}
+	}
+	return l
+}
+
+// of is whether a deny without a condition lists p or the wildcard covering it, and, before the first
+// that does, or where none does, those with one that do, in their order, as deniedBy reads them:
+// none for a permission no deny removes. A permission not indexed is compared with each deny's
+// list, so one it wasn't built for is never decided by none.
+func (l listedDenies) of(p Permission) (unconditional bool, conditional []denial) {
+	if undeniable(p) {
+		return false, nil
+	}
+	reading := func(d denial) bool {
+		if d.condition == "" {
+			unconditional = true
+			return false
+		}
+		conditional = append(conditional, d)
+		return true
+	}
+	at, indexed := l.listed[p]
+	if !indexed {
+		perm, wildcard, _ := matchable(p)
+		for _, d := range l.ds {
+			if lists(d.permissions, perm, wildcard) && !reading(d) {
+				break
+			}
+		}
+		return unconditional, conditional
+	}
+	t, _ := p.parts()
+	// Merged in the order of ds, a deny listing both once.
+	for x, y := at, l.wild[t]; len(x) > 0 || len(y) > 0; {
+		var i int
+		switch {
+		case len(y) == 0 || len(x) > 0 && x[0] < y[0]:
+			i, x = x[0], x[1:]
+		case len(x) == 0 || y[0] < x[0]:
+			i, y = y[0], y[1:]
+		default:
+			i, x, y = x[0], x[1:], y[1:]
+		}
+		if !reading(l.ds[i]) {
+			break
+		}
+	}
+	return unconditional, conditional
 }
 
 // denial is a deny as a check reads it.
@@ -159,16 +260,26 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding,
 // deniedBy returns the first deny that removes p for this request: an unconditional one, or one
 // whose condition holds or can't be evaluated, failing closed, the cheapest first.
 func (a *Authorizer) deniedBy(ds []denial, p Permission, spend *budget, vars map[string]any) (denial, bool) {
+	perm, wildcard, ok := matchable(p)
+	if !ok {
+		return denial{}, false
+	}
 	var conditional []denial
 	for _, d := range ds {
 		switch {
-		case !denies(d.permissions, p):
+		case !lists(d.permissions, perm, wildcard):
 		case d.condition == "":
 			return d, true
 		default:
 			conditional = append(conditional, d)
 		}
 	}
+	return a.conditionallyDeniedBy(conditional, spend, vars)
+}
+
+// conditionallyDeniedBy is deniedBy of conditional, the denies with a condition that list the
+// permission, in their order.
+func (a *Authorizer) conditionallyDeniedBy(conditional []denial, spend *budget, vars map[string]any) (denial, bool) {
 	cheapestFirst(conditional, denial.expression)
 	for _, d := range conditional {
 		held, evaluated := a.conds.decide(spend, d.condition, vars)
@@ -183,7 +294,8 @@ func (a *Authorizer) deniedBy(ds []denial, p Permission, spend *budget, vars map
 // conditionallyDenied reports whether a deny among ds whose condition decides may remove p, so a
 // decision of p reads what conditions read, which none needs where none does.
 func conditionallyDenied(ds []denial, p Permission) bool {
-	return slices.ContainsFunc(ds, func(d denial) bool { return d.condition != "" && denies(d.permissions, p) })
+	perm, wildcard, ok := matchable(p)
+	return ok && slices.ContainsFunc(ds, func(d denial) bool { return d.condition != "" && lists(d.permissions, perm, wildcard) })
 }
 
 func (d denial) expression() string { return d.condition }

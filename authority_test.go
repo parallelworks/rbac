@@ -95,6 +95,72 @@ func TestAnActivationLastsNoLongerThanThePlaceThatMakesItsSubjectEligible(t *tes
 	}
 }
 
+// An activation may end as the membership or the place in a group it rests on does, as it may end
+// as its eligibility does, and no later: it is in force until then and not after, and a change
+// ending another of its holder's places leaves it whole.
+func TestAnActivationMayEndAsThePathItRestsOnDoes(t *testing.T) {
+	for name, c := range map[string]struct {
+		eligible rbac.Principal
+		groups   []string
+		// ends is the membership or the place in a group that ends at $1.
+		ends string
+	}{
+		"its membership": {
+			eligible: identity("u"),
+			ends:     `UPDATE rbac_memberships SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:u'`,
+		},
+		"its place in the group": {
+			eligible: groupOf("oncall"), groups: []string{"oncall"},
+			ends: `UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND group_id = 'oncall' AND principal = 'user:u'`,
+		},
+		"its group's place in the group": {
+			eligible: groupOf("oncall"), groups: []string{"inner"},
+			ends: `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at) VALUES ('t1', 'oncall', 'group', 'inner', $1)`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := grouped(t)
+			ctx := t.Context()
+			h.groups(t, "oncall", "inner", "other")
+			u := h.as(t, "u", append([]string{"other"}, c.groups...)...)
+			end := h.now.Add(time.Hour)
+			if _, err := h.pool.Exec(ctx, c.ends, end); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.authz.SetEligibility(ctx, h.as(t, "owner"), cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: c.eligible, MaxDuration: 2 * time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			act := func(d time.Duration) (rbac.Grant, error) {
+				return h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "cluster.sudo", Duration: d, Justification: "INC-1"})
+			}
+			if _, err := act(time.Hour + time.Microsecond); !errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("an activation ending a microsecond after what it rests on: %v", err)
+			}
+			g, err := act(time.Hour)
+			if err != nil || !g.ExpiresAt.Equal(end) {
+				t.Fatalf("an activation ending as what it rests on does: %+v, %v", g, err)
+			}
+			h.events = nil
+			if err := h.authz.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "other", Principal: identity("u")}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range h.events {
+				if slices.ContainsFunc(slices.Concat(e.Shortened, e.Revoked), func(r rbac.Grant) bool { return r.ID == g.ID }) {
+					t.Errorf("leaving another group cut the activation short: %+v", e)
+				}
+			}
+			h.now = end.Add(-time.Microsecond)
+			if !allowed(t, h, u, root, cluster) {
+				t.Error("the activation isn't in force the moment before it ends")
+			}
+			h.now = end
+			if allowed(t, h, u, root, cluster) {
+				t.Error("the activation is in force as what it rests on ends")
+			}
+		})
+	}
+}
+
 // lastEvent is the last change h reported, failing t where it reported none.
 func lastEvent(t *testing.T, h *harness) rbac.ChangeEvent {
 	t.Helper()
