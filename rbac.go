@@ -635,20 +635,29 @@ type Constraint struct {
 // whose Reason names it and whose message doesn't, as is a change whose actor's attributes
 // ValidateGrant can't be given for that. A protobuf message among them is copied by its fields,
 // each message it reaches once, so one holding itself is given as a copy holding itself, as a map
-// holding itself is. A slice reached at several lengths is copied once, each length a slice of the
-// copy, and a value holding no map, slice or pointer, as an array, is shared where an interface
-// holds it, as nothing writes to it through one. A message of a
+// holding itself is. A slice reached at several lengths or capacities is copied once, each length a
+// slice of the copy, and a value holding no map, slice or pointer, as an array, is shared where an
+// interface holds it, as nothing writes to it through one. A message of a
 // host's type that is its own reflection but makes messages of another, as one embedding a dynamic
 // message does, is copied as any other pointer of the host's type, by the struct it points to, so a
 // constraint reads the type the host passed, in a list, a field or a map of that type too: its
 // message is a copy of its own where the field embedding it is exported, as embedding it by its
-// type's name makes it, and shared, as below, where it isn't. Past 20,000 deep, twice as deep as any condition reads, a copy holds zero
-// values, but for what it copied less deep, as copying deeper would overflow the stack. A host's
-// struct among the attributes is copied by its exported fields and those an unexported struct it
-// embeds promotes: the rest, a pointer it embeds unexported and the fields that promotes among
-// them, reflection can't set, so they are shared. A map's keys are shared, and what a pointer among
-// them reaches, as a copied key would be another key: key a map among the attributes by values, not
-// pointers, or write through none.
+// type's name makes it, and can't be copied, as below, where it isn't. Past 20,000 deep, twice as
+// deep as any condition reads, a copy holds zero values, but for what it copied less deep, as
+// copying deeper would overflow the stack. A host's struct among the attributes is copied by its
+// exported fields and those an unexported struct it embeds promotes, and the rest, which reflection
+// can't set, whole, so one holding there a pointer, a slice, a map or an interface, which the copy
+// would share, can't be copied. Nor can a channel, a func, a lock or an unsafe pointer, wherever it
+// lies, nor a map keyed by a pointer, or by a value holding one, in place or in an interface: a
+// copy sets a map's keys as they are, as a copied key would be another key. Nor can a message, or a
+// message's reflection, whose copying panics, as the host's own reflection's methods can, or makes
+// a message of another type. Where the attributes hold one, the constraint can't be asked, and the
+// call is refused as above. A time in a zone of the host's own, as time.FixedZone and
+// time.LoadLocation make, is copied in a copy of the zone, one for each copy, a map's key too: a
+// zone's methods write none of it, but assigning through Location writes it whole, so a constraint
+// doing so wrote the host's. So such a time in a copy is == to none of the host's, nor to one in
+// another copy, as the subject's and the resource's are copied apart, though Equal to both, and a
+// map keyed by such times finds its entries by times in its copy's zone alone.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
@@ -1067,10 +1076,13 @@ type Config struct {
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
-	// what it writes as the host's, not as the change's. A delete's event holds every row it
-	// removes, in memory at once: for a tenant of millions of rows, remove them a part at a time
-	// first, its resources' grants with DeleteScopes, a batch of scopes at a time, and its
-	// identities' memberships, places in groups and grants on the tenant with DeletePrincipal.
+	// what it writes as the host's, not as the change's. It is told what the change wrote, not
+	// given copies as a hook is (ConstraintInput): the times its event holds are as PostgreSQL
+	// returns them, in the zone the connection reads them in, as Grants returns them, none in a
+	// zone the host passed. A delete's event holds every row it removes, in memory at once: for a
+	// tenant of millions of rows, remove them a part at a time first, its resources' grants with
+	// DeleteScopes, a batch of scopes at a time, and its identities' memberships, places in groups
+	// and grants on the tenant with DeletePrincipal.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 	// OnRefused is told of every change refused as ErrDenied or ErrInvalid, as an attempt that
 	// failed, which history doesn't record, as nothing of it is written; but not of one on an
@@ -1478,10 +1490,14 @@ func (c *callClock) wentBack() error {
 	return fmt.Errorf("%w: the host's clock went back while this change took its locks; try again", ErrConflict)
 }
 
-// GrantInput is a grant Config.ValidateGrant is asked about.
+// GrantInput is a grant Config.ValidateGrant is asked about, the hook's own, as a constraint's input
+// is (ConstraintInput).
 type GrantInput struct {
-	Tenant  string
-	Scope   Scope
+	Tenant string
+	Scope  Scope
+	// Binding is the grant, its expiry in a copy of its zone where that is the host's own, as a
+	// hook's copy holds a time (ConstraintInput), so it is == to none of the host's, though Equal to
+	// it: given in the host's, ValidateGrant writing through its Location wrote the host's zone.
 	Binding Binding
 	// Role is what the grant gives: the role as defined now, or with ViaRedefinition, as it will be.
 	Role RoleDefinition
