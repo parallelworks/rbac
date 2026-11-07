@@ -208,8 +208,9 @@ erDiagram
   50 types costs 1,000 lookups: each permission looked up with each type, twice, deriving a
   tenant's 300 such roles took 640 ms. A check, `Activate` and a change read only the custom roles
   they and the grants they read name, each by its key (`book`), a change's read of its actor's
-  authority with those their `GrantableRoles` name, through others too (`listingSQL`), as
-  `holdsRole` walks them; only a read needing every one reads the tenant's by the tenant
+  authority with those the roles it grants list, through others too (`listingSQL`), as
+  `holdsRole` walks them, but not those its actor's roles list, of which it reads only their ids
+  (`powerOf`); only a read needing every one reads the tenant's by the tenant
   (`everyCustomRole`): `CustomRoles` and `Roles`, which list them, `Grantable`, which offers any,
   `SetRole`, which reads those listing the role and counts them, `DeleteRole`, which refuses a role
   another lists, and the check of exclusive values, which finds those giving one by their

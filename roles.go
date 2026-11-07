@@ -1721,15 +1721,22 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 // of them looks each up by its key.
 const everyCustomRole = "rbac_roles WHERE tenant = $1"
 
-// listingSQL is SQL for the WITH entry listing, of roleColumns, of the custom roles in the tenant $1
-// in the text array named and those their GrantableRoles name, through others too, each read by its
-// key (byKey): every role a decision of whether an actor may grant those named reads, as holdsRole
-// walks the roles each lists, and a tenant's other roles, however many or large, cost it nothing.
+// listingSQL is SQL for the WITH entries listing, of roleColumns, of the custom roles in the tenant
+// $1 in the text array named and those their GrantableRoles name, through others too, and listed,
+// those with the custom roles the WITH entry held's grants hold, each read by its key (byKey): every
+// role a decision of whether an actor may grant those named reads, as holdsRole walks the roles each
+// lists, while of the roles a held one lists it reads only their ids (powerOf). A tenant's other
+// roles, however many or large, cost it nothing: those the actor's roles list too, as an admin's
+// role listing every role.
 func listingSQL(named string) string {
 	return `listing AS (
 		  ` + byKey(named, "rbac_roles", "id", roleColumns, "tenant = $1") + `
 		  UNION
 		  SELECT r.* FROM listing l CROSS JOIN LATERAL (` + byKey("l.grantable_roles", "rbac_roles", "id", roleColumns, "tenant = $1") + `) r
+		), listed AS (
+		  SELECT * FROM listing
+		  UNION ALL
+		  ` + byKey(namedCustom("SELECT role FROM held EXCEPT SELECT id FROM listing"), "rbac_roles", "id", roleColumns, "tenant = $1") + `
 		)`
 }
 

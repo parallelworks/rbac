@@ -1329,9 +1329,9 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 // (belowSQL): so a change decides where such a deny may stop it by what bound the actor as it held
 // the power it acts by. Read apart, an actor moving in between from a group giving it that power to
 // one a deny exempts passed both reads, though at no moment did it hold the power and escape the
-// deny. It returns the read too. Of the tenant's custom roles it reads those its grants and roles
-// name and those their GrantableRoles name, each by its key (listedRoles), or with everyRole, all of
-// them, as SetRole reads those listing the role it defines.
+// deny. It returns the read too. Of the tenant's custom roles it reads those its grants name, and
+// those among roles with those they list in GrantableRoles, through others too, each by its key
+// (listedRoles), or with everyRole, all of them, as SetRole reads those listing the role it defines.
 func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, with alsoRead,
 ) ([]authority, grantsRead, error) {
 	which := listedRoles

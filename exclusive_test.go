@@ -1415,10 +1415,12 @@ func TestAChangeReachingManyScopesReadsTheActorsRolesForExclusiveValuesOnce(t *t
 // Activate, Import, and a change checking an exclusive dimension, read of a tenant's custom roles
 // only those they name, those their GrantableRoles name, and those giving a value: so beside 298
 // others of 1,000 permissions on 50 types, which give none, each derives as many roles, and reads as
-// many of their entries, as alone. Before, Activate and Import read every role of the tenant twice,
-// Activate taking 1.2 s, half of it holding its locks, the check every one under the tenant's lock
-// on exclusive values, so a SetMemberships of one member took 600 ms, and a change granting a custom
-// role every one twice more for its actor's authority.
+// many of their entries, as alone, though the role the actor holds lists one of them, which lists
+// the next, and so on. Before, Activate and Import read every role of the tenant twice, Activate
+// taking 1.2 s, half of it holding its locks, the check every one under the tenant's lock on
+// exclusive values, so a SetMemberships of one member took 600 ms, and a change granting a custom
+// role every one twice more for its actor's authority; and that read every role the actor's held
+// roles list, through others too, though a decision reads of those only their ids.
 func TestActivateAndAnExclusiveCheckReadNoOtherCustomRole(t *testing.T) {
 	var perms []rbac.Permission
 	var types []string
@@ -1439,7 +1441,7 @@ func TestActivateAndAnExclusiveCheckReadNoOtherCustomRole(t *testing.T) {
 	u := h.as(t, "u")
 	for _, q := range []string{
 		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
-		  ('t1', 'custom.x', '{cluster:view}', '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:view,cluster:grant}', '{cluster}', '{custom.x}')`,
+		  ('t1', 'custom.x', '{cluster:view}', '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:view,cluster:grant}', '{cluster}', '{custom.x,custom.r1}')`,
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		  VALUES ('t1', 'cluster', 'c1', 'group', 'team', 'custom.x'), ('t1', 'cluster', 'c1', 'user', 'u', 'custom.lister')`,
 		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
@@ -1497,8 +1499,8 @@ func TestActivateAndAnExclusiveCheckReadNoOtherCustomRole(t *testing.T) {
 		return costs
 	}
 	alone := read()
-	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
-		SELECT 't1', 'custom.r' || i, $1::text[], $2::text[] FROM generate_series(1, 298) i`, perms, types); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.r' || i, $1::text[], $2::text[], ARRAY['custom.r' || (i + 1)] FROM generate_series(1, 298) i`, perms, types); err != nil {
 		t.Fatal(err)
 	}
 	for name, beside := range read() {

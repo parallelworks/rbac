@@ -171,7 +171,7 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access. A check, `Activate`
   and a change read only the custom roles they and the grants they read name, a change with those
-  their `GrantableRoles` name, through others too, so the tenant's other roles cost them nothing;
+  the roles it grants list, through others too, so the tenant's other roles cost them nothing;
   `CustomRoles`, `Roles`, `Grantable`, `SetRole` and `DeleteRole` read every one, which
   `rbac.MaxCustomRoles` bounds.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions

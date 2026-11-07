@@ -1869,7 +1869,7 @@ type rolesRead int
 const (
 	// namedRoles are those the grants name.
 	namedRoles rolesRead = iota
-	// listedRoles are those the grants name, those alsoRead.listing names and those their
+	// listedRoles are those the grants name, and those alsoRead.listing names with those their
 	// GrantableRoles name, through others too: all a change's authority decides by.
 	listedRoles
 	// tenantRoles are all of them, as Grantable offers any and SetRole reads those listing a role.
@@ -2064,7 +2064,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		for i, r := range with.listing {
 			ids[i] = string(r)
 		}
-		customRoles, listing = "listing", `, `+listingSQL(namedCustom("SELECT role FROM held UNION ALL SELECT unnest($9::text[])"))
+		customRoles, listing = "listed", `, `+listingSQL(namedCustom("SELECT unnest($9::text[]) AS role"))
 		named = []any{ids}
 	case tenantRoles:
 	}
