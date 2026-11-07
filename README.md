@@ -701,7 +701,11 @@ as `Record` says, so `History` reads on past it. `History` reads the primary, an
 replica. A generation (`Cursor.Generation`) names the cluster, and the database and schema history
 is in, so no two installations in a cluster share one. A failover or a recovery to a point in time
 starts a new one, and a restore that starts none, as from a disk snapshot, loses what came after it:
-either can number again what the last one numbered past what it kept. `History` refuses a cursor
+either can number again what the last one numbered past what it kept. A `pg_upgrade` starts a new
+one too, as it gives the cluster a new identifier and starts its timeline at 1, though it loses
+nothing: export to the end before it, and keep the last checkpoint, as every cursor from before it
+is then refused, and the whole of history is exported again from `Genesis` under a new chain, which
+an audit compares with the last export up to that checkpoint. `History` refuses a cursor
 from another generation, whose last record the database no longer holds, or after which a prune
 since its export began deleted records, as below, and history is exported again from the start, kept
 apart from the last export: an export from it would read on past what is gone. A restore that keeps
@@ -780,7 +784,19 @@ COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large `
 costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s past its commit
 record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that sets a large
 `temp_buffers` and makes many such tables holds its own commit back accordingly; set `temp_buffers`
-no larger than the session's temporary data needs. `pg_stat_activity` lists a session
+no larger than the session's temporary data needs. The rest of a commit also writes the
+notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQL's notification
+queue, which no SQL can see beforehand: about 1.6 ms a MB on a test server, 260 ms for 160 MB, and
+some 13 s at the default queue of 8 GB, which `lock_timeout` doesn't bound either. Any role may
+`NOTIFY`, which takes no privilege, so revoking `EXECUTE` on `pg_notify` from `PUBLIC` bounds
+nothing. From PostgreSQL 17 on, `max_notify_queue_pages`, set as the server starts, bounds it: a
+commit whose notifications overflow the queue fails with SQLSTATE 54000, its changes with it, rather
+than being held, so 1,024 pages, 8 MB, hold one about 13 ms at most. But the queue holds every
+notification some listener in the cluster has yet to read, and any role may `LISTEN`, so a small
+one fills while a listener lags, as one in a long transaction does, and every commit that notifies
+then fails until that listener catches up or ends: where the host's own transactions notify, size
+it for how far its listeners fall behind, and retry such a commit once the queue drains, or keep
+the default and watch `pg_notification_queue_usage()`. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
@@ -790,14 +806,22 @@ which `AsOf` counts it from, as its latest. It refuses a transaction that declar
 HOLD`, which committing runs to its end, also one a procedure or a `DO` block declares in a
 transaction after it committed, and a session that has an enabled deferrable trigger on a temporary
 table, which fires as it commits: either would run a session's own code after the commit record was
-written. The check of a temporary table's deferrable trigger reads the catalog as the commit record
-is written, so it is a best-effort defense that holds only where a hostile session can't make
-temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBLIC` and grant it to
-none of them, as no call of the package's makes a temporary object, `AsOf`'s included, so none of
-them makes any, and against them the defense holds. So the application's role can hold a change's
-commit past its commit record only through the host's code that runs as the transaction commits, as
-a deferred trigger of the host's or a deferred constraint checking a row the role can lock, or for as
-long as the operator's settings of synchronous replication and prepared transactions let it; a role
+written. In a procedure or a `DO` block, it refuses too a transaction that has a cursor `WITH HOLD`
+open that the block declared in an earlier transaction, whose commit ran it, as a cursor's creation
+time is the block's, and nothing tells it from one declared in this transaction: declare such a
+cursor before the block, in a transaction of its own, and fetch from it in the block by its name, or
+close it before a transaction that changes the package's tables commits. A `FOR` loop over a query,
+which PL/pgSQL runs to its end as each `COMMIT` in it begins, is not refused. The check of a
+temporary table's deferrable trigger reads the catalog as the commit record is written, so it is a
+best-effort defense that holds only where a hostile session can't make temporary objects: the roles
+below revoke `TEMPORARY` on the database from `PUBLIC` and grant it to none of them, as no call of
+the package's makes a temporary object, `AsOf`'s included, so none of them makes any, and against
+them the defense holds. So the application's role can hold a change's commit past its commit record
+by what runs after it as the transaction commits, which includes the host's code that runs then, as
+a deferred trigger of the host's that reads a table by a name a temporary table can take, or a
+deferred constraint checking a row the role can lock; the notifications the transaction queued, for
+as long as writing them takes, which only `max_notify_queue_pages` bounds; and the operator's
+settings of synchronous replication and prepared transactions, for as long as they let it. A role
 given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
 or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
 deferrable trigger, against which the check is best-effort.
@@ -944,12 +968,16 @@ have the server load a library or run a program of its choosing; and:
    there, as an extension installed there makes, would run in place of the package's, as whoever
    reads as of a time.
 2. A role of history's own, which the administrator's role is a member of and the application's
-   isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
+   isn't, owns `rbac_history` and the functions `rbac_record` and `rbac_history_commit`: transfer
+   them to it after migrating. A migration that makes such a function later, as
+   `0029_commit_trigger` makes `rbac_history_commit`, gives it to `rbac_record`'s owner itself, or
+   fails.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
    as it, which refuses the write without it; `EXECUTE` on the functions `rbac_tenant_keys` and
    `rbac_text_array`, which history's index of the keys denies name calls for each record, and
    which every role has unless it is revoked; and `CREATE` there to be given them, unless a
-   superuser gives them.
+   superuser gives them, or, for one a migration gives it, the schema's owner migrates, which grants
+   it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
@@ -1197,6 +1225,34 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   than the views, or another role being able to create there, when the read begins or as it ends, or
   one of the views dropped as it ran. Drop the views' schema with the package's: dropping the
   package's drops the views, which read its history, but not their schema.
+  `0029_commit_trigger` has `rbac_history_committed` run a function of its own,
+  `rbac_history_commit`, in place of `rbac_record`. The trigger fires as a transaction commits once
+  for each record the transaction wrote, which ran with `rbac_record`'s settings and start and read
+  to the end of an index page for a later record of the transaction: about 12.5 µs a record on a
+  test server, 250 ms of `COMMIT` for 20,000 records, a fifth of what writing them took, and some
+  12 s for a million, which a `statement_timeout` can end. It now looks among the next 32 ids first,
+  as a statement's records take ids one after another, or nearly: about 8 µs a record, 160 ms for
+  20,000. Where none of those is the transaction's, as where more than 32 sessions write history at
+  once, record by record, it reads both, about 15.5 µs. It replaces the trigger, which locks history
+  against reads and writes until it commits, so every change, as each writes history, and every read
+  of history, as `AsOf` and an export, waits for it, and a transaction under way as it starts that
+  made a change can make it give way. The role migrating makes the function, which writes history as
+  its owner, and gives it to `rbac_record`'s owner, history's role where the roles are set up as
+  [History](#history) says: as a superuser, or as a role that may `SET ROLE` to history's role,
+  where that role has `CREATE` on the schema or the role migrating may grant it that, as the
+  schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
+  42501, having changed nothing, rather than leave the function to another role: grant history's
+  role `CREATE` on the schema, or history's role to the role migrating with the `SET` option, as its
+  hint says, or migrate as a superuser, and migrate again. No role but its owner may execute it, nor
+  `rbac_record`, which writes history as its owner too, as only their triggers call them: migrating
+  revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the schema's default
+  privileges can grant it as each is made, where `0003_history` revoked it on `rbac_record` from
+  `PUBLIC` alone; a role holding it could attach either to a table of its own in `pg_temp`, whose
+  triggers would then run as history's role. It replaces `rbac_record` too, which keeps its owner
+  and its settings, without its path for a commit record, which no trigger reaches any more. A
+  procedure or a `DO` block that changes the package's tables with a cursor `WITH HOLD` open that it
+  declared in an earlier transaction is refused as before, as nothing tells that cursor from one
+  declared in the transaction committing: its refusal now says so, and how such a batch commits.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

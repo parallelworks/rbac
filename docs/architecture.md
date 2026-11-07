@@ -1224,16 +1224,23 @@ flowchart LR
   that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in
   no tenant, keyed by nothing), and AsOf counts each change from it, or from the change's own date
   where that is later. The constraint trigger `rbac_history_committed`, deferred to the commit, runs
-  `rbac_record` as history's role for each record the transaction wrote, and the event of its last,
-  by id, writes the commit record, dated by the clock then. A session can fire deferred triggers
-  early with `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit record's own
-  event fires inside the trigger that wrote it, a level deeper than at the commit, so there it
-  defers the trigger again, by name, and writes a record dated -infinity, which no read counts from,
-  whose event records the commit anew as it commits; AsOf counts from the latest. A cursor `WITH
-  HOLD` the transaction declared, also in a procedure's or a `DO` block's later transaction, whose
-  creation time is the block's, and an enabled deferrable trigger on a temporary table, would run
-  the session's own code after the commit record as it commits, so a transaction with either is
-  refused. The temporary-table check reads the catalog as the commit record is written, so it is a
+  `rbac_history_commit` as history's role for each record the transaction wrote, which looks for a
+  later record of the transaction among the next 32 ids and then among all of its records, and the
+  event of its last, by id, writes the commit record, dated by the clock then. Each event costs the
+  commit about 8 µs where the transaction's records take ids one after another, or nearly, and 15.5
+  where more than 32 sessions write history at once, record by record. A session can fire deferred
+  triggers early with `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit
+  record's own event fires inside the trigger that wrote it, a level deeper than at the commit, so
+  there it defers the trigger again, by name, and writes a record dated -infinity, which no read
+  counts from, whose event records the commit anew as it commits; AsOf counts from the latest. A
+  cursor `WITH HOLD` the transaction declared, also in a procedure's or a `DO` block's later
+  transaction, whose creation time is the block's, and an enabled deferrable trigger on a temporary
+  table, would run the session's own code after the commit record as it commits, so a transaction
+  with either is refused. So is one with a cursor `WITH HOLD` open that its block declared in an
+  earlier transaction, whose commit ran it: its creation time is the block's too, and neither the
+  cursors open at the transaction's first record nor a time that record took tells it from one
+  declared in the transaction before its first change. Declared before the block, or closed first,
+  it isn't. The temporary-table check reads the catalog as the commit record is written, so it is a
   best-effort defense that assumes the README's roles: it holds against a session with no
   `TEMPORARY` privilege, which can make no temporary object, and is best-effort against one with it.
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
@@ -1243,12 +1250,15 @@ flowchart LR
   default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
   the temporary buffers; 2,000 held a commit about 5.4 s at `temp_buffers = 4GB`, which
   `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
-  those tables, the wait for synchronous replication, and for a prepared transaction, everything
-  until `COMMIT PREPARED`. A transaction that committed before `0027_commit_dates` has none, and its
-  changes count from their own dates. `History` returns no commit record, but each record with its
-  transaction's (`Record.CommittedAt`), which the chain covers as every other field; a prune deletes
-  it with the last of its transaction's other records. What AsOf reads of a time is final once every
-  transaction whose commit record is dated by then is seen by others.
+  those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
+  can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
+  queue, which only `max_notify_queue_pages` bounds), the wait for synchronous replication, and for
+  a prepared transaction, everything until `COMMIT PREPARED`. A transaction that committed before
+  `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
+  commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
+  covers as every other field; a prune deletes it with the last of its transaction's other records.
+  What AsOf reads of a time is final once every transaction whose commit record is dated by then is
+  seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
   takes at its first write, and only those of transactions older than every transaction still
   running, which have all ended. So a cursor never passes a record that commits later. That is
@@ -1263,7 +1273,12 @@ flowchart LR
   search_path, would: that role can do neither.
 - **Generations.** A cursor names its generation: the database cluster, by its system and
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
-  new generation, which an export starts again from `Genesis`. A restore that starts none, as
+  new generation, which an export starts again from `Genesis`, and so does a `pg_upgrade`, which
+  gives the cluster a new identifier and starts its timeline at 1: the whole of history is exported
+  again under a new chain. Keying a generation on an identifier the installation stores would keep
+  it across a `pg_upgrade`, but a logical dump copies that row to a cluster whose transactions
+  number anew, which must start one, and nothing SQL reads that a `pg_upgrade` keeps, as a table's
+  OID, is sure to differ in such a copy. A restore that starts none, as
   from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
   refuses that cursor, and history is exported again from the start. Where it kept that record
   and lost what came after, nothing in the database tells it from recovering from a crash, so a
@@ -1435,7 +1450,7 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 ```mermaid
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
-    histrole["History's role<br/>owns rbac_history and rbac_record"]
+    histrole["History's role<br/>owns rbac_history, rbac_record<br/>and rbac_history_commit"]
     app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
