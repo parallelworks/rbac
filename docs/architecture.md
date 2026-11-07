@@ -671,8 +671,10 @@ sequenceDiagram
   by its type among those conditions read (`wellKnown`), as finding it one by reflection's
   `Implements` took five times what converting a number does, and so is one of CEL's own scalars
   (`celScalar`), which took three times what converting a string does; what reflection finds of
-  another type with methods is kept for the type (`methodsOf`), as asked of each value, converting
-  the host's messages, which no condition reads, took four times what converting a list does.
+  another type with methods is kept for the type (`methodsOf`), a map's key's too (`keyType`), as
+  asked of each value, converting the host's messages, which no condition reads, took four times
+  what converting a list does, and asked of each key, a map of interfaces holding CEL's timestamps
+  as keys, which no condition keys one by, 335 ns a unit.
   The subject's and the request's attributes are converted once for a call, by one converter
   (`askingOf`), as a change checks them
   on each scope it reaches, before its transaction and in it, and each check converts its resource's

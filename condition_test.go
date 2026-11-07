@@ -3031,10 +3031,10 @@ func jsonDraw(rng *rand.Rand, depth int, b *strings.Builder) {
 // of CEL's strings, and a map keyed by them, took a check three times what Go's did, charged alike;
 // timed against Go's, CEL's took 2.8 times as long once on a loaded machine, though read so. A type
 // of the host's own with methods is asked about, as a value, a map's key and a map's type, and its
-// values once for the type: asked of each, converting the host's messages, which no condition reads,
-// took four times what converting a list does.
+// values and keys once for the type: asked of each, converting the host's messages, which no
+// condition reads, took four times what converting a list does, and a map of interfaces holding
+// CEL's timestamps as keys, which none keys one by, three times what one holding strings does.
 func TestConvertingCELsOwnValuesReadsNoMethodsOfTheirTypes(t *testing.T) {
-	read := rbac.CountMethodsRead(t)
 	cels := []any{
 		types.String("a"), types.Bytes("b"), types.Bytes(nil), types.Double(1.5), types.Int(-1), types.Uint(2), types.True, types.NullValue,
 		types.Timestamp{Time: time.Unix(1, 0)},
@@ -3051,7 +3051,7 @@ func TestConvertingCELsOwnValuesReadsNoMethodsOfTheirTypes(t *testing.T) {
 			"m": map[string]any{"a": time.Second, "t": time.Unix(1, 0)}, "k": map[int]bool{1: true}, "p": new(int),
 		},
 	} {
-		*read = 0
+		read := rbac.CountMethodsRead(t)
 		if _, ok := rbac.ConvertingCharge(attributes); !ok || *read != 0 {
 			t.Errorf("%s: read %t, the methods of their types read %d times", name, ok, *read)
 		}
@@ -3059,18 +3059,21 @@ func TestConvertingCELsOwnValuesReadsNoMethodsOfTheirTypes(t *testing.T) {
 	for name, attributes := range map[string]map[string]any{
 		"a value": {"v": stringer("a")}, "a map's key": {"m": map[any]int{stringer("a"): 1}}, "a map's type": {"m": map[stringer]int{}},
 	} {
-		*read = 0
+		read := rbac.CountMethodsRead(t)
 		if _, ok := rbac.ConvertingCharge(attributes); !ok || *read == 0 {
 			t.Errorf("%s of a type with methods: read %t, the methods of its type read %d times", name, ok, *read)
 		}
 	}
 	strs, messages := make([]stringer, 1000), make([]*wideMessage, 1000)
+	keys := map[any]int{}
 	for i := range messages {
 		messages[i] = &wideMessage{}
+		keys[stringer(strconv.Itoa(i))], keys[types.Double(i)], keys[types.Timestamp{Time: time.Unix(int64(i), 0)}] = i, i, i
 	}
-	*read = 0
-	if rbac.ConvertingCharge(map[string]any{"s": strs, "m": messages}); *read > 10 {
-		t.Errorf("1,000 strings of the host's type and 1,000 messages of the host's: the methods of their types read %d times", *read)
+	read := rbac.CountMethodsRead(t)
+	if rbac.ConvertingCharge(map[string]any{"s": strs, "m": messages, "k": keys}); *read > 10 {
+		t.Errorf("1,000 strings of the host's type, 1,000 messages of the host's, and a map keyed by 1,000 strings of the host's type, "+
+			"CEL's doubles and CEL's timestamps: the methods of their types read %d times", *read)
 	}
 }
 

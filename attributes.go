@@ -472,10 +472,11 @@ const (
 	asMessage
 )
 
-// methodsOf is how of reads a value of t, a type with methods but CEL's own scalars, found once for
-// each type (methodTypes): reflection's Implements reads the methods of the type, and asked of each
-// value, converting the host's messages, which it refuses, took four times what converting a list
-// does, 500 ns a unit, and pointers to CEL's strings three times what other pointers took.
+// methodsOf is how of reads a value of t, a type with methods but CEL's own scalars, and whether
+// keyType takes it, found once for each type (methodTypes): reflection's Implements reads the
+// methods of the type, and asked of each value, converting the host's messages, which it refuses,
+// took four times what converting a list does, 500 ns a unit, and pointers to CEL's strings three
+// times what other pointers took.
 func methodsOf(t reflect.Type) methodsRead {
 	if known, ok := methodTypes.Load(t); ok {
 		r, _ := known.(methodsRead)
@@ -740,7 +741,12 @@ func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	return types.NewRefValMap(types.DefaultTypeAdapter, out), height + 1
 }
 
-// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or nil.
+// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or nil. Its
+// type is one keyType takes, found of the map's own once for the map (dict), and here of one with
+// methods an interface holds, by its type (methodsOf): asking reflection of each key, a map of
+// interfaces holding CEL's timestamps as keys, which no condition keys one by, took 335 ns a unit
+// to convert, and holding the host's own ref.Val 184. So it is read by its kind, CEL's own too, as
+// the same values, and one of another kind is refused.
 func (c *converter) key(k reflect.Value) ref.Val {
 	if !c.pay(1) {
 		return nil
@@ -749,14 +755,9 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		if k.IsNil() {
 			return c.refuse()
 		}
-		k = k.Elem()
-	}
-	t := k.Type()
-	if t.NumMethod() > 0 && (celScalar(t) || implements(t, refValType)) {
-		if v, ok := k.Interface().(ref.Val); ok && keyType(t) {
-			return c.spend(textSize(v)-1, v)
+		if k = k.Elem(); k.Type().NumMethod() > 0 && !keyType(k.Type()) {
+			return c.refuse()
 		}
-		return c.refuse()
 	}
 	switch k.Kind() {
 	case reflect.Bool:
@@ -828,13 +829,14 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 	}
 }
 
-// keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
+// keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too,
+// and so whether a key of type t an interface holds is one a condition reads.
 func keyType(t reflect.Type) bool {
 	switch t {
 	case celBoolType, celIntType, celStringType, celUintType:
 		return true
 	}
-	if t.NumMethod() > 0 && implements(t, refValType) {
+	if t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) == byItsMethods) {
 		return false
 	}
 	switch t.Kind() {
