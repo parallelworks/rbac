@@ -1468,7 +1468,14 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   history records each time it wrote; a time past the clock, which only a role that may disable the
   table's triggers can leave there, or the database's clock going back, has a call of a host behind
   that clock decide at it as each of its statements reads it, and such a host's changes tried again
-  (`rbac.ErrConflict`) until the clock passes the time.
+  (`rbac.ErrConflict`) until the clock passes the time. The bound takes nothing from a time a run
+  recorded only where a read bounds it by the clock the run recorded it by, which hasn't gone back
+  since: where that clock has gone back, or on a hot standby, whose own clock can be behind the
+  primary's, a read can cut a run's time to before what the run removed ended, and until the clock
+  passes that time decide by the state the run left, which no moment held. Keep the database's
+  clock from stepping back, and make checks, and run `Filter`'s conditions, on the primary, or on a
+  standby whose clock is kept with it; `AsOf`, which doesn't read the table, reads on a standby as
+  before.
   A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the

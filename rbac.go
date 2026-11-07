@@ -303,14 +303,16 @@ func (a *Authorizer) decidedSQL(now string) string {
 // database's clock as the statement reads it, null for none, which least alone would read as that
 // clock. No write records a time past the clock as its own statement began (rbac_expired_until),
 // which is before it commits, so before a snapshot that sees it is taken, and the clock read after:
-// so it takes nothing from a time DeleteExpired recorded. Not the clock as the statement began: a
-// statement of a simple query takes its snapshot after it is planned, once it has waited for the
-// locks it reads by, as do those after the first of several in one, so it could see a time a run
-// recorded after it began, and decide before the end of a row the run removed, by a state no moment
-// held. A time past the clock, which only a role that may disable the table's triggers, or the
-// database's clock going back, can leave there, would otherwise have every call decide at it, for
-// good: a deny binding a subject through a place ending before then lifted, and a condition reading
-// request.time met.
+// so it takes nothing from a time DeleteExpired recorded, by the clock of the server it recorded it
+// on, while that clock doesn't go back; a hot standby reads by its own (README: Expiry). Not the
+// clock as the statement began: a statement of a simple query takes its snapshot after it is
+// planned, once it has waited for the locks it reads by, as do those after the first of several in
+// one, so it could see a time a run recorded after it began, and decide before the end of a row the
+// run removed, by a state no moment held. A time past the clock, which only a role that may disable
+// the table's triggers, or the database's clock going back, can leave there, would otherwise have
+// every call decide at it, for good: a deny binding a subject through a place ending before then
+// lifted, and a condition reading request.time met. In decidedSQL the clock is read once for the
+// statement, as no plan inlines a CTE that calls a volatile function.
 const expiredUntil = `CASE WHEN max(until) IS NOT NULL THEN least(max(until), clock_timestamp()) END`
 
 // decidedAt is SQL for the time decidedSQL defines.

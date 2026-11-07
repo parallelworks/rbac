@@ -1249,7 +1249,11 @@ flowchart TB
   condition reading `request.time` met. A time past the clock now only the table's owner disabling
   its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
   a host behind the clock then decides at it as each statement reads it, and that host's changes are
-  tried again until the clock passes the time.
+  tried again until the clock passes the time. The bound leaves a run's time whole only where a
+  read bounds it by the clock the run recorded it by, which hasn't gone back since: a clock gone
+  back, or a hot standby's own clock behind the primary's, cuts it to before what the run removed
+  ended, and a read then decides by the state the run left, which no moment held, until the clock
+  passes it.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
