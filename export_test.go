@@ -1280,6 +1280,17 @@ func CountCopies(t *testing.T) *int {
 	return n
 }
 
+// CountTypesWalked counts the types copying and converting walk to find what they find of each, an
+// array's or a struct's whether a copy shares it, what it costs, whether hashing it reads more and
+// whether a copy can hold it, and whether a type of the host's own is a lock, until t ends.
+func CountTypesWalked(t *testing.T) *int {
+	t.Helper()
+	old, n := walkingType, new(int)
+	walkingType = func() { *n++ }
+	t.Cleanup(func() { walkingType = old })
+	return n
+}
+
 // CopiedInOneCall is what one call gives a hook of each of n values made by fresh, asked about one
 // after another, each dropped and the garbage collected before the next is made.
 func CopiedInOneCall(n int, fresh func(i int) map[string]any) []map[string]any {
