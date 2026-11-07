@@ -532,9 +532,14 @@ sequenceDiagram
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
-  failing closed. Nothing else does, nor on the order of the kinds: JSON text whose values may cost
-  more than `maxConverted`, by its brackets, braces, commas and colons, each bracket and brace what
-  building a list or an object costs (`jsonValues`), fails them all unparsed, where compared with
+  failing closed. A map of structs, which no condition reads, is refused unread at 2 for each entry
+  (`refusedWhole`), as reading an entry copies it whole: a map of 2,000 structs of 64 KiB took 7 ms,
+  charged as much. Nothing else turns on map order, nor on the order of the kinds, whether a hook
+  can be given a copy included (below), and a loop gives a map's keys in an order of its own
+  (`stepping.order`, below): JSON text
+  whose values may cost more than `maxConverted`, by its brackets, braces, commas and colons, each
+  bracket and brace what building a list or an object costs (`jsonValues`), fails them all
+  unparsed, where compared with
   what was left, it failed them where what came before it left less than it may hold, though what it
   holds fit, as `[]` holds less than its brackets count. A value reached twice
   is converted once, but for a resource's sharing it with the subject's or the request's (below),
@@ -543,7 +548,31 @@ sequenceDiagram
   array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
   times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
   as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
-  for a hook, whatever held it, where reading one in a condition takes 70 to 145 ns, and a check
+  for a hook, whatever held it, a copy charging a struct a tenth of the bytes it sets whole, and a
+  slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
+  before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a
+  struct, which reading an entry moves and setting it hashes (`keyTenths`), each before it moves
+  them, and of the strings such a key holds and what its interfaces hold, which hashing reads too
+  (`payHashed`): charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms,
+  and of 2,000 entries keyed by arrays of 4 KiB 8 ms, and charged their bytes in place alone, of 50
+  keyed by structs each holding a string of 1 MiB 1.4 ms, for 167. Nor does it move a slice's
+  elements or a map's values where what they hold in place, at least one for each 24 bytes, costs
+  more than is left (`leastCopied`): a map holding an array of 4 MiB allocated 12 MB, and 2,000
+  arrays of 4,096 interfaces 133 MB, before being found past what a copy holds. A copy holds
+  nothing nesting past `maxCopied`: it is
+  refused there (`overflow`), where it held the zero value, or the copy of a value reached less
+  deep before, as map order decided, so a constraint was given a value on one call and its zero
+  value on the next. Each map, pointer and message it keeps how much deeper it reaches, copied
+  whole, and each slice each prefix of its elements (`copied.reached`), so reaching one again
+  deeper is refused where copying it there would be, and whether a value nests that deep is of what
+  it holds. Around a cycle it isn't: the path a copy takes around one nests as deep as where it
+  entered it, which map order picks, so two links each holding the other, beside a chain of 9,998
+  links to one, were copied on one call and refused on the next, and an order-free depth would be
+  a longest simple path. So a copy that reaches a value it is still copying (`around`) is refused
+  once it has reached 20,000 maps, lists, pointers, structs, arrays and messages, counting each
+  time it reaches one, and a message a pointer reaches apart from the pointer (`hold`), however
+  shallow the value: a path nests no deeper, in any order, than the values it reaches hold. Reading one
+  in a condition takes 70 to 145 ns, and a check
   converts in about 20 ms at most what it may spend on a scope's grants' conditions, past which
   every condition reading an attribute fails: converting isn't charged to a condition, and charging
   the check would let what one condition reads fail the others. A message the host passes is known
@@ -572,8 +601,24 @@ sequenceDiagram
   each element or entry it builds, and a loop's step for each logical operator and choice it may
   evaluate, on top of what CEL charges, a key a condition computes by its
   length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
-  empty either is. A comparison is charged as it measures the values (`measured`), once, reading
-  both in step until the smaller is read whole, before it runs: measured again at each doubling of
+  empty either is. A loop over a map reads its keys in turn, which CEL gives as Go ranges over the
+  map, in an order that changes from one evaluation to the next, so what `map()` and `filter()`
+  made, and how far `all()` or `exists()` went, and what they cost, turned on it: a grant reading
+  the first key `map()` made allowed 55 of 100 identical checks, and a deny reading the first
+  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, so
+  the cost tracking observes it as it did, its value a map whose keys come sorted (`stepping.order`):
+  bools, ints, uints, doubles, strings and bytes, each by value (`compareKeys`), by a merge sort that
+  compares each key at most once at each of `⌈log2 n⌉` levels, reading no more of either than the
+  key it places holds (`sortKeys`). The loop is charged that before it sorts, and bounded alike
+  (`sortCost`): 1 for each two keys at each level, as comparing and moving a key took 13 to 15 ns
+  where a unit covers 20 to 145 ns elsewhere, and each key what reading it costs past 1, once, as
+  comparing reads about 50 bytes a nanosecond, so the eleven levels a condition can pay for read a
+  key's bytes in a tenth of what charging them once covers. Charged 1 for each key and its bytes at
+  each level, sorting 500 keys of 36 bytes cost 18,000, past what a condition may, for 64 µs of
+  work. A map holding more than one key of
+  another type, as a literal keyed by lists, has no order, and a loop over it fails; a range CEL
+  plans as something else, as a loop, is left where CEL checks it as a list, and refused otherwise.
+  A comparison is charged as it measures the values (`measured`), once, reading both in step until the smaller is read whole, before it runs: measured again at each doubling of
   how far it read, again in search of a double that isn't finite and again for CEL's charge,
   comparing JSON nested 3,300 deep took twenty times what it was charged. Reading a time in a zone
   loads the zone once for the process (`zones`), bounded at `maxZones`, and finds a name names none

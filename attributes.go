@@ -2,6 +2,7 @@ package rbac
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,7 +119,9 @@ import (
 // each list, ListValue or JSON array, each pointer, but to a message, and each other message. So a
 // unit converted costs about what one read does, 20 to 115 ns, and a check converts no more than
 // its conditions may spend reading, about 20 ms, where charged one each, as a number is, 160,000
-// empty maps took 93 ms. Each kind is converted whole, whether it can be read or not: past that,
+// empty maps took 93 ms. Each kind is converted whole, whether it can be read or not, but a map of
+// structs, which no condition reads, is refused unread, charged 2 for each entry: reading an entry
+// copies it whole, and a map of 2,000 structs of 64 KiB, charged as much, took 7 ms. Past that,
 // every condition reading an attribute of any kind fails, as it does where JSON text may cost more
 // than that, by its brackets, braces, commas and colons, which isn't parsed. A call converts the
 // subject's and the request's attributes once, the first time one of its checks reads a condition,
@@ -131,16 +134,22 @@ import (
 // converting stops there, so what it is charged, and whether the kinds after it fit what is left,
 // can turn on the order a map's entries come in: either way it can't be read, and the others are
 // read or, past what is left, fail. Nothing else converting finds turns on that order, nor on the
-// order of the kinds. The subject's, the resource's and the request's attributes share it, so
-// attributes a tenant's users write, as a resource's tags, can take every check of the resource
-// past that, where a grant's condition reading an attribute gives nothing and a deny's applies,
-// whoever asks: bound what users may store, or pass conditions only what they read. A hook, a
-// constraint or ValidateGrant, is given a copy of the subject's or the resource's attributes, or
-// the actor's, of no more than that either, counted as converting counts it, whatever the copy
-// shares, but for what JSON text and packed messages decode to, which it holds as bytes, so it can
-// be given whatever a check converts; past that it can't be asked and the call is refused
-// (ConstraintInput). A declared attribute is a value of its type as converted, so a named string
-// type is a string.
+// order of the kinds, and no condition reads it: a loop gives a map's keys in an order of their
+// own (Condition). The subject's, the resource's and the request's attributes share what a check
+// converts, so attributes a tenant's users write, as a resource's tags, can take every check of the
+// resource past it, where a grant's condition reading an attribute gives nothing and a deny's
+// applies, whoever asks: bound what users may store, or pass conditions only what they read. A
+// hook, a constraint or ValidateGrant, is given a copy of the subject's or the resource's
+// attributes, or the actor's, of no more than that either, counted as converting counts it,
+// whatever the copy shares, but for what JSON text and packed messages decode to, which it holds as
+// bytes, so it can be given whatever a check converts; past that it can't be asked and the call is
+// refused (ConstraintInput), as it is where what it would be given nests past 20,000 deep along any
+// path, wherever a value reached twice is reached first, so a hook is never given a part of it, and
+// where it holds itself and reaches 20,000 maps, lists, pointers, structs, arrays and messages,
+// counting each time it reaches one, as a path around the cycle could nest that deep: how deep the
+// one the copy takes nests turns on where it enters the cycle, which the order a map's entries come
+// in picks, so neither refusal turns on that order. A declared attribute is a value of its type as
+// converted, so a named string type is a string.
 type Attributes struct {
 	Subject, Resource, Request map[string]AttributeType
 }
@@ -586,6 +595,15 @@ func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	if !c.building(mapCost-1, 2*length(v.Len())) {
 		return nil, 0
 	}
+	// Reading an entry copies its value whole, though a struct is refused whatever it holds: a map of
+	// 2,000 structs of 64 KiB took 7 ms to convert, charged 4,017. One that holds any is refused once,
+	// unread, at the least its entries cost.
+	if v.Len() > 0 && refusedWhole(v.Type().Elem()) {
+		if !c.pay(2 * length(v.Len())) {
+			return nil, 0
+		}
+		return c.refuse(), 1
+	}
 	out, height := make(map[ref.Val]ref.Val, v.Len()), 0
 	// Each entry is read into the same two values, as reading it into new ones allocates for each,
 	// a string key or an interface value too: nothing converting reads keeps them.
@@ -641,6 +659,19 @@ func (c *converter) key(k reflect.Value) ref.Val {
 	default:
 	}
 	return c.refuse()
+}
+
+// refusedWhole reports whether of refuses every value of type t, whatever it holds: a struct, but
+// for a time, and an array of one.
+func refusedWhole(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Struct:
+		return t != timeType && t != celTimestampType && t != celDurationType
+	case reflect.Array:
+		return t.Len() > 0 && refusedWhole(t.Elem())
+	default:
+		return false
+	}
 }
 
 // keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
@@ -1317,24 +1348,24 @@ func typing(attrs Attributes) (*cel.Env, error) {
 }
 
 // deepCopy is a copy of v whose maps, slices, arrays, pointers and structs' exported fields are its
-// own, to maxCopied deep, past which it holds their zero values, a protobuf message among them
-// copied field by field, as cloning it would, but for one of a host's type that makes messages of
-// another, copied as any other pointer (itself), and a value reached twice copied once, a message
-// too, so a cycle ends. A slice is copied once for where it starts and its capacity, however many
-// lengths it is reached with, each a slice of the one copy, as each is of the host's, but for one
-// reached while its elements are copied, before a longer length outgrew that copy, which is a slice
-// of a copy of its own: copied for each length, the prefixes of one slice of 3,000 maps took half a
-// second. A value holding no map, slice or pointer, as an array of bytes, is copied whole, and
-// shared where an interface holds it, as nothing writes through one: copied element by element for
-// each interface holding it, a hundred holding one array of 100 KB took 170 ms. So is a time, whose
-// fields are unexported. A struct's fields an unexported struct it embeds promotes are its own too,
-// but its other unexported fields are shared, a pointer it embeds unexported among them, and so the
-// fields that one promotes: reflection can't set them. A map's keys are shared too, and what a
-// pointer among them reaches: a copied key would be another key, so the copy would find nothing
-// under the one the host passed. It copies at most what a check converts (maxConverted), counted as
-// converting counts it, whatever it shares or copies whole (mapCost), past which it reports false,
-// and the copy is v's zero value: copying recurses as far as v reaches, as a check's converting
-// does, which stops there.
+// own, a protobuf message among them copied field by field, as cloning it would, but for one of a
+// host's type that makes messages of another, copied as any other pointer (itself), and a value
+// reached twice copied once, a message too, so a cycle ends. A slice is copied once for where it
+// starts and its capacity, however many lengths it is reached with, each a slice of the one copy,
+// as each is of the host's, but for one reached while its elements are copied, before a longer
+// length outgrew that copy, which is a slice of a copy of its own: copied for each length, the
+// prefixes of one slice of 3,000 maps took half a second. A value holding no map, slice or pointer,
+// as an array of bytes, is copied whole, and shared where an interface holds it, as nothing writes
+// through one: copied element by element for each interface holding it, a hundred holding one array
+// of 100 KB took 170 ms. So is a time, whose fields are unexported. A struct's fields an unexported
+// struct it embeds promotes are its own too, but its other unexported fields are shared, a pointer
+// it embeds unexported among them, and so the fields that one promotes: reflection can't set them.
+// A map's keys are shared too, and what a pointer among them reaches: a copied key would be another
+// key, so the copy would find nothing under the one the host passed. It copies at most what a check
+// converts (maxConverted), counted as converting counts it, whatever it shares or copies whole
+// (mapCost), and no value nesting past maxCopied deep, nor one holding itself that reaches as many
+// values holding others (copier.around), past which it reports false, and the copy is v's zero
+// value: copying recurses as far as v reaches, as a check's converting does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
@@ -1350,11 +1381,20 @@ func deepCopy[T any](v T) (T, bool) {
 // copying runs as deepCopy copies a value, as a test's counter.
 var copying = func() {}
 
-// maxCopied is how deep deepCopy copies a value, past which the copy holds the zero value, or the
-// copy of one it copied less deep: copying recurses as deep as the value nests, and a list nested
-// three million deep overflowed the stack, which no recover catches, ending the process wherever a
-// hook was asked about it. No condition reads what lies deeper (maxNested), and sharing it would let
-// a hook write to what the host holds less deep too.
+// maxCopied is how deep deepCopy copies a value, past which it copies none: copying recurses as
+// deep as the value nests, and a list nested three million deep overflowed the stack, which no
+// recover catches, ending the process wherever a hook was asked about it. No condition reads what
+// lies deeper (maxNested), and sharing it would let a hook write to what the host holds less deep
+// too. A copy holding the zero value there instead, or the copy of a value it reached less deep
+// before, as the order a map's entries come in decided, gave a hook a value on one call and its
+// zero value on the next, by which a constraint could deny one and allow the other: a chain of
+// 19,999 pointers ending at a value the map also held one level deep was copied 34 times and zeroed
+// 6 in 40. Whether a value nests that deep is of what it holds, wherever a value it reaches twice
+// was reached first (kept, copied.reached), but where it holds itself: a path around the cycle
+// nests as deep as where the copy entered it, so whether it nested past maxCopied turned on that
+// order too, and a value holding itself beside a chain of 9,998 links to it was refused in 22 of 200
+// calls and copied whole in the others. One holding itself is refused where it reaches as many
+// values holding others as could nest that deep (copier.around), in every order.
 const maxCopied = 2 * maxNested
 
 // copier copies values for deepCopy, keeping each map and pointer it copied by where it points and
@@ -1362,7 +1402,7 @@ const maxCopied = 2 * maxNested
 // type makes (message), and each slice by where it starts, its capacity and its type (sliceKey); and
 // what it may still copy (left), past which it is over.
 type copier struct {
-	done map[copiedKey]reflect.Value
+	done map[copiedKey]kept
 	// slices are the copies of each slice's elements, each changed where it is kept as its elements
 	// are copied: kept by value, each element cost the copy five lookups of it, as much as copying
 	// the element did.
@@ -1374,15 +1414,39 @@ type copier struct {
 	outgrown map[copiedKey][]reflect.Value
 	left     uint64
 	over     bool
+	// deepest is the deepest copy has reached in what it is copying (descend).
+	deepest int
+	// holders counts each time copy reached a value holding others (hold), and cycled is set once it
+	// reached one it was still copying (around).
+	holders int
+	cycled  bool
+}
+
+// kept is the copy of a map, pointer or message, and once it is copied whole, how much deeper than
+// where it was reached what it holds reaches, so reaching it again deeper copies none past
+// maxCopied either, as copying it there would have (reached); and whether it is a message, which
+// nests a level below a pointer reaching it (hold).
+type kept struct {
+	out            reflect.Value
+	height         int
+	whole, message bool
 }
 
 // copied is the copy of a slice's elements from where it starts, as many as the longest it was
 // reached with, of which filled are copied: a copy reaching it again while it is copied, as a slice
-// holding itself, is a slice of this one.
+// holding itself, is a slice of this one. measured are how many of its elements, in turn from the
+// first, are copied whole, and rises where among those how much deeper than the slice they reach
+// grows, and to what, as each length it is reached with reaches no deeper than its own elements.
 type copied struct {
-	out    reflect.Value
-	filled int
+	out      reflect.Value
+	filled   int
+	measured int
+	rises    []rise
 }
+
+// rise is where among a slice's elements how deep they reach grows: from the one at, height deeper
+// than the slice.
+type rise struct{ at, height int }
 
 type copiedKey struct {
 	t   reflect.Type
@@ -1423,19 +1487,16 @@ func (c *copier) building(n, least uint64) bool {
 	return c.pay(n)
 }
 
-// copy is a copy of v, which is depth deep, or past maxCopied deep its zero value, not kept, so a
-// copy reaching it less deep copies it; or once c is over, the zero value.
+// copy is a copy of v, which is depth deep, or once c is over, the zero value: past maxCopied deep,
+// c is over.
 func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
+	at := depth
 	if v.Kind() != reflect.Interface {
 		if depth >= maxCopied {
-			if k, ok := copiedKeyOf(v); ok && v.Kind() != reflect.Slice && c.done[k].IsValid() {
-				return c.done[k]
-			}
-			if s := c.slices[sliceKey(v)]; v.Kind() == reflect.Slice && !v.IsNil() && s != nil && s.out.Len() >= v.Len() {
-				return s.out.Slice3(0, v.Len(), v.Len())
-			}
+			c.overflow()
 			return reflect.Zero(v.Type())
 		}
+		c.deepest = max(c.deepest, depth)
 		depth++
 		if !c.pay(1) {
 			return reflect.Zero(v.Type())
@@ -1447,6 +1508,9 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 			return reflect.Zero(v.Type())
 		}
 		return v
+	}
+	if v.Kind() != reflect.Interface {
+		c.hold()
 	}
 	switch v.Kind() {
 	case reflect.Interface:
@@ -1465,26 +1529,18 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		k, _ := copiedKeyOf(v)
-		if done := c.done[k]; done.IsValid() {
-			return done
-		}
-		// Each entry costs at least its key and its value, so a map of more than is left isn't made.
-		if !c.building(mapCost-1, 2*length(v.Len())) {
-			return reflect.Zero(v.Type())
-		}
-		out := reflect.MakeMapWithSize(v.Type(), v.Len())
-		c.keep(k, out)
-		for it := v.MapRange(); it.Next() && c.pay(textLength(textOf(it.Key()))); {
-			out.SetMapIndex(it.Key(), c.copy(it.Value(), depth))
-		}
-		return out
+		return c.dict(v, at, depth)
 	case reflect.Slice:
 		if v.IsNil() {
 			return v
 		}
 		return c.slice(v, depth)
 	case reflect.Struct:
+		// Set whole, its unexported fields too, and so charged its bytes, as a flat one is (payWhole):
+		// charged one, a copy of 2,000 structs each holding a map and 64 KiB took 38 ms.
+		if !c.pay(tenths(v.Type()) / 10) {
+			return reflect.Zero(v.Type())
+		}
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
 		c.fields(out, v, depth)
@@ -1503,31 +1559,146 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		if v.IsNil() {
 			return v
 		}
-		k, _ := copiedKeyOf(v)
-		if done := c.done[k]; done.IsValid() {
-			return done
-		}
-		if m, ok := v.Interface().(proto.Message); ok && itself(m) {
-			return reflect.ValueOf(c.message(m.ProtoReflect(), depth).Interface())
-		}
-		if !c.pay(pointerCost - 1) {
-			return reflect.Zero(v.Type())
-		}
-		out := reflect.New(v.Type().Elem())
-		c.keep(k, out)
-		out.Elem().Set(c.copy(v.Elem(), depth))
-		return out
+		return c.pointer(v, at, depth)
 	default:
 		return v
 	}
 }
 
-// keep keeps out, the copy of the map, pointer or message k knows.
-func (c *copier) keep(k copiedKey, out reflect.Value) {
-	if c.done == nil {
-		c.done = map[copiedKey]reflect.Value{}
+// dict is a copy of v, a map that isn't nil, reached at, whose entries are depth deep. It is apart
+// from copy, which copying recurses through as deep as maxCopied, so its frame holds none of what
+// this needs.
+func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
+	k, _ := copiedKeyOf(v)
+	if done := c.done[k]; done.out.IsValid() {
+		c.reachedAgain(done, at)
+		return done.out
 	}
-	c.done[k] = out
+	// Each entry costs at least its key and what its value holds in place (leastCopied), so a map
+	// of more than is left isn't made, nor an entry read, which moves it whole: a map holding an
+	// array of 4 MiB allocated 12 MB before being found past what a copy holds.
+	if !c.building(mapCost-1, length(v.Len())*(1+leastCopied(v.Type().Elem()))) {
+		return reflect.Zero(v.Type())
+	}
+	out := reflect.MakeMapWithSize(v.Type(), v.Len())
+	c.keep(k, out, false)
+	outer := c.descend(at)
+	// Reading an entry moves its key and its value whole, and setting it hashes the key, so each is
+	// charged what it holds in place first: a key of another type than a string its bytes, held
+	// in an interface too, and what hashing reads past them (payHashed), and a value the structs it
+	// holds (inlineTenths), as lengthen charges a slice's elements. Uncharged, a copy of 2,000
+	// entries keyed by arrays of 4 KiB took 8 ms, charged 4,017, and one reached 20,000 deep moved
+	// each struct it held only to drop it.
+	kt := v.Type().Key()
+	moved, hashed := (keyTenths(kt)+inlineTenths(v.Type().Elem()))/10, kt.Kind() != reflect.String && hashesHeld(kt)
+	for it := v.MapRange(); it.Next() && c.pay(moved); {
+		key := it.Key()
+		if !c.pay(textLength(textOf(key))) || hashed && !c.payHashed(key) {
+			break
+		}
+		out.SetMapIndex(key, c.copy(it.Value(), depth))
+	}
+	c.ascendFrom(k, at, outer)
+	return out
+}
+
+// pointer is a copy of v, a pointer that isn't nil, reached at, what it points to depth deep, apart
+// from copy as dict is.
+func (c *copier) pointer(v reflect.Value, at, depth int) reflect.Value {
+	k, _ := copiedKeyOf(v)
+	if done := c.done[k]; done.out.IsValid() {
+		if done.message {
+			c.hold()
+		}
+		c.reachedAgain(done, at)
+		return done.out
+	}
+	if m, ok := v.Interface().(proto.Message); ok && itself(m) {
+		c.hold()
+		return reflect.ValueOf(c.message(m.ProtoReflect(), depth).Interface())
+	}
+	if !c.pay(pointerCost - 1) {
+		return reflect.Zero(v.Type())
+	}
+	out := reflect.New(v.Type().Elem())
+	c.keep(k, out, false)
+	outer := c.descend(at)
+	out.Elem().Set(c.copy(v.Elem(), depth))
+	c.ascendFrom(k, at, outer)
+	return out
+}
+
+// keep keeps out, the copy of the map, pointer or message k knows.
+func (c *copier) keep(k copiedKey, out reflect.Value, message bool) {
+	if c.done == nil {
+		c.done = map[copiedKey]kept{}
+	}
+	c.done[k] = kept{out: out, message: message}
+}
+
+// overflow is c over, as it is past maxCopied deep.
+func (c *copier) overflow() { c.over, c.left = true, 0 }
+
+// descend starts measuring how deep what is reached at reaches, returning how deep what holds it
+// had reached, for ascend.
+func (c *copier) descend(at int) (outer int) {
+	outer, c.deepest = c.deepest, at
+	return outer
+}
+
+// ascend is how much deeper than at what descend measured from there reaches, which what holds it
+// reaches too.
+func (c *copier) ascend(at, outer int) int {
+	height := c.deepest - at
+	c.deepest = max(outer, c.deepest)
+	return height
+}
+
+// ascendFrom keeps how much deeper than at what k knows reaches, copied whole (ascend).
+func (c *copier) ascendFrom(k copiedKey, at, outer int) {
+	done := c.done[k]
+	done.height, done.whole = c.ascend(at, outer), true
+	c.done[k] = done
+}
+
+// reached notes that what is reached at reaches height deeper, as it did where it was copied, and
+// is over where that is past maxCopied, as copying it there would be.
+func (c *copier) reached(at, height int) {
+	if at+height >= maxCopied {
+		c.overflow()
+		return
+	}
+	c.deepest = max(c.deepest, at+height)
+}
+
+// reachedAgain is reached for done, copied before, unless it is still being copied, as a value
+// holding itself is when it reaches itself.
+func (c *copier) reachedAgain(done kept, at int) {
+	if done.whole {
+		c.reached(at, done.height)
+	} else {
+		c.around()
+	}
+}
+
+// hold counts a value holding others that copy reaches, a map, list, pointer, struct, array or
+// message, each time it reaches one, a message a pointer reaches as well as the pointer, a level
+// below it (holders), and is over once so many are reached around a cycle (around).
+func (c *copier) hold() {
+	if c.holders++; c.cycled && c.holders >= maxCopied {
+		c.overflow()
+	}
+}
+
+// around notes that copy reached a value it is still copying, as a value holding itself does, and
+// is over where it has reached values holding others so often that a path around the cycle could
+// nest past maxCopied in another order: the path it copies around one nests as deep as where it
+// entered it, which turns on the order a map's entries come in, but how often it reaches each such
+// value doesn't, and each level of a path above its deepest value is one of them.
+func (c *copier) around() {
+	if c.cycled = true; c.holders >= maxCopied {
+		c.overflow()
+	}
 }
 
 // set sets the ith element of s, the copy of the slice k knows, and of each copy of it outgrown
@@ -1555,8 +1726,17 @@ func sliceKey(v reflect.Value) copiedKey {
 // longer than it may grow to, so each element is copied once. Each copy is as long as its capacity,
 // so appending to one writes to none of the others.
 func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
-	n, k := v.Len(), sliceKey(v)
+	n, k, at := v.Len(), sliceKey(v), depth-1
 	s := c.slices[k]
+	if s != nil {
+		// An element it reaches that isn't measured holds the slice: it is still being copied, or was
+		// around a cycle.
+		if min(n, s.filled) > s.measured {
+			c.around()
+		}
+		// The elements it copied before reach as much deeper from here.
+		c.reached(at, s.reach(n))
+	}
 	if s == nil || s.out.Len() < n {
 		if s = c.lengthen(v, k, s); s == nil {
 			return reflect.Zero(v.Type())
@@ -1567,9 +1747,13 @@ func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 			switch e := v.Index(i); {
 			case !unreachable(e):
 				s.filled = i + 1
+				outer := c.descend(at)
 				c.set(s, k, i, c.copy(e, depth))
+				s.reached(i, c.ascend(at, outer))
 			case !c.payHeld(e):
 				return reflect.Zero(v.Type())
+			default:
+				s.reached(i, 0)
 			}
 		}
 		s.filled = max(n, s.filled)
@@ -1578,6 +1762,29 @@ func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 		return s.out
 	}
 	return s.out.Slice3(0, n, n)
+}
+
+// reached notes how much deeper than the slice its ith element reaches, copied whole, where those
+// before it were: one copied before them reaches the slice again around a cycle, which leaves the
+// lengths past it unmeasured.
+func (s *copied) reached(i, height int) {
+	if i != s.measured {
+		return
+	}
+	s.measured++
+	if height > s.reach(i) {
+		s.rises = append(s.rises, rise{i, height})
+	}
+}
+
+// reach is how much deeper than the slice its first n elements reach, of those measured.
+func (s *copied) reach(n int) int {
+	n = min(n, s.measured)
+	i, _ := slices.BinarySearchFunc(s.rises, n, func(r rise, n int) int { return cmp.Compare(r.at, n) })
+	if i == 0 {
+		return 0
+	}
+	return s.rises[i-1].height
 }
 
 // lengthen makes s, the copy of v's elements, which k knows, as long as v, holding the host's
@@ -1594,6 +1801,10 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 	// what building a list does, once for where it starts. Each costs at least one, but a byte, so a
 	// slice of more than is left isn't made. Counted once more for each, a list of 100,000 short
 	// strings, which a check converts, couldn't be copied, so a constrained check of it was refused.
+	// Elements of another type are moved whole here before each is copied, and so charged the
+	// structs they hold in place (inlineTenths), as each costs again when copied, and moved only
+	// where what they hold in place costs no more than is left (leastCopied): 2,000 arrays of 4,096
+	// interfaces allocated 133 MB before being found past what a copy holds.
 	elem, made := v.Type().Elem(), uint64(listCost-1)
 	if s != nil {
 		made = 0
@@ -1612,7 +1823,7 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 				return nil
 			}
 		}
-	case !c.building(made, length(n-had)):
+	case !c.building(made, length(n-had)*leastCopied(elem)) || !c.pay(length(n-had)*(inlineTenths(elem)/10)):
 		return nil
 	}
 	switch {
@@ -1640,7 +1851,7 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 		reflect.Copy(s.out.Slice(s.filled, n), v.Slice(s.filled, n))
 	}
 	if shared(elem) {
-		s.filled = n
+		s.filled, s.measured = n, n
 	}
 	return s
 }
@@ -1666,16 +1877,16 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 		k.len = -1
 	}
 	if depth >= maxCopied {
-		if done := c.done[k]; keyed && done.IsValid() {
-			if d, ok := done.Interface().(proto.Message); ok {
-				return d.ProtoReflect()
-			}
-		}
+		c.overflow()
 		return m.New()
 	}
+	// It is measured from what reached it, as a pointer copy gives it, so reaching it again either way
+	// finds how much deeper it reaches alike.
+	at := depth - 1
 	depth++
-	if done := c.done[k]; keyed && done.IsValid() {
-		if d, ok := done.Interface().(proto.Message); ok {
+	if done := c.done[k]; keyed && done.out.IsValid() {
+		if d, ok := done.out.Interface().(proto.Message); ok {
+			c.reachedAgain(done, at)
 			return d.ProtoReflect()
 		}
 	}
@@ -1683,8 +1894,10 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 	if !c.pay(ownCost(m.Descriptor())) {
 		return out
 	}
+	outer := c.descend(at)
+	c.deepest = at + 1
 	if keyed {
-		c.keep(k, reflect.ValueOf(out.Interface()))
+		c.keep(k, reflect.ValueOf(out.Interface()), true)
 	}
 	// Each element of a list, and each key and value of a map, costs one, as converting counts it,
 	// a key a tenth of its bytes more, and each message a field holds one, and what it costs.
@@ -1718,6 +1931,11 @@ func (c *copier) message(m protoreflect.Message, depth int) protoreflect.Message
 	})
 	if unknown := m.GetUnknown(); len(unknown) > 0 && c.pay(length(len(unknown))/10) {
 		out.SetUnknown(slices.Clone(unknown))
+	}
+	if keyed {
+		c.ascendFrom(k, at, outer)
+	} else {
+		c.ascend(at, outer)
 	}
 	return out
 }
@@ -1755,6 +1973,7 @@ func holdsMessages(fd protoreflect.FieldDescriptor) bool {
 func (c *copier) field(fd protoreflect.FieldDescriptor, v protoreflect.Value, depth int) protoreflect.Value {
 	switch fd.Kind() {
 	case protoreflect.MessageKind, protoreflect.GroupKind:
+		c.hold()
 		return protoreflect.ValueOfMessage(c.message(v.Message(), depth))
 	case protoreflect.BytesKind:
 		n := length(len(v.Bytes())) / 10
@@ -1881,9 +2100,9 @@ func textOf(v reflect.Value) int {
 	return v.Len()
 }
 
-// tenths is what copying a value of t, which is flat, whole costs, in tenths: a tenth of each of
-// its bytes, as converting counts bytes, but for a string's, which is one value, as converting
-// counts it, though moving it moves 16 bytes.
+// tenths is what copying a value of t whole costs, in tenths: a tenth of each of its bytes, as
+// converting counts bytes, but for a string's, which is one value, as converting counts it, though
+// moving it moves 16 bytes.
 func tenths(t reflect.Type) uint64 {
 	switch t.Kind() {
 	case reflect.String:
@@ -1901,7 +2120,102 @@ func tenths(t reflect.Type) uint64 {
 	}
 }
 
-var celTimestampType = reflect.TypeFor[types.Timestamp]()
+// inlineTenths is what moving the structs a value of t holds in place whole costs, in tenths
+// (tenths), but times and durations, which converting reads: copying anything else a value holds
+// costs at least one for each 24 bytes moving it moves.
+func inlineTenths(t reflect.Type) uint64 {
+	switch {
+	case t.Kind() == reflect.Struct && t != timeType && t != celTimestampType && t != celDurationType:
+		return tenths(t)
+	case t.Kind() == reflect.Array:
+		return length(t.Len()) * inlineTenths(t.Elem())
+	default:
+		return 0
+	}
+}
+
+var celTimestampType, celDurationType = reflect.TypeFor[types.Timestamp](), reflect.TypeFor[types.Duration]()
+
+// leastCopied is what copying a value of type t costs at the least: one for each 24 bytes it holds
+// in place, and at least one, as each value it holds costs at least one and holds no more, and a
+// byte, or a struct's, a tenth of one (payWhole).
+func leastCopied(t reflect.Type) uint64 { return max(1, uint64(t.Size())/24) }
+
+// keyTenths is what moving a map's key of type t whole costs past what converting a key costs, in
+// tenths (tenths): the bytes of an array or a struct, which converting refuses as a key, and nothing
+// for the rest, which hold no more than 16 in place. Hashing it reads what the strings and
+// interfaces it holds hold too (payHashed).
+func keyTenths(t reflect.Type) uint64 {
+	if t.Kind() == reflect.Array || t.Kind() == reflect.Struct {
+		return tenths(t)
+	}
+	return 0
+}
+
+// payHashed pays for what hashing key, which setting it in the copy does, reads past what reading it
+// moved and its text cost: an array or a struct an interface key holds, which reading it moved none
+// of, a tenth of its bytes in place (keyTenths), and the strings an array or a struct key holds, and
+// what the interfaces it holds hold, a tenth of their bytes (payHashing), as Go hashes a key whole.
+// Charged an array's or a struct's bytes in place alone, a copy of 50 entries keyed by structs each
+// holding a string of 1 MiB took 1.4 ms, charged 167.
+func (c *copier) payHashed(key reflect.Value) bool {
+	if key.Kind() != reflect.Interface {
+		return c.payHashing(key)
+	}
+	if key.IsNil() {
+		return true
+	}
+	key = key.Elem()
+	return c.pay(keyTenths(key.Type())/10) && (key.Kind() == reflect.String || !hashesHeld(key.Type()) || c.payHashing(key))
+}
+
+// payHashing pays a tenth of the bytes of each string v holds in place, and of what each interface it
+// holds holds, in place and in turn, as hashing v reads them (payHashed).
+func (c *copier) payHashing(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.String:
+		return c.pay(length(v.Len()) / 10)
+	case reflect.Interface:
+		if v.IsNil() {
+			return true
+		}
+		e := v.Elem()
+		return c.pay(tenths(e.Type())/10) && (!hashesHeld(e.Type()) || c.payHashing(e))
+	case reflect.Array:
+		for i := range v.Len() {
+			if !c.payHashing(v.Index(i)) {
+				return false
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if f := v.Field(i); hashesHeld(f.Type()) && !c.payHashing(f) {
+				return false
+			}
+		}
+	default:
+	}
+	return true
+}
+
+// hashesHeld reports whether hashing a value of type t reads more than it holds in place: a string's
+// bytes, or what an interface holds, or an array or struct holding either.
+func hashesHeld(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.String, reflect.Interface:
+		return true
+	case reflect.Array:
+		return t.Len() > 0 && hashesHeld(t.Elem())
+	case reflect.Struct:
+		for i := range t.NumField() {
+			if hashesHeld(t.Field(i).Type) {
+				return true
+			}
+		}
+	default:
+	}
+	return false
+}
 
 // shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
 // one holding no map, slice, pointer or interface a copy would share (flat), and a time, whose

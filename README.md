@@ -302,23 +302,27 @@ scopes conditional ones reach, to check one by one.
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
   but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
-  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message.
-  That is about a map of 50,000 short strings, nearly 16,000 maps of one entry each, or nearly
-  40,000 timestamps, and a unit costs about what reading one does, so a check spends no more
-  converting than its conditions may reading, about 20 ms: each map charged one, as a number is, a
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
+  a map of structs, which none reads and reading copies whole, is refused unread at 2 for each
+  entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms. That is about a map of
+  50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
+  unit costs about what reading one does, so a check spends no more converting than its conditions
+  may reading, about 20 ms: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
   empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
-  nor on the order of the kinds. The subject's, the
-  resource's and the request's attributes share that, so attributes a tenant's users write, as a
-  resource's tags, can take every check of the resource past it, where a grant's condition reading
-  an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
-  conditions only what they read. A call reads the subject's and the request's as its first check
-  converted them: change none of them while it runs, as from a hook, as a check after the change can
-  read them as they were, though never another value as one of them. Comparing a double that isn't
-  finite fails, and no list or map a condition reads holds one: building a list or a map holding one
+  nor on the order of the kinds, whether a hook can be given a copy included, below: a loop gives a
+  map's keys in an order of their own. The subject's, the
+  resource's and the request's attributes share what a check converts, so attributes a tenant's
+  users write, as a resource's tags, can take every check of the resource past it, where a grant's
+  condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
+  may store, or pass conditions only what they read. A call reads the subject's and the request's as
+  its first check converted them: change none of them while it runs, as from a hook, as a check
+  after the change can read them as they were, though never another value as one of them.
+  Comparing a double that isn't finite fails, and no list or map a condition reads holds one:
+  building a list or a map holding one
   fails, and an attribute holding one, however deep, is refused, as a declared double that isn't
   finite is, failing whatever reads it, and whatever reads its kind whole; and where no
   declarations cover the kind, none of its attributes can be read, as where they hold anything
@@ -337,9 +341,19 @@ scopes conditional ones reach, to check one by one.
   `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
   element and a map literal 2 for each entry, each time it is built, and a step of a loop 1 more
   for each `&&`, `||` and `?:` it may evaluate, its macro's own among them, which CEL charges a
-  constant or nothing. `contains` costs what reading both strings does, multiplied, and
-  `startsWith` and `endsWith` what reading
-  the shorter does, at least 1 however short or empty either is, and one costing more than a
+  constant or nothing. A loop over a map gives its keys in one order, whatever order the map's
+  entries come in: bools, ints, uints, doubles, strings and then bytes, each by its value, strings
+  and bytes by their bytes, so `{"b": 1, "a": 2}.map(k, k)` is `["a", "b"]`. It gave them in the
+  order Go happened to range over the map, which changes from one evaluation to the next, so over
+  a request's three scopes `request.attributes.scopes.map(k, k)[0] == "read"` held in 55 of 100
+  identical checks, `Explain` disagreeing with the check before it in 51, and a deny's
+  `request.attributes.scopes.filter(k, true)[0] == "admin"` lifted in 84, so a requester could ask
+  until it lifted; and how far `all()` or `exists()` went before it stopped, and so what it cost,
+  turned on it too. Sorting the keys costs, when the loop starts, 1 for each two keys each time
+  their number halves to one, and each key what reading it does past 1, once, and a loop over a
+  map holding more than one key of another type, as a literal keyed by lists can, fails.
+  `contains` costs what reading both strings does, multiplied, and `startsWith` and `endsWith` what
+  reading the shorter does, at least 1 however short or empty either is, and one costing more than a
   condition may fails before it runs: `contains` of one long string the request passes in another
   tries each place in it, which can take a third of a second. A comparison costs reading the
   smaller value, read once, in step with the other, and charged before it runs: measured again
@@ -388,7 +402,13 @@ scopes conditional ones reach, to check one by one.
   a zone an attribute names is bounded 500 higher than before loading it was charged, so a scope's
   conditions that read many may be past a bound as an upgrade leaves them, and costs those 500 at
   each read, so one reading more than about sixteen in a loop, which held once the process had
-  loaded them, fails. Adding to `request.time`, or converting it, was bounded at all a condition
+  loaded them, fails. A loop over a map costs sorting its keys, so one over 500 short keys, which
+  cost about half what a condition may, now costs about two thirds, and one over more than about
+  700 fails the same way, or over more than about 580 keys of 36 bytes, as ids, each costing its
+  bytes once more, as does one over a map literal holding more than one key of another
+  type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
+  so they may be past a bound as an upgrade leaves them. Adding
+  to `request.time`, or converting it, was bounded at all a condition
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
@@ -396,7 +416,14 @@ scopes conditional ones reach, to check one by one.
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
-  whatever grants it; and a condition building a list or a map holding attributes no condition can
+  whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
+  interface, which a hook's copy sets whole and is now charged their bytes, as it charged a struct
+  holding none, or maps keyed by arrays or structs, or by interfaces holding them, whose keys it is
+  now charged the bytes of, and of the strings they hold and what their interfaces hold, as hashing
+  them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as
+  its zero value, and ones holding themselves that reach 20,000 maps, lists, pointers, structs,
+  arrays and messages, counting each time one is reached, however shallow, which were copied
+  whole; and a condition building a list or a map holding attributes no condition can
   read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
@@ -455,8 +482,15 @@ scopes conditional ones reach, to check one by one.
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
   `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
-  more than a check converts, counted alike: where the attributes hold more, the hook can't be
-  asked, and the call is refused as any other, a `DeniedError` of the permission on the resource
+  more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
+  condition reads, along any path, wherever a value reached twice is reached first, nor a value
+  holding itself, as a graph of objects with links back can, that reaches 20,000 maps, lists,
+  pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
+  deep a path around the cycle nests turns on where the copy enters it, which the order a map's
+  entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
+  of them, were copied on one call and refused on the next. Where the attributes hold more, nest
+  deeper or hold themselves so, the hook can't be asked, rather than be given part of them,
+  and the call is refused as any other, a `DeniedError` of the permission on the resource
   asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
   users can write what takes attributes past it, as a resource's tags, and the message named the
   constraint. What one removes from an actor the actor can't hand on, but for a
