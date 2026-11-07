@@ -179,15 +179,20 @@ erDiagram
     rbac_history {
         bigint id PK
         xid8 txid
+        bigint cluster "the cluster that wrote it, system_identifier"
         timestamptz effective_at
         text tenant
         text entity
         text key
-        text op "create, update, delete, expire, baseline, prune"
+        text op "create, update, delete, expire, baseline, prune, commit"
         jsonb before
         jsonb after
         text actor
         text how
+    }
+    rbac_expired {
+        bigint id PK
+        timestamptz until "a time DeleteExpired deleted by"
     }
     rbac_roles ||--o{ rbac_grants : "a custom role's grants"
     rbac_roles ||--o{ rbac_eligibilities : "a custom role's eligibilities"
@@ -198,6 +203,7 @@ erDiagram
     rbac_groups ||--o{ rbac_grants : "granted to"
     rbac_grants ||--o{ rbac_history : "recorded"
     rbac_members ||--o{ rbac_history : "recorded"
+    rbac_expired ||--o{ rbac_history : "recorded, in no tenant"
 ```
 
 - **Built-in roles are not stored.** They are the host's `Config.Catalog`, so a deploy changes
@@ -444,6 +450,12 @@ flowchart LR
 statement, the grants and denies on the tenant its label values are decided by too, apart from the
 conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
 something allows. So a label is decided by the values the subject held as it held its grants.
+`Permissions` decides each permission as a check of it would, by one such read, and the label only
+once the grants give something it decides, so it asks the constraints about values only where a
+check would; and it walks a role's permissions once for each carrier its grants have, and once for
+each carrier and condition its conditional ones have (`permissionsOf`), however many groups grant
+it: once for each grant, a subject in 1,000 groups each granted a role of 1,000 permissions on the
+4 scopes of a path had it read 4 million entries, in 180 ms, against 2,000 in 17.
 
 ```mermaid
 flowchart TB
@@ -1367,7 +1379,11 @@ flowchart TB
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
   the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
-  is named and keyed as a tenant's own is (above), by the schema it migrates.
+  is named and keyed as a tenant's own is (above), by the schema it migrates. Only the role owning
+  the tables migrates them, as a migration makes what it makes its maker's, and from
+  `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
+  role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
 
 ```mermaid
 flowchart TB
@@ -1378,6 +1394,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
+    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
@@ -1667,14 +1684,17 @@ transactions commit after the commit record. The README's
 
 ```mermaid
 flowchart LR
-    admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
+    admin["Administrator's role<br/>runs Migrate, a superuser's as it,<br/>owns the tables, rbac_expired_through<br/>and AsOf's views"]
     histrole["History's role<br/>owns rbac_history, rbac_record<br/>and rbac_history_commit"]
-    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
+    app["Application's role<br/>USAGE on the schema; SELECT, INSERT,<br/>UPDATE and DELETE on the tables but<br/>rbac_history, rbac_expired and rbac_migrations;<br/>EXECUTE on rbac_group_members, rbac_tenant_keys,<br/>rbac_text_array, rbac_changes_grants<br/>and rbac_expired_through; USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
     histrole -->|"inserts"| hist[("rbac_history")]
     app -.->|"SELECT only"| hist
+    app -.->|"SELECT only"| expired[("rbac_expired")]
+    app -->|"DeleteExpired, through<br/>rbac_expired_through, as its owner"| expired
+    expired -->|"rbac_record runs as"| histrole
     admin -->|"PruneHistory"| hist
 ```
 

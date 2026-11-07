@@ -618,7 +618,8 @@ func TestTheApplicationsRoleWritesExpiredOnlyAsDeleteExpiredDoes(t *testing.T) {
 // create in the schema; where it may not but the role migrating owns the schema, which lends it
 // CREATE for the migration alone; and where neither holds, or the role migrating may not SET ROLE to
 // history's role, migrating fails, saying which to fix, and lending nothing, and once fixed gives it.
-// Whatever the schema's default privileges grant, no role may execute it, nor rbac_record, which
+// A superuser's migration fails alike, as it migrates as the role owning the tables, so the hint
+// offers none. Whatever the schema's default privileges grant, no role may execute it, nor rbac_record, which
 // writes history as its owner too, and a change by the application's role commits with its commit
 // record.
 func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
@@ -653,17 +654,22 @@ func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 			}
 			recordMigrations(t, r.adminPool, made)
 			r.harden(t)
-			// Migrating fails, with hint, and leaves history's role no CREATE it was lent.
+			// Migrating fails, with hint, and leaves history's role no CREATE it was lent: as a superuser
+			// too, which migrates as the administrator's role, owning the tables, so the hint offers no
+			// superuser's migration.
+			superuser := superuserOn(t, r.schema)
 			refused := func(where, hint string) {
 				t.Helper()
-				err := rbac.Migrate(ctx, r.adminPool)
-				if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" ||
-					!strings.Contains(pgErr.Message, "rbac_history_commit") || !strings.Contains(pgErr.Hint, hint) {
-					t.Fatalf("migrating where %s: %v", where, err)
-				}
-				var creates bool
-				if err := r.super.QueryRow(ctx, `SELECT has_schema_privilege($1, $2, 'CREATE')`, r.history, r.schema).Scan(&creates); err != nil || creates {
-					t.Fatalf("history's role may create in the schema after migrating failed: %t, %v", creates, err)
+				for _, db := range []rbac.DB{r.adminPool, superuser} {
+					err := rbac.Migrate(ctx, db)
+					if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" ||
+						!strings.Contains(pgErr.Message, "rbac_history_commit") || !strings.Contains(pgErr.Hint, hint) || strings.Contains(pgErr.Hint, "superuser") {
+						t.Fatalf("migrating where %s: %v", where, err)
+					}
+					var creates bool
+					if err := r.super.QueryRow(ctx, `SELECT has_schema_privilege($1, $2, 'CREATE')`, r.history, r.schema).Scan(&creates); err != nil || creates {
+						t.Fatalf("history's role may create in the schema after migrating failed: %t, %v", creates, err)
+					}
 				}
 			}
 			switch c {
@@ -703,6 +709,362 @@ func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 				AND c.txid = (SELECT m.txid FROM rbac_history m WHERE m.entity = 'membership' AND m.key = 'user:u')`).Scan(&commits); err != nil || commits != 1 {
 				t.Errorf("the application's change has %d commit records: %v", commits, err)
 			}
+		})
+	}
+}
+
+// strangers are the package's schema and the views', and the objects in them, that neither the
+// administrator's role nor history's owns: what a migration made as another role.
+func (r *readmeRoles) strangers(t *testing.T) []string {
+	t.Helper()
+	var got []string
+	if err := r.super.QueryRow(t.Context(), `WITH ours AS (SELECT oid FROM pg_roles WHERE rolname IN ($2, $3)),
+		  s AS (SELECT oid, nspname, nspowner FROM pg_namespace WHERE nspname::text IN ($1::text, $1::text || '_as_of'))
+		SELECT ARRAY(SELECT 'schema ' || s.nspname FROM s WHERE s.nspowner NOT IN (SELECT oid FROM ours)
+		  UNION ALL SELECT c.oid::regclass::text FROM pg_class c JOIN s ON s.oid = c.relnamespace WHERE c.relowner NOT IN (SELECT oid FROM ours)
+		  UNION ALL SELECT p.oid::regprocedure::text FROM pg_proc p JOIN s ON s.oid = p.pronamespace WHERE p.proowner NOT IN (SELECT oid FROM ours)
+		  ORDER BY 1)`, r.schema, r.admin, r.history).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// asOf reads as of now as the application's role.
+func (r *readmeRoles) asOf(ctx context.Context, t *testing.T) error {
+	t.Helper()
+	authz, err := rbac.New(r.appPool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var now time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	return authz.AsOf(ctx, "t1", now, func(a *rbac.Authorizer) error {
+		_, err := a.Permissions(ctx, rbac.Subject{Principal: identity("u")}, cluster)
+		return err
+	})
+}
+
+// readsAsOf fails t unless the application's role reads as of a time, and the administrator's makes
+// AsOf's views again.
+func (r *readmeRoles) readsAsOf(t *testing.T) {
+	t.Helper()
+	if err := r.asOf(t.Context(), t); err != nil {
+		t.Errorf("AsOf as the application's role: %v", err)
+	}
+	if _, err := r.adminPool.Exec(t.Context(), `SELECT rbac_as_of_views()`); err != nil {
+		t.Errorf("rbac_as_of_views() as the administrator's role: %v", err)
+	}
+}
+
+// madeViews is the migration that makes AsOf's views, and its version.
+func madeViews(t *testing.T) (string, int) {
+	t.Helper()
+	sqls := migrationSQL(t)
+	for _, name := range slices.Sorted(maps.Keys(sqls)) {
+		if strings.Contains(sqls[name], "CREATE FUNCTION rbac_as_of_views()") {
+			var v int
+			if _, err := fmt.Sscanf(name, "%04d_", &v); err != nil {
+				t.Fatal(err)
+			}
+			return name, v
+		}
+	}
+	t.Fatal("no migration makes AsOf's views")
+	return "", 0
+}
+
+// Only the role owning the package's tables migrates them, as a migration makes what it makes its
+// maker's, and from 0028_as_of_views on checks the schema of AsOf's views against it: a superuser
+// migrates as that role. Where the README's administrator's role migrated part of the way, from
+// where it had made only the first tables, from before AsOf's views or after them, or with one
+// migration pending, a superuser's migration, on transactions of its own or a host's, leaves the
+// package's schema and the views', and every object in them, that role's or history's, and the
+// host's transaction the superuser's again; and the application's role reads as of a time, and the
+// administrator's makes the views again. Migrating as itself, a superuser made what it migrated
+// its own, and failed at the first migration making AsOf's views, whose schema was the
+// administrator's: 0028 where that was pending, and 0033 after it, having made rbac_expired and
+// rbac_expired_through its own.
+func TestASuperuserMigratesTheTablesAsTheirOwner(t *testing.T) {
+	names, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, _ := madeViews(t)
+	after := names[slices.Index(names, made)+1]
+	for _, c := range []struct {
+		from string
+		host bool
+	}{{names[1], false}, {made, false}, {after, false}, {after, true}, {names[len(names)-1], false}} {
+		t.Run(fmt.Sprintf("from %s, on a host's transaction %t", c.from, c.host), func(t *testing.T) {
+			ctx := t.Context()
+			r := newReadmeRoles(t)
+			if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", c.from); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, r.adminPool, c.from)
+			// History's role takes history over once it is made.
+			var history bool
+			if err := r.super.QueryRow(ctx, `SELECT to_regclass($1 || '.rbac_history') IS NOT NULL`, r.schema).Scan(&history); err != nil {
+				t.Fatal(err)
+			}
+			if history {
+				r.harden(t)
+			}
+			superuser := superuserOn(t, r.schema)
+			if c.host {
+				err = pgx.BeginFunc(ctx, superuser, func(tx pgx.Tx) error {
+					if err := rbac.Migrate(ctx, tx); err != nil {
+						return err
+					}
+					var current, session string
+					if err := tx.QueryRow(ctx, `SELECT current_user, session_user`).Scan(&current, &session); err != nil {
+						return err
+					}
+					if current != session {
+						return fmt.Errorf("the host's transaction runs as %s after Migrate, not as %s", current, session)
+					}
+					return nil
+				})
+			} else {
+				err = rbac.Migrate(ctx, superuser)
+			}
+			if err != nil {
+				t.Fatalf("Migrate as a superuser: %v", err)
+			}
+			if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
+				t.Errorf("migrated to %d", v)
+			}
+			if !history {
+				r.harden(t)
+			}
+			if s := r.strangers(t); len(s) > 0 {
+				t.Errorf("a superuser's migration left %v another role's", s)
+			}
+			r.readsAsOf(t)
+		})
+	}
+}
+
+// Where the schema of AsOf's views isn't made, as the README has a superuser make it for the
+// administrator's role, a superuser's migration from before 0028_as_of_views fails there, as that
+// role's does, saying so, and having made nothing its own, and once the schema is made, migrates.
+// Migrating as itself, it made the schema and the views its own, and AsOf, which reads the views of
+// the role owning the tables, refused every read, saying to migrate to a migration recorded.
+func TestASuperuserMakesAsOfsViewsAsTheTablesOwner(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	views := r.schema + "_as_of"
+	if _, err := r.super.Exec(ctx, `DROP SCHEMA `+views); err != nil {
+		t.Fatal(err)
+	}
+	made, version := madeViews(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", made); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, made)
+	r.harden(t)
+	superuser := superuserOn(t, r.schema)
+	err := rbac.Migrate(ctx, superuser)
+	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" ||
+		!strings.Contains(pgErr.Hint, "CREATE SCHEMA "+views+" AUTHORIZATION "+r.admin) {
+		t.Fatalf("Migrate as a superuser where the views' schema isn't made: %v", err)
+	}
+	if v := migratedTo(t, r.adminPool); v != version-1 {
+		t.Errorf("migrated to %d", v)
+	}
+	if s := r.strangers(t); len(s) > 0 {
+		t.Errorf("a superuser's migration that failed left %v another role's", s)
+	}
+	if _, err := r.super.Exec(ctx, `CREATE SCHEMA `+views+` AUTHORIZATION `+r.admin); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, superuser); err != nil {
+		t.Fatalf("Migrate as a superuser once the views' schema is made: %v", err)
+	}
+	if s := r.strangers(t); len(s) > 0 {
+		t.Errorf("a superuser's migration left %v another role's", s)
+	}
+	r.readsAsOf(t)
+}
+
+// Migrate as a role that doesn't own the package's tables and is no superuser is refused, naming
+// the role that does, before it applies anything or takes a lock, so it doesn't wait for another
+// replica's migration first: as the application's role, and as a member of the administrator's,
+// whose migration would make what it makes its own. Each waited for the other replica, and the
+// member's then made its own what it migrated.
+func TestMigrateAsARoleNotOwningTheTablesIsRefused(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	made, version := madeViews(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", made); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, made)
+	r.harden(t)
+	member := "rbac_member_" + strings.ToLower(rand.Text())
+	if _, err := r.super.Exec(ctx, `CREATE ROLE `+member+`; GRANT `+r.admin+` TO `+member); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := r.super.Exec(context.WithoutCancel(ctx), `DROP ROLE `+member); err != nil {
+			t.Errorf("DROP ROLE %s: %v", member, err)
+		}
+	})
+	superuser := superuserOn(t, r.schema)
+	replica, err := superuser.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = replica.Rollback(context.WithoutCancel(ctx)) }()
+	sql, args := rbac.MigrateLock(r.schema)
+	if _, err := replica.Exec(ctx, sql, args...); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgx.ParseConfig(pgtest.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RuntimeParams["search_path"] = r.schema
+	for _, role := range []string{r.app, member} {
+		func() {
+			conn, err := pgx.ConnectConfig(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+			if _, err := conn.Exec(ctx, `SET ROLE `+role); err != nil {
+				t.Fatal(err)
+			}
+			bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := rbac.Migrate(bounded, conn); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), r.admin) {
+				t.Errorf("Migrate as %s, beside another replica's migration: %v", role, err)
+			}
+		}()
+	}
+	if err := replica.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v := migratedTo(t, r.adminPool); v != version-1 {
+		t.Errorf("migrated to %d", v)
+	}
+	if s := r.strangers(t); len(s) > 0 {
+		t.Errorf("a refused migration left %v another role's", s)
+	}
+}
+
+// Where a superuser's migration of the tables the administrator's role owns ran as itself, as
+// before Migrate migrated as the role owning them, what the README says gives back what it made.
+// From before 0028_as_of_views, it made AsOf's views, their schema and rbac_as_of_views its own,
+// and AsOf, which reads only the views of the role owning the tables, refuses every read, saying
+// what a superuser and that role run, and once they have, reads as of a time, as it does where the
+// views' schema is gone; from 0028 on, it failed at 0033, and once given back migrates on. Either
+// way it made rbac_expired and its functions its own, which the README's statements give back, so
+// every object of both schemas is the administrator's role's or history's, and DeleteExpired runs as
+// the application's role. AsOf said to migrate to 0028_as_of_views, which was recorded, as that
+// role, which couldn't run the function, and a superuser's migration failed at 0033 again.
+func TestASuperusersMigrationAsItselfIsGivenBackAsTheReadmeSays(t *testing.T) {
+	names, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, _ := madeViews(t)
+	last := names[len(names)-1]
+	quoted := func(name string) string { return pgx.Identifier{name}.Sanitize() }
+	for _, before := range []bool{true, false} {
+		t.Run(fmt.Sprintf("from before AsOf's views %t", before), func(t *testing.T) {
+			ctx := t.Context()
+			r := newReadmeRoles(t)
+			views := r.schema + "_as_of"
+			// From before the views, whose schema wasn't made for the administrator's role, to the last;
+			// and from after them, as far as the last, which failed.
+			from, to := names[slices.Index(names, made)+1], last
+			if before {
+				if _, err := r.super.Exec(ctx, `DROP SCHEMA `+views); err != nil {
+					t.Fatal(err)
+				}
+				from, to = made, ""
+			}
+			if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", from); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, r.adminPool, from)
+			r.harden(t)
+			superuser := superuserOn(t, r.schema)
+			if err := applyMigrations(ctx, superuser, pgx.ReadCommitted, from, to); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range names {
+				if name >= from && (to == "" || name < to) {
+					if _, err := superuser.Exec(ctx, `INSERT INTO rbac_migrations (version) VALUES ($1::text::integer)`, name[:4]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// The README's statements, as a superuser with the package's schema first on its search_path.
+			for _, sql := range []string{
+				`ALTER TABLE rbac_expired OWNER TO <administrator>`,
+				`ALTER FUNCTION rbac_expired_until() OWNER TO <administrator>`,
+				`ALTER FUNCTION rbac_expired_through(timestamptz) OWNER TO <administrator>`,
+			} {
+				if _, err := superuser.Exec(ctx, strings.ReplaceAll(sql, "<administrator>", r.admin)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// says fails t unless AsOf fails saying to run each of super as a superuser, and then the
+			// function as the administrator's role, and runs them.
+			says := func(super ...string) {
+				t.Helper()
+				err := r.asOf(ctx, t)
+				if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "as that role, with "+r.schema+" first on its search_path, SELECT rbac_as_of_views()") {
+					t.Fatalf("AsOf where the views aren't the administrator's role's: %v", err)
+				}
+				for _, sql := range super {
+					if !strings.Contains(err.Error(), sql) {
+						t.Errorf("AsOf's error doesn't say to run %s: %v", sql, err)
+					}
+					if _, err := r.super.Exec(ctx, sql); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := r.adminPool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if before {
+				says(`DROP SCHEMA IF EXISTS `+quoted(views)+` CASCADE`, `CREATE SCHEMA `+quoted(views)+` AUTHORIZATION `+quoted(r.admin),
+					`ALTER FUNCTION `+quoted(r.schema)+`.rbac_as_of_views() OWNER TO `+quoted(r.admin))
+			} else if err := rbac.Migrate(ctx, superuser); err != nil {
+				t.Fatalf("Migrate as a superuser where its migration as itself failed: %v", err)
+			}
+			if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
+				t.Errorf("migrated to %d", v)
+			}
+			if s := r.strangers(t); len(s) > 0 {
+				t.Errorf("given back as the README says, %v are another role's", s)
+			}
+			r.readsAsOf(t)
+			authz, err := rbac.New(r.appPool, rbac.Config{
+				Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+				ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := authz.DeleteExpired(ctx); err != nil {
+				t.Errorf("DeleteExpired as the application's role: %v", err)
+			}
+			// Where the views' schema is gone, AsOf says to make it again.
+			if _, err := r.super.Exec(ctx, `DROP SCHEMA `+views+` CASCADE`); err != nil {
+				t.Fatal(err)
+			}
+			says(`CREATE SCHEMA ` + quoted(views) + ` AUTHORIZATION ` + quoted(r.admin))
+			r.readsAsOf(t)
 		})
 	}
 }

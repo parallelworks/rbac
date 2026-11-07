@@ -297,6 +297,22 @@ func (h holding) carries(def RoleDefinition, p Permission) bool {
 	return h.Principal.carries(def, p) && (h.Principal.carrier() == "" || !def.Privileged)
 }
 
+// roleCarrier is a grant's role and all carries reads of its principal (Principal.carrier), so
+// grants of one give alike.
+type roleCarrier struct {
+	role    Role
+	carrier PrincipalKind
+}
+
+func (h holding) roleCarrier() roleCarrier { return roleCarrier{h.Role, h.Principal.carrier()} }
+
+// underCondition is a roleCarrier and a condition's expression, so conditional grants of one decide
+// alike on a request.
+type underCondition struct {
+	roleCarrier
+	expression string
+}
+
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
 func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ []Permission, err error) {
 	defer conflicting(&err)
@@ -317,27 +333,28 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 		return nil, err
 	}
 	readingRoles()
-	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give, but on the
-	// tenant the label values and powers to release it holds, which no label of the tenant's decides
-	// (decidedOn).
-	var only func(Permission) bool
-	if r.Labels.asks() {
-		h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels)
-		switch {
-		case err != nil:
-			return nil, err
-		case h.Unsatisfied(r.Labels) == "":
-		case r.Type != TenantScope:
-			return nil, nil
-		default:
-			only = a.labelPermission
-		}
-	}
-	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r), held, ds, roles, nil)
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, nil, a.constrain(ctx, s, r), held, ds, roles, nil)
 	if err != nil {
 		return nil, err
 	}
-	return slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }), nil
+	perms = slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] })
+	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give, but on the
+	// tenant the label values and powers to release it holds, which no label of the tenant's decides
+	// (decidedOn). Decided, as a check decides it, only once a grant gives something the label
+	// decides: so a constraint is asked about the values only where a check would ask too.
+	if !slices.ContainsFunc(perms, func(p Permission) bool { return a.decidedOn(p, r).Labels.asks() }) {
+		return perms, nil
+	}
+	h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels)
+	switch {
+	case err != nil:
+		return nil, err
+	case h.Unsatisfied(r.Labels) == "":
+		return perms, nil
+	case r.Type != TenantScope:
+		return nil, nil
+	}
+	return slices.DeleteFunc(perms, func(p Permission) bool { return !a.labelPermission(p) }), nil
 }
 
 // deciding is what conditions read deciding permissions on a resource for a request, but for its
@@ -406,8 +423,11 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 // a change reads them back in its transaction. It shares shared, where not nil, with the decisions
 // before and after it by the same grants and denies on the same request (runs), and where shared is
 // unevaluated, evaluates no condition: what one decides is in byCondition all the same, as it is
-// whatever the conditions come to. A holding passes held and roles narrowed to what gives values
-// (labeling), so its walk reads each role once.
+// whatever the conditions come to. It walks a role's permissions once for each carrier its
+// unconditional grants have (roleCarrier), and once for each carrier and condition its conditional
+// ones have (underCondition), however many grants hold it, as a subject in a thousand groups each
+// granted the role does. A holding passes held and roles narrowed to what gives values (labeling),
+// so its walk reads those alone.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
 	held []holding, ds []denial, roles book, shared *runs,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
@@ -417,22 +437,30 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	// What the grants give, under a condition or not: all a deny is asked about (listDenies).
 	asked := map[Permission]bool{}
 	var conditional []holding
+	walked := map[roleCarrier]bool{}
+	// Whether a role gives anything kept, read once for all its conditional grants, whatever their
+	// carrier.
+	givesKept := map[Role]bool{}
 	for _, h := range held {
 		def, ok := roles.role(h.Role)
 		switch {
 		case !ok || !def.GrantableOn(r.Type):
 		case h.conditional:
-			readingEntries(len(def.Permissions))
-			gives := false
-			for _, p := range def.Permissions {
-				if kept(p) {
-					gives, asked[p] = true, true
+			gives, read := givesKept[h.Role]
+			if !read {
+				readingEntries(len(def.Permissions))
+				for _, p := range def.Permissions {
+					if kept(p) {
+						gives, asked[p] = true, true
+					}
 				}
+				givesKept[h.Role] = gives
 			}
 			if gives {
 				conditional = append(conditional, h)
 			}
-		default:
+		case !walked[h.roleCarrier()]:
+			walked[h.roleCarrier()] = true
 			readingEntries(len(def.Permissions))
 			for _, p := range def.Permissions {
 				if kept(p) {
@@ -501,7 +529,16 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)
+	// A grant of the role, carrier and condition of one before it decides nothing that one didn't:
+	// it gives the same, its condition has decided each permission on that permission's budget,
+	// which pays for it once (budget.decided), and the constraints and denies were asked.
+	decided := map[underCondition]bool{}
 	for _, h := range conditional {
+		k := underCondition{h.roleCarrier(), h.Condition.Expression}
+		if decided[k] {
+			continue
+		}
+		decided[k] = true
 		def, _ := roles.role(h.Role)
 		readingEntries(len(def.Permissions))
 		for _, p := range def.Permissions {
