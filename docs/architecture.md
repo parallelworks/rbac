@@ -624,9 +624,9 @@ sequenceDiagram
   one and a tenth of its length, 150,000 slices of a byte took 76 ms to copy, and 79,000 JSON texts
   of a byte 80 ms to convert, each read through a `json.Decoder` of its own, which took most of a
   microsecond for each text, so converting parses JSON itself (`jsonParser`). So weighed, a unit
-  took 20 to 145 ns to convert and 25 to 360 ns to copy for a hook, a copied message the most, but
-  a microsecond for a message of the host's own type whose reflection panics, which a copy asks of
-  each (`itself`), whatever held it, a copy
+  took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
+  dynamic one of the host's up to 361, but a microsecond for a message of the host's own type whose
+  reflection panics, which a copy asks of each (`itself`), whatever held it, a copy
   charging a struct a tenth of the bytes it sets whole, and a
   slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
   before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a

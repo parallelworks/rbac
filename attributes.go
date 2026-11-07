@@ -217,9 +217,10 @@ const maxConverted = 2 * maxCheckCost
 // Counted one, as a number is, 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to
 // copy, where as many ints took 12 ms and 6 ms, and counted one and a tenth of their length,
 // 150,000 slices of a byte took a hook 76 ms to copy, and 79,000 JSON texts of a byte a check 80 ms
-// to convert; so weighed, a unit takes 20 to 145 ns to convert and 25 to 360 ns to copy, whatever
-// holds it, a copied message the most, but for a message of the host's own type whose reflection
-// panics, which a copy asks of each (itself), and which took a microsecond a unit.
+// to convert; so weighed, a unit takes 20 to 145 ns to convert and 25 to 400 ns to copy, whatever
+// holds it, a copied message the most, a dynamic one of the host's up to 361, but for a message of
+// the host's own type whose reflection panics, which a copy asks of each (itself), and which took a
+// microsecond a unit.
 const (
 	mapCost     = 8
 	listCost    = 4
