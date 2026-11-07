@@ -448,12 +448,14 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
   converts. Attributes holding a lock of the host's own that isn't a struct, as an integer a pointer
   to which locks and unlocks, were read by its kind and now can't be, failing every condition
-  reading their kind, as no hook can be given them either, below; and a `Value` holding a nil
-  `Struct` or `ListValue`, read as null, is now read as an empty map or list, as CEL reads it, so a
-  condition comparing it with `null`, as a grant's `request.attributes.v == null`, no longer holds,
-  and one reading its size does; but attributes holding a nil `Struct`, `ListValue`, `Timestamp`,
-  `Duration` or `Any` the host passes, read as null, now can't be read, failing every condition
-  reading their kind, a declared one's too, which failed only those reading it. Attributes
+  reading their kind, as no hook can be given them either, below, nor can ones holding an empty
+  slice or map of them, or a nil pointer to one, read as `[]`, `{}` or `null`; and a `Value`
+  holding a nil `Struct` or `ListValue`, read as null, is now read as an empty map or list, as CEL
+  reads it, so a condition comparing it with `null`, as a grant's `request.attributes.v == null`,
+  no longer holds, and one reading its size does; but attributes holding a nil `Struct`,
+  `ListValue`, `Timestamp`, `Duration` or `Any` the host passes, read as null, now can't be read,
+  failing every condition reading their kind, a declared one's too, which failed only those reading
+  it. Attributes
   holding maps, lists, pointers or messages are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a

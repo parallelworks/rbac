@@ -543,7 +543,9 @@ sequenceDiagram
   which locks and unlocks, among them, which a converter refuses too (`hostLock`), as conditions
   read it by its kind: asked only where a value was held in place, a copy copied one alone and in an
   array, and refused one in an array of arrays, so every constrained call was refused for a value
-  conditions read. An empty array holds none of these, and marks a struct never to be copied only
+  conditions read; and a nil one that is a slice or a map, which an interface holds, was shared as
+  other nil ones are (`unreachable`). An empty array holds none of these, and marks a struct never
+  to be copied only
   where it is of a lock (`marks`), as protobuf's own state's of a mutex is, as one of a func marks a
   struct never to be compared, and what it would hold isn't walked. A message's reflection is
   copied as that of a copy of the message (`pointer`), and refused where that isn't of its type. A
@@ -567,7 +569,9 @@ sequenceDiagram
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
   host's own, a list, map or optional of CEL's a host makes, a struct, a lock of the host's own, as
-  no hook can be given it (`hostLock`), another message, a map keyed by a double or a lock or
+  no hook can be given it (`hostLock`), one that is a byte too, in an array or a slice, which is
+  read as a list of them rather than as bytes (`byteKind`), another message, a map keyed by a
+  double or a lock or
   holding two keys read as the same value, and so JSON text naming a member twice
   once unescaped, read through `json.Decoder`'s tokens (`parseJSON`), or a packed message setting a
   field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the

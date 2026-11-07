@@ -438,12 +438,12 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 			return to, height + 1
 		})
 	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
+		if byteKind(t.Elem()) {
 			return c.bytes(v), 1
 		}
 		return c.once(v, func() (ref.Val, int) { return c.list(v) })
 	case reflect.Array:
-		if t.Elem().Kind() == reflect.Uint8 {
+		if byteKind(t.Elem()) {
 			return c.bytes(v), 1
 		}
 		return c.list(v)
@@ -752,9 +752,9 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 	case reflect.Pointer:
 		return refusedType(t.Elem(), outer)
 	case reflect.Slice:
-		return t.Elem().Kind() != reflect.Uint8 && refusedType(t.Elem(), outer)
+		return !byteKind(t.Elem()) && refusedType(t.Elem(), outer)
 	case reflect.Array:
-		return t.Elem().Kind() != reflect.Uint8 && t.Len() > 0 && refusedType(t.Elem(), outer)
+		return !byteKind(t.Elem()) && t.Len() > 0 && refusedType(t.Elem(), outer)
 	case reflect.Map:
 		kt := t.Key()
 		return kt.Kind() != reflect.Interface && !keyType(kt) || refusedType(t.Elem(), outer)
@@ -783,6 +783,12 @@ func keyType(t reflect.Type) bool {
 	}
 	return false
 }
+
+// byteKind reports whether a slice or an array of t is read as bytes: t is a byte, of a type of the
+// host's own too, read by its kind, but a lock (hostLock), which a slice or an array of is read as a
+// list of what it holds, so refused: read as bytes, one in an array or a slice was read where no
+// hook could be given it.
+func byteKind(t reflect.Type) bool { return t.Kind() == reflect.Uint8 && !hostLock(t) }
 
 // hostLock reports whether t, the type of a value or a key the host passes, is a lock (lockType):
 // one of the host's own read by its kind, as an integer a pointer to which spins, is read no more
@@ -2283,7 +2289,9 @@ func unreachable(v reflect.Value) bool {
 	}
 	switch e := v.Elem(); e.Kind() {
 	case reflect.Map, reflect.Pointer, reflect.Slice:
-		return e.IsNil()
+		// A nil one of a type no copy holds, a lock of the host's own, is refused as it is held
+		// directly: shared, an interface holding a nil lock was copied where an array of it wasn't.
+		return e.IsNil() && copyable(e.Type())
 	default:
 		return shared(e.Type())
 	}
@@ -2306,7 +2314,7 @@ func (c *copier) payWhole(v reflect.Value) bool {
 	switch {
 	case t.Kind() == reflect.String:
 		return c.pay(length(v.Len()) / 10)
-	case t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8:
+	case t.Kind() == reflect.Array && byteKind(t.Elem()):
 		return c.pay(length(v.Len()) / 10)
 	case t.Kind() == reflect.Array:
 		if !c.pay(listCost - 1 + length(v.Len())) {

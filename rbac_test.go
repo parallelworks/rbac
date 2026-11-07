@@ -3458,6 +3458,18 @@ type spinLock uint32
 func (*spinLock) Lock()   {}
 func (*spinLock) Unlock() {}
 
+// spinLocks is a lock of the host's own that is a slice, so it can be nil.
+type spinLocks []uint32
+
+func (*spinLocks) Lock()   {}
+func (*spinLocks) Unlock() {}
+
+// byteLock is a lock of the host's own that is a byte, which an array or a slice of holds as bytes.
+type byteLock uint8
+
+func (*byteLock) Lock()   {}
+func (*byteLock) Unlock() {}
+
 // A hook's copy shared a channel or a func with the host where it held one but in a struct's
 // unexported field: a constraint sending on its copy's channel sent on the host's, and calling its
 // func ran the host's closure. And a lock of the host's own, as an integer a pointer to which spins,
@@ -3465,9 +3477,11 @@ func (*spinLock) Unlock() {}
 // arrays, so every constrained call was refused, though conditions read it wherever it lay. Each,
 // and an unsafe pointer, is refused wherever it lies, nil too, alone, in an array, a slice, a map's
 // value or key, a struct's field, or what a pointer or an interface holds, and conditions read none
-// of them, as no hook can be given them; an empty array holds none of them, and is read and copied,
-// and so is the host's own integer that isn't a lock, wherever it lies, but where no condition reads
-// what holds it.
+// of them, as no hook can be given them: an interface holding a nil lock that is a slice gave a
+// hook the lock, where an array of it was refused, and a lock that is a byte, in an array or a
+// slice, was read as bytes. An empty array holds none of them, and is read and copied, and so is
+// the host's own integer that isn't a lock, wherever it lies, but where no condition reads what
+// holds it.
 func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing.T) {
 	ch, x := make(chan int, 1), 1
 	type count uint32
@@ -3503,7 +3517,8 @@ func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing
 	}
 	for name, v := range map[string]any{
 		"a channel": ch, "a nil channel": (chan int)(nil), "a func": func() { x++ }, "a nil func": (func())(nil),
-		"a lock of the host's own": spinLock(1), "an unsafe pointer": unsafe.Pointer(&x),
+		"a lock of the host's own": spinLock(1), "a nil lock of the host's own that is a slice": spinLocks(nil),
+		"a lock of the host's own that is a byte": byteLock(1), "an unsafe pointer": unsafe.Pointer(&x),
 	} {
 		for by, attribute := range held(v) {
 			attributes := map[string]any{"v": attribute, "ok": true}

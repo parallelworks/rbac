@@ -413,7 +413,8 @@ func TestAListOrAPointerOfValuesNoConditionReadsFailsItsConditionsEmptyToo(t *te
 		"a nil message of another type": (*emptypb.Empty)(nil), "an empty slice of messages of another type": []*emptypb.Empty{},
 		"an empty slice of maps keyed by doubles": []map[float64]int{}, "an empty slice of messages of an int": []*intMessage{},
 		"an empty slice of locks of the host's own": []spinLock{}, "a nil pointer to one": (*spinLock)(nil),
-		"an empty map keyed by one": map[spinLock]int{},
+		"an empty map keyed by one": map[spinLock]int{}, "an empty slice of locks of the host's own that are bytes": []byteLock{},
+		"a nil one": []byteLock(nil), "an array of them": [2]byteLock{},
 	} {
 		for _, expr := range []string{`request.attributes.v != 1`, `request.attributes.ok == true`} {
 			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v, "ok": true}); err != nil || evaluated {
