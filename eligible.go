@@ -620,9 +620,11 @@ var restsSQL = `
 // each to the end at its place in $2. Each found by its id: joined to the ends, a plan made while
 // the table was small read it whole. And each one's place looked up by its id in an object of them
 // made once for the statement: looked up among the ends for each, it read the square of their
-// number, 15 seconds under the change's locks for 5,000.
+// number, 15 seconds under the change's locks for 5,000. The object is keyed by each id as a uuid,
+// as the activations are found: keyed by the id's text, one written otherwise, as in capitals, was
+// found and cut to no end at all.
 const cutSQL = `UPDATE rbac_grants g SET updated_by = $3, updated_at = now(),
-	  expires_at = ($2::timestamptz[])[((SELECT jsonb_object_agg(c.i, c.n) FROM unnest($1::text[]) WITH ORDINALITY AS c(i, n)) ->> g.id::text)::int]
+	  expires_at = ($2::timestamptz[])[((SELECT jsonb_object_agg(c.i::uuid, c.n) FROM unnest($1::text[]) WITH ORDINALITY AS c(i, n)) ->> g.id::text)::int]
 	WHERE id = ANY($1::text[]::uuid[])
 	RETURNING ` + grantColumns
 

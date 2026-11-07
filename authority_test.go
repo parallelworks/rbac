@@ -677,13 +677,7 @@ func TestCuttingActivationsShortReadsEachEndOnce(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
 	const n = 500
-	var ids []string
-	if err := h.pool.QueryRow(ctx, `WITH made AS (
-		  INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
-		  SELECT 't1', 'cluster', 'c1', 'user', 'u' || i, 'cluster.sudo', 'activation', $2 FROM generate_series(1, $1) i RETURNING id)
-		SELECT array_agg(id::text ORDER BY id) FROM made`, n, h.now.Add(time.Hour)).Scan(&ids); err != nil {
-		t.Fatal(err)
-	}
+	ids := activationsToCut(t, h, n)
 	ends := make([]time.Time, n)
 	for i := range ends {
 		ends[i] = h.now.Add(time.Duration(n-i) * time.Second)
@@ -733,6 +727,47 @@ func TestCuttingActivationsShortReadsEachEndOnce(t *testing.T) {
 			t.Fatalf("activation %s was cut short to %v, not %v", id, got[id], ends[i])
 		}
 	}
+}
+
+// A change cutting activations short finds each one's end by its id as it finds the activation, as
+// a uuid: by the id's text, one written otherwise, as in capitals, was found but its end wasn't, and
+// it was cut to no end at all, lasting for good.
+func TestCuttingActivationsShortFindsEachEndAsItFindsTheActivation(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ids := activationsToCut(t, h, 2)
+	ends := []time.Time{h.now.Add(time.Minute), h.now.Add(2 * time.Minute)}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, rbac.CutSQL, []string{strings.ToUpper(ids[0]), ids[1]}, ends, "user:host"); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		var until *time.Time
+		if err := tx.QueryRow(ctx, `SELECT expires_at FROM rbac_grants WHERE id = $1::uuid`, id).Scan(&until); err != nil {
+			t.Fatal(err)
+		}
+		if until == nil || !until.Equal(ends[i]) {
+			t.Errorf("activation %s was cut short to %v, not %v", id, until, ends[i])
+		}
+	}
+}
+
+// activationsToCut writes n activations in t1 that last an hour past h.now, and returns their ids
+// in order.
+func activationsToCut(t *testing.T, h *harness, n int) []string {
+	t.Helper()
+	var ids []string
+	if err := h.pool.QueryRow(t.Context(), `WITH made AS (
+		  INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+		  SELECT 't1', 'cluster', 'c1', 'user', 'u' || i, 'cluster.sudo', 'activation', $2 FROM generate_series(1, $1) i RETURNING id)
+		SELECT array_agg(id::text ORDER BY id) FROM made`, n, h.now.Add(time.Hour)).Scan(&ids); err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
 
 // An identity whose membership is made to end sooner, and ends, joins again in none of its groups
