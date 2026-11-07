@@ -54,9 +54,11 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   64-bit hash, so one whose condition shares both with another's of the same grant otherwise is
   refused with `ErrInvalid`. Each has an `ID`, who made it and when, and who last changed it.
 - **Changes:** `Apply` grants and revokes on one scope in one transaction. A revoke removes a
-  role's grants to a principal from a source, or with an `ID`, still naming the role, one grant;
-  revoking and granting a role at once replaces its grants, keeping those granted again as they
-  are.
+  role's grants to a principal from a source, or with an `ID`, still naming the role, one grant.
+  The `ID` is the grant's uuid, matched by value in any spelling PostgreSQL's uuid input reads, as
+  in capitals, without hyphens or in braces, and one that isn't a uuid is refused with
+  `ErrInvalid`, by `DeleteGrants` too. Revoking and granting a role at once replaces its grants,
+  keeping those granted again as they are.
 - **Sources:** a host that manages some grants itself, such as those it syncs from a directory,
   grants them from a `Source` of its own and revokes only those. Listed in `Config.Sources`, only
   the host changes them: `Apply` refuses to grant or revoke from one, and the host writes them with

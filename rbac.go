@@ -501,8 +501,10 @@ func (r Resource) path() []string {
 
 // Binding is one role for one principal, optionally until a time or under a condition.
 type Binding struct {
-	// ID is a stored grant's, set on grants read back. In Change.Revoke, with the grant's role and
-	// principal, it picks that one grant.
+	// ID is a stored grant's, a uuid, set on grants read back. In Change.Revoke and DeleteGrants,
+	// with the grant's role and principal, it picks that one grant, matched by value in any spelling
+	// PostgreSQL's uuid input reads, as in capitals, without hyphens or in braces; one that isn't a
+	// uuid is invalid.
 	ID        string
 	Role      Role
 	Principal Principal
