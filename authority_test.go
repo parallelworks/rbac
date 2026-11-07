@@ -6327,7 +6327,7 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 		c.Catalog = append(slices.Clone(c.Catalog), groupOwner, guardRole)
 	})
 	ctx := t.Context()
-	tables := []string{"rbac_grants", "rbac_denies", "rbac_members", "rbac_eligibilities", "rbac_memberships", "rbac_groups"}
+	tables := []string{"rbac_grants", "rbac_denies", "rbac_members", "rbac_eligibilities", "rbac_memberships", "rbac_groups", "rbac_roles"}
 	// Autovacuum would analyze them as they grow, which invalidates the plans; and their writes are
 	// unrecorded, as growing does.
 	for _, table := range tables {
@@ -6343,7 +6343,7 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 	groups, manager := h.as(t, "groups"), h.as(t, "manager")
 	u, w := h.as(t, "u", "crew"), h.as(t, "w")
 	h.as(t, "v", "sub")
-	h.as(t, "z")
+	z := h.as(t, "z")
 	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{
 		Role:      "cluster.sudo",
 		Principal: identity("u"), Condition: rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`},
@@ -6364,12 +6364,14 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 		  ('t1', 'cluster', 'c2', 'frozen', '{user:y}', '{cluster:grant}')`,
 		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.x', '{cluster:view}', '{cluster}')`,
 		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'user', 'z', 'custom.x')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'z', 'custom.x', 3600)`,
 	} {
 		if _, err := h.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")+`, rbac_roles`); err != nil {
+	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")); err != nil {
 		t.Fatal(err)
 	}
 	activate := func(a *rbac.Authorizer) error {
@@ -6424,6 +6426,13 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 			return a.DeleteEligibility(ctx, manager, cluster, "cluster.sudo", groupOf("team"))
 		}},
 		{"Activate", activate},
+		{"Activate of a custom role", func(a *rbac.Authorizer) error {
+			_, err := a.Activate(ctx, z, cluster, rbac.Activation{Role: "custom.x", Duration: time.Hour, Justification: "on call"})
+			return err
+		}},
+		{"Apply granting a custom role", func(a *rbac.Authorizer) error {
+			return a.Apply(ctx, manager, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "custom.x", Principal: identity("w")}}})
+		}},
 		{"Deactivate", func(a *rbac.Authorizer) error {
 			if err := activate(a); err != nil {
 				return err
@@ -6432,6 +6441,7 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 		}},
 		{"Authorize of a conditional grant", func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, root, cluster) }},
 		{"Explain", func(a *rbac.Authorizer) error { return ignore(a.Explain(ctx, u, root, cluster)) }},
+		{"Explain of a custom role", func(a *rbac.Authorizer) error { return ignore(a.Explain(ctx, z, view, cluster)) }},
 		{"Permissions", func(a *rbac.Authorizer) error { return ignore(a.Permissions(ctx, u, cluster)) }},
 		{"Grantable", func(a *rbac.Authorizer) error { return ignore(a.Grantable(ctx, manager, cluster)) }},
 		{"Holders", func(a *rbac.Authorizer) error { return ignore(a.Holders(ctx, login, cluster)) }},
@@ -6439,6 +6449,7 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 		{"Filter", func(a *rbac.Authorizer) error {
 			return ignore(a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1))
 		}},
+		{"CustomRoles", func(a *rbac.Authorizer) error { return ignore(a.CustomRoles(ctx, "t1")) }},
 		{"Members", func(a *rbac.Authorizer) error { return ignore(a.Members(ctx, "t1", "crew")) }},
 		{"GroupsOf", func(a *rbac.Authorizer) error { return ignore(a.GroupsOf(ctx, "t1", u.Principal)) }},
 		{"Grants", func(a *rbac.Authorizer) error {
@@ -6527,6 +6538,10 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
 		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i, 'user', 'o' || i FROM generate_series(1, 20000) i
 		 UNION ALL SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i, 'group', 'o' || (i + 2) FROM generate_series(1, 20000) i`,
+		// In tenants of their own alone, as a tenant holds at most MaxCustomRoles, which a read of them
+		// all reads by the tenant.
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		 SELECT 's' || (i % 2000), 'custom.r' || i, '{cluster:view,cluster:login}', '{cluster}' FROM generate_series(1, 20000) i`,
 	} {
 		if _, err := h.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
@@ -6541,6 +6556,135 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 				t.Errorf("%s: %d pages, and %d once the tables grew under a plan made while they were small: %s", what, n, many, sql[:min(len(sql), 160)])
 			}
 		}
+	}
+}
+
+// DeletePrincipalEverywhere finds the tenants an identity is in by the indexes leading to it, under
+// a generic plan made while the tables were small: by every statement's plan made then (scansWhole),
+// and beside 20,000 grants, memberships and places in groups of others, as few pages of them as
+// beside a few. With sequential scans on, as it sent the read, the plan read every row of each.
+// Whom eligibilities name as approvers and denies exempt, which no index finds across tenants, it
+// reads a page of each table at a time, in its order: with sequential scans off, a plan read each
+// through a whole index, in its order, ten times as many pages as the table holds. So it does where
+// the host's sessions turn TID scans off: with them off too, a plan read each so, and every place in
+// groups to remove the identity's, which it finds by where they are stored.
+func TestDeletePrincipalEverywhereFindsItsTenantsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
+	for _, session := range []struct{ name, params string }{{"as set", ""}, {"TID scans off", "&enable_tidscan=off"}} {
+		t.Run(session.name, func(t *testing.T) {
+			h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"+session.params), func(c *rbac.Config) { c.OnChange = nil })
+			ctx := t.Context()
+			tables := []string{"rbac_grants", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies"}
+			for _, table := range tables {
+				if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.groups(t, "team")
+			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "w"))
+			h.as(t, "w", "team")
+			if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")); err != nil {
+				t.Fatal(err)
+			}
+			deleting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeletePrincipalEverywhere(ctx, host, identity("w")) }
+			// Not the eligibilities and denies, whose approvers and exemptions it reads, every row of them.
+			scansWhole(ctx, t, h.pool, "DeletePrincipalEverywhere", deleting, tables[:3]...)
+			// The pages of each table the read of its tenants reads, made once before, so its plan is made and
+			// cached, in a transaction it rolls back.
+			read := func() map[string]int64 {
+				t.Helper()
+				pages := map[string]int64{}
+				for range 2 {
+					func() {
+						tx, err := h.pool.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						counting := countingPages(t, tx, tables...)
+						if err := deleting(counting); err != nil {
+							t.Fatal(err)
+						}
+						counting.end(ctx)
+						for _, table := range tables {
+							pages[table] = counting.starting("SELECT tenant FROM rbac_grants WHERE principal = $1", table)
+						}
+					}()
+				}
+				return pages
+			}
+			few := read()
+			for _, q := range []string{
+				`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.login' FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'user', 'o' || i FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_groups (tenant, id) SELECT 's' || i, 'team' FROM generate_series(1, 2000) i`,
+				`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+			 SELECT CASE WHEN i % 10 = 0 THEN 't1' ELSE 's' || (i % 2000 + 1) END, 'team', 'user', 'o' || i FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.sudo', 3600, ARRAY['user:a' || i]
+			 FROM generate_series(1, 20000) i`,
+				`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['user:o' || i], ARRAY['user:a' || i], '{cluster:login}'
+			 FROM generate_series(1, 20000) i`,
+			} {
+				if _, err := h.pool.Exec(ctx, q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			held := relationPages(t, h, currentSchema(t, h))
+			for table, many := range read() {
+				n, most := few[table], 3*few[table]+deeper
+				// Of those whose every row it reads, each page once.
+				if table == "rbac_eligibilities" || table == "rbac_denies" {
+					most += held[table]
+				}
+				if many > most {
+					t.Errorf("finding the tenants an identity is in read %d pages of %s, and %d once the tables grew under a plan made while they were small", n, table, many)
+				}
+			}
+		})
+	}
+}
+
+// DeletePrincipalEverywhere reads the tenants an identity is in as of one moment: where a change
+// committing as it reads them has the identity named in a tenant where it stops approving, that
+// tenant is still found, as at every moment something there named it. Read apart, what names it
+// before the change and whom eligibilities name as approvers after it, the tenant was found by
+// neither, and the identity kept its grant there.
+func TestDeletePrincipalEverywhereReadsItsTenantsAsOfOneMoment(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t2', 'cluster', 'c1', 'user', 'w', 'cluster.login')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 VALUES ('t3', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{user:w}')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// As it reads whom eligibilities name as approvers: w granted in t3, and no longer its approver.
+	rbac.BeforeStatement(t, "approvers @>", true, func() {
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t3', 'cluster', 'c1', 'user', 'w', 'cluster.login')`,
+			`UPDATE rbac_eligibilities SET approvers = '{user:u}' WHERE tenant = 't3'`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, identity("w")); err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	if err := h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(tenant ORDER BY tenant), '{}') FROM rbac_grants WHERE principal = 'user:w'`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if len(left) > 0 {
+		t.Errorf("w still holds grants in %v", left)
 	}
 }
 
@@ -6681,6 +6825,10 @@ func wholeReads(ctx context.Context, t *testing.T, tx pgx.Tx, sql string, args [
 		if slices.Contains(tables, table) {
 			leads := slices.DeleteFunc(slices.Clone(ix.columns), func(c string) bool { return c == "tenant" })
 			switch {
+			// A read of every custom role of a tenant, as a list of them, seeks the tenant alone, which
+			// holds at most MaxCustomRoles.
+			case table == "rbac_roles" && strings.Contains(sql, rbac.EveryCustomRole) &&
+				strings.Trim(tenantEquals.ReplaceAllString(n.IndexCond, ""), "() ") == "" && n.IndexCond != "":
 			case n.Type == "Seq Scan":
 				found["every row of "+table] = true
 			case n.Index != "" && n.IndexCond == "":

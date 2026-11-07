@@ -341,7 +341,7 @@ func (a *Authorizer) expiredBy(ctx context.Context, q DB) error {
 		return nil
 	}
 	var expired *time.Time
-	if err := q.QueryRow(ctx, `SELECT `+expiredUntil+` FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
+	if err := a.queryRowIndexed(ctx, q, `SELECT `+expiredUntil+` FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
 		return err
 	}
 	return a.clock.passed(*expired, false)
@@ -1119,6 +1119,11 @@ type Authorizer struct {
 	// `type:*` may name.
 	permissionTypes map[string]bool
 	unprivileged    map[permissionOn]bool
+	// unprivilegedOn are unprivileged by permission: the types each is given on by a role that isn't
+	// privileged, each a bit of typeBits, so whether a role is privileged reads each of its
+	// permissions once, however many types it is for.
+	unprivilegedOn map[Permission]typeSet
+	typeBits       map[string]int
 	// checked are the permissions the host checks (Config.Permissions), and checkedTypes the
 	// resource types a check may name: those the built-in roles are for and those checked
 	// permissions are for.
@@ -1141,6 +1146,30 @@ type Authorizer struct {
 type permissionOn struct {
 	p Permission
 	t string
+}
+
+// typeSet is a set of the types the built-in roles are for, each a bit (Authorizer.typeBits).
+type typeSet []uint64
+
+func (s typeSet) with(bit int) typeSet {
+	for len(s) <= bit/64 {
+		s = append(s, 0)
+	}
+	s[bit/64] |= 1 << (bit % 64)
+	return s
+}
+
+// within reports whether every type in s is in of.
+func (s typeSet) within(of typeSet) bool {
+	for i, w := range s {
+		if i < len(of) {
+			w &^= of[i]
+		}
+		if w != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // New checks the configuration and returns an Authorizer that runs its queries on db: safe for
@@ -1232,6 +1261,14 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 			}
 		}
 	}
+	typeBits := make(map[string]int, len(resourceTypes))
+	for _, t := range slices.Sorted(maps.Keys(resourceTypes)) {
+		typeBits[t] = len(typeBits)
+	}
+	unprivilegedOn := map[Permission]typeSet{}
+	for on := range unprivileged {
+		unprivilegedOn[on.p] = unprivilegedOn[on.p].with(typeBits[on.t])
+	}
 	permissionTypes := map[string]bool{}
 	for p := range perms {
 		t, _ := p.parts()
@@ -1248,6 +1285,7 @@ func New(db DB, cfg Config) (*Authorizer, error) {
 	return &Authorizer{
 		db: db, cfg: cfg, roles: roles, roleSets: setsOf(roles), containers: containers, containerTypes: slices.Sorted(maps.Keys(containers)),
 		kinds: kinds, owned: owned, permissions: perms, types: resourceTypes, permissionTypes: permissionTypes, unprivileged: unprivileged,
+		unprivilegedOn: unprivilegedOn, typeBits: typeBits,
 		checked: checked, checkedTypes: checkedTypes, conds: conds, labels: labels,
 	}, nil
 }
@@ -1555,12 +1593,15 @@ var (
 	// reads each table by an index, a GIN index through a bitmap, whatever the table held when its
 	// session planned it: one planned generically while a table was small, or by statistics from
 	// then, read every row of it until the plan was invalidated, and for a list read a key at a time
-	// (byKey), every row once for each key.
-	indexed = []setting{{"enable_seqscan", "off"}}
+	// (byKey), every row once for each key. It turns TID scans on, as a host's session may have them
+	// off: rows are found by where they are stored too, places in groups, which have no id, and the
+	// approvers and exemptions DeletePrincipalEverywhere reads by a range of every ctid, which with
+	// them off too a plan read through the whole table, or through a whole index in its order.
+	indexed = []setting{{"enable_seqscan", "off"}, {"enable_tidscan", "on"}}
 )
 
-// unjitted is withoutJIT, with sequential scans off too as indexed has them, but as of a time, as
-// readIndexed.
+// unjitted is withoutJIT, with sequential scans off and TID scans on too as indexed has them, but as
+// of a time, as readIndexed.
 func (a *Authorizer) unjitted() []setting {
 	if a.history != "" {
 		return withoutJIT

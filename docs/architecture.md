@@ -202,7 +202,22 @@ erDiagram
 
 - **Built-in roles are not stored.** They are the host's `Config.Catalog`, so a deploy changes
   them for every tenant at once. Custom roles are a tenant's own, prefixed `custom.`, and give
-  only permissions and types the catalog has.
+  only permissions and types the catalog has. A read derives each as the catalog has it now
+  (`current`), privileged by whether its types are those each of its permissions is unprivileged
+  on, sets of the catalog's types built once (`unprivilegedOn`), so a role of 1,000 permissions for
+  50 types costs 1,000 lookups: each permission looked up with each type, twice, deriving a
+  tenant's 300 such roles took 640 ms. A check, `Activate` and a change read only the custom roles
+  they and the grants they read name, each by its key (`book`), a change's read of its actor's
+  authority with those the roles it grants list, through others too (`listingSQL`), as
+  `holdsRole` walks them, but not those its actor's roles list, of which it reads only their ids
+  (`powerOf`); only a read needing every one reads the tenant's by the tenant
+  (`everyCustomRole`): `CustomRoles` and `Roles`, which list them, `Grantable`, which offers any,
+  `SetRole`, which reads those listing the role and counts them, `DeleteRole`, which refuses a role
+  another lists, and the check of exclusive values, which finds those giving one by their
+  permissions in its statement (`customGivenSQL`), so a role giving none is never read into it.
+  Before, `Activate` read every one, twice, and a change granting a custom role every one for its
+  actor's authority, before its transaction and under its locks: beside 299 roles of 1,000
+  permissions for 50 types, `Activate` of a role of one took 1.2 s, against 7 ms.
 - **A grant is one role to one principal on one scope**, from one source, until one time, under
   one condition. The key index `rbac_grants_key` holds what a check reads, so a check's read of
   grants is an index-only scan. The indexes by scope and by principal lead to both too and hold the
@@ -226,10 +241,26 @@ erDiagram
   the database so, and its removal of the places it ends (`leave`), which deletes each by where it
   is stored, as `restingIn` holds it: matched beside `tenant = $1`, a plan made while the table was
   small read every place in the tenant and for each one every place in the table, 2.6 million pages
-  to remove one member. A plan made while a table fit in a page reads it whole whatever the
-  statement's shape, so only the setting pins it; and the shapes pin what a plan reads with it off,
-  as statistics from a near-empty table count every value as distinct: a key's rows are read in the
-  order of the index leading to it where another leads to the tenant alone (`seekBy`), rows to lock
+  to remove one member. The custom roles a check, `Activate` and a change name are read so a key at
+  a time (`book`, `listingSQL`), and those a read of them all reads by the tenant
+  (`everyCustomRole`): read with them on, beside 40,000 roles of other tenants, `Explain` read 817
+  pages of them, and `Activate` 1,634. `DeletePrincipalEverywhere` finds the tenants an identity is
+  in by the indexes leading to it, its places in groups in the order only the one leading to the
+  principal gives, by `= ANY`, which a plan doesn't take as fixing the principal: by equality, a plan
+  by statistics from a near-empty table skipped through the index leading to the tenant, a descent
+  for each tenant. Whom denies exempt and eligibilities name as approvers, which no index finds
+  across tenants, it reads in the same statement, by a range of every row's `ctid`, which reads each
+  table a page at a time, in its order, as a sequential scan does, and which the setting doesn't
+  plan away: with it off and no such range, each table was read through a whole index, in its order,
+  as it was with TID scans off too, which a host's session can have, so `indexed` turns them on, as
+  every statement finding rows by where they are stored needs: a removal of places in groups, which
+  have no id, read every place with both off. Read in a statement of their own, the tenants were of
+  two moments, and a change between them naming the identity where it stopped approving had that
+  tenant found by neither. A plan made while a table fit
+  in a page reads it whole whatever the statement's shape, so only the setting pins it; and the
+  shapes pin what a plan reads with it off, as statistics from a near-empty table count every value
+  as distinct: a key's rows are read in the order of the index leading to it where another leads to
+  the tenant alone (`seekBy`), rows to lock
   are sorted from what their keys found and locked each by its key (`lockedInOrder`,
   `lockedDenies`), a count of a principal's groups reads its places in no
   order (`groupsBounded`), a typed count reads the scopes' index in its order, up to the count, and names the type too, so the primary key is sought by it, and the denies naming a subject's keys are kept to the types outside their read, so the index of keys finds them (`bindingDenies`), and an upsert
@@ -1030,7 +1061,11 @@ flowchart TB
   lists anyone left able to, as a catalog change can leave them. Which values an actor holds none
   of, and so can't hand on, a change reaching many scopes decides from each path's grants
   (`authorities`), reading each of its roles' permissions once for all of them. Where no dimension
-  is exclusive, nothing is read.
+  is exclusive, nothing is read. Of the tenant's custom roles, the check reads only which values
+  those giving one give, found by their permissions in the statement (`customExclusive`): read
+  whole and derived under the tenant's lock on exclusive values, 299 roles of 1,000 permissions,
+  giving none, had a `SetMemberships` of one member take 600 ms, against 6, while every change in
+  the tenant waited.
 
 ## Transactions and locks
 
@@ -1639,7 +1674,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Permissions`, a check deciding label values and a change's read of its actor's authority read each such deny's permissions once however many permissions they decide, each entry looked up among those the grants give, or for fewer than four compared with each (`listedDenies`); a change, which doesn't know what it will hand on, compares the first three it asks about, and one its actor holds none of (`askingDenies`). So each permission is decided by the denies listing it alone: compared with each permission's, `Permissions` of 300 beside 400 denies of 256 other permissions took 300 ms, and takes 12, and granting a role of 300 beside 368 such denies binding the actor took 350 ms, and takes 36. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
-| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
+| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. A read needing every role of a tenant reads at most these, and every other read those it names, with those they list. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |

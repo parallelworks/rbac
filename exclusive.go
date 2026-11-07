@@ -276,11 +276,11 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 		len(e.Roles)+len(widened) == 0 {
 		return nil
 	}
-	custom, err := a.customRoles(ctx, tx, tenant)
+	custom, err := a.customExclusive(ctx, tx, tenant, gives)
 	if err != nil {
 		return err
 	}
-	maps.Copy(gives, a.exclusiveValues(custom))
+	maps.Copy(gives, custom)
 	// Empty, never nil, which pgx would send as NULL.
 	seeds, redefined := []string{}, []string{}
 	for _, g := range e.Granted {
@@ -311,6 +311,45 @@ func (a *Authorizer) excludes(ctx context.Context, tx pgx.Tx, tenant string, e C
 		who = "the public"
 	}
 	return fmt.Errorf("%w: the change leaves %s able to hold two values of %s, whose values are exclusive", ErrInvalid, who, found[0].Dimension)
+}
+
+// customExclusive reads, on q, the values of exclusive dimensions each custom role of a tenant
+// gives as current reads it, for those giving any. catalog is what each built-in role gives of them,
+// which holds every value a custom role can give. The statement finds them, so a role giving none,
+// however many permissions, is never read here: read whole and derived, a tenant's 300 roles of
+// 1,000 permissions took 600 ms under its lock on exclusive values.
+func (a *Authorizer) customExclusive(ctx context.Context, q DB, tenant string, catalog map[Role][]Permission) (map[Role][]Permission, error) {
+	values := []string{}
+	for _, ps := range catalog {
+		for _, p := range ps {
+			values = append(values, string(p))
+		}
+	}
+	gives := map[Role][]Permission{}
+	if len(values) == 0 {
+		return gives, nil
+	}
+	slices.Sort(values)
+	rows, err := a.queryIndexed(ctx, q, customGivenSQL("$2"), tenant, slices.Compact(values))
+	if err != nil {
+		return nil, err
+	}
+	var role, value string
+	_, err = pgx.ForEachRow(rows, []any{&role, &value}, func() error {
+		gives[Role(role)] = append(gives[Role(role)], Permission(value))
+		return nil
+	})
+	return gives, err
+}
+
+// customGivenSQL is SQL selecting, as (id, value), each custom role of the tenant $1 and each value
+// of the text array values it gives, as current reads it: a role stored for another type too gives
+// no label value. Every role is read by the tenant (everyCustomRole), as no index finds those giving
+// a value, and its permissions unnested only where they hold one.
+func customGivenSQL(values string) string {
+	return `SELECT r.id, p.value FROM (
+		    SELECT id, permissions FROM ` + everyCustomRole + ` AND ` + tenantAloneSQL("resource_types") + ` AND permissions && ` + values + `::text[]
+		  ) r CROSS JOIN LATERAL unnest(r.permissions) AS p(value) WHERE p.value = ANY(` + values + `::text[])`
 }
 
 // conflicts returns up to limit, or with 0 every, conflict of the identities the seeds reach, as
@@ -383,8 +422,7 @@ var (
 	// which IN would hash for each.
 	givenWithCustom = valuesGiven{
 		with: `custom_given(role, value) AS (
-		  SELECT r.id, p.value FROM rbac_roles r CROSS JOIN LATERAL unnest(r.permissions) AS p(value)
-		  WHERE r.tenant = $1 AND p.value = ANY($6::text[]) AND ` + tenantAloneSQL("r.resource_types") + `
+		  ` + customGivenSQL("$6") + `
 		), given(role, value) AS (
 		  SELECT * FROM unnest($5::text[], $6::text[]) UNION ALL SELECT * FROM custom_given
 		), `,

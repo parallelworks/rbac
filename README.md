@@ -170,7 +170,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   anything on or not, keeps the role listed from being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
-  privileged when it gives what only privileged roles do, or changes access.
+  privileged when it gives what only privileged roles do, or changes access. A check, `Activate`
+  and a change read only the custom roles they and the grants they read name, a change with those
+  the roles it grants list, through others too, so the tenant's other roles cost them nothing;
+  `CustomRoles`, `Roles`, `Grantable`, `SetRole` and `DeleteRole` read every one, which
+  `rbac.MaxCustomRoles` bounds.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
@@ -242,7 +246,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   redefining a custom role so that its grants give no value they couldn't, as renaming or narrowing
   it, is never refused. Where a dimension is exclusive, a tenant's changes run in turn, so two can't
   each give one value. The check reads every identity a change reaches, so a grant to the tenant's
-  members or the public reads every member. A subject whose grants could give it two anyway, as
+  members or the public reads every member, and of the tenant's custom roles only which values those
+  giving one give: a role giving none, however large, costs it nothing. A subject whose grants could give it two anyway, as
   after a catalog change, holds none of them, whatever the request, a constraint or a deny removes:
   checks and searches of its labels and of the values themselves refuse it, and it can't hand them
   on, but for those a role it holds lists in `GrantableRoles`, which it grants without holding, as
@@ -1477,24 +1482,32 @@ the package's uses foreign data, so none of the roles needs any.
   spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
-- **Planner settings:** every statement a check, list or change sends on the package's tables, but
-  as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
-  `Conflicts` turn JIT off for theirs. Each sets them in the round trip that sends the statement,
-  several of a change's together, and puts the session's back after it, keeping each meanwhile in a
-  variable of the package's own named for it, as `rbac.enable_seqscan` and `rbac.jit`: a connection
-  plans a statement once for all its runs, and one planned while a table fit in a page read every
-  row of it, whatever the statement's shape, until an analysis had it planned again, as reading a
-  page costs less than descending any index. The statements are written so that, with them off, a
-  plan reaches its rows by key, by the group, the principal, the scope or the id the indexes lead
-  to, whatever the statistics: statistics from a near-empty table count every value as distinct, so
-  an index leading to the tenant looks as few rows to read by the tenant alone as by a key, and a
-  plan for rows sorted in a table's order reads a whole index in that order. A plan made while the
-  tables were small read 3,680 pages of grants, 7,546 of places and 5,772 of eligibilities to delete
-  one group beside 20,000 of each, and `Reachable` 18,744 of grants. The statement deleting a group
-  is planned so too, and with it the foreign key's cascade to its places, which PostgreSQL plans as
-  the first deletion in a session runs it and keeps: a host's own deletion of a group, planned with
-  sequential scans on while the places were few, leaves a plan that reads every one. `Filter`'s
-  condition runs in the host's statement, which the host plans (Lists).
+- **Planner settings:** every statement a check, list or change sends to read the package's tables,
+  but as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
+  `Conflicts` turn JIT off for theirs; and each that finds rows by where they are stored, as places
+  in groups, which have no id, turns TID scans on, should the host's session have them off, as with
+  them off too a plan read every place to remove one. Each sets them in the round trip that sends
+  the statement, several of a change's together, and puts the session's back after it, keeping each
+  meanwhile in a variable of the package's own named for it, as `rbac.enable_seqscan` and
+  `rbac.jit`: a connection plans a statement once for all its runs, and one planned while a table
+  fit in a page read every row of it, whatever the statement's shape, until an analysis had it
+  planned again, as reading a page costs less than descending any index. The statements are written
+  so that, with them off, a plan reaches its rows by key, by the group, the principal, the scope or
+  the id the indexes lead to, whatever the statistics: statistics from a near-empty table count
+  every value as distinct, so an index leading to the tenant looks as few rows to read by the tenant
+  alone as by a key, and a plan for rows sorted in a table's order reads a whole index in that
+  order. A plan made while the tables were small read 3,680 pages of grants, 7,546 of places and
+  5,772 of eligibilities to delete one group beside 20,000 of each, and `Reachable` 18,744 of
+  grants; beside 40,000 custom roles of other tenants, `Explain` and `CustomRoles` read 817 pages of
+  them, and `Activate` 1,634. No index finds whom denies exempt and eligibilities name as approvers
+  across tenants, so `DeletePrincipalEverywhere` reads every row of both, by a range of every row's
+  `ctid`, a page at a time in the table's order, which sequential scans being off doesn't plan away:
+  with them off and no such range, or TID scans off too, a plan read each through a whole index, in
+  its order, ten times the pages the table holds. The statement deleting a group is planned so too,
+  and with it the foreign key's cascade to its places, which PostgreSQL plans as the first deletion
+  in a session runs it and keeps: a host's own deletion of a group, planned with sequential scans on
+  while the places were few, leaves a plan that reads every one. `Filter`'s condition runs in the
+  host's statement, which the host plans (Lists).
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
