@@ -593,8 +593,8 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 			conditions = append(conditions, &InvalidError{Binding: grants[i].Binding, Reason: "only Activate grants from " + SourceActivation})
 		}
 	}
-	check := func(read func(context.Context, DB, string, []Role) (book, error), q DB, errs ...error) (book, error) {
-		roles, err := read(ctx, q, tenant, roleIDs(grants))
+	check := func(q DB, errs ...error) (book, error) {
+		roles, err := a.book(ctx, q, tenant, roleIDs(grants))
 		if err != nil {
 			return book{}, err
 		}
@@ -607,7 +607,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		}
 		return roles, errors.Join(errs...)
 	}
-	roles, err := check(a.tenantBook, a.db, conditions...)
+	roles, err := check(a.db, conditions...)
 	if err != nil {
 		return err
 	}
@@ -652,7 +652,7 @@ func (a *Authorizer) Import(ctx context.Context, actor Principal, tenant string,
 		}
 		// Again under the locks, so a custom role deleted since isn't granted, nor one redefined
 		// since the host was asked about it.
-		now, err := check(a.tenantBook, tx)
+		now, err := check(tx)
 		if err != nil {
 			return ChangeEvent{}, gains{}, err
 		}
@@ -1301,9 +1301,9 @@ func (p power) lists(r Role, condition string) bool {
 }
 
 // authorityOn reads the actor's grants on a resource's path, and the roles they and the call
-// name. With a custom role among them it reads all the tenant's, which a role's GrantableRoles
-// can name, in the statement that reads the grants, as a check reads them: read apart, a grant
-// made and a role narrowed meanwhile could refuse what no moment did.
+// name, with those the call's GrantableRoles name, through others too, in the statement that reads
+// the grants, as a check reads them: read apart, a grant made and a role narrowed meanwhile could
+// refuse what no moment did.
 func (a *Authorizer) authorityOn(ctx context.Context, q DB, actor Subject, on Resource, roles []Role) (authority, error) {
 	aus, err := a.authorities(ctx, q, actor, []Resource{on}, roles)
 	if err != nil {
@@ -1329,13 +1329,16 @@ func (a *Authorizer) authorities(ctx context.Context, q DB, actor Subject, on []
 // (belowSQL): so a change decides where such a deny may stop it by what bound the actor as it held
 // the power it acts by. Read apart, an actor moving in between from a group giving it that power to
 // one a deny exempts passed both reads, though at no moment did it hold the power and escape the
-// deny. It returns the read too.
+// deny. It returns the read too. Of the tenant's custom roles it reads those its grants and roles
+// name and those their GrantableRoles name, each by its key (listedRoles), or with everyRole, all of
+// them, as SetRole reads those listing the role it defines.
 func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, tenant string, on []Resource, roles []Role, with alsoRead,
 ) ([]authority, grantsRead, error) {
-	which := heldTenantRoles
-	if slices.ContainsFunc(roles, isCustom) {
+	which := listedRoles
+	if with.everyRole {
 		which = tenantRoles
 	}
+	with.listing = roles
 	paths, keys := make([][]string, len(on)), map[string]bool{}
 	for i, r := range on {
 		paths[i] = r.path()
@@ -3020,19 +3023,36 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 			if err != nil {
 				return err
 			}
-			rows, err := tx.Query(ctx, `SELECT tenant FROM rbac_grants WHERE principal = $1
+			// What names it, by the indexes leading to the principal, with sequential scans off, as a plan
+			// made while the tables were small read every row of each: its places in the order only
+			// rbac_members_tenants gives, by = ANY, which a plan doesn't read as fixing the principal, as
+			// by equality one skipped through the index leading to the tenant, a descent for each tenant.
+			// And apart, with them on, what names it an approver or exempts it, which no index finds across
+			// tenants, so every row is read, as with them off each table was through a whole index, in its
+			// order.
+			rows, err := queryByIndexes(ctx, tx, `SELECT tenant FROM rbac_grants WHERE principal = $1
 				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1
 				UNION SELECT tenant FROM rbac_memberships WHERE principal = $1
-				UNION SELECT tenant FROM rbac_members WHERE principal = $1
-				UNION SELECT tenant FROM rbac_eligibilities WHERE approvers @> ARRAY[$1::text]
-				UNION SELECT tenant FROM rbac_denies WHERE exempt @> ARRAY[$1::text] ORDER BY tenant LIMIT $2`, p.key(), batch)
+				UNION (SELECT tenant FROM rbac_members WHERE principal = ANY(ARRAY[$1::text]) ORDER BY principal, tenant) ORDER BY tenant LIMIT $2`, p.key(), batch)
 			if err != nil {
 				return err
 			}
-			tenants, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			named, err := pgx.CollectRows(rows, pgx.RowTo[string])
 			if err != nil {
 				return err
 			}
+			if rows, err = tx.Query(ctx, `SELECT tenant FROM rbac_eligibilities WHERE approvers @> ARRAY[$1::text]
+				UNION SELECT tenant FROM rbac_denies WHERE exempt @> ARRAY[$1::text] ORDER BY tenant LIMIT $2`, p.key(), batch); err != nil {
+				return err
+			}
+			approving, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				return err
+			}
+			tenants := slices.Concat(named, approving)
+			slices.Sort(tenants)
+			tenants = slices.Compact(tenants)
+			tenants = tenants[:min(len(tenants), batch)]
 			n = len(tenants)
 			events := make([]ChangeEvent, 0, n)
 			// In tenant order, so two of these for one principal never deadlock; each tenant's exclusive

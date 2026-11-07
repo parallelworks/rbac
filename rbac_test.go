@@ -7878,6 +7878,51 @@ func TestACustomRoleListsAtMostMaxRoleEntries(t *testing.T) {
 	}
 }
 
+// Whether a custom role is privileged is read a permission at a time, against the types each is
+// unprivileged on: so a tenant's 300 roles of 1,000 permissions are listed about as fast for 50
+// types each as for one. Each permission read against each type, twice, the 50 took 680 ms.
+func TestACustomRolesPrivilegeIsReadAPermissionAtATime(t *testing.T) {
+	var perms []rbac.Permission
+	var types []string
+	for i := range 50 {
+		types = append(types, fmt.Sprintf("t%02d", i))
+		for j := range 20 {
+			perms = append(perms, rbac.Permission(fmt.Sprintf("t%02d:v%02d", i, j)))
+		}
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "big", Permissions: perms, ResourceTypes: types})
+	})
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		SELECT 'one', 'custom.r' || i, $1::text[], $2::text[] FROM generate_series(1, 300) i
+		UNION ALL SELECT 'every', 'custom.r' || i, $1::text[], $3::text[] FROM generate_series(1, 300) i`, perms, types[:1], types); err != nil {
+		t.Fatal(err)
+	}
+	took := map[string]time.Duration{}
+	// Each runs first in every other round, so a stretch of load meets both alike.
+	order := []string{"one", "every"}
+	for range 7 {
+		for _, tenant := range order {
+			start := time.Now()
+			roles, err := h.authz.CustomRoles(ctx, tenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d := time.Since(start); took[tenant] == 0 || d < took[tenant] {
+				took[tenant] = d
+			}
+			if len(roles) != 300 || roles[0].Privileged {
+				t.Fatalf("%s: %d roles, the first privileged %t", tenant, len(roles), roles[0].Privileged)
+			}
+		}
+		slices.Reverse(order)
+	}
+	if one, every := took["one"], took["every"]; every > 3*one+20*time.Millisecond {
+		t.Errorf("listing 300 custom roles of %d permissions took %v for one type each and %v for %d", len(perms), one, every, len(types))
+	}
+}
+
 func TestDefiningARoleChecksTheActor(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()

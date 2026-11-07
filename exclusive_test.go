@@ -1412,6 +1412,103 @@ func TestAChangeReachingManyScopesReadsTheActorsRolesForExclusiveValuesOnce(t *t
 	}
 }
 
+// Activate, Import, and a change checking an exclusive dimension, read of a tenant's custom roles
+// only those they name, those their GrantableRoles name, and those giving a value: so beside 298
+// others of 1,000 permissions on 50 types, which give none, each derives as many roles, and reads as
+// many of their entries, as alone. Before, Activate and Import read every role of the tenant twice,
+// Activate taking 1.2 s, half of it holding its locks, the check every one under the tenant's lock
+// on exclusive values, so a SetMemberships of one member took 600 ms, and a change granting a custom
+// role every one twice more for its actor's authority.
+func TestActivateAndAnExclusiveCheckReadNoOtherCustomRole(t *testing.T) {
+	var perms []rbac.Permission
+	var types []string
+	for i := range 50 {
+		types = append(types, fmt.Sprintf("t%02d", i))
+		for j := range 20 {
+			perms = append(perms, rbac.Permission(fmt.Sprintf("t%02d:v%02d", i, j)))
+		}
+	}
+	big := rbac.RoleDefinition{ID: "big", Permissions: perms, ResourceTypes: types}
+	h := grouped(t, withLabels, banks, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), big)
+		c.OnChange = nil
+	})
+	ctx := t.Context()
+	h.groups(t, "team")
+	manager := h.as(t, "manager")
+	u := h.as(t, "u")
+	for _, q := range []string{
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles) VALUES
+		  ('t1', 'custom.x', '{cluster:view}', '{cluster}', '{}'), ('t1', 'custom.lister', '{cluster:view,cluster:grant}', '{cluster}', '{custom.x}')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'team', 'custom.x'), ('t1', 'cluster', 'c1', 'user', 'u', 'custom.lister')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		  VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'custom.x', 3600)`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var derived, entries, n int
+	rbac.SetDerivingRoles(t, func(k int) { derived += k })
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	next := func() rbac.Principal {
+		n++
+		p := identity(fmt.Sprint("p", n))
+		h.as(t, p.ID)
+		return p
+	}
+	calls := []struct {
+		name string
+		call func() error
+	}{
+		{"Activate", func() error {
+			_, err := h.authz.Activate(ctx, u, cluster, rbac.Activation{Role: "custom.x", Duration: time.Hour, Justification: "on call"})
+			return err
+		}},
+		{"SetMemberships", func() error {
+			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity(fmt.Sprint("new", n))}})
+		}},
+		{"ChangeMembers", func() error {
+			return h.authz.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "team", Principal: next()}}, nil)
+		}},
+		{"Apply by a role listing the one it grants", func() error {
+			return h.authz.Apply(ctx, u, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "custom.x", Principal: next()}}})
+		}},
+		{"Import", func() error {
+			return h.authz.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "custom.x", rbac.User, next().ID)})
+		}},
+	}
+	type cost struct{ derived, entries int }
+	read := func() map[string]cost {
+		t.Helper()
+		costs := map[string]cost{}
+		for _, c := range calls {
+			derived, entries = 0, 0
+			if err := c.call(); err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			costs[c.name] = cost{derived, entries}
+			if err := h.authz.Deactivate(ctx, u, cluster, "custom.x"); err != nil {
+				t.Fatal(err)
+			}
+			n++
+		}
+		return costs
+	}
+	alone := read()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+		SELECT 't1', 'custom.r' || i, $1::text[], $2::text[] FROM generate_series(1, 298) i`, perms, types); err != nil {
+		t.Fatal(err)
+	}
+	for name, beside := range read() {
+		if beside != alone[name] {
+			t.Errorf("%s derived %d custom roles and read %d of their entries alone, and %d and %d beside 298 others of %d permissions",
+				name, alone[name].derived, alone[name].entries, beside.derived, beside.entries, len(perms))
+		}
+	}
+}
+
 // What a change's authorities on many scopes find its actor's grants could give two values of an
 // exclusive dimension of, each role's permissions read once for all of them, is what each path's
 // own grants give, in random tenants: grants of roles giving values, conditional ones and those to

@@ -1869,10 +1869,11 @@ type rolesRead int
 const (
 	// namedRoles are those the grants name.
 	namedRoles rolesRead = iota
-	// tenantRoles are all of them, as a role's GrantableRoles can name any.
+	// listedRoles are those the grants name, those alsoRead.listing names and those their
+	// GrantableRoles name, through others too: all a change's authority decides by.
+	listedRoles
+	// tenantRoles are all of them, as Grantable offers any and SetRole reads those listing a role.
 	tenantRoles
-	// heldTenantRoles are all of them where a grant names one.
-	heldTenantRoles
 )
 
 // heldOrDenied is readHeld of the grants, the denies of any permission and the roles alone.
@@ -1905,6 +1906,11 @@ type alsoRead struct {
 	// group of those it is in, ends (lapseSQL): until then its keys, and the denies binding and
 	// exempting it by them, are as read, whatever later time a statement decides at.
 	lapse bool
+	// listing are, with listedRoles, the roles the call names, as a change grants them.
+	listing []Role
+	// everyRole has authoritiesIn read every custom role of the tenant (tenantRoles), as SetRole
+	// reads those listing the role it defines and counts them.
+	everyRole bool
 }
 
 // grantsRead is what readHeld reads.
@@ -2048,13 +2054,19 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	// to read every role of the tenant or look up those the grants name. Those are looked up a key at
 	// a time (byKey): matched to the grants, a plan counting the tenant's roles as a few reads them
 	// all, and as of a time each one's every version, again for each version.
-	customRoles := "rbac_roles WHERE tenant = $1"
+	customRoles, listing := everyCustomRole, ""
+	var named []any
 	switch roles {
 	case namedRoles:
 		customRoles = "(" + byKey(namedCustom("SELECT role FROM held"), "rbac_roles", "id", roleColumns, "tenant = $1") + ") r"
+	case listedRoles:
+		ids := make([]string, len(with.listing))
+		for i, r := range with.listing {
+			ids[i] = string(r)
+		}
+		customRoles, listing = "listing", `, `+listingSQL(namedCustom("SELECT role FROM held UNION ALL SELECT unnest($9::text[])"))
+		named = []any{ids}
 	case tenantRoles:
-	case heldTenantRoles:
-		customRoles += " AND EXISTS (SELECT FROM held WHERE role LIKE '" + CustomPrefix + "%')"
 	}
 	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
 	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
@@ -2144,7 +2156,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		  SELECT id::text, principal, scope, role, expires_at, conditional, false FROM rbac_grants
 		  WHERE `+values+` AND tenant = $1 AND principal = ANY(ARRAY(SELECT k FROM keys WHERE NOT (`+counted("$7", "$8")+`) ORDER BY k))
 		    AND scope = 'tenant:' || $1 AND (expires_at IS NULL OR expires_at > `+decidedAt+`)
-		)`+places+`
+		)`+places+listing+`
 		SELECT 0, id, principal, scope, role, expires_at, conditional, NULL::text[], '', NULL::text[], false, false, NULL::text[], '', '', counts
 		FROM held
 		UNION ALL
@@ -2157,8 +2169,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+changes+`
 		UNION ALL
 		SELECT 7, '', '', '', '', expired, false, NULL, '', NULL, false, false, NULL, '', '', false FROM decided WHERE expired IS NOT NULL
-		ORDER BY 1, 3, 4, 5, 2`,
-		tenant, s.identityKey(), scopes, now, perm, wildcard, counts.public, counts.members); err != nil {
+		ORDER BY 1, 3, 4, 5, 2`, append([]any{tenant, s.identityKey(), scopes, now, perm, wildcard, counts.public, counts.members}, named...)...); err != nil {
 		return grantsRead{}, err
 	}
 	if expired != nil {

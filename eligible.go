@@ -311,7 +311,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	if _, _, err := a.eligible(ctx, a.db, s, on, act, b.ExpiresAt, reached, approving); err != nil {
 		return Grant{}, err
 	}
-	roles, err := a.tenantBook(ctx, a.db, on.Tenant, []Role{act.Role})
+	roles, err := a.book(ctx, a.db, on.Tenant, []Role{act.Role})
 	if err != nil {
 		return Grant{}, err
 	}
@@ -357,7 +357,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 		if err != nil {
 			return ChangeEvent{}, err
 		}
-		now, err := a.tenantBook(ctx, tx, on.Tenant, []Role{act.Role})
+		now, err := a.book(ctx, tx, on.Tenant, []Role{act.Role})
 		if err != nil {
 			return ChangeEvent{}, err
 		}
