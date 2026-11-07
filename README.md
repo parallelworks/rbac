@@ -1402,10 +1402,11 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   plan for rows sorted in a table's order reads a whole index in that order. A plan made while the
   tables were small read 3,680 pages of grants, 7,546 of places and 5,772 of eligibilities to delete
   one group beside 20,000 of each, and `Reachable` 18,744 of grants; beside 40,000 custom roles of
-  other tenants, `Explain` and `CustomRoles` read 817 pages of them, and `Activate` 1,634. But
-  `DeletePrincipalEverywhere` reads whom denies exempt and eligibilities name as approvers with them
-  on, in a statement of its own: no index finds those across tenants, so it reads every row of both,
-  and with them off read each through a whole index, in its order. The statement deleting a group
+  other tenants, `Explain` and `CustomRoles` read 817 pages of them, and `Activate` 1,634. No index
+  finds whom denies exempt and eligibilities name as approvers across tenants, so
+  `DeletePrincipalEverywhere` reads every row of both, by a range of every row's `ctid`, a page at a
+  time in the table's order, which sequential scans being off doesn't plan away: with them off, a
+  plan read each through a whole index, in its order. The statement deleting a group
   is planned so too, and with it the foreign key's cascade to its places, which PostgreSQL plans as
   the first deletion in a session runs it and keeps: a host's own deletion of a group, planned with
   sequential scans on while the places were few, leaves a plan that reads every one. `Filter`'s

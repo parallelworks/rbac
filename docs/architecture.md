@@ -247,9 +247,12 @@ erDiagram
   in by the indexes leading to it, its places in groups in the order only the one leading to the
   principal gives, by `= ANY`, which a plan doesn't take as fixing the principal: by equality, a plan
   by statistics from a near-empty table skipped through the index leading to the tenant, a descent
-  for each tenant. It reads whom denies exempt and eligibilities name as approvers apart, with them
-  on, as no index finds those across tenants: with them off, each table was read through a whole
-  index, in its order. A plan made while a table fit
+  for each tenant. Whom denies exempt and eligibilities name as approvers, which no index finds
+  across tenants, it reads in the same statement, by a range of every row's `ctid`, which reads each
+  table a page at a time, in its order, as a sequential scan does, and which the setting doesn't
+  plan away: with it off, each table was read through a whole index, in its order. Read in a
+  statement of their own, the tenants were of two moments, and a change between them naming the
+  identity where it stopped approving had that tenant found by neither. A plan made while a table fit
   in a page reads it whole whatever the statement's shape, so only the setting pins it; and the
   shapes pin what a plan reads with it off, as statistics from a near-empty table count every value
   as distinct: a key's rows are read in the order of the index leading to it where another leads to

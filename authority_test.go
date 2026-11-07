@@ -6497,10 +6497,13 @@ func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 // a generic plan made while the tables were small: by every statement's plan made then (scansWhole),
 // and beside 20,000 grants, memberships and places in groups of others, as few pages of them as
 // beside a few. With sequential scans on, as it sent the read, the plan read every row of each.
+// Whom eligibilities name as approvers and denies exempt, which no index finds across tenants, it
+// reads a page of each table at a time, in its order: with sequential scans off, a plan read each
+// through a whole index, in its order, ten times as many pages as the table holds.
 func TestDeletePrincipalEverywhereFindsItsTenantsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
 	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), func(c *rbac.Config) { c.OnChange = nil })
 	ctx := t.Context()
-	tables := []string{"rbac_grants", "rbac_memberships", "rbac_members", "rbac_eligibilities"}
+	tables := []string{"rbac_grants", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies"}
 	for _, table := range tables {
 		if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
 			t.Fatal(err)
@@ -6513,7 +6516,7 @@ func TestDeletePrincipalEverywhereFindsItsTenantsByKeyUnderAPlanMadeWhileTheTabl
 		t.Fatal(err)
 	}
 	deleting := func(tx pgx.Tx) error { return h.authz.WithTx(tx).DeletePrincipalEverywhere(ctx, host, identity("w")) }
-	// Not the eligibilities, whose approvers it reads in a statement of its own, every row of them.
+	// Not the eligibilities and denies, whose approvers and exemptions it reads, every row of them.
 	scansWhole(ctx, t, h.pool, "DeletePrincipalEverywhere", deleting, tables[:3]...)
 	// The pages of each table the read of its tenants reads, made once before, so its plan is made and
 	// cached, in a transaction it rolls back.
@@ -6548,17 +6551,68 @@ func TestDeletePrincipalEverywhereFindsItsTenantsByKeyUnderAPlanMadeWhileTheTabl
 		`INSERT INTO rbac_groups (tenant, id) SELECT 's' || i, 'team' FROM generate_series(1, 2000) i`,
 		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
 		 SELECT CASE WHEN i % 10 = 0 THEN 't1' ELSE 's' || (i % 2000 + 1) END, 'team', 'user', 'o' || i FROM generate_series(1, 20000) i`,
-		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
-		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.sudo', 3600 FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'user', 'o' || i, 'cluster.sudo', 3600, ARRAY['user:a' || i]
+		 FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['user:o' || i], ARRAY['user:a' || i], '{cluster:login}'
+		 FROM generate_series(1, 20000) i`,
 	} {
 		if _, err := h.pool.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
 	}
+	held := relationPages(t, h, currentSchema(t, h))
 	for table, many := range read() {
-		if n := few[table]; many > 3*n+deeper {
+		n, most := few[table], 3*few[table]+deeper
+		// Of those whose every row it reads, each page once.
+		if table == "rbac_eligibilities" || table == "rbac_denies" {
+			most += held[table]
+		}
+		if many > most {
 			t.Errorf("finding the tenants an identity is in read %d pages of %s, and %d once the tables grew under a plan made while they were small", n, table, many)
 		}
+	}
+}
+
+// DeletePrincipalEverywhere reads the tenants an identity is in as of one moment: where a change
+// committing as it reads them has the identity named in a tenant where it stops approving, that
+// tenant is still found, as at every moment something there named it. Read apart, what names it
+// before the change and whom eligibilities name as approvers after it, the tenant was found by
+// neither, and the identity kept its grant there.
+func TestDeletePrincipalEverywhereReadsItsTenantsAsOfOneMoment(t *testing.T) {
+	h := setup(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t2', 'cluster', 'c1', 'user', 'w', 'cluster.login')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 VALUES ('t3', 'cluster', 'c1', 'user', 'v', 'cluster.sudo', 3600, '{user:w}')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// As it reads whom eligibilities name as approvers: w granted in t3, and no longer its approver.
+	rbac.BeforeStatement(t, "approvers @>", true, func() {
+		for _, q := range []string{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t3', 'cluster', 'c1', 'user', 'w', 'cluster.login')`,
+			`UPDATE rbac_eligibilities SET approvers = '{user:u}' WHERE tenant = 't3'`,
+		} {
+			if _, err := h.pool.Exec(ctx, q); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err := h.authz.DeletePrincipalEverywhere(ctx, host, identity("w")); err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	if err := h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(tenant ORDER BY tenant), '{}') FROM rbac_grants WHERE principal = 'user:w'`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if len(left) > 0 {
+		t.Errorf("w still holds grants in %v", left)
 	}
 }
 

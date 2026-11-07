@@ -3027,32 +3027,24 @@ func (a *Authorizer) DeletePrincipalEverywhere(ctx context.Context, actor, p Pri
 			// made while the tables were small read every row of each: its places in the order only
 			// rbac_members_tenants gives, by = ANY, which a plan doesn't read as fixing the principal, as
 			// by equality one skipped through the index leading to the tenant, a descent for each tenant.
-			// And apart, with them on, what names it an approver or exempts it, which no index finds across
-			// tenants, so every row is read, as with them off each table was through a whole index, in its
-			// order.
+			// What names it an approver or exempts it no index finds across tenants, so every row is read,
+			// in the table's order, by a range of every ctid, which sequential scans being off doesn't
+			// plan away: with them off, each table was read through a whole index, in its order. In one
+			// statement, so the tenants are of one moment: read apart, a change between the reads naming
+			// it where it stopped approving had that tenant found by neither, and its grant there kept.
 			rows, err := queryByIndexes(ctx, tx, `SELECT tenant FROM rbac_grants WHERE principal = $1
 				UNION SELECT tenant FROM rbac_eligibilities WHERE principal = $1
 				UNION SELECT tenant FROM rbac_memberships WHERE principal = $1
-				UNION (SELECT tenant FROM rbac_members WHERE principal = ANY(ARRAY[$1::text]) ORDER BY principal, tenant) ORDER BY tenant LIMIT $2`, p.key(), batch)
+				UNION (SELECT tenant FROM rbac_members WHERE principal = ANY(ARRAY[$1::text]) ORDER BY principal, tenant)
+				UNION SELECT tenant FROM rbac_eligibilities WHERE ctid >= '(0,0)' AND approvers @> ARRAY[$1::text]
+				UNION SELECT tenant FROM rbac_denies WHERE ctid >= '(0,0)' AND exempt @> ARRAY[$1::text] ORDER BY tenant LIMIT $2`, p.key(), batch)
 			if err != nil {
 				return err
 			}
-			named, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			tenants, err := pgx.CollectRows(rows, pgx.RowTo[string])
 			if err != nil {
 				return err
 			}
-			if rows, err = tx.Query(ctx, `SELECT tenant FROM rbac_eligibilities WHERE approvers @> ARRAY[$1::text]
-				UNION SELECT tenant FROM rbac_denies WHERE exempt @> ARRAY[$1::text] ORDER BY tenant LIMIT $2`, p.key(), batch); err != nil {
-				return err
-			}
-			approving, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				return err
-			}
-			tenants := slices.Concat(named, approving)
-			slices.Sort(tenants)
-			tenants = slices.Compact(tenants)
-			tenants = tenants[:min(len(tenants), batch)]
 			n = len(tenants)
 			events := make([]ChangeEvent, 0, n)
 			// In tenant order, so two of these for one principal never deadlock; each tenant's exclusive
