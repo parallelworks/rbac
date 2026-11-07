@@ -476,8 +476,10 @@ type Record struct {
 	// record before it. AsOf counts it from CommittedAt where that is later.
 	RecordedAt, EffectiveAt time.Time
 	Tenant                  string
-	// Entity is what changed: grant, role, deny, eligibility, membership, group or member, or
-	// history itself, in no tenant, for a prune. Key is which, in the tenant.
+	// Entity is what changed: grant, role, deny, eligibility, membership, group or member; expired, in
+	// no tenant, for a time DeleteExpired deleted by, which every check and change decides no earlier
+	// than, keyed by its row's id, as two rows can hold one time; or history itself, in no tenant, for
+	// a prune. Key is which, in the tenant.
 	Entity, Key string
 	// Op is create, update, delete or expire; baseline, a row written before history was installed,
 	// as migrating found it, dated when it was created, or a role when it last changed, or at the

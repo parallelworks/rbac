@@ -1751,34 +1751,35 @@ func (a *Authorizer) filterKeys(arg func(int) string, of string) string {
 // filterAt is SQL for the time Filter's statement decides at: the call's, or the later time
 // DeleteExpired deleted by that the host's statement sees, as decidedSQL decides a read of a
 // subject. The host runs it later than Filter read the time, by which a run can have removed what
-// ended since. Each use reads it in the statement's snapshot, so all read the same; one older than
-// Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees no run they
-// didn't, so it decides at the call's time, which no later run's removals it sees can mix with.
-// arg numbers Filter's arguments.
+// ended since. Each use reads it in the statement's snapshot, so all read the same, but for a time
+// past the database's clock, which each bounds by the clock as it reads it (expiredUntil); one
+// older than Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees
+// no run they didn't, so it decides at the call's time, which no later run's removals it sees can
+// mix with. arg numbers Filter's arguments.
 func (a *Authorizer) filterAt(arg func(int) string) string {
 	if a.asOf {
 		return arg(4)
 	}
-	return "greatest(" + arg(4) + "::timestamptz, (SELECT max(until) FROM rbac_expired))"
+	return "greatest(" + arg(4) + "::timestamptz, (SELECT " + expiredUntil + " FROM rbac_expired))"
 }
 
-// filterHolding is SQL, after the label's test, and its argument, numbered from arg's first, keeping
-// a row only where Filter's statement decides before lapses, the earliest time after Filter's that
-// the subject's membership, or a place in a group of its own or of a group it is in, ended
-// (alsoRead.lapse); zero is never. The holding is Filter's, which the statement doesn't read. Before
-// then, the subject's keys, and the denies binding and exempting it by them, are at the time the
-// statement decides at (filterAt) what they were at Filter's, and the grants in force then are no
-// more than at Filter's: so a row it keeps, the subject could do p to at Filter's time by the
-// holding and by the grants and denies the statement reads, with what DeleteExpired removed since,
-// which had all ended by then. From then on, as once DeleteExpired has removed the place a deny
-// binds it by and passed over the one that gave it a value, it keeps none, rather than a row its
-// label kept by the holding of one moment and its grants and denies of another: build the
-// condition again. As of a time, it decides at that time.
+// filterHolding is SQL, after the label's test, and its argument, numbered from arg's first,
+// keeping a row only where Filter's statement decides before lapses, the earliest time after
+// Filter's that the subject's keys differ by time alone, as its membership or the latest path to
+// one of its groups ends (alsoRead.lapse); zero is never. The holding is Filter's, which the
+// statement doesn't read. Before then, the subject's keys, and the denies binding and exempting it
+// by them, are at the time the statement decides at (filterAt) what they were at Filter's, and the
+// grants in force then are no more than at Filter's: so a row it keeps, the subject could do p to
+// at Filter's time by the holding and by the grants and denies the statement reads, with what
+// DeleteExpired removed since, which had all ended by then. From then on, as once DeleteExpired has
+// removed the place a deny binds it by and passed over the one that gave it a value, it keeps none,
+// rather than a row its label kept by the holding of one moment and its grants and denies of
+// another: build the condition again. As of a time, it decides at that time.
 func (a *Authorizer) filterHolding(arg func(int) string, first int, lapses time.Time) (string, []any) {
 	if a.asOf || lapses.IsZero() {
 		return "", nil
 	}
-	return " AND (SELECT coalesce(max(until) < " + arg(first) + "::timestamptz, true) FROM rbac_expired)", []any{lapses}
+	return " AND (SELECT coalesce(" + expiredUntil + " < " + arg(first) + "::timestamptz, true) FROM rbac_expired)", []any{lapses}
 }
 
 // filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject
@@ -1907,9 +1908,9 @@ type alsoRead struct {
 	// exempts it only until a time (belowSQL), so a change to a custom role decides whether one may
 	// stop it by what bound it as it held its grants. With ending, whose paths it reads.
 	below bool
-	// lapse is the earliest time after the read's that the subject's membership, or a place in a
-	// group of those it is in, ends (lapseSQL): until then its keys, and the denies binding and
-	// exempting it by them, are as read, whatever later time a statement decides at.
+	// lapse is the earliest time after the read's that the subject's keys differ by time alone
+	// (lapseSQL): until then they, and the denies binding and exempting it by them, are as read,
+	// whatever later time a statement decides at.
 	lapse bool
 }
 
@@ -2033,7 +2034,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	if with.lapse {
 		changes += `
 		UNION ALL
-		SELECT 8, '', '', '', '', ` + lapseSQL("$1", "$2::text") + `, false, NULL, '', NULL, false, false, NULL, '', '', false`
+		SELECT 8, '', '', '', '', ` + lapseSQL + `, false, NULL, '', NULL, false, false, NULL, '', '', false`
 	}
 	forP := read + ` AND ($5 = '' OR $5 = ANY(permissions) OR $6 = ANY(permissions)) AND EXISTS (SELECT FROM keys WHERE ` + counted("$7", "$8") + `)`
 	// In the statement, so they are of the moment its grants are, as are the denies binding it that
@@ -2042,8 +2043,11 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	var places, ends, kept string
 	exempted := keyed("exempt", "SELECT k FROM exempted")
 	exempt, until := ` AND NOT `+exempted, `NULL::timestamptz AS until`
+	if with.ending || with.lapse {
+		places = `, ` + endsSQL("$2::text", decidedAt)
+	}
 	if with.ending {
-		places = `, ` + endsSQL("$2::text", decidedAt) + `, ` + lastingSQL("$1::text", "$2::text")
+		places += `, ` + lastingSQL("$1::text", "$2::text")
 		ends = `
 		UNION ALL
 		SELECT 3, k, '', '', '', e, false, NULL, '', NULL, false, false, NULL, '', '', false FROM ends`
