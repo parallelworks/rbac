@@ -222,7 +222,9 @@ const maxConverted = 2 * maxCheckCost
 // points and allocated, and a copied message built by reflection. Counted one, as a number is,
 // 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where as many ints took
 // 12 ms and 6 ms; so weighed, a unit takes 20 to 115 ns to convert and 25 to 200 ns to copy,
-// whatever holds it, a copied message the most.
+// whatever holds it, a copied message the most, but for times an interface holds each in a zone of
+// the host's own, as parsing text with an offset makes them, about 290 ns, as a copy copies each
+// such zone (copier.zone).
 const (
 	mapCost     = 8
 	listCost    = 4
@@ -1666,11 +1668,8 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		if !c.payWhole(v) {
 			return reflect.Value{}
 		}
-		if zoned(v.Type()) && !global(zoneOf(v)) {
-			out := reflect.New(v.Type()).Elem()
-			out.Set(v)
-			c.rezone(out)
-			return out
+		if zoned(v.Type()) {
+			return c.moved(v)
 		}
 		return v
 	}
@@ -1687,13 +1686,9 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 			}
 			return v
 		}
-		held := c.copy(v.Elem(), depth)
-		if c.over {
-			return reflect.Value{}
-		}
-		out := reflect.New(v.Type()).Elem()
-		out.Set(held)
-		return out
+		// Its copy is set where v lay, which holds it in an interface of v's type: made one here, a
+		// time a copy moved to a zone of its own cost a third allocation in a list of them.
+		return c.copy(v.Elem(), depth)
 	case reflect.Map:
 		if v.IsNil() {
 			return v
@@ -2343,18 +2338,34 @@ func zoned(t reflect.Type) bool { return t == timeType || t == celTimestampType 
 // which a copy holds as it is.
 func global(at *time.Location) bool { return at == time.UTC || at == time.Local }
 
-// zoneOf is the zone of v, a time (zoned), read in place where v is addressable, as reading it
-// otherwise copies it, and as an unexported field of a copy's struct can only be read.
-func zoneOf(v reflect.Value) *time.Location {
+// zoneOf is the zone of v, a time (zoned).
+func zoneOf(v reflect.Value) *time.Location { return timeOf(v).Location() }
+
+// timeOf is v, a time (zoned), as the time it is, read in place where v is addressable, as reading
+// it otherwise copies it.
+func timeOf(v reflect.Value) time.Time {
 	if v.Type() == celTimestampType {
 		v = v.Field(0)
 	}
 	if v.CanAddr() {
 		at, _ := reflect.NewAt(timeType, v.Addr().UnsafePointer()).Interface().(*time.Time)
-		return at.Location()
+		return *at
 	}
 	at, _ := v.Interface().(time.Time)
-	return at.Location()
+	return at
+}
+
+// moved is v, a time (zoned) a copy sets whole, in a zone of the copy's own (zone), or v where its
+// zone is the process's.
+func (c *copier) moved(v reflect.Value) reflect.Value {
+	at := timeOf(v)
+	if global(at.Location()) {
+		return v
+	}
+	if v.Type() == celTimestampType {
+		return reflect.ValueOf(types.Timestamp{Time: c.zone(at)})
+	}
+	return reflect.ValueOf(c.zone(at))
 }
 
 // zone is t, a time of the host's, in a zone of the copy's own, one for each zone of the host's own

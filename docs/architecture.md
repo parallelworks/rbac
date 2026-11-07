@@ -650,7 +650,8 @@ sequenceDiagram
   array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
   times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
   as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
-  for a hook, whatever held it, a copy charging a struct a tenth of the bytes it sets whole, and
+  for a hook, whatever held it, but for times an interface holds each in a zone of the host's own,
+  as parsing text with an offset makes them, 290 ns, as a copy copies each such zone, a copy charging a struct a tenth of the bytes it sets whole, and
   each of its fields at least a tenth, as finding what it costs and whether it shares it walks each,
   found once for each type (`typeFact`), and none of the types an empty array would hold: walked for
   each value, and along each path through such arrays, a copy of 10,000 structs of 4,000 empty
