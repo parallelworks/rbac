@@ -182,8 +182,8 @@ BEGIN
             RAISE EXCEPTION 'rbac_history_commit, which writes history as its owner, can''t be given to %, which owns rbac_record: % may not SET ROLE to it, or it has no CREATE on schema %',
                 owner, current_user, here USING ERRCODE = 'insufficient_privilege',
                 HINT = CASE WHEN pg_catalog.has_schema_privilege(owner, here, 'CREATE')
-                    THEN pg_catalog.format('Grant %s to %I with the SET option, or migrate as a superuser, and migrate again.', owner, current_user)
-                    ELSE pg_catalog.format('Grant %s CREATE on schema %I, or migrate as a superuser, and migrate again.', owner, here) END;
+                    THEN pg_catalog.format('Grant %s to %I with the SET option, and migrate again.', owner, current_user)
+                    ELSE pg_catalog.format('Grant %s CREATE on schema %I, and migrate again.', owner, here) END;
         END;
         IF lent THEN
             EXECUTE pg_catalog.format('REVOKE CREATE ON SCHEMA %I FROM %s', here, owner);
