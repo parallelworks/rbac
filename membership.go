@@ -1023,7 +1023,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 	if err := byIndexes(ctx, tx, slices.Concat(
 		[]statement{removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ended,
 			lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes)},
-		a.unapproving(tenant, principals, &unapproved, &e.Eligible),
+		a.unapproving(tenant, principals, nil, &unapproved, &e.Eligible),
 		[]statement{
 			removing(a, "rbac_denies", denyColumns, collectDenies, &e.DeletedDenies,
 				anyOf("ctid", byKey("$2", "rbac_denies", "scope", "ctid", "tenant = $1")), tenant, scopes),
@@ -1032,7 +1032,7 @@ func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string,
 			// names one of them: none of them is empty.
 			removing(a, "rbac_denies", denyColumns, collectDenies, &named,
 				naming("principals", "$2")+" AND principals <@ $2::text[]", tenant, principals),
-			unexempting(tenant, actor, principals, true, &e.Denies),
+			unexempting(tenant, actor, principals, true, nil, &e.Denies),
 			removing(a, "rbac_members", memberColumns, collectMembers, &e.Left,
 				lockedByKeys("rbac_members", "ctid", placeOrder, "group_id", "principal"), tenant, ids, principals),
 			removing(a, "rbac_groups", groupColumns, collectGroups, &e.DeletedGroups, "tenant = $1 AND id = ANY($2::text[])", tenant, ids),
@@ -1112,9 +1112,13 @@ func anyOf(key string, selects ...string) string {
 // waited for that change would pass over it. Matched to the denies in a semi-join instead, a plan
 // can read the table whole. Not by its scope too, which rbac_denies_scope would seek, reading every
 // deny on the scope for each.
-func lockedDenies(selects ...string) string {
-	return `SELECT FROM (SELECT DISTINCT ` + denyKey + ` FROM (` + strings.Join(selects, " UNION ALL ") + ` OFFSET 0) u ORDER BY ` + denyOrder + `) k
-		CROSS JOIN LATERAL (SELECT FROM rbac_denies d
+func lockedDenies(selects ...string) string { return lockedDeniesSelecting("", selects...) }
+
+// lockedDeniesSelecting is lockedDenies selecting out of each deny it locks, SQL of d.ctid, its
+// version locked.
+func lockedDeniesSelecting(out string, selects ...string) string {
+	return `SELECT ` + out + ` FROM (SELECT DISTINCT ` + denyKey + ` FROM (` + strings.Join(selects, " UNION ALL ") + ` OFFSET 0) u ORDER BY ` + denyOrder + `) k
+		CROSS JOIN LATERAL (SELECT d.ctid FROM rbac_denies d
 		  WHERE d.tenant = k.tenant AND d.scope_type = k.scope_type AND d.scope_id = k.scope_id AND d.id = k.id FOR UPDATE) d`
 }
 

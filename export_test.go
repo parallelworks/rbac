@@ -570,6 +570,15 @@ func SetDerivingRoles(t *testing.T, f func(n int)) {
 	t.Cleanup(func() { derivingRoles = old })
 }
 
+// SetReadingDenies runs f each time a decision reads n entries of a deny's permissions, comparing
+// them with a permission or indexing them, until t ends.
+func SetReadingDenies(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := readingDenies
+	readingDenies = f
+	t.Cleanup(func() { readingDenies = old })
+}
+
 // SetMatchingKeys runs f each time Holders' read of its identities' label values looks n keys up to
 // find the denies binding them, until t ends.
 func SetMatchingKeys(t *testing.T, f func(n int)) {

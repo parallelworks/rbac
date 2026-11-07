@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,6 +257,8 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := []string{
+				"rbac_expired_through search_path=pg_catalog, pg_temp",
+				"rbac_expired_until search_path=pg_catalog, pg_temp",
 				"rbac_group_members enable_seqscan=off",
 				"rbac_history_append_only search_path=pg_catalog, pg_temp",
 				"rbac_history_commit search_path=pg_catalog, pg_temp, plan_cache_mode=force_generic_plan, enable_seqscan=off",
@@ -264,6 +267,283 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 			}
 			if !slices.Equal(settings, want) {
 				t.Errorf("the package's functions are set as %q, want %q", settings, want)
+			}
+		})
+	}
+}
+
+// Migrating to 0032 records what rbac_expired holds, as its baseline, each row by the id it gives
+// it, brings a time there past the database's clock back to it, recorded as an update, and leaves
+// each role that could write the table only SELECT on it, and rbac_expired_through in its place,
+// and no role any privilege on the id's sequence, which the schema's default privileges grant the
+// application's role as it is made: the application's role, hardened as the README said before,
+// runs DeleteExpired as before with no step of its own, and the latest time it wrote stands no
+// later than the database's clock.
+func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	var before time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	past, future := before.Add(-time.Hour).Truncate(time.Second), before.AddDate(1, 0, 0).Truncate(time.Second)
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1), ($2)`, past, future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.adminPool.Exec(ctx, `ALTER DEFAULT PRIVILEGES IN SCHEMA `+r.schema+` GRANT ALL ON SEQUENCES TO `+r.app); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	var times []time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT array_agg(until ORDER BY until) FROM rbac_expired`).Scan(&times); err != nil {
+		t.Fatal(err)
+	}
+	var after time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if len(times) != 2 || !times[0].Equal(past) || times[1].Before(before) || times[1].After(after) {
+		t.Fatalf("rbac_expired holds %v once migrated, not %v and the time it migrated at", times, past)
+	}
+	kept, brought := expiredID(t, r.appPool, past), expiredID(t, r.appPool, times[1])
+	want := []expiredRecord{
+		{kept, expiredTime(past), "baseline", "Migrate", r.admin},
+		{brought, expiredTime(future), "baseline", "Migrate", r.admin},
+		{brought, expiredTime(times[1]), "update", "Migrate", r.admin},
+	}
+	if got := expiredRecords(t, r.appPool); !slices.Equal(got, want) {
+		t.Errorf("history records rbac_expired as %q, want %q", got, want)
+	}
+	var writes, reads, executes, public, numbers bool
+	if err := r.super.QueryRow(ctx, `SELECT has_table_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER'),
+		has_table_privilege($1, $2 || '.rbac_expired', 'SELECT'),
+		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
+		has_function_privilege('public', $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
+		has_sequence_privilege($1, pg_get_serial_sequence($2 || '.rbac_expired', 'id'), 'USAGE, SELECT, UPDATE')`,
+		r.app, r.schema).Scan(&writes, &reads, &executes, &public, &numbers); err != nil {
+		t.Fatal(err)
+	}
+	if writes || !reads || !executes || public || numbers {
+		t.Errorf("once migrated, the application's role writes rbac_expired %t, reads it %t and executes rbac_expired_through %t, every role executes it %t, and the application's role uses the id's sequence %t",
+			writes, reads, executes, public, numbers)
+	}
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(r.appPool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); err != nil || n != 1 {
+		t.Errorf("DeleteExpired on the application's role once migrated removed %d rows: %v", n, err)
+	}
+}
+
+// A role holding INSERT and UPDATE on rbac_expired's column alone, not on the table, which a revoke
+// of the table's privileges from the roles holding them never reaches, holds neither once migrated
+// to 0032, and executes rbac_expired_through in place of its INSERT, as a role holding the table's
+// does.
+func TestMigratingTakesTheWritesOfExpiredsColumnToo(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	for _, sql := range []string{
+		`REVOKE INSERT, UPDATE, DELETE ON rbac_expired FROM ` + r.app,
+		`GRANT INSERT (until), UPDATE (until) ON rbac_expired TO ` + r.app,
+	} {
+		if _, err := r.adminPool.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	const write = `INSERT INTO rbac_expired (until) VALUES (clock_timestamp() - interval '1 hour')`
+	if _, err := r.appPool.Exec(ctx, write); err != nil {
+		t.Fatalf("by its column's INSERT, before migrating: %v", err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	var writes, executes bool
+	if err := r.super.QueryRow(ctx, `SELECT has_any_column_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE'),
+		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE')`, r.app, r.schema).Scan(&writes, &executes); err != nil {
+		t.Fatal(err)
+	}
+	if writes || !executes {
+		t.Errorf("once migrated, the application's role writes rbac_expired's column %t and executes rbac_expired_through %t", writes, executes)
+	}
+	if _, err := r.appPool.Exec(ctx, write); sqlState(err) != "42501" {
+		t.Errorf("once migrated, the application's role wrote rbac_expired by its column's INSERT: %v", err)
+	}
+}
+
+// A trigger on rbac_expired that runs a function a role other than the table's owner or a
+// superuser owns, as a role holding TRIGGER on it could have made, which the README's roles never
+// do, would run that role's code as the table's owner once rbac_expired_through writes the table,
+// whoever calls it: migrating to 0032 refuses it, having changed nothing, and goes on once it is
+// dropped, beside triggers whose functions the table's owner and a superuser own, which run only
+// what they wrote.
+func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	// As a superuser: the application's role, which may make no function, can't here.
+	for _, sql := range []string{
+		`CREATE FUNCTION ` + r.schema + `.planted() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`ALTER FUNCTION ` + r.schema + `.planted() OWNER TO ` + r.app,
+		`CREATE TRIGGER planted BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.planted()`,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42501" ||
+		!strings.Contains(err.Error(), "trigger planted runs planted(), which "+r.app+" owns") {
+		t.Fatalf("migrating with a trigger on rbac_expired running the application's role's function: %v", err)
+	}
+	var applied int
+	var through bool
+	if err := r.adminPool.QueryRow(ctx, `SELECT max(version), to_regprocedure('rbac_expired_through(timestamptz)') IS NOT NULL
+		FROM rbac_migrations`).Scan(&applied, &through); err != nil || applied != 31 || through {
+		t.Fatalf("migrating, refused, applied up to %d and made rbac_expired_through %t: %v", applied, through, err)
+	}
+	for _, sql := range []string{
+		`DROP TRIGGER planted ON ` + r.schema + `.rbac_expired`,
+		`CREATE FUNCTION ` + r.schema + `.owners() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`ALTER FUNCTION ` + r.schema + `.owners() OWNER TO ` + r.admin,
+		`CREATE TRIGGER owners BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.owners()`,
+		`CREATE FUNCTION ` + r.schema + `.superusers() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`CREATE TRIGGER superusers BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.superusers()`,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("migrating once the trigger is dropped: %v", err)
+	}
+}
+
+// Code from 0032_expired_writes on, run before it is applied, fails DeleteExpired as ErrInvalid,
+// saying to migrate, as each of its batches calls rbac_expired_through, rather than as a call to a
+// function that doesn't exist, with PostgreSQL's hint to cast its arguments; and removes nothing.
+func TestDeleteExpiredBeforeItsMigrationSaysToMigrate(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "0032_expired_writes") || n != 0 {
+		t.Errorf("DeleteExpired before 0032_expired_writes is applied removed %d rows: %v", n, err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants`).Scan(&left); err != nil || left != 1 {
+		t.Errorf("%d grants left: %v", left, err)
+	}
+}
+
+// A batch of DeleteExpired of the code before 0032 locks rbac_expired as its statement begins, and
+// writes history only as it ends, as the triggers recording what it removes fire, and a change
+// reads rbac_expired before it writes, and history as it does: migrating, which locked history first
+// and then waited for the table, deadlocked with such a batch in flight, which waited for history,
+// until one of them gave way, and adding the table's id, which locks it against reads too, would have
+// with a change. Here a transaction stands in for each: it writes rbac_expired, or reads it, and
+// once migrating, on a host's transaction that waits for locks as long as it takes, waits for it,
+// removes a grant, which history records, and commits. Both go on.
+func TestMigratingToExpiredWritesWaitsForABatchOfTheCodeBefore(t *testing.T) {
+	for name, first := range map[string]string{
+		"a batch":  `INSERT INTO rbac_expired (until) VALUES (clock_timestamp() - interval '1 hour')`,
+		"a change": `SELECT max(until) FROM rbac_expired`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			pool := pgtest.Open(t, "")
+			if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", "0032"); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, pool, "0032")
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login')`); err != nil {
+				t.Fatal(err)
+			}
+			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			batch, err := pool.Begin(bounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = batch.Rollback(context.WithoutCancel(ctx)) }()
+			var pid int32
+			if err := batch.QueryRow(bounded, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := batch.Exec(bounded, first); err != nil {
+				t.Fatal(err)
+			}
+			host, err := pool.Begin(bounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := host.Exec(bounded, `SET LOCAL lock_timeout = 0`); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- rbac.Migrate(bounded, host) }()
+			for waiting := false; !waiting; {
+				select {
+				case err := <-done:
+					t.Fatalf("migrating didn't wait for %s: %v", name, err)
+				default:
+					if err := pool.QueryRow(bounded, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`,
+						pid).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if _, err := batch.Exec(bounded, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:y'`); err != nil {
+				t.Errorf("%s, as migrating waited for it: %v", name, err)
+			}
+			if err := batch.Commit(bounded); err != nil {
+				t.Errorf("%s's commit: %v", name, err)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("migrating beside %s: %v", name, err)
+			}
+			if err := host.Commit(bounded); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
