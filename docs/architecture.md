@@ -1437,7 +1437,16 @@ flowchart TB
   the tables migrates them, as a migration makes what it makes its maker's, and from
   `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
   role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
-  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after,
+  where its login may set its role to that one, as PostgreSQL checks it against the login, and is
+  refused as `ErrInvalid` too where it may not. It decides again once it holds the lock, before it
+  reads what is applied, as the replica it waited for can have made the tables, or given them to
+  another role, meanwhile: it reads the tables' owner by name at the statement's snapshot, as
+  `to_regclass` reads the session's catalog cache, which keeps what it read before the lock until
+  the session takes a relation's lock, which the advisory lock isn't. Where none are made, a
+  superuser makes them as the schema's owner, or the database's where `pg_database_owner` owns the
+  schema, as it does `public`, unless that is a superuser too, so its first migration of the
+  administrator's schema leaves them that role's, as that role's own would.
 
 ```mermaid
 flowchart TB
@@ -1448,7 +1457,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
+    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```

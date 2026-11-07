@@ -1073,7 +1073,10 @@ have the server load a library or run a program of its choosing; and:
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
    disable the triggers that record them. Once they are made, `Migrate` as another role is refused,
-   but as a superuser, which migrates as that role ([Running it](#running-it), Tables). A later
+   but as a superuser, which migrates as that role ([Running it](#running-it), Tables). That role
+   owns the package's schema too, which a superuser makes for it,
+   `CREATE SCHEMA <schema> AUTHORIZATION <administrator>`: where none of the tables are made, a
+   superuser's migration makes them as the schema's owner, so it makes them that role's too. A later
    migration can change history too, so the administrator's role keeps both owners' rights. It
    owns the schema of `AsOf`'s views too, named
    as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
@@ -1182,7 +1185,17 @@ the package's uses foreign data, so none of the roles needs any.
   each migration as that role, by `SET LOCAL ROLE`, and is itself again after: a superuser's
   migration makes and checks what that role's own would, and fails where that one's would, as
   where it may not make the views' schema or give `rbac_history_commit` to history's role, saying
-  what to do. A tool of the host's own applies them as that role too. Before this release, a
+  what to do. A tool of the host's own applies them as that role too. `Migrate` decides so again
+  once it holds the schema's lock, before it reads what is applied, as the replica it waited for
+  can have made the tables, or given them to another role, meanwhile. A superuser's migration sets
+  its role to the one owning the tables, which PostgreSQL lets a session do only where its login
+  may: a superuser whose login may not, as one whose login is no superuser but sets its role to a
+  superuser role, is refused as `rbac.ErrInvalid` too, saying to migrate as that role. Where none
+  are made yet, the role migrating makes them, and owns them, but a superuser makes them as the
+  schema's owner, or the database's where `pg_database_owner` owns the schema, as it does `public`
+  from PostgreSQL 15 on, unless that is a superuser too: so where the administrator's role owns
+  the package's schema, a superuser's first migration makes them that role's, as that role's own
+  would, rather than its own, which that role couldn't migrate. Before this release, a
   superuser's migration of tables another role owned ran as itself: from before `0028_as_of_views`,
   it made the views' schema, the views and `rbac_as_of_views` its own, so `AsOf` refuses every read,
   saying what to run, as it reads only the views of the role owning the tables; from `0028` on, it
