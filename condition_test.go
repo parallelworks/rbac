@@ -4978,7 +4978,7 @@ func TestAVariableNamedFromTheRootPastALoopsVariableIsReadAsAnyOther(t *testing.
 		`[1].all(request, .request.attributes.m["a"] == 2)`, `[1].all(request, (true ? .request.attributes : {}).m.a == 2)`,
 		`[resource.attributes].exists(subject, subject.k == "a" && .subject.id == "u")`,
 		`[1].all(request, .request.attributes.m == {"0": 1, "a": 2})`, `["a"].all(y, [1].all(request, .request.attributes.m[y] == 2))`,
-		`[1].all(int, type(1) == .int)`,
+		`[{"attributes": {"k": "0"}}].all(request, .request.attributes.m[request.attributes.k] == 1)`, `[1].all(int, type(1) == .int)`,
 	} {
 		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
 			t.Errorf("%s: held %t, %v", expr, held, err)
