@@ -3626,11 +3626,12 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 	}
 }
 
-// CEL's cost tracking holds what a loop's steps evaluate until they are charged, and a loop's own
-// values until it ends, and reads all it holds in search of what a step didn't evaluate, as the
-// argument a failing call never reached: each step of a loop over a list the host passes would
-// take longer than the one before, past what it is charged, and one failing, charged little, the
-// most. It holds no more for a step than the step evaluates, whatever came before.
+// CEL's cost tracking held what a loop's steps evaluated until they were charged, and a loop's own
+// values until it ended, and read all it held in search of what a step didn't evaluate, as the
+// argument a failing call never reached: each step of a loop over a list the host passes took
+// longer than the one before, past what it was charged, and one failing, charged little, the most.
+// It holds no more for a step than the step evaluates, whatever came before, and none where each
+// call passes it the arguments it charges the call by.
 func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
 	l := make([]any, 3000)
 	for i := range l {
@@ -3738,11 +3739,12 @@ func TestALoopsStepCostsEachLogicalOperatorItEvaluates(t *testing.T) {
 	}
 }
 
-// CEL copies the keys of a map the host passes before a loop over it takes its first step, however
-// few it takes, so a loop over one, inside another loop, took time growing with the map's size and
-// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, however the
-// host passed the map, and one over a literal map no more than its bound, though the bound counts a
-// step of map() whose transform is a literal only 1 more than it costs.
+// A loop over a map reads each of its keys before it takes its first step, however few it takes, to
+// order them, as CEL copied the keys of a map the host passes, so a loop over one, inside another
+// loop, took time growing with the map's size and the outer loop's steps, charged only for the
+// steps. Such a loop costs 1 for each key, however the host passed the map, and one over a literal
+// map no more than its bound, though the bound counts a step of map() whose transform is a literal
+// only 1 more than it costs.
 func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
 	m, n := map[string]any{}, map[string]int{}
 	for i := range 3000 {
@@ -4233,6 +4235,38 @@ func TestALiteralCostsWhatItBuilds(t *testing.T) {
 			if b, got := rbac.ConditionCost(t, looped(n), nil); got != cost+more || b != bound+more {
 				t.Errorf("%s cost %d, bounded at %d, and with one element %d, bounded at %d", looped(n)[:60], got, b, cost, bound)
 			}
+		}
+	}
+}
+
+// CEL charges each call, attribute and literal it plans as it evaluates it, so what the package plans
+// in place of one, to charge what it reads before it runs, to order a map's keys or to charge a key,
+// is charged as CEL charged the one it replaced only where the package charges CEL so: planned
+// otherwise, comparisons cost 1 less, reading a time in a zone 100 less, and a loop's range and a
+// map literal's key read from an attribute 1 less, than they did. CEL charges a condition as a check
+// plans it what it charges it planned as CEL plans it, and 1 more for each key of a map a loop
+// starts over. CEL charges the qualifiers of a variable named from the root past a loop's variable
+// of its name where the check passes the variables as a map, as here, and not where it passes them
+// as the activation a check passes, which a check plans such a variable to charge them all the same.
+func TestAConditionIsChargedWhatCELChargesIt(t *testing.T) {
+	attributes := map[string]any{
+		"n": 4, "s": "ab", "k": "a", "zone": "Asia/Tokyo", "l": []any{"a", "b", "c"}, "m": map[string]any{"a": 1, "b": 2, "c": 3},
+	}
+	for expr, keys := range map[string]uint64{
+		`request.attributes.n > 3 && request.attributes.s != "x" && request.attributes.s in ["ab"]`:                               0,
+		`request.time.getHours("Europe/Paris") >= 0 && request.time.getMinutes(request.attributes.zone) >= 0`:                     0,
+		`request.attributes.l.all(x, x != "q") && request.attributes.l.map(x, x + x).size() == 3`:                                 0,
+		`(request.attributes.n > 3 ? request.attributes.l : []).exists_one(x, x == "a")`:                                          0,
+		`{request.attributes.s: 1}[request.attributes.s] == 1 && request.attributes.m[request.attributes.k] == 1`:                 0,
+		`request.attributes.m.all(k, request.attributes.m[k] > 0) && request.attributes.m.filter(k, k != "a") != []`:              6,
+		`[request.attributes.m, {"x": 1}].all(m, m.all(k, k != ""))`:                                                              4,
+		`dyn(request.attributes.m).all(k, true)`:                                                                                  3,
+		`[1].all(request, .request.attributes.n > 3 && has(.request.attributes.s) && (true ? .request : {}).attributes.s != "x")`: 0,
+		`[1].all(request, .request.attributes.m[.request.attributes.k] == 1 && .request.attributes["m"]["b"] == 2)`:               0,
+	} {
+		planned, alone := rbac.ConditionCharged(t, expr, attributes)
+		if planned != alone+keys {
+			t.Errorf("%s: CEL charged %d as a check plans it, and %d as CEL plans it", expr, planned, alone)
 		}
 	}
 }
@@ -4954,6 +4988,23 @@ func TestAZoneThatFailsToLoadForAWhileLoadsOnceItCan(t *testing.T) {
 	}
 }
 
+// A condition reading a time in a zone a literal names is one, though the platform's files fail to
+// give the zone for a while, so a change bounding what a check reads together counts it at all a
+// condition may cost: counted nothing, as one that isn't a condition, a change could add another
+// past that bound while they failed, which checks then read once the zone loads.
+func TestAConditionWhoseZoneFailsToLoadForAWhileIsBoundedAsAnyCondition(t *testing.T) {
+	const zone = "Pacific/Chatham"
+	h := setup(t)
+	expr := `request.time.getMinutes("` + zone + `") >= 0`
+	rbac.ForgetZones(zone)
+	restore := rbac.FailZoneLoads(t, syscall.EMFILE)
+	failing := rbac.ConditionLimit(h.authz, expr)
+	restore()
+	if limit := rbac.ConditionLimit(h.authz, expr); limit == 0 || failing < limit {
+		t.Errorf("a condition whose zone fails to load is bounded at %d, and at %d once it loads", failing, limit)
+	}
+}
+
 // The host's clock is read in UTC, as a time it passes as an attribute is, and as CEL reads one
 // with no zone: string() writes a time in its own zone, so a clock or a database returning times in
 // each replica's local zone decided by where the replica runs, a deny comparing the request's time
@@ -5054,8 +5105,8 @@ func (o otherwise) ID() int64 { return o.id }
 
 // A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
 // it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
-// dropped, so it would run unbounded. Nor is one whose range it plans under another id: its first
-// step wouldn't find the range, so a loop over a map would copy its keys uncharged. Nor is one
+// dropped, so it would run unbounded. Nor is one whose range it plans under another id, where
+// nothing would order a map's keys or charge them as the loop starts. Nor is one
 // whose range, which may be a map, it plans as something else, which nothing orders, so a loop
 // over it would give its keys as Go ranges over it, but where CEL checks the range as a list.
 func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
@@ -5086,6 +5137,89 @@ func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
 			if err := rbac.PlanLoopsOtherwise(t, expr, ranges, same); err != nil {
 				t.Errorf("%s planned as CEL plans it: %v", expr, err)
 			}
+		}
+	}
+}
+
+// CEL reads a variable a condition names from the root where a loop's variable of the same name
+// hides it, as `.request` in `l.all(request, ...)`, from what the check passed, outside the
+// evaluation, and qualifies it there, where nothing is charged: a key it computed, and whatever
+// computing it evaluated, ran uncharged, so a key searching a string of 99,990 bytes at each of
+// 3,000 steps of a loop cost 6,003, and so did each of its fields, so a loop reading one 24 deep
+// cost about half what reading another so does; and a key naming a loop's variable it read outside
+// the loop, where one of another name failed, and the one hiding the variable read the variable.
+// Such a variable is charged, and decides, as one read beside a loop's variable of another name,
+// and a type named so, as `.int`, is still the type.
+func TestAVariableNamedFromTheRootPastALoopsVariableIsReadAsAnyOther(t *testing.T) {
+	n := rbac.CountSearches(t)
+	l := make([]any, 3000)
+	for i := range l {
+		l[i] = fmt.Sprint(i)
+	}
+	var d any = 1
+	for range 22 {
+		d = map[string]any{"a": d}
+	}
+	attributes := map[string]any{
+		"l": l, "ten": l[:10], "s": strings.Repeat("x", 99_990), "m": map[string]any{"0": 1, "a": 2}, "k": "a", "d": d,
+	}
+	deep := `.attributes.d` + strings.Repeat(".a", 22)
+	reads := []string{
+		`%[1]s` + deep + ` == 1`, `has(%[1]s` + deep + `)`, `(true ? %[1]s : {})` + deep + ` == 1`,
+		`%[1]s.attributes.m.exists(k, %[1]s.attributes.m[k] == 2)`,
+	}
+	searching := `%[1]s.attributes.l.filter(x, %[1]s.attributes.s.contains(x)).size()`
+	for _, key := range []string{
+		`string(` + searching + `)`, `[string(` + searching + `)][0]`, `(` + searching + ` > 0 ? "a" : "0")`,
+		`%[1]s.attributes.k`, `string(size(%[1]s.attributes.s) - 99990)`, `y`,
+	} {
+		reads = append(reads, `%[1]s.attributes.m[`+key+`] == 2`, `(true ? %[1]s.attributes.m : {})[`+key+`] == 2`,
+			`%[1]s.attributes["m"][`+key+`] == 2`)
+	}
+	for _, read := range reads {
+		var decided [2][]rbac.Decided
+		for i, named := range [][2]string{{"request", ".request"}, {"other", "request"}} {
+			expr := `request.attributes.ten.all(z, ["a"].all(y, [1].all(` + named[0] + `, ` + fmt.Sprintf(read, named[1]) + `)))`
+			*n = 0
+			var err error
+			if decided[i], err = rbac.Evaluations(t, expr, attributes, 1); err != nil || *n > 1 {
+				t.Errorf("%s, searching %d times: %v", expr, *n, err)
+			}
+		}
+		if !slices.Equal(decided[0], decided[1]) {
+			t.Errorf("%s read past a loop's variable of its name: %+v, and beside one of another: %+v", read, decided[0], decided[1])
+		}
+	}
+	for _, expr := range []string{
+		`[1].all(request, .request.attributes.m["a"] == 2)`, `[1].all(request, (true ? .request.attributes : {}).m.a == 2)`,
+		`[resource.attributes].exists(subject, subject.k == "a" && .subject.id == "u")`,
+		`[1].all(request, .request.attributes.m == {"0": 1, "a": 2})`, `["a"].all(y, [1].all(request, .request.attributes.m[y] == 2))`,
+		`[{"attributes": {"k": "0"}}].all(request, .request.attributes.m[request.attributes.k] == 1)`, `[1].all(int, type(1) == .int)`,
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
+// A condition whose variable named from the root past a loop's variable of its name CEL plans as
+// something else than an attribute reading it, or under another id, as another version of CEL may,
+// isn't a condition: what qualifies it would run uncharged again.
+func TestAVariableNamedFromTheRootPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{
+		`[1].all(request, .request.attributes.k == "a")`, `["x"].all(action, .action == "cluster:login")`,
+		`[1].all(request, .request.attributes.m[.request.attributes.k] == 2)`,
+	} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+		} {
+			if err := rbac.PlanRootedOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its variable named from the root planned %s is a condition", expr, how)
+			}
+		}
+		if err := rbac.PlanRootedOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
 		}
 	}
 }
@@ -5312,6 +5446,62 @@ func TestAChangesConditionsCompileBriefly(t *testing.T) {
 	// u1's holds; u0's doesn't.
 	if allowed(t, h, h.as(t, "u0"), login, cluster) || !allowed(t, h, h.as(t, "u1"), login, cluster) || rbac.Compiled(h.authz) != before+2 {
 		t.Error("checks keep what they compile")
+	}
+}
+
+// A condition stored that no longer compiles, as one ordering numbers of different types once it
+// has checked a loop does after an upgrade of CEL, is compiled once, as one that compiles is, and
+// not again for each check reading it, each of which pays for compiling it once, cached or not:
+// charged 16,384 for 2 KiB, each took 45 ms. Compiling it takes about as long as compiling one of
+// its length that compiles, as CEL wrote out each of its errors twice, with the line holding it,
+// which a check reads none of. A change storing it again is refused, whatever checks keep, with
+// what CEL found, and a change bounding the conditions on a scope reads its limit, nothing, once.
+func TestAConditionThatNoLongerCompilesIsCompiledOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	fill := func(part func(i int) string) string {
+		s := part(0)
+		for i := 1; len(s)+len(" && ")+len(part(i)) <= rbac.MaxExpression; i++ {
+			s += " && " + part(i)
+		}
+		return s
+	}
+	expr := fill(func(i int) string { return fmt.Sprintf("[1].all(v, true) && %d < 2u", i) })
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: expr}
+	storeAround(t, h, g)
+	compiles := rbac.CountCompiles(t)
+	u := h.as(t, "u")
+	for range 3 {
+		if allowed(t, h, u, login, cluster) {
+			t.Fatal("a condition that doesn't compile held")
+		}
+	}
+	if *compiles != 1 {
+		t.Errorf("3 checks compiled a condition that doesn't compile %d times", *compiles)
+	}
+	b := rbac.Binding{Role: "cluster.login", Principal: identity("v"), Condition: rbac.Condition{Expression: expr}}
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrInvalid) ||
+		!strings.Contains(err.Error(), "found no matching overload for '_<_'") {
+		t.Errorf("storing a condition checks keep as failing: %v", err)
+	}
+	*compiles = 0
+	for range 2 {
+		if limit := rbac.ConditionLimit(h.authz, expr+" || true"); limit != 0 {
+			t.Errorf("a condition that doesn't compile is bounded at %d", limit)
+		}
+	}
+	if *compiles != 1 {
+		t.Errorf("reading the limit of a condition that doesn't compile twice compiled it %d times", *compiles)
+	}
+	compiled, err := rbac.CompileTook(t, fill(func(int) string { return "[1, 2, 3] == [1, 2, 3]" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, failing := range []string{expr, fill(func(i int) string { return fmt.Sprintf("request.attributes.f%d()", i) })} {
+		if took, err := rbac.CompileTook(t, failing); err == nil || took > 3*compiled {
+			t.Errorf("%d bytes that don't compile took %v to compile, as many that do %v: %v", len(failing), took, compiled, err)
+		}
 	}
 }
 

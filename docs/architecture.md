@@ -567,9 +567,11 @@ sequenceDiagram
   during the call would leave its place to one made after, which would be given the first one's
   copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
-  `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
-  errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
-  CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
+  `Config.Attributes`. Each is compiled once, and one that doesn't compile is found so once, as
+  checks keep it as they keep a program (`conditions.compile`), bounded in cost, and fails closed:
+  a condition that errors gives nothing, and a deny's that errors denies. A check converts what the
+  host passes into CEL's own values once (`converter`), deeply, from a closed set of Go values
+  (`Attributes`): bools,
   strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
   slices, arrays, pointers, maps
   keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.
@@ -592,6 +594,10 @@ sequenceDiagram
   are read as it is, by their fields' names alone (`variable`), as a kind declarations refuse in
   part is, so no list or map an operator meets holds it; hashed, a map literal keyed by two kinds
   past `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held.
+  Its type has none of a map's traits, so CEL has no `size()` or `in` for it, but CEL loops over a
+  value that is a map or a list in Go whatever type it says it is, so a loop's range is refused where
+  its type can't be looped over (`stepping.inOrder`): looped over, `subject.attributes.all(k, false)`
+  held for `unreadable`, which is empty.
   Built, a list holding it was decided by its size or by another value it held, as comparing reads
   the smaller value whole and no further, so `[subject.attributes] != []` held, and
   `[subject.attributes, 1] == [{}, 2]` failed for a kind that can't be read but was false for one
@@ -722,8 +728,9 @@ sequenceDiagram
   map, in an order that changes from one evaluation to the next, so what `map()` and `filter()`
   made, and how far `all()` or `exists()` went, and what they cost, turned on it: a grant reading
   the first key `map()` made allowed 55 of 100 identical checks, and a deny reading the first
-  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, so
-  the cost tracking observes it as it did, its value a map whose keys come sorted (`stepping.order`):
+  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, and
+  evaluated by what CEL planned, so CEL charges it as it would, its value a map whose keys come
+  sorted (`stepping.order`), which folds by its iterator, as it has no `Fold` of its own:
   bools, ints, uints, doubles, strings and bytes, each by value (`compareKeys`), by a merge sort that
   compares each key at most once at each of `⌈log2 n⌉` levels, reading no more of either than the
   key it places holds (`sortKeys`). The loop is charged that before it sorts, and bounded alike
@@ -754,10 +761,23 @@ sequenceDiagram
   of dyn may hold, but where a loop's variable named `request` hides it. Where reading the
   platform's files failed, as once the process
   ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
-  the next check plans it again: kept, a real zone failed until the process dropped it. A
+  the next check plans it again: kept, a real zone failed until the process dropped it. Meanwhile a
+  change bounding what a check reads together counts such a condition at all a condition may cost
+  (`conditions.limit`), as it is one: counted nothing, a change could add another past the bound. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
   as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
-  key or a loop's condition where the package can't charge or refuse it isn't a condition. What a
+  key, a loop's condition or a variable named from the root past a loop's variable of its name
+  where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
+  `.request` in `l.all(request, ...)`, from what the check passed, outside the evaluation, and
+  qualifies it there, where nothing is charged: a key searching a string costing 10,000 at each of
+  3,000 steps cost 6,003, its fields cost nothing, and a key naming a loop's variable failed, or,
+  naming the one that hides the variable, read the variable. So it
+  is planned as an attribute of the variable read from what the check passed (`rooting`), which CEL
+  qualifies, and evaluates a key or a choice of, on the evaluation's frame, charged as anywhere
+  else. CEL charges each call it plans as the call runs, so the call planned in place of one
+  (`charged`) charges CEL as that call once it has run, and a key or a loop's range read from an attribute is
+  evaluated by what CEL planned, so CEL charges each as it would: otherwise a comparison cost 1
+  less, and reading a time in a zone `zoneCost` less, than their bounds count. What a
   check reads together is bounded where it is stored, for each scope: an identity's conditional
   grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional

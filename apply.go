@@ -889,9 +889,10 @@ func (a *Authorizer) checkCondition(checked map[string]error, b Binding) []error
 }
 
 // conditionFaults returns why a condition, of a grant or a deny, can't be stored. Each expression
-// is compiled once in checked, nil for one condition alone: one that doesn't compile isn't cached,
-// so a change of many bindings carrying it would otherwise compile it for each, past what
-// MaxConditionBytes, which counts it once, lets it spend.
+// is compiled once in checked, nil for one condition alone: a change caches nothing it compiles,
+// and checks cache only what they read stored, so a change of many bindings carrying one that
+// doesn't compile would otherwise compile it for each, past what MaxConditionBytes, which counts it
+// once, lets it spend.
 func (a *Authorizer) conditionFaults(checked map[string]error, c Condition) []string {
 	var faults []string
 	bad := func(reason string) { faults = append(faults, reason) }

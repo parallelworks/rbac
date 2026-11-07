@@ -438,7 +438,31 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
   so they may be past a bound as an upgrade leaves them. Adding
   to `request.time`, or converting it, was bounded at all a condition
-  may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
+  may cost and is now bounded as the timestamp it is, a few units. CEL now refuses ordering numbers
+  of different types, as `[1, 2].exists(i, i < 2u)`, which it accepted before once it had checked a
+  loop, so a condition stored so no longer compiles: a grant's gives nothing and a deny's applies;
+  and where `Config.Attributes` declares a number, so does one ordering it against a number of
+  another type past a loop, as `[1].all(v, true) && request.attributes.n < 2u` for an int `n`, though
+  it compiles where none is declared. To find those stored, list each condition stored, `SELECT
+  condition FROM rbac_grants UNION SELECT condition FROM rbac_denies UNION SELECT requires FROM
+  rbac_eligibilities`, and compile each but the empty one with CEL's `cel.NewEnv` declaring
+  `subject`, `resource` and `request` as `cel.MapType(cel.StringType, cel.DynType)` and `action` as
+  `cel.StringType`, as the package compiles them: one whose `Compile` gives issues no longer
+  compiles. Storing one again is refused with what CEL found (`rbac.ErrInvalid`), one failing
+  against the declarations too, which compiling so doesn't find. `AsOf` compiles those history
+  holds too, `SELECT after->>'condition' FROM rbac_history WHERE entity IN ('grant', 'deny') UNION
+  SELECT after->>'requires' FROM rbac_history WHERE entity = 'eligibility'`, which can't be stored
+  again, so a check of a time one of them was stored decides it as failing. A condition naming a
+  variable from the root where a loop's variable of the same name hides it, as `.request` in
+  `l.all(request, ...)`, read a key indexing it outside the loop, so one naming a loop's variable
+  of another name, as `k` in `.request.attributes.m.exists(k, .request.attributes.m[k] > 0)`,
+  failed, and one naming the loop's variable that hides it, as `request.attributes.k` in
+  `l.all(request, .request.attributes.m[request.attributes.k] > 0)`, read the variable instead: each
+  is now read in the loop. Each field or key such a variable is read by costs 1, as it does of any
+  other, and so does what computing such a key evaluates, which CEL charged nothing for, though its
+  bound counted it, so one whose key searches or loops over what the request passes can now cost
+  past what a condition may, and fails the same way.
+  Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
   reading their kind, and so are ones holding an empty or nil slice, map or pointer of values no
@@ -1507,10 +1531,10 @@ the package's uses foreign data, so none of the roles needs any.
   History), or where constraints were set immediate, as the statement that did, or the first change
   after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
   where its `lock_timeout` is longer.
-- **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
-  conditions are cached. Read a resource's ancestors and attributes from where they are stored,
-  never from request input, no earlier than the content they protect, and from the primary. A
-  deny is only as complete as the ancestors passed.
+- **What the host passes:** a check reads grants, memberships and groups as they are; only
+  conditions, compiled or found not to compile, are cached. Read a resource's ancestors and
+  attributes from where they are stored, never from request input, no earlier than the content
+  they protect, and from the primary. A deny is only as complete as the ancestors passed.
 - **Ids:** an id names its identity, group or resource for good. Never reuse one, or a new
   resource or account inherits the grants of the one before it. Delete a resource's grants with
   `DeleteScopes` in the transaction that deletes it, in one call with every scope under it too,

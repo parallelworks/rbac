@@ -1315,6 +1315,44 @@ func CountEvaluations(t *testing.T) *int {
 	return n
 }
 
+// CountCompiles counts the expressions compiled, whether or not each is a condition, until t ends.
+func CountCompiles(t *testing.T) *int {
+	t.Helper()
+	old, n := compiling, new(int)
+	compiling = func() { *n++ }
+	t.Cleanup(func() { compiling = old })
+	return n
+}
+
+// CompileTook is the least time compiling expr took of three tries, as a check compiles one, by
+// conditions that have compiled others before, and why it isn't a condition: a check reads none
+// of that.
+func CompileTook(t *testing.T, expr string) (took time.Duration, err error) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the environment makes once, on the first failure too, as the names its errors suggest.
+	if _, err := c.build("true"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.build("undeclared"); err == nil {
+		t.Fatal("an undeclared name compiles")
+	}
+	took = time.Duration(1<<63 - 1)
+	for range 3 {
+		start := time.Now()
+		_, err = c.build(expr)
+		took = min(took, time.Since(start))
+	}
+	return took, err
+}
+
+// ConditionLimit is the most evaluating expr can cost, as a change bounding the conditions on a
+// scope reads it from a.
+func ConditionLimit(a *Authorizer, expr string) uint64 { return a.conds.limit(expr) }
+
 // CountSearches counts the searches of a string conditions run, contains, startsWith and endsWith,
 // until t ends.
 func CountSearches(t *testing.T) *int {
@@ -1403,6 +1441,37 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
 	vars := a.vars(WithRequest(t.Context(), attributes), s, p, r)
 	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
+}
+
+// ConditionCharged is what CEL's cost tracking charges evaluating expr on a request with attributes,
+// which the resource carries too, as a check plans it, and as CEL plans it with none of the
+// package's planning but what costs charges calls.
+func ConditionCharged(t *testing.T, expr string, attributes map[string]any) (planned, alone uint64) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	own, err := c.env.Program(checked, cel.CostTracking(costs{patterns}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	charged := func(p cel.Program, in any) uint64 {
+		out, details, err := p.Eval(in)
+		if err != nil || out != types.True || details == nil || details.ActualCost() == nil {
+			t.Fatalf("%s: %v, %v", expr, out, err)
+		}
+		return *details.ActualCost()
+	}
+	return charged(prg.Program, &counting{vars: vars}), charged(own, vars)
 }
 
 // EvaluateCondition evaluates expr as a check does, on a request with attributes, which the
@@ -1799,6 +1868,29 @@ func PlanKeysOtherwise(t *testing.T, expr string, replan func(interpreter.Interp
 	return err
 }
 
+// PlanRootedOtherwise is why expr can't be planned as a condition where CEL plans each variable it
+// names from the root past a loop's variable of its name as replan makes it, as another version of
+// CEL may, or nil.
+func PlanRootedOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	names := newRooting(c.env, checked.NativeRep()).names
+	if len(names) == 0 {
+		t.Fatalf("%s names no variable from the root past a loop's variable of its name", expr)
+	}
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if _, ok := names[i.ID()]; ok {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
+}
+
 // PlanLiteralsOtherwise is why expr can't be planned as a condition where CEL plans each list or map
 // literal holding any as replan makes it, as another version of CEL may, or nil.
 func PlanLiteralsOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
@@ -1854,8 +1946,8 @@ func PlanIn(t *testing.T, env *cel.Env, expr string) error {
 }
 
 // probing plans each uint literal as a probe, which evaluates and is charged as the literal, but
-// which CEL's cost tracking reads as a call of an argument none of the values it holds is of, so
-// it reads them all.
+// which CEL's cost tracking, where it holds values, reads as a call of an argument none of them is
+// of, so it reads them all.
 type probing struct{ read, most, reached int }
 
 func (p *probing) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {

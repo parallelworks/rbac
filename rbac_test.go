@@ -12591,29 +12591,11 @@ func (tx *refusingTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 func (tx *refusingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
 	for _, q := range b.QueuedQueries {
 		if strings.Contains(q.SQL, tx.sql) {
-			return refusedBatch{}
+			return pgx.FailedBatchResults(b, errors.New(refused))
 		}
 	}
 	return tx.Tx.SendBatch(ctx, b)
 }
-
-// refusedBatch is a batch refusingTx refused, whose every result is the refusal.
-type refusedBatch struct{}
-
-func (refusedBatch) Exec() (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New(refused)
-}
-
-func (refusedBatch) Query() (pgx.Rows, error) { return nil, errors.New(refused) }
-
-func (b refusedBatch) QueryRow() pgx.Row { return refusedRow{} }
-
-func (refusedBatch) Close() error { return errors.New(refused) }
-
-// refusedRow is a row refusingTx refused.
-type refusedRow struct{}
-
-func (refusedRow) Scan(...any) error { return errors.New(refused) }
 
 // scanned is how many rows of table tx has read by scanning it, whole or through a bitmap, and how
 // many entries of its indexes by scanning them, as an index scan finds each row it fetches.
