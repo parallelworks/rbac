@@ -3762,6 +3762,13 @@ func TestAChangeReadsEachRoleItsRolesListOnceHoweverManyListIt(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
+		// A plan caching each lookup of a role by its key (Memoize) hides from the indexes' counts a
+		// walk looking a role up again for each role listing it, as one carrying each role's id and
+		// list does: with it on, that walk read as many entries as the chain's, and with it off, 4,228
+		// against 260.
+		if _, err := tx.Exec(ctx, `SET LOCAL enable_memoize = off`); err != nil {
+			t.Fatal(err)
+		}
 		startEntries, startPages := rolesRead(ctx, t, tx)
 		if err := h.authz.WithTx(tx).Apply(ctx, u, cluster, rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: identity("w")}}}); err != nil {
 			t.Fatal(err)
