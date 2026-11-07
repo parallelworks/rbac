@@ -802,7 +802,7 @@ func (a *Authorizer) valuesOfAll(ctx context.Context, q DB, tenant string, ident
 	}
 	// Each identity's keys cost the planner as a walk of many groups, which across many identities is
 	// past JIT's thresholds.
-	if err := planned(ctx, q, withoutJIT, scan, `
+	if err := planned(ctx, q, a.unjitted(), scan, `
 		WITH idents AS MATERIALIZED (
 		  SELECT t.identity, ks.keys, ks.bound, ks.exempted FROM (SELECT unnest($2::text[]) COLLATE "C" AS identity) t
 		  CROSS JOIN LATERAL (WITH RECURSIVE `+keysSQL("$1::text", "t.identity", "$3")+`
@@ -908,7 +908,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// A privileged role gives nothing through the tenant's members or the public. The grants on the
 	// path are read once, and of the custom roles those that they name (namedCustom).
 	alone := a.labelPermission(p)
-	rows, err := a.db.Query(ctx, `WITH held AS MATERIALIZED (`+byKey("$2", "rbac_grants", "scope", "id::text AS id, principal_kind, principal_id, conditional, role", `
+	rows, err := a.queryIndexed(ctx, a.db, `WITH held AS MATERIALIZED (`+byKey("$2", "rbac_grants", "scope", "id::text AS id, principal_kind, principal_id, conditional, role", `
 		  tenant = $1 AND (expires_at IS NULL OR expires_at > $4) AND (NOT $5 OR principal_kind <> ALL($6::text[]))`)+`)
 		SELECT id, principal_kind, principal_id, conditional FROM held
 		WHERE role = ANY(`+givingSQL("$3", "$1", "$7", "$8", custom, namedCustom("SELECT role FROM held"), false, alone)+`)
@@ -966,7 +966,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	identities := slices.Sorted(maps.Keys(direct))
 	// The identities in the groups granted, through those nested in them, and those granted
 	// directly, that are members or guests of the tenant now.
-	rows, err = a.db.Query(ctx, `
+	rows, err = a.queryIndexed(ctx, a.db, `
 		WITH RECURSIVE `+a.standingSQL("$2", "$3")+`
 		SELECT root, principal, guest FROM inside
 		UNION
@@ -1055,7 +1055,7 @@ func (a *Authorizer) boundByDenies(ctx context.Context, p Permission, r Resource
 		}
 	}
 	if len(identities) > 0 && len(groups) > 0 {
-		rows, err := a.db.Query(ctx, `
+		rows, err := a.queryIndexed(ctx, a.db, `
 			WITH RECURSIVE `+insideSQL("$2", "$3", "$4", false)+`
 			SELECT DISTINCT principal, 'group:' || root FROM inside`,
 			r.Tenant, groups, now, identities)
@@ -1280,7 +1280,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	// The subject's grants on scopes of the types are read once, and of the custom roles those that
 	// they name (namedCustom).
 	alone := a.labelPermission(p)
-	rows, err := a.db.Query(ctx, `
+	rows, err := a.queryIndexed(ctx, a.db, `
 		WITH held AS MATERIALIZED (`+a.heldByType("$5", "$2", "g.scope, g.conditional, g.role, g.principal", `
 		  g.tenant = $1 AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
 		SELECT scope, bool_and(conditional) FROM held
@@ -1317,7 +1317,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	if perm, wildcard, deniable := matchable(p); deniable {
 		narrow := countedOf(binding, broad{})
 		wide := slices.DeleteFunc(slices.Clone(binding), func(k string) bool { return slices.Contains(narrow, k) })
-		rows, err = a.db.Query(ctx, `
+		rows, err = a.queryIndexed(ctx, a.db, `
 			SELECT scope, bool_or(condition = '') FROM (`+bindingDenies("$1", "$2", "$3", "$7", "scope, condition, exempt, permissions", a.history)+`) d
 			WHERE `+bindsIfRead("$4 = ANY(permissions) OR $5 = ANY(permissions)", "NOT "+keyed("exempt", "SELECT unnest($6::text[])"))+`
 			GROUP BY scope ORDER BY scope`,
@@ -1595,7 +1595,7 @@ func (a *Authorizer) ofType() string {
 	if a.history != "" {
 		return "split_part(g.scope, ':', 1) = t.t"
 	}
-	return ofType("g.scope", "t.t")
+	return ofType("g.scope")
 }
 
 // broadOn is SQL selecting, for broadArgs, the roles of the grants of custom roles in the tenant $1
@@ -1648,29 +1648,44 @@ func byKey(keys, table, col, cols, where string) string {
 // tenant's denies are on scopes of the types, they are read a type at a time, each a range of the
 // scopes (ofType), and past that they are found by those keys too. Each way reads every deny the
 // other passes over, so with many of both a list reads every deny in the tenant naming broad. The
-// count reads at most manyTypedDenies entries of the scopes' index, once for the statement, in its
-// snapshot. As of a time, history being the table of it, by its schema, the count is of the
-// versions history holds of denies on the scopes, deleted ones' too: a count of the denies the
-// views give read every version, as the views read each to find a deny's last, and with fewer than
-// manyTypedDenies live, read them all again by type. A deny naming both narrow and broad is
+// count reads at most manyTypedDenies entries of the scopes' index for each type, in its order, once
+// for the statement, in its snapshot. As of a time, history being the table of it, by its schema, the count
+// is of the versions history holds of denies on the scopes, deleted ones' too: a count of the denies
+// the views give read every version, as the views read each to find a deny's last, and with fewer
+// than manyTypedDenies live, read them all again by type. A deny naming both narrow and broad is
 // selected twice.
 func bindingDenies(tenant, types, narrow, broad, cols, history string) string {
-	ofTypes := func(table, cols, where string) string {
+	ofTypes := func(table, cols, where, then string) string {
 		return `SELECT d.* FROM unnest(` + types + `::text[]) AS t(t) CROSS JOIN LATERAL (SELECT ` + cols + ` FROM ` + table + `
-			WHERE tenant = ` + tenant + ` AND ` + where + ofType("scope", "t.t") + ` OFFSET 0) d`
+			WHERE tenant = ` + tenant + ` AND ` + where + ` ` + then + `) d`
 	}
-	counted := ofTypes("rbac_denies", "1", "")
+	// Each type's in the order of its range of scopes, which the index of scopes reads in that order,
+	// up to the count: unordered, a plan for its arguments read the whole range through a bitmap
+	// before the count stopped it. And by the type too, so the primary key, which leads to the tenant
+	// and the type, is sought by the type where a plan reads it, as one made by statistics from a
+	// near-empty table did, for the tenant's every deny. As of a time, history's, by its index of
+	// denies by scope, and the denies the views give, by the range, which the views take to it.
+	typed := "scope_type = t.t AND " + ofType("scope")
+	counted := ofTypes("rbac_denies", "1", typed, fmt.Sprintf("ORDER BY scope LIMIT %d", manyTypedDenies))
+	then := "ORDER BY scope"
 	if history != "" {
-		counted = ofTypes(history, "1", "entity = 'deny' AND ")
+		counted = ofTypes(history, "1", "entity = 'deny' AND "+ofType("scope"), fmt.Sprintf("ORDER BY scope LIMIT %d", manyTypedDenies))
+		typed, then = ofType("scope"), "OFFSET 0"
 	}
-	return fmt.Sprintf(`WITH typed(few) AS MATERIALIZED (SELECT count(*) < %[5]d FROM (%[6]s LIMIT %[5]d) c)
-		SELECT %[4]s FROM rbac_denies WHERE %[2]s AND scope_type = ANY(%[1]s::text[])
+	// Those naming the keys, of any type, as the index of keys finds them, kept to the types outside
+	// it, so no plan seeks them by the type: by statistics from a near-empty table, a plan read the
+	// primary key by the types, skipping over every tenant.
+	named := func(keys string) string {
+		return `SELECT ` + cols + ` FROM (SELECT ` + cols + `, scope_type AS of_type FROM rbac_denies WHERE ` + namingIn(tenant, "principals", keys) +
+			` OFFSET 0) n WHERE of_type = ANY(` + types + `::text[])`
+	}
+	return fmt.Sprintf(`WITH typed(few) AS MATERIALIZED (SELECT count(*) < %[3]d FROM (%[4]s LIMIT %[3]d) c)
+		%[1]s
 		UNION ALL
-		SELECT %[4]s FROM rbac_denies WHERE %[3]s AND scope_type = ANY(%[1]s::text[]) AND NOT (SELECT few FROM typed)
+		%[2]s AND NOT (SELECT few FROM typed)
 		UNION ALL
-		SELECT * FROM (%[7]s) d WHERE (SELECT few FROM typed)`,
-		types, namingIn(tenant, "principals", narrow), namingIn(tenant, "principals", broad), cols, manyTypedDenies,
-		counted, ofTypes("rbac_denies", cols, "principals && "+broad+"::text[] AND "))
+		SELECT * FROM (%[5]s) d WHERE (SELECT few FROM typed)`,
+		named(narrow), named(broad), manyTypedDenies, counted, ofTypes("rbac_denies", cols, "principals && "+broad+"::text[] AND "+typed, then))
 }
 
 // manyTypedDenies is how many denies on scopes of the types a list reads bindingDenies reads by type
@@ -1678,11 +1693,11 @@ func bindingDenies(tenant, types, narrow, broad, cols, history string) string {
 // a time, how many versions of them history holds.
 const manyTypedDenies = 16
 
-// ofType is SQL keeping the rows whose scope, col, is of the type t. A scope is `type:id`, and in
-// the C collation the scopes of a type sort from `type:` to just before `type;`, so a btree on the
-// scope reads only them, as one on split_part couldn't.
-func ofType(col, t string) string {
-	return fmt.Sprintf("(%s >= (%s || ':') AND %s < (%s || ';'))", col, t, col, t)
+// ofType is SQL keeping the rows whose scope, col, is of the type t.t, as the types a search reads
+// are unnested. A scope is `type:id`, and in the C collation the scopes of a type sort from `type:`
+// to just before `type;`, so a btree on the scope reads only them, as one on split_part couldn't.
+func ofType(col string) string {
+	return fmt.Sprintf("(%s >= (t.t || ':') AND %s < (t.t || ';'))", col, col)
 }
 
 // keyed is SQL for whether one of the keys of a path, col, is a scope scopes selects: each is
@@ -1824,7 +1839,7 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container b
 	}
 	// The containers' and the tenant's are of the types Filter reads denies on by each key (16).
 	query := fmt.Sprintf(`SELECT %s, %s`, onResources, count(arg(16), max(maxOverlap, maxContainerOverlap)+1))
-	err = a.db.QueryRow(ctx, query, read...).Scan(&resources, &containers)
+	err = a.queryRowIndexed(ctx, a.db, query, read...).Scan(&resources, &containers)
 	return resources, containers, err
 }
 
@@ -2191,7 +2206,7 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 	// time, history finds a grant's versions by its principal, not by its id. And by scope, so every
 	// index a generic plan can pick seeks those grants: by the principals alone, it would read every
 	// grant of a group granted on thousands of resources.
-	rows, err := q.Query(ctx, `SELECT id::text, condition FROM rbac_grants
+	rows, err := a.queryIndexed(ctx, q, `SELECT id::text, condition FROM rbac_grants
 		WHERE id = ANY($1::uuid[]) AND tenant = $2 AND principal = ANY($3::text[]) AND scope = ANY($4::text[])`,
 		ids, tenant, principals, scopes)
 	if err != nil {
@@ -2222,7 +2237,7 @@ func (a *Authorizer) heldGrants(ctx context.Context, q DB, tenant string, princi
 	if len(principals) == 0 {
 		return nil, nil
 	}
-	rows, err := q.Query(ctx, `
+	rows, err := a.queryIndexed(ctx, q, `
 		SELECT `+grantColumns+` FROM rbac_grants
 		WHERE tenant = $1 AND principal = ANY($2::text[]) AND scope = ANY($3::text[])
 		  AND (expires_at IS NULL OR expires_at > $4)

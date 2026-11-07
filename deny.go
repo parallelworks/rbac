@@ -138,7 +138,7 @@ func (a *Authorizer) deniesOn(ctx context.Context, q DB, tenant string, binding,
 	}
 	binds := `($3::text[] IS NULL OR ` + keyed("principals", "SELECT unnest($3::text[])") + ` AND NOT ` + keyed("exempt", "SELECT unnest($6::text[])") + `)`
 	// In the order a check reads them, so Explain names the deny Authorize does.
-	rows, err := q.Query(ctx, byKey("$2", "rbac_denies", "scope", "id, scope, permissions, principals, exempt, condition",
+	rows, err := a.queryIndexed(ctx, q, byKey("$2", "rbac_denies", "scope", "id, scope, permissions, principals, exempt, condition",
 		`tenant = $1 AND `+bindsIfRead("$4 = ANY(permissions) OR $5 = ANY(permissions)", binds))+`
 		ORDER BY id, scope`,
 		tenant, scopes, binding, perm, wildcard, exempt)
@@ -312,8 +312,9 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		if err := a.denyAllowed(ctx, tx, actor, on, cs, nil, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		rows, err := tx.Query(ctx, `SELECT id, condition, permissions FROM rbac_denies WHERE tenant = $1 AND scope = $2`,
-			on.Tenant, d.Scope.Key())
+		// By its type and id too, so every index leading to the tenant seeks the scope (holdDeny).
+		rows, err := a.queryIndexed(ctx, tx, `SELECT id, condition, permissions FROM rbac_denies
+			WHERE tenant = $1 AND scope = $2 AND scope_type = $3 AND scope_id = $4`, on.Tenant, d.Scope.Key(), d.Scope.Type, d.Scope.ID)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -346,7 +347,7 @@ func (a *Authorizer) SetDeny(ctx context.Context, actor Subject, on Resource, d 
 		if d.Condition.Expression != "" && !a.conds.within(a.evaluations(before, readsAction), a.evaluations(after, readsAction)) {
 			return ChangeEvent{}, fmt.Errorf("%w: a scope's conditional denies cost more together than a check may spend evaluating them", ErrInvalid)
 		}
-		rows, err = tx.Query(ctx, `
+		rows, err = a.queryIndexed(ctx, tx, `
 			INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, name, principals, exempt, permissions,
 			  condition_title, condition_description, condition, created_by, updated_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
@@ -399,8 +400,8 @@ func (a *Authorizer) DeleteDeny(ctx context.Context, actor Subject, on Resource,
 		if err := a.denyAllowed(ctx, tx, actor, on, cs, nil, nil); err != nil {
 			return ChangeEvent{}, err
 		}
-		rows, err := tx.Query(ctx, `DELETE FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND id = $3 RETURNING `+denyColumns,
-			on.Tenant, on.Scope().Key(), id)
+		rows, err := a.queryIndexed(ctx, tx, `DELETE FROM rbac_denies WHERE tenant = $1 AND scope = $2 AND scope_type = $3 AND scope_id = $4
+			AND id = $5 RETURNING `+denyColumns, on.Tenant, on.Scope().Key(), on.Scope().Type, on.Scope().ID, id)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -487,7 +488,7 @@ func (a *Authorizer) Denies(ctx context.Context, tenant string, scopes []Scope) 
 		keys[i] = s.Key()
 	}
 	slices.Sort(keys)
-	rows, err := a.db.Query(ctx, `SELECT `+denyColumns+` FROM (`+byKey("$2", "rbac_denies", "scope", denyColumns+", scope", "tenant = $1")+`) d
+	rows, err := a.queryIndexed(ctx, a.db, `SELECT `+denyColumns+` FROM (`+byKey("$2", "rbac_denies", "scope", denyColumns+", scope", "tenant = $1")+`) d
 		ORDER BY scope, id`, tenant, slices.Compact(keys))
 	if err != nil {
 		return nil, err
@@ -553,7 +554,6 @@ func permissionStrings(ps []Permission) []string {
 // group's or a principal's removal changes the denies naming or exempting it without their scope's
 // lock, and a wait for one would leave that time behind.
 func holdDeny(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, id string) error {
-	_, err := tx.Exec(ctx, `SELECT FROM rbac_denies WHERE tenant = $1 AND scope_type = $2 AND scope_id = $3 AND id = $4 FOR UPDATE`,
-		tenant, scope.Type, scope.ID, id)
-	return err
+	return byIndexes(ctx, tx, stmt(nil, `SELECT FROM rbac_denies WHERE tenant = $1 AND scope_type = $2 AND scope_id = $3 AND id = $4 FOR UPDATE`,
+		tenant, scope.Type, scope.ID, id))
 }

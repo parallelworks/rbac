@@ -3398,6 +3398,25 @@ func TestAGroupsMembersAndTheirMembershipsAreReadInOneSnapshot(t *testing.T) {
 	}
 }
 
+// rbac_group_members lists each place in its groups once however often a group is named, standing
+// or not, as it did reading them by = ANY of the groups: read a group at a time, a group named twice
+// was read twice.
+func TestAGroupNamedTwiceListsItsMembersOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.as(t, "a", "g")
+	for _, standing := range []bool{false, true} {
+		var members []string
+		if err := h.pool.QueryRow(ctx, `SELECT coalesce(array_agg(principal ORDER BY principal), '{}')
+			FROM rbac_group_members('t1', '{g,g}', $1, NULL, $2)`, h.now, standing).Scan(&members); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(members, []string{"user:a"}) {
+			t.Errorf("standing %t, the members of g named twice: %v", standing, members)
+		}
+	}
+}
+
 func TestHoldersReadDeniesOnTheMembersAndThePublic(t *testing.T) {
 	viewer := rbac.RoleDefinition{ID: "cluster.viewer", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}, Public: true}
 	guard := rbac.RoleDefinition{ID: "guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}

@@ -5358,6 +5358,255 @@ func TestDeletingGroupsAndWhatTheyReachAtOnceNeverDeadlocks(t *testing.T) {
 	}
 }
 
+// heldRow is a row a test writes with seed and holds alone with hold, each run with its args.
+type heldRow struct {
+	name               string
+	seed, hold         string
+	seedArgs, holdArgs []any
+}
+
+func grantRow(s rbac.Scope, p rbac.Principal, role string) heldRow {
+	args := []any{s.Type, s.ID, string(p.Kind), p.ID, role}
+	return heldRow{
+		name:     fmt.Sprintf("grant of %s to %s:%s on %s", role, p.Kind, p.ID, s.Key()),
+		seed:     `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', $1, $2, $3, $4, $5)`,
+		hold:     `SELECT FROM rbac_grants WHERE tenant = 't1' AND scope_type = $1 AND scope_id = $2 AND principal_kind = $3 AND principal_id = $4 AND role = $5 FOR UPDATE`,
+		seedArgs: args, holdArgs: args,
+	}
+}
+
+func eligibilityRow(s rbac.Scope, p rbac.Principal, role string, approvers ...string) heldRow {
+	args := []any{s.Type, s.ID, string(p.Kind), p.ID, role}
+	return heldRow{
+		name: fmt.Sprintf("eligibility for %s of %s:%s on %s", role, p.Kind, p.ID, s.Key()),
+		seed: `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+			VALUES ('t1', $1, $2, $3, $4, $5, 3600, $6)`,
+		hold:     `SELECT FROM rbac_eligibilities WHERE tenant = 't1' AND scope_type = $1 AND scope_id = $2 AND principal_kind = $3 AND principal_id = $4 AND role = $5 FOR UPDATE`,
+		seedArgs: append(slices.Clone(args), append([]string{}, approvers...)), holdArgs: args,
+	}
+}
+
+func denyRow(s rbac.Scope, id string, principals, exempt []string, permission string) heldRow {
+	args := []any{s.Type, s.ID, id}
+	return heldRow{
+		name: fmt.Sprintf("deny %s on %s", id, s.Key()),
+		seed: `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+			VALUES ('t1', $1, $2, $3, $4, $5, ARRAY[$6])`,
+		hold:     `SELECT FROM rbac_denies WHERE tenant = 't1' AND scope_type = $1 AND scope_id = $2 AND id = $3 FOR UPDATE`,
+		seedArgs: append(slices.Clone(args), principals, append([]string{}, exempt...), permission), holdArgs: args,
+	}
+}
+
+func membershipRow(p rbac.Principal) heldRow {
+	args := []any{string(p.Kind), p.ID}
+	return heldRow{
+		name:     fmt.Sprintf("membership of %s:%s", p.Kind, p.ID),
+		seed:     `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', $1, $2)`,
+		hold:     `SELECT FROM rbac_memberships WHERE tenant = 't1' AND principal_kind = $1 AND principal_id = $2 FOR UPDATE`,
+		seedArgs: args, holdArgs: args,
+	}
+}
+
+func placeRow(group string, p rbac.Principal) heldRow {
+	args := []any{group, string(p.Kind), p.ID}
+	return heldRow{
+		name:     fmt.Sprintf("place of %s:%s in %s", p.Kind, p.ID, group),
+		seed:     `INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', $1, $2, $3)`,
+		hold:     `SELECT FROM rbac_members WHERE tenant = 't1' AND group_id = $1 AND principal_kind = $2 AND principal_id = $3 FOR UPDATE`,
+		seedArgs: args, holdArgs: args,
+	}
+}
+
+// A change holding several rows of its tables locks them in one order, of the tables and of each
+// table's rows by their keys, in the C collation their columns sort in, whatever the plan: a
+// statement locking rows sorts what its keys found and locks each by its key in a nested loop over
+// them (lockedInOrder), so no plan, generic or for its arguments, or with the planner's other ways
+// off, takes them in an index's or the table's order. Each row is written in the reverse of that
+// order, keyed so that the order by principal, or in the database's collation, differs, and held by
+// a transaction of its own, which ends once the change waits for it: so the change waits for each
+// in turn, in the order it locks them.
+func TestChangesLockRowsInTheOrderOfTheirTables(t *testing.T) {
+	big, small, onGroup := rbac.Scope{Type: "cluster", ID: "B"}, rbac.Scope{Type: "cluster", ID: "a"}, rbac.Scope{Type: rbac.GroupScope, ID: "g"}
+	p, q, x, y, z, g := identity("p"), identity("q"), identity("x"), identity("y"), identity("Z"), groupOf("g")
+	for _, c := range []struct {
+		name string
+		// rows are in the order the change locks them, and extra written beside them.
+		rows  []heldRow
+		extra []string
+		call  func(ctx context.Context, h *harness) error
+	}{{
+		name: "DeleteScopes",
+		rows: []heldRow{
+			eligibilityRow(big, z, "cluster.sudo"), eligibilityRow(small, x, "cluster.sudo"),
+			denyRow(big, "e", []string{"public:"}, nil, "cluster:login"), denyRow(small, "d", []string{"public:"}, nil, "cluster:login"),
+			denyRow(small, "e", []string{"public:"}, nil, "cluster:login"),
+			grantRow(big, z, "cluster.login"), grantRow(big, x, "cluster.login"), grantRow(small, z, "cluster.login"), grantRow(small, x, "cluster.login"),
+		},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.DeleteScopes(ctx, host, "t1", []rbac.Scope{small, big})
+		},
+	}, {
+		name: "DeletePrincipal of an identity",
+		rows: []heldRow{
+			eligibilityRow(big, p, "cluster.sudo"), eligibilityRow(small, p, "cluster.sudo"), eligibilityRow(small, q, "cluster.sudo", "user:p"),
+			denyRow(big, "d", []string{"public:"}, []string{"user:p"}, "cluster:login"), denyRow(small, "e", []string{"user:q"}, []string{"user:p"}, "cluster:login"),
+			membershipRow(p),
+			placeRow("G", p), placeRow("g", p),
+			grantRow(big, p, "cluster.login"), grantRow(small, p, "cluster.login"),
+		},
+		extra: []string{`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'G'), ('t1', 'g')`},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipal(ctx, host, "t1", p)
+		},
+	}, {
+		name: "DeletePrincipal of a group",
+		rows: []heldRow{
+			eligibilityRow(big, g, "cluster.sudo"), eligibilityRow(small, g, "cluster.sudo"), eligibilityRow(small, q, "cluster.sudo", "group:g"),
+			denyRow(big, "d", []string{"public:"}, []string{"group:g"}, "cluster:login"),
+			placeRow("G", g), placeRow("h", g),
+			grantRow(big, g, "cluster.login"), grantRow(small, g, "cluster.login"),
+		},
+		extra: []string{`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'G'), ('t1', 'g'), ('t1', 'h')`},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.DeletePrincipal(ctx, host, "t1", g)
+		},
+	}, {
+		name: "DeleteGroups",
+		rows: []heldRow{
+			eligibilityRow(big, g, "cluster.sudo"), eligibilityRow(small, g, "cluster.sudo"), eligibilityRow(small, q, "cluster.sudo", "group:g"),
+			eligibilityRow(onGroup, z, "group.owner"),
+			denyRow(big, "d", []string{"public:"}, []string{"group:g"}, "cluster:login"), denyRow(small, "d", []string{"group:g", "user:q"}, nil, "cluster:login"),
+			denyRow(onGroup, "d", []string{"user:q"}, nil, "group:manage"),
+			placeRow("G", g), placeRow("g", z), placeRow("g", y),
+			grantRow(big, g, "cluster.login"), grantRow(small, g, "cluster.login"), grantRow(onGroup, z, "group.owner"),
+		},
+		extra: []string{`INSERT INTO rbac_groups (tenant, id) VALUES ('t1', 'G'), ('t1', 'g')`},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.DeleteGroups(ctx, host, "t1", []string{"g"})
+		},
+	}, {
+		name: "Apply revoking",
+		rows: []heldRow{grantRow(big, z, "cluster.login"), grantRow(big, x, "cluster.login"), grantRow(big, y, "cluster.login")},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.Apply(ctx, rbac.Subject{Principal: identity("manager")}, rbac.Resource{Tenant: "t1", Type: big.Type, ID: big.ID},
+				rbac.Change{Revoke: []rbac.Binding{
+					{Role: "cluster.login", Principal: y}, {Role: "cluster.login", Principal: x}, {Role: "cluster.login", Principal: z},
+				}})
+		},
+	}, {
+		name: "DeleteGrants",
+		rows: []heldRow{grantRow(big, z, "cluster.login"), grantRow(big, x, "cluster.login"), grantRow(small, z, "cluster.login"), grantRow(small, x, "cluster.login")},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{
+				grant(small, "cluster.login", rbac.User, "x"), grant(small, "cluster.login", rbac.User, "Z"),
+				grant(big, "cluster.login", rbac.User, "x"), grant(big, "cluster.login", rbac.User, "Z"),
+			})
+		},
+	}, {
+		name: "DeleteRole",
+		rows: []heldRow{
+			eligibilityRow(big, x, "custom.x"), eligibilityRow(small, z, "custom.x"),
+			grantRow(big, z, "custom.x"), grantRow(big, x, "custom.x"), grantRow(small, z, "custom.x"),
+		},
+		extra: []string{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.x', '{cluster:view}', '{cluster}')`},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.DeleteRole(ctx, rbac.Subject{Principal: identity("manager")}, "t1", "custom.x")
+		},
+	}, {
+		name: "SetMemberships",
+		rows: []heldRow{membershipRow(z), membershipRow(x), membershipRow(y)},
+		call: func(ctx context.Context, h *harness) error {
+			return h.authz.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: y, Note: "n"}, {Principal: x, Note: "n"}, {Principal: z, Note: "n"}})
+		},
+	}} {
+		for _, mode := range []string{
+			"plan_cache_mode=force_generic_plan", "plan_cache_mode=force_custom_plan",
+			"enable_nestloop=off&enable_sort=off&enable_hashagg=off&enable_material=off&enable_memoize=off&enable_indexscan=off",
+		} {
+			t.Run(c.name+", "+mode, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				defer cancel()
+				// The change runs on the pool's one connection, and the holds each on one of others'.
+				h := groupedOn(t, pgtest.Open(t, "pool_max_conns=1&"+mode))
+				h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.roles", rbac.User, "manager"), grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "manager"),
+					grant(big, "cluster.admin", rbac.User, "manager"), grant(small, "cluster.admin", rbac.User, "manager"))
+				h.as(t, "manager")
+				for _, q := range c.extra {
+					if _, err := h.pool.Exec(ctx, q); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, r := range slices.Backward(c.rows) {
+					if _, err := h.pool.Exec(ctx, r.seed, r.seedArgs...); err != nil {
+						t.Fatalf("%s: %v", r.name, err)
+					}
+				}
+				var pid int32
+				if err := h.pool.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+					t.Fatal(err)
+				}
+				cfg := h.pool.Config().Copy()
+				cfg.MaxConns = int32(len(c.rows) + 1)
+				others, err := pgxpool.NewWithConfig(ctx, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer others.Close()
+				holds, of := make([]pgx.Tx, len(c.rows)), map[int32]int{}
+				for i, r := range c.rows {
+					if holds[i], err = others.Begin(ctx); err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = holds[i].Rollback(context.WithoutCancel(ctx)) }()
+					var held int32
+					if err := holds[i].QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&held); err != nil {
+						t.Fatal(err)
+					}
+					of[held] = i
+					if tag, err := holds[i].Exec(ctx, r.hold, r.holdArgs...); err != nil || tag.RowsAffected() != 1 {
+						t.Fatalf("holding the %s: %v, %v", r.name, tag, err)
+					}
+				}
+				done := make(chan error, 1)
+				go func() { done <- c.call(ctx, h) }()
+				var waited []string
+				for len(waited) < len(c.rows) {
+					select {
+					case err := <-done:
+						t.Fatalf("the change returned %v having waited for %q", err, waited)
+					default:
+					}
+					var blocking []int32
+					if err := others.QueryRow(ctx, `SELECT pg_blocking_pids($1)`, pid).Scan(&blocking); err != nil {
+						t.Fatalf("waiting for %q: %v", waited, err)
+					}
+					if len(blocking) == 0 {
+						continue
+					}
+					i, ok := of[blocking[0]]
+					if !ok || len(blocking) > 1 {
+						t.Fatalf("the change waits for sessions %v", blocking)
+					}
+					waited = append(waited, c.rows[i].name)
+					if err := holds[i].Rollback(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				var want []string
+				for _, r := range c.rows {
+					want = append(want, r.name)
+				}
+				if !slices.Equal(waited, want) {
+					t.Errorf("the change locked\n%s\nwant\n%s", strings.Join(waited, "\n"), strings.Join(want, "\n"))
+				}
+			})
+		}
+	}
+}
+
 func TestDeleteScopesHoldsBoundedLocks(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -11082,7 +11331,8 @@ func TestAReadLeavesTheHostItsPlannerSettingsWhereItFails(t *testing.T) {
 // which the host recovers from. On the pool, and in the host's transaction or a savepoint of it, the
 // host rolling back to that where the call failed; and on a DB that sends no batches, which wraps
 // either. A panic left the batch unread, so the pool never had its connection back, and the host's
-// transaction could run nothing more.
+// transaction could run nothing more. So too for a read whose rows its caller reads on, closing them
+// as it ends (QueriedIndexed).
 func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T) {
 	ctx := t.Context()
 	schema := pgtest.Open(t, "pool_max_conns=1").Config()
@@ -11117,69 +11367,88 @@ func TestAReadPlannedAloneLeavesItsSessionAsItFoundItHoweverItEnds(t *testing.T)
 		"the host's transaction":                 func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return tx },
 		"a DB that sends no batches on the host's transaction": func(_ *pgxpool.Pool, tx pgx.Tx) rbac.DB { return hostTx{tx} },
 	}
-	for name, db := range on {
-		for how, end := range ends {
-			t.Run(name+", where "+how, func(t *testing.T) {
-				bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-				// A pool of one connection of its own, which closes only once it has it back.
-				pool, err := pgxpool.NewWithConfig(bounded, schema)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() {
-					closed := make(chan struct{})
-					go func() {
-						pool.Close()
-						close(closed)
-					}()
-					select {
-					case <-closed:
-					case <-time.After(10 * time.Second):
-						t.Error("the pool never had its connection back")
-					}
-				}()
-				var host pgx.Tx
-				if strings.Contains(name, "host's transaction") {
-					var err error
-					if host, err = pool.Begin(bounded); err != nil {
+	ways := map[string]func(ctx context.Context, q rbac.DB, read func(pgx.Rows) error, sql string) error{
+		"planned": func(ctx context.Context, q rbac.DB, read func(pgx.Rows) error, sql string) error {
+			return rbac.Planned(ctx, q, read, sql)
+		},
+		"read on": func(ctx context.Context, q rbac.DB, read func(pgx.Rows) error, sql string) error {
+			rows, err := rbac.QueriedIndexed(ctx, q, sql)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			if err := read(rows); err != nil {
+				return err
+			}
+			rows.Close()
+			return rows.Err()
+		},
+	}
+	for way, read := range ways {
+		for name, db := range on {
+			for how, end := range ends {
+				t.Run(way+" on "+name+", where "+how, func(t *testing.T) {
+					bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					// A pool of one connection of its own, which closes only once it has it back.
+					pool, err := pgxpool.NewWithConfig(bounded, schema)
+					if err != nil {
 						t.Fatal(err)
 					}
-					defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
-					if _, err := host.Exec(bounded, `SAVEPOINT before`); err != nil {
-						t.Fatal(err)
-					}
-				}
-				err = func() (err error) {
 					defer func() {
-						if r := recover(); r != nil {
-							if r != panicked {
-								panic(r)
-							}
-							err = errors.New(panicked)
+						closed := make(chan struct{})
+						go func() {
+							pool.Close()
+							close(closed)
+						}()
+						select {
+						case <-closed:
+						case <-time.After(10 * time.Second):
+							t.Error("the pool never had its connection back")
 						}
 					}()
-					return rbac.Planned(bounded, db(pool, host), end.read, end.sql)
-				}()
-				if (err == nil) != (how == "it reads") {
-					t.Fatalf("the read returned %v", err)
-				}
-				// As a host whose call failed, back to before it, but where it panicked after its
-				// statements ran, which the host goes on from.
-				if err != nil && host != nil && how != "its read panics" {
-					if _, err := host.Exec(bounded, `ROLLBACK TO SAVEPOINT before`); err != nil {
-						t.Fatal(err)
+					var host pgx.Tx
+					if strings.Contains(name, "host's transaction") {
+						var err error
+						if host, err = pool.Begin(bounded); err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+						if _, err := host.Exec(bounded, `SAVEPOINT before`); err != nil {
+							t.Fatal(err)
+						}
 					}
-				}
-				var q rbac.DB = pool
-				if host != nil {
-					q = host
-				}
-				var seqscan string
-				if err := q.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
-					t.Errorf("enable_seqscan = %q, %v, once the read ended", seqscan, err)
-				}
-			})
+					err = func() (err error) {
+						defer func() {
+							if r := recover(); r != nil {
+								if r != panicked {
+									panic(r)
+								}
+								err = errors.New(panicked)
+							}
+						}()
+						return read(bounded, db(pool, host), end.read, end.sql)
+					}()
+					if (err == nil) != (how == "it reads") {
+						t.Fatalf("the read returned %v", err)
+					}
+					// As a host whose call failed, back to before it, but where it panicked after its
+					// statements ran, which the host goes on from.
+					if err != nil && host != nil && how != "its read panics" {
+						if _, err := host.Exec(bounded, `ROLLBACK TO SAVEPOINT before`); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var q rbac.DB = pool
+					if host != nil {
+						q = host
+					}
+					var seqscan string
+					if err := q.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {
+						t.Errorf("enable_seqscan = %q, %v, once the read ended", seqscan, err)
+					}
+				})
+			}
 		}
 	}
 }
@@ -11219,6 +11488,19 @@ func TestAReadPlannedAloneHoldsItsSettingsInEveryWayAPoolSendsStatements(t *test
 					return err
 				}, `SELECT 1 / (SELECT 0)`); err == nil {
 					t.Fatal("a statement dividing by zero ran")
+				}
+				// So too a read whose rows its caller reads on (QueriedIndexed).
+				rows, err := rbac.QueriedIndexed(bounded, pool, `SELECT current_setting('enable_seqscan') WHERE $1::text[] IS NOT NULL`, []string{"t1"})
+				if err == nil {
+					during, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[string])
+				}
+				if err != nil || during != "off" {
+					t.Fatalf("enable_seqscan = %q, %v, as its rows were read", during, err)
+				}
+				if rows, err := rbac.QueriedIndexed(bounded, pool, `SELECT 1 / (SELECT 0)`); err == nil {
+					if _, err = pgx.CollectRows(rows, pgx.RowTo[int32]); err == nil {
+						t.Fatal("a statement dividing by zero ran")
+					}
 				}
 				var seqscan string
 				if err := pool.QueryRow(bounded, `SELECT current_setting('enable_seqscan')`).Scan(&seqscan); err != nil || seqscan != "on" {

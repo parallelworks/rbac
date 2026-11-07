@@ -2,6 +2,7 @@ package rbac_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -666,6 +667,107 @@ func TestWalkingUpLayeredGroupsWalksTheLatestPathToEachAlone(t *testing.T) {
 		t.Fatalf("the activation isn't reported cut short to when u's latest path ends: %+v", e)
 	}
 	walks("Ending places sooner", rbac.RestsSQL, "t1", []string{g.ID}, h.now)
+}
+
+// A change cutting activations short finds each one's end once: looked up among the ends for each
+// activation, the statement read the square of their number, and a change cutting 1,000 short, as
+// one removing a group its members activated through, held its locks for half a second more, and
+// for 5,000, 15 seconds.
+func TestCuttingActivationsShortReadsEachEndOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	const n = 500
+	ids := activationsToCut(t, h, n)
+	ends := make([]time.Time, n)
+	for i := range ends {
+		ends[i] = h.now.Add(time.Duration(n-i) * time.Second)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The rows each node of the plan read, kept or not.
+	type node struct {
+		Rows    float64 `json:"Actual Rows"`
+		Loops   float64 `json:"Actual Loops"`
+		Removed float64 `json:"Rows Removed by Filter"`
+		Plans   []node
+	}
+	var read func(node) float64
+	read = func(p node) float64 {
+		sum := (p.Rows + p.Removed) * p.Loops
+		for _, c := range p.Plans {
+			sum += read(c)
+		}
+		return sum
+	}
+	var plan []struct{ Plan node }
+	if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+rbac.CutSQL, ids, ends, "user:host").Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if rows := read(plan[0].Plan); rows > 8*n {
+		t.Errorf("cutting %d activations short read %.0f rows", n, rows)
+	}
+	rows, err := tx.Query(ctx, `SELECT id::text, expires_at FROM rbac_grants WHERE id = ANY($1::uuid[])`, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]time.Time{}
+	var id string
+	var until time.Time
+	if _, err := pgx.ForEachRow(rows, []any{&id, &until}, func() error {
+		got[id] = until
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		if !got[id].Equal(ends[i]) {
+			t.Fatalf("activation %s was cut short to %v, not %v", id, got[id], ends[i])
+		}
+	}
+}
+
+// A change cutting activations short finds each one's end by its id as it finds the activation, as
+// a uuid: by the id's text, one written otherwise, as in capitals, was found but its end wasn't, and
+// it was cut to no end at all, lasting for good.
+func TestCuttingActivationsShortFindsEachEndAsItFindsTheActivation(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	ids := activationsToCut(t, h, 2)
+	ends := []time.Time{h.now.Add(time.Minute), h.now.Add(2 * time.Minute)}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, rbac.CutSQL, []string{strings.ToUpper(ids[0]), ids[1]}, ends, "user:host"); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		var until *time.Time
+		if err := tx.QueryRow(ctx, `SELECT expires_at FROM rbac_grants WHERE id = $1::uuid`, id).Scan(&until); err != nil {
+			t.Fatal(err)
+		}
+		if until == nil || !until.Equal(ends[i]) {
+			t.Errorf("activation %s was cut short to %v, not %v", id, until, ends[i])
+		}
+	}
+}
+
+// activationsToCut writes n activations in t1 that last an hour past h.now, and returns their ids
+// in order.
+func activationsToCut(t *testing.T, h *harness, n int) []string {
+	t.Helper()
+	var ids []string
+	if err := h.pool.QueryRow(t.Context(), `WITH made AS (
+		  INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at)
+		  SELECT 't1', 'cluster', 'c1', 'user', 'u' || i, 'cluster.sudo', 'activation', $2 FROM generate_series(1, $1) i RETURNING id)
+		SELECT array_agg(id::text ORDER BY id) FROM made`, n, h.now.Add(time.Hour)).Scan(&ids); err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
 
 // An identity whose membership is made to end sooner, and ends, joins again in none of its groups
@@ -3665,7 +3767,7 @@ func TestReadsOfAnIdentityInManyTenantsAreCostedBelowJIT(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
-			rec := &recordingTx{Tx: tx}
+			rec := recording(tx)
 			if err := f(h.authz.WithTx(rec)); err != nil {
 				t.Fatalf("%s: %v", what, err)
 			}
@@ -3704,25 +3806,55 @@ func TestReadsOfAnIdentityInManyTenantsAreCostedBelowJIT(t *testing.T) {
 	}
 }
 
-// recordingTx is a transaction that records the statements its queries and batches run, with their
-// arguments.
+// recordingTx is a transaction that records the statements it runs, with their arguments, as Exec,
+// Query and QueryRow run them or a batch holds them, in it and in the savepoints it begins.
 type recordingTx struct {
 	pgx.Tx
+	*sent
+}
+
+// sent is what a recordingTx and its savepoints recorded, in order.
+type sent struct {
 	sqls []string
 	args [][]any
 }
 
+func (r *sent) record(sql string, args []any) {
+	r.sqls, r.args = append(r.sqls, sql), append(r.args, args)
+}
+
+func (tx *recordingTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	tx.record(sql, args)
+	return tx.Tx.Exec(ctx, sql, args...)
+}
+
 func (tx *recordingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	tx.sqls, tx.args = append(tx.sqls, sql), append(tx.args, args)
+	tx.record(sql, args)
 	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx *recordingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	tx.record(sql, args)
+	return tx.Tx.QueryRow(ctx, sql, args...)
 }
 
 func (tx *recordingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
 	for _, q := range b.QueuedQueries {
-		tx.sqls, tx.args = append(tx.sqls, q.SQL), append(tx.args, q.Arguments)
+		tx.record(q.SQL, q.Arguments)
 	}
 	return tx.Tx.SendBatch(ctx, b)
 }
+
+func (tx *recordingTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	inner, err := tx.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingTx{Tx: inner, sent: tx.sent}, nil
+}
+
+// recording is a recordingTx of tx.
+func recording(tx pgx.Tx) *recordingTx { return &recordingTx{Tx: tx, sent: &sent{}} }
 
 // What a change rests on is read in rows as many as whom it names, whichever plan PostgreSQL
 // picks: it costs the memberships a change reaches as ten, so where sorting is dear, as at a
@@ -3968,6 +4100,24 @@ func TestHoldersAndMembersReadTheMembershipsOfALargeGroupInAsManyPages(t *testin
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Holders and Members list a group's members in a statement PostgreSQL may run in parallel, as it
+// runs every statement whose plan holds a Gather, however small its part: rbac_group_members, kept
+// to the plan's leader, runs there in parallel mode, where a function may change a setting only by
+// its SET clause, and one that set enable_seqscan itself failed the call (SQLSTATE 25000).
+func TestHoldersAndMembersListAGroupInAParallelPlan(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "debug_parallel_query=on"))
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Group, "crew"))
+	h.as(t, "u", "crew")
+	holders, err := h.authz.Holders(ctx, login, cluster)
+	if want := []rbac.Principal{identity("u")}; err != nil || !slices.Equal(holderPrincipals(holders), want) {
+		t.Errorf("Holders = %+v, %v, want %v", holders, err, want)
+	}
+	if ms, err := h.authz.Members(ctx, "t1", "crew"); err != nil || len(ms) != 1 || ms[0].Principal != identity("u") {
+		t.Errorf("Members = %+v, %v", ms, err)
 	}
 }
 
@@ -6025,17 +6175,18 @@ func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *test
 				for _, table := range []string{"rbac_denies", "rbac_eligibilities"} {
 					before[table] = pagesRead(ctx, t, tx, table)
 				}
-				removing := &pagesOfStatements{Tx: tx, t: t, prefix: "DELETE FROM rbac_members", table: "rbac_members", pages: new(int64)}
+				removing := countingPages(t, tx, "rbac_members")
 				if err := change(removing); err != nil {
 					t.Fatal(err)
 				}
+				removing.end(ctx)
 				if !measured {
 					return
 				}
 				for table, n := range before {
 					pages["the reads of "+table] = pagesRead(ctx, t, tx, table) - n
 				}
-				pages["the removal of places"] = *removing.pages
+				pages["the removal of places"] = removing.starting("DELETE FROM rbac_members", "rbac_members")
 			}()
 		}
 		return pages
@@ -6074,27 +6225,285 @@ func TestAChangeToMembersReadsByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *test
 	}
 }
 
-// scansWhole fails t where a statement f sends by a query or a batch, on a transaction of pool it
-// rolls back, reads one of tables by a sequential scan under a plan made now: generic, as a
-// connection plans a statement it keeps, with the settings the statement was sent with, which it
-// sets again as the batches did, in order. It fails t too where no such statement reads one of
-// tables. A test's pages read once the tables grow catch a plan made while they were small only
-// where the connection kept it until then: a schema any session makes or drops in the database, or
-// a burst of catalog changes anywhere on the server, invalidates every plan a connection keeps, and
-// the next run plans by the tables' size, as most runs on a database other tests share did.
+// The changes, checks and lists read, lock and delete their rows by key once the tables have grown
+// under a generic plan made while they were small, by statistics from then, as a connection planned
+// it: by every statement's plan made while they are small (scansWhole), which reads none of them
+// whole, by a sequential scan, an index scan with nothing to seek, or one seeking the tenant alone,
+// as statistics counting every value as distinct have a plan pick an index by the tenant as readily
+// as one by the key; and by the pages each statement reads once ten thousand rows of each table are
+// beside them in the tenant and as many in others. Before, DeleteGroup read 3,680 pages of grants,
+// 7,546 of places and 5,772 of eligibilities under such a plan, and Reachable 18,744 of grants.
+func TestCallsReadByKeyUnderAPlanMadeWhileTheTablesWereSmall(t *testing.T) {
+	h := groupedOn(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), func(c *rbac.Config) {
+		c.OnChange = nil
+		c.Catalog = append(slices.Clone(c.Catalog), groupOwner, guardRole)
+	})
+	ctx := t.Context()
+	tables := []string{"rbac_grants", "rbac_denies", "rbac_members", "rbac_eligibilities", "rbac_memberships", "rbac_groups"}
+	// Autovacuum would analyze them as they grow, which invalidates the plans; and their writes are
+	// unrecorded, as growing does.
+	for _, table := range tables {
+		if _, err := h.pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off), DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, grant(tenant, "tenant.roles", rbac.User, "manager"), grant(tenant, "tenant.admin", rbac.User, "manager"),
+		grant(tenant, "guard", rbac.User, "manager"), grant(cluster.Scope(), "cluster.login", rbac.Group, "team"),
+		grant(cluster.Scope(), "cluster.login", rbac.User, "w"))
+	h.groups(t, "crew", "parent", "sub", "team")
+	groups, manager := h.as(t, "groups"), h.as(t, "manager")
+	u, w := h.as(t, "u", "crew"), h.as(t, "w")
+	h.as(t, "v", "sub")
+	h.as(t, "z")
+	if err := h.authz.Import(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: rbac.Binding{
+		Role:      "cluster.sudo",
+		Principal: identity("u"), Condition: rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'parent', 'group', 'crew'),
+		  ('t1', 'crew', 'group', 'sub'), ('t1', 'team', 'user', 'w')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'group', 'crew', 'user', 'w', 'group.owner')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'crew', 'cluster.login', '2025-01-01')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		  VALUES ('t1', 'group', 'crew', 'user', 'w', 'group.owner', 3600), ('t1', 'cluster', 'c1', 'group', 'team', 'cluster.sudo', 36000)`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at)
+		  VALUES ('t1', 'cluster', 'c1', 'group', 'crew', 'cluster.sudo', 3600, '2025-01-01')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'group', 'crew', 'd1', '{user:x}', '{group:manage}'),
+		  ('t1', 'cluster', 'c2', 'frozen', '{user:y}', '{cluster:grant}')`,
+		`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.x', '{cluster:view}', '{cluster}')`,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'user', 'z', 'custom.x')`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE `+strings.Join(tables, ", ")+`, rbac_roles`); err != nil {
+		t.Fatal(err)
+	}
+	activate := func(a *rbac.Authorizer) error {
+		_, err := a.Activate(ctx, w, cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "on call"})
+		return err
+	}
+	ignore := func(_ any, err error) error { return err }
+	type call struct {
+		name string
+		call func(a *rbac.Authorizer) error
+	}
+	calls := []call{
+		{"DeleteGroup", func(a *rbac.Authorizer) error { return a.DeleteGroup(ctx, groups, "t1", "crew") }},
+		{"DeleteGroups", func(a *rbac.Authorizer) error { return a.DeleteGroups(ctx, host, "t1", []string{"crew"}) }},
+		{"Apply revoking", func(a *rbac.Authorizer) error {
+			return a.Apply(ctx, manager, cluster, rbac.Change{Revoke: []rbac.Binding{{Role: "cluster.login", Principal: identity("w")}}})
+		}},
+		{"Apply granting", func(a *rbac.Authorizer) error {
+			return a.Apply(ctx, manager, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("z"), ExpiresAt: h.now.Add(time.Hour)}}})
+		}},
+		{"Import", func(a *rbac.Authorizer) error {
+			return a.Import(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.Group, "crew")})
+		}},
+		{"DeleteGrants", func(a *rbac.Authorizer) error {
+			return a.DeleteGrants(ctx, host, "t1", []rbac.Grant{grant(cluster.Scope(), "cluster.login", rbac.User, "w")})
+		}},
+		{"DeleteScopes", func(a *rbac.Authorizer) error { return a.DeleteScopes(ctx, host, "t1", []rbac.Scope{cluster.Scope()}) }},
+		{"DeletePrincipal of an identity", func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", identity("w")) }},
+		{"DeletePrincipal of a group", func(a *rbac.Authorizer) error { return a.DeletePrincipal(ctx, host, "t1", groupOf("team")) }},
+		{"DeleteRole", func(a *rbac.Authorizer) error { return a.DeleteRole(ctx, manager, "t1", "custom.x") }},
+		{"ChangeMembers", func(a *rbac.Authorizer) error {
+			return a.ChangeMembers(ctx, manager, "t1", []rbac.Member{{Group: "team", Principal: identity("z")}},
+				[]rbac.Member{{Group: "team", Principal: identity("w")}})
+		}},
+		{"ImportMembers", func(a *rbac.Authorizer) error {
+			return a.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "team", Principal: identity("z")}})
+		}},
+		{"DeleteMembers", func(a *rbac.Authorizer) error {
+			return a.DeleteMembers(ctx, host, "t1", []rbac.Member{{Group: "team", Principal: identity("w")}})
+		}},
+		{"SetMemberships", func(a *rbac.Authorizer) error {
+			return a.SetMemberships(ctx, host, "t1", []rbac.Membership{{Principal: identity("w"), ExpiresAt: h.now.Add(time.Hour)}})
+		}},
+		{"SetDeny", func(a *rbac.Authorizer) error {
+			return a.SetDeny(ctx, manager, cluster, rbac.Deny{ID: "x", Principals: []rbac.Principal{identity("z")}, Permissions: []rbac.Permission{root}})
+		}},
+		{"DeleteDeny", func(a *rbac.Authorizer) error { return a.DeleteDeny(ctx, manager, cluster, "x") }},
+		{"SetEligibility", func(a *rbac.Authorizer) error {
+			return a.SetEligibility(ctx, manager, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: identity("z"), MaxDuration: time.Hour})
+		}},
+		{"DeleteEligibility", func(a *rbac.Authorizer) error {
+			return a.DeleteEligibility(ctx, manager, cluster, "cluster.sudo", groupOf("team"))
+		}},
+		{"Activate", activate},
+		{"Deactivate", func(a *rbac.Authorizer) error {
+			if err := activate(a); err != nil {
+				return err
+			}
+			return a.Deactivate(ctx, w, cluster, "cluster.sudo")
+		}},
+		{"Authorize of a conditional grant", func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, root, cluster) }},
+		{"Explain", func(a *rbac.Authorizer) error { return ignore(a.Explain(ctx, u, root, cluster)) }},
+		{"Permissions", func(a *rbac.Authorizer) error { return ignore(a.Permissions(ctx, u, cluster)) }},
+		{"Grantable", func(a *rbac.Authorizer) error { return ignore(a.Grantable(ctx, manager, cluster)) }},
+		{"Holders", func(a *rbac.Authorizer) error { return ignore(a.Holders(ctx, login, cluster)) }},
+		{"Reachable", func(a *rbac.Authorizer) error { return ignore(a.Reachable(ctx, u, root, "t1", "cluster")) }},
+		{"Filter", func(a *rbac.Authorizer) error {
+			return ignore(a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1))
+		}},
+		{"Members", func(a *rbac.Authorizer) error { return ignore(a.Members(ctx, "t1", "crew")) }},
+		{"GroupsOf", func(a *rbac.Authorizer) error { return ignore(a.GroupsOf(ctx, "t1", u.Principal)) }},
+		{"Grants", func(a *rbac.Authorizer) error {
+			return ignore(a.Grants(ctx, "t1", rbac.GrantFilter{Scopes: []rbac.Scope{cluster.Scope()}, Principals: []rbac.Principal{identity("w")}}))
+		}},
+		{"Eligibilities", func(a *rbac.Authorizer) error {
+			return ignore(a.Eligibilities(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{groupOf("team")}}))
+		}},
+		{"Denies", func(a *rbac.Authorizer) error { return ignore(a.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()})) }},
+		{"Memberships", func(a *rbac.Authorizer) error {
+			return ignore(a.Memberships(ctx, "t1", []rbac.Principal{identity("w")}))
+		}},
+		{"MembershipsOf", func(a *rbac.Authorizer) error { return ignore(a.MembershipsOf(ctx, identity("w"))) }},
+		{"a change's read of its actor's authority", func(a *rbac.Authorizer) error {
+			return rbac.ReadAuthority(ctx, a, manager, []rbac.Resource{cluster})
+		}},
+	}
+	// Each statement's plans, made generically while the tables are small, right after the call has
+	// had its plans made and cached, as the transactions the calls roll back leave pages behind, and
+	// once they have grown, by the statistics from then, generically and for its arguments
+	// (scansWhole).
+	plans := func(when string, custom bool, calls ...call) {
+		for _, c := range calls {
+			t.Run(when+"/"+c.name, func(t *testing.T) {
+				scansWholePlanned(ctx, t, h.pool, c.name, custom, func(tx pgx.Tx) error { return c.call(h.authz.WithTx(tx)) }, tables...)
+			})
+		}
+	}
+	// Each statement's pages of each table, by call, in a transaction it rolls back: made once
+	// before, so its plans are made and cached.
+	read := func(small bool) map[string]map[string]int64 {
+		t.Helper()
+		pages := map[string]map[string]int64{}
+		for _, c := range calls {
+			for _, measured := range []bool{false, true} {
+				func() {
+					tx, err := h.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					counting := countingPages(t, tx, tables...)
+					if err := c.call(h.authz.WithTx(counting)); err != nil {
+						t.Fatalf("%s: %v", c.name, err)
+					}
+					counting.end(ctx)
+					if !measured {
+						return
+					}
+					for _, table := range tables {
+						for sql, n := range counting.of(table) {
+							if pages[c.name+" of "+table] == nil {
+								pages[c.name+" of "+table] = map[string]int64{}
+							}
+							pages[c.name+" of "+table][sql] = n
+						}
+					}
+				}()
+			}
+			if small {
+				plans("small", false, c)
+			}
+		}
+		return pages
+	}
+	few := read(true)
+	// Grants, denies, eligibilities, memberships, groups and places in groups of others, in t1 and in
+	// tenants of their own, naming groups and on their scopes too.
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'group', 'o' || i, 'cluster.login' FROM generate_series(1, 20000) i
+		 UNION ALL SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'group', 'o' || i, 'user', 'o' || i, 'group.owner' FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'd', ARRAY['group:o' || i], ARRAY['user:o' || i], '{cluster:root,cluster:grant}'::text[]
+		 FROM generate_series(1, 20000) i
+		 UNION ALL SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'group', 'o' || i, 'd', ARRAY['user:o' || i], ARRAY['user:p' || i], '{group:manage}'::text[]
+		 FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, approvers)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'cluster', 'k' || i, 'group', 'o' || i, 'cluster.sudo', 3600, ARRAY['group:o' || i]
+		 FROM generate_series(1, 20000) i
+		 UNION ALL SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'group', 'o' || i, 'user', 'o' || i, 'group.owner', 3600, ARRAY['user:p' || i]
+		 FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'user', 'o' || i FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_groups (tenant, id) SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i FROM generate_series(1, 20000) i`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id)
+		 SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i, 'user', 'o' || i FROM generate_series(1, 20000) i
+		 UNION ALL SELECT CASE WHEN i % 2 = 0 THEN 't1' ELSE 's' || i END, 'o' || i, 'group', 'o' || (i + 2) FROM generate_series(1, 20000) i`,
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plans("grown", false, calls...)
+	plans("grown, for its arguments", true, calls...)
+	for what, statements := range read(false) {
+		for sql, many := range statements {
+			// A statement looking many keys up descends each one's index a level or two deeper.
+			if n := few[what][sql]; many > 3*n+deeper {
+				t.Errorf("%s: %d pages, and %d once the tables grew under a plan made while they were small: %s", what, n, many, sql[:min(len(sql), 160)])
+			}
+		}
+	}
+}
+
+// scansWhole fails t where a statement f sends, on a transaction of pool it rolls back, reads one of
+// tables whole under a plan made now: generic, as a connection plans a statement it keeps, with the
+// settings the statement was sent with, which it sets again as the batches did, in order. A plan
+// reads a table whole by a sequential scan, by an index scan with no condition the index seeks, or
+// by one seeking the tenant alone, as statistics from a near-empty table, which count every value
+// as distinct, have a plan read a tenant's rows by an index leading to it as cheaply as a key's by
+// the index leading to that. It fails t too where no statement reads any of tables. A test's pages
+// read once the tables grow catch a plan made while they were small only where the connection
+// kept it until then: a schema any session makes or drops in the database, or a burst of catalog
+// changes anywhere on the server, invalidates every plan a connection keeps, and the next run plans
+// by the tables' size, as most runs on a database other tests share did.
 func scansWhole(ctx context.Context, t *testing.T, pool *pgxpool.Pool, what string, f func(pgx.Tx) error, tables ...string) {
+	t.Helper()
+	scansWholePlanned(ctx, t, pool, what, false, f, tables...)
+}
+
+// scansWholePlanned is scansWhole of plans made for the arguments each statement was sent with,
+// where custom says, as a connection plans its first five runs of a statement.
+func scansWholePlanned(ctx context.Context, t *testing.T, pool *pgxpool.Pool, what string, custom bool, f func(pgx.Tx) error, tables ...string) {
 	t.Helper()
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	rec := &recordingTx{Tx: tx}
+	rec := recording(tx)
 	if err := f(rec); err != nil {
 		t.Fatalf("%s: %v", what, err)
 	}
+	indexes := map[string]index{}
+	rows, err := tx.Query(ctx, `SELECT i.relname, t.relname, array_agg(coalesce(a.attname, '') ORDER BY k.n)
+		FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class t ON t.oid = x.indrelid
+		CROSS JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS k(attnum, n)
+		LEFT JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+		WHERE t.relnamespace = current_schema()::regnamespace AND k.n <= x.indnkeyatts
+		GROUP BY i.relname, t.relname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var name string
+	var ix index
+	if _, err := pgx.ForEachRow(rows, []any{&name, &ix.table, &ix.columns}, func() error {
+		indexes[name] = ix
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	read := map[string]bool{}
-	whole := regexp.MustCompile(`Seq Scan on (\w+)`)
 	for i, sql := range rec.sqls {
 		if strings.HasPrefix(sql, "SELECT set_config(") {
 			if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
@@ -6104,82 +6513,200 @@ func scansWhole(ctx context.Context, t *testing.T, pool *pgxpool.Pool, what stri
 		}
 		var reading []string
 		for _, table := range tables {
-			if strings.Contains(sql, "FROM "+table) {
+			if strings.Contains(sql, "FROM "+table) || strings.Contains(sql, "INTO "+table) || strings.Contains(sql, "UPDATE "+table) {
 				reading, read[table] = append(reading, table), true
 			}
 		}
 		if len(reading) == 0 {
 			continue
 		}
+		statement := strings.Join(strings.Fields(sql), " ")
+		var args []any
+		if custom {
+			args = rec.args[i]
+		}
+		for _, whole := range wholeReads(ctx, t, tx, sql, args, indexes, reading) {
+			t.Errorf("%s reads %s under a plan made while the tables were small: %s", what, whole, statement[:min(len(statement), 160)])
+		}
+	}
+	if len(read) == 0 {
+		t.Fatalf("%s read none of %s", what, strings.Join(tables, ", "))
+	}
+}
+
+// planNode is a node of a plan EXPLAIN gives as JSON.
+type planNode struct {
+	Type      string     `json:"Node Type"`
+	Relation  string     `json:"Relation Name"`
+	Index     string     `json:"Index Name"`
+	IndexCond string     `json:"Index Cond"`
+	Plans     []planNode `json:"Plans"`
+}
+
+// index is an index's table and key columns, in order, an expression's as "".
+type index struct {
+	table   string
+	columns []string
+}
+
+var (
+	// tenantEquals is a condition of an index on the tenant alone.
+	tenantEquals = regexp.MustCompile(`\btenant = [^ ()]+`)
+	// seeksKey is a condition an index seeks a key by: an equality, an array's, a row comparison's, a
+	// GIN index's, or a range of a key, as of a type's scopes.
+	seeksKey = regexp.MustCompile(`[^<>!]= |&&|@>|<@|ROW\(|[<>]=? \(`)
+)
+
+// wholeReads is how the plan of sql, made now on tx, generic or with args, reads one of tables whole,
+// or a tenant's rows of it, by their indexes, each once: by a sequential scan, an index scan with no
+// condition, one that seeks none of the key the index leads to after the tenant, as by a skip scan
+// of its second column, or one that skips over the tenant an index leads to.
+func wholeReads(ctx context.Context, t *testing.T, tx pgx.Tx, sql string, args []any, indexes map[string]index, tables []string) []string {
+	t.Helper()
+	var plans []struct{ Plan planNode }
+	if args != nil {
+		var raw []byte
+		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, args...).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &plans); err != nil {
+			t.Fatal(err)
+		}
+	} else {
 		// By the simple protocol, which binds no parameters: GENERIC_PLAN plans with none.
-		results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN) "+sql).ReadAll()
+		results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN, FORMAT JSON) "+sql).ReadAll()
 		if err != nil {
 			t.Fatal(err)
 		}
-		scanned := map[string]bool{}
-		for _, r := range results {
-			for _, row := range r.Rows {
-				if m := whole.FindSubmatch(row[0]); m != nil && slices.Contains(reading, string(m[1])) {
-					scanned[string(m[1])] = true
-				}
+		if err := json.Unmarshal(results[len(results)-1].Rows[0][0], &plans); err != nil {
+			t.Fatal(err)
+		}
+	}
+	found := map[string]bool{}
+	var walk func(planNode)
+	walk = func(n planNode) {
+		ix := indexes[n.Index]
+		table := n.Relation
+		if table == "" {
+			table = ix.table
+		}
+		if slices.Contains(tables, table) {
+			leads := slices.DeleteFunc(slices.Clone(ix.columns), func(c string) bool { return c == "tenant" })
+			switch {
+			case n.Type == "Seq Scan":
+				found["every row of "+table] = true
+			case n.Index != "" && n.IndexCond == "":
+				found["all of "+n.Index] = true
+			case n.Index != "" && !seeksKey.MatchString(tenantEquals.ReplaceAllString(n.IndexCond, "")),
+				n.Index != "" && len(leads) > 0 && leads[0] != "" && !regexp.MustCompile(`\b`+leads[0]+`\b`).MatchString(n.IndexCond):
+				found["the tenant's entries in "+n.Index+", by "+n.IndexCond] = true
+			case n.Index != "" && len(ix.columns) > 0 && ix.columns[0] == "tenant" && !strings.Contains(n.IndexCond, "tenant"):
+				found["every tenant's entries in "+n.Index+", by "+n.IndexCond] = true
 			}
 		}
-		statement := strings.Join(strings.Fields(sql), " ")
-		for _, table := range slices.Sorted(maps.Keys(scanned)) {
-			t.Errorf("%s reads every row of %s under a plan made while the tables were small: %s", what, table, statement[:min(len(statement), 100)])
+		for _, c := range n.Plans {
+			walk(c)
 		}
 	}
-	for _, table := range tables {
-		if !read[table] {
-			t.Fatalf("%s read no %s", what, table)
-		}
+	for _, p := range plans {
+		walk(p.Plan)
 	}
+	return slices.Sorted(maps.Keys(found))
 }
 
-// pagesOfStatements is a transaction that counts the pages of table and its indexes read by its
-// statements starting with prefix, as Exec runs them or a batch holds them, in it and in the
-// savepoints it begins.
+// pagesOfStatements is a transaction that counts, for each statement it runs, as Exec, Query and
+// QueryRow run them or a batch holds them, in it and in the savepoints it begins, the pages of each
+// of tables and its indexes the statement read: a batch's statements together, but for those
+// setting and putting back a read's settings. A statement's are counted once the next is sent, or
+// end is called, as by then it has been read.
 type pagesOfStatements struct {
 	pgx.Tx
-	t             *testing.T
-	prefix, table string
-	pages         *int64
+	*statementPages
+}
+
+// statementPages is what a pagesOfStatements and its savepoints counted.
+type statementPages struct {
+	t      *testing.T
+	root   pgx.Tx
+	tables []string
+	// sqls are the statements in the order they ran, and pages each one's by table.
+	sqls  []string
+	pages []map[string]int64
+	last  map[string]int64
+}
+
+// countingPages is a pagesOfStatements of tx counting the pages of tables.
+func countingPages(t *testing.T, tx pgx.Tx, tables ...string) *pagesOfStatements {
+	t.Helper()
+	return &pagesOfStatements{Tx: tx, statementPages: &statementPages{t: t, root: tx, tables: tables}}
+}
+
+// next counts what the statement before read, and starts counting sql's.
+func (p *statementPages) next(ctx context.Context, sql string) {
+	p.end(ctx)
+	p.sqls, p.pages = append(p.sqls, strings.Join(strings.Fields(sql), " ")), append(p.pages, map[string]int64{})
+}
+
+// end counts what the last statement read.
+func (p *statementPages) end(ctx context.Context) {
+	p.t.Helper()
+	now := map[string]int64{}
+	for _, table := range p.tables {
+		now[table] = pagesRead(ctx, p.t, p.root, table)
+	}
+	if n := len(p.pages); n > 0 && p.last != nil {
+		for table, read := range now {
+			p.pages[n-1][table] += read - p.last[table]
+		}
+	}
+	p.last = now
+}
+
+// of is each statement's pages of table, by its text and the how-manyth of that text it is.
+func (p *statementPages) of(table string) map[string]int64 {
+	read, seen := map[string]int64{}, map[string]int{}
+	for i, sql := range p.sqls {
+		seen[sql]++
+		read[fmt.Sprintf("%s (%d)", sql, seen[sql])] = p.pages[i][table]
+	}
+	return read
+}
+
+// starting is the pages of table the statements starting with prefix read.
+func (p *statementPages) starting(prefix, table string) int64 {
+	var n int64
+	for i, sql := range p.sqls {
+		if strings.HasPrefix(sql, prefix) {
+			n += p.pages[i][table]
+		}
+	}
+	return n
 }
 
 func (p *pagesOfStatements) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if !strings.HasPrefix(sql, p.prefix) {
-		return p.Tx.Exec(ctx, sql, args...)
-	}
-	before := pagesRead(ctx, p.t, p.Tx, p.table)
-	tag, err := p.Tx.Exec(ctx, sql, args...)
-	if err == nil {
-		*p.pages += pagesRead(ctx, p.t, p.Tx, p.table) - before
-	}
-	return tag, err
+	p.next(ctx, sql)
+	return p.Tx.Exec(ctx, sql, args...)
+}
+
+func (p *pagesOfStatements) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	p.next(ctx, sql)
+	return p.Tx.Query(ctx, sql, args...)
+}
+
+func (p *pagesOfStatements) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	p.next(ctx, sql)
+	return p.Tx.QueryRow(ctx, sql, args...)
 }
 
 func (p *pagesOfStatements) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
-	if !slices.ContainsFunc(b.QueuedQueries, func(q *pgx.QueuedQuery) bool { return strings.HasPrefix(q.SQL, p.prefix) }) {
-		return p.Tx.SendBatch(ctx, b)
+	var sqls []string
+	for _, q := range b.QueuedQueries {
+		if !strings.HasPrefix(q.SQL, "SELECT set_config(") {
+			sqls = append(sqls, q.SQL)
+		}
 	}
-	before := pagesRead(ctx, p.t, p.Tx, p.table)
-	return &measuredBatch{BatchResults: p.Tx.SendBatch(ctx, b), done: func() {
-		*p.pages += pagesRead(ctx, p.t, p.Tx, p.table) - before
-	}}
-}
-
-// measuredBatch is a batch that runs done once it is closed.
-type measuredBatch struct {
-	pgx.BatchResults
-	done func()
-}
-
-func (b *measuredBatch) Close() error {
-	err := b.BatchResults.Close()
-	if err == nil {
-		b.done()
-	}
-	return err
+	p.next(ctx, strings.Join(sqls, "; "))
+	return p.Tx.SendBatch(ctx, b)
 }
 
 func (p *pagesOfStatements) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -6187,7 +6714,7 @@ func (p *pagesOfStatements) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pagesOfStatements{Tx: tx, t: p.t, prefix: p.prefix, table: p.table, pages: p.pages}, nil
+	return &pagesOfStatements{Tx: tx, statementPages: p.statementPages}, nil
 }
 
 // reportedRead is how many pages of table and its indexes the database has counted read, once the

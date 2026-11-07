@@ -635,6 +635,12 @@ func Planned(ctx context.Context, q DB, read func(pgx.Rows) error, sql string, a
 	return planned(ctx, q, indexed, read, sql, args...)
 }
 
+// QueriedIndexed is q.Query of sql with sequential scans off for its plan alone, as a list reads
+// its rows on (plannedQuery).
+func QueriedIndexed(ctx context.Context, q DB, sql string, args ...any) (pgx.Rows, error) {
+	return plannedQuery(ctx, q, indexed, sql, args...)
+}
+
 // HeldByMembers is why making custom role id privileged in tenant is refused at now, read on q, as
 // its tenant's members hold it (heldByMembers).
 func HeldByMembers(ctx context.Context, q DB, tenant string, id Role, now time.Time) error {
@@ -1156,6 +1162,10 @@ var HoldSQL = holdSQL
 // RestsSQL is the statement a change ending places reads the paths left to activations with:
 // tenant $1, the activations' ids $2, now $3.
 var RestsSQL = restsSQL
+
+// CutSQL is the statement a change cuts activations short with: their ids $1, their ends $2 in the
+// same order, the actor's key $3.
+const CutSQL = cutSQL
 
 // EndsSQL is the statement a change reads when its actor's paths to each key it holds end with:
 // tenant $1, the identity's key $2, now $3.

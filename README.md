@@ -118,7 +118,14 @@ few versions of denies there, deleted ones too, and otherwise every one in the t
 `Reachable` returns the same as scopes, for resources kept in another store, and of the listed type
 alone: a scope reaches everything under it, so a store holding several types keeps to that type
 itself. Both search one tenant, and count only unconditional grants: `Reach.Conditional` names the
-scopes conditional ones reach, to check one by one.
+scopes conditional ones reach, to check one by one. The condition reads the package's tables in the
+host's statement, which the host plans, so the package can't pin its plan as it pins its own reads
+(Planner settings): a plan the host's session made while those tables were small, and keeps, reads
+each of them whole, once for each type and key the condition looks up, as a page read whole costs
+less than descending any index. Run the query with sequential scans off for it alone, as in
+`SET LOCAL enable_seqscan = off` before it and `RESET enable_seqscan` after, in its transaction, or
+plan it again once the tables have grown, as an analysis of them does: under a plan cached while
+they held a few rows, a list read 43,736 pages of grants and 4,502 of denies beside 20,000 of each.
 
 ## Policies
 
@@ -1268,6 +1275,16 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   doesn't record it, and `AsOf` doesn't read it. Code before it never reads it. Run `DeleteExpired`
   only from code after it once any runs: an earlier one records nothing, so the reads of later
   code can find what it removed by a clock ahead of theirs.
+  `0031_member_reads` replaces `rbac_group_members` again, which keeps its owner and who may execute
+  it and takes no lock on the tables, to plan its statements with sequential scans off, by its SET
+  clause, whatever its caller's: it reads the groups' places a group at a time, in the order of the
+  primary key, and the members' memberships by their keys, through a bitmap where a plan counts
+  them as many, and each on its own where it counts them as few, as in a tenant holding a small share
+  of the table, though none the keys don't name.
+  Code from this release runs every statement calling it with them off, so its join of a group of
+  20,000 to their memberships, as before, looked each up on its own, 20,179 pages that fill 856, and
+  code from before it reads the places by statistics alone, every place in the table by those from
+  when it was nearly empty. Code from before it and after it run beside each other, applied or not.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1366,14 +1383,24 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
-- **Planner settings:** a check's read of its subject's grants and denies, a change's of its
-  actor's, and a change to members' reads of what names its groups and its removal of places, turn
-  sequential scans off for their own statement, as `Holders`' read of label values and `Conflicts`
-  turn JIT off for theirs. Each sets them in the round trip that sends the statement, and puts the
-  session's back after it, keeping each meanwhile in a variable of the package's own named for it,
-  as `rbac.enable_seqscan` and `rbac.jit`: a connection plans a statement once for all its runs,
-  and one planned while the tables were small read every row of them until an analysis had it
-  planned again.
+- **Planner settings:** every statement a check, list or change sends on the package's tables, but
+  as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
+  `Conflicts` turn JIT off for theirs. Each sets them in the round trip that sends the statement,
+  several of a change's together, and puts the session's back after it, keeping each meanwhile in a
+  variable of the package's own named for it, as `rbac.enable_seqscan` and `rbac.jit`: a connection
+  plans a statement once for all its runs, and one planned while a table fit in a page read every
+  row of it, whatever the statement's shape, until an analysis had it planned again, as reading a
+  page costs less than descending any index. The statements are written so that, with them off, a
+  plan reaches its rows by key, by the group, the principal, the scope or the id the indexes lead
+  to, whatever the statistics: statistics from a near-empty table count every value as distinct, so
+  an index leading to the tenant looks as few rows to read by the tenant alone as by a key, and a
+  plan for rows sorted in a table's order reads a whole index in that order. A plan made while the
+  tables were small read 3,680 pages of grants, 7,546 of places and 5,772 of eligibilities to delete
+  one group beside 20,000 of each, and `Reachable` 18,744 of grants. The statement deleting a group
+  is planned so too, and with it the foreign key's cascade to its places, which PostgreSQL plans as
+  the first deletion in a session runs it and keeps: a host's own deletion of a group, planned with
+  sequential scans on while the places were few, leaves a plan that reads every one. `Filter`'s
+  condition runs in the host's statement, which the host plans (Lists).
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

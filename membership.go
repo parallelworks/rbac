@@ -242,8 +242,11 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// its own and locked in order, as removeGroups finds and locks its own; each key's membership is
 		// looked up on its own, as in widening, and OFFSET 0 keeps a generic plan from making that an
 		// anti-join that reads every one.
-		leaving := lockedAnyOf("rbac_members", "ctid", placeOrder, byKeys("rbac_members", "ctid", "principal", `(
-			  ARRAY(SELECT principal FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) AND expires_at <= $3)
+		// Its end is tested as no index holds it, so a plan made by statistics from a near-empty table
+		// can't read the ended memberships of every tenant by the index of expiries for those.
+		leaving := lockedAnyOf("rbac_members", "ctid", placeOrder, byKeys("rbac_members", "ctid", placeOrder, "principal", `(
+			  ARRAY(SELECT m.principal FROM unnest($2::text[]) AS k CROSS JOIN LATERAL (SELECT principal FROM rbac_memberships
+			    WHERE tenant = $1 AND principal = k AND coalesce(expires_at, 'infinity') <= $3 OFFSET 0) m)
 			  || ARRAY(SELECT k FROM unnest($2::text[]) AS k WHERE NOT EXISTS (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k OFFSET 0)))`))
 		// The places of the memberships that had ended at the time the change picks what it holds by
 		// (earlier) are held before it reads the time it decides at, as are the activations resting on
@@ -257,11 +260,13 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		// deadlock: DeleteExpired, which takes no lock, may be deleting one that has ended by its clock,
 		// which the upsert would wait for. In a statement of its own, as a subquery's lock is taken only
 		// once its statement reads the subquery, which one finding no places to read never does.
+		// Each membership locked by its key, in order, as lockedInOrder locks rows.
 		was := a.clock.earlier()
-		b := &pgx.Batch{}
-		b.Queue(`SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = ANY($2::text[]) ORDER BY principal FOR UPDATE`, tenant, keys)
-		b.Queue(`SELECT FROM rbac_members WHERE `+leaving, tenant, keys, was)
-		if err := tx.SendBatch(ctx, b).Close(); err != nil {
+		if err := byIndexes(ctx, tx,
+			stmt(nil, `SELECT FROM (SELECT DISTINCT k COLLATE "C" AS k FROM unnest($2::text[]) AS k ORDER BY 1) k
+				CROSS JOIN LATERAL (SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = k.k FOR UPDATE) m`, tenant, keys),
+			stmt(nil, `SELECT FROM rbac_members WHERE `+leaving, tenant, keys, was),
+		); err != nil {
 			return ChangeEvent{}, nil, err
 		}
 		r, err := a.restingOn(ctx, tx, tenant, ending, nil, was)
@@ -288,7 +293,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 		if err != nil {
 			return ChangeEvent{}, nil, err
 		}
-		rows, err := tx.Query(ctx, `
+		rows, err := a.queryIndexed(ctx, tx, `
 			INSERT INTO rbac_memberships AS m (tenant, principal_kind, principal_id, guest, suspended, source, expires_at, note,
 			  created_by, updated_by)
 			SELECT $1, k, i, g, s, src, e, n, $9, $9
@@ -327,7 +332,7 @@ func (a *Authorizer) SetMemberships(ctx context.Context, actor Principal, tenant
 func widening(ctx context.Context, tx pgx.Tx, tenant string, set []Membership, keys []string, at time.Time) ([]string, error) {
 	// Each key's membership is looked up on its own: as a join, a generic plan, costing the tenant's
 	// memberships by averages, reads every one. OFFSET 0 keeps the planner from making it one.
-	rows, err := tx.Query(ctx, `SELECT m.principal, m.guest, m.suspended, m.expires_at FROM unnest($2::text[]) AS k
+	rows, err := queryByIndexes(ctx, tx, `SELECT m.principal, m.guest, m.suspended, m.expires_at FROM unnest($2::text[]) AS k
 		CROSS JOIN LATERAL (SELECT principal, guest, suspended, expires_at FROM rbac_memberships
 		  WHERE tenant = $1 AND principal = k AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) m`, tenant, keys, at)
 	if err != nil {
@@ -381,7 +386,7 @@ func (a *Authorizer) Memberships(ctx context.Context, tenant string, principals 
 	if len(principals) > 0 {
 		which, keys = "principal = ANY($2::text[])", keysOf(principals)
 	}
-	rows, err := a.db.Query(ctx, `SELECT `+membershipColumns+` FROM rbac_memberships
+	rows, err := a.queryIndexed(ctx, a.db, `SELECT `+membershipColumns+` FROM rbac_memberships
 		WHERE tenant = $1 AND `+which+` AND (expires_at IS NULL OR expires_at > $3)
 		ORDER BY principal`, tenant, keys, a.cfg.Now())
 	if err != nil {
@@ -401,7 +406,7 @@ func (a *Authorizer) MembershipsOf(ctx context.Context, p Principal) (_ []Member
 	if !validName(string(p.Kind)) || !validID(p.ID) {
 		return nil, fmt.Errorf("%w: MembershipsOf needs a kind and an id of text without NUL of at most %d bytes", ErrInvalid, MaxID)
 	}
-	rows, err := a.db.Query(ctx, `SELECT `+membershipColumns+` FROM rbac_memberships
+	rows, err := a.queryIndexed(ctx, a.db, `SELECT `+membershipColumns+` FROM rbac_memberships
 		WHERE principal = $1 AND (expires_at IS NULL OR expires_at > $2) ORDER BY tenant`, p.key(), a.cfg.Now())
 	if err != nil {
 		return nil, err
@@ -568,7 +573,7 @@ func (a *Authorizer) ImportGroups(ctx context.Context, actor Principal, tenant s
 		e := ChangeEvent{Groups: changed}
 		// Each group's found on its own, as removeGroups finds them.
 		if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
-			lockedAnyOf("rbac_members", "ctid", placeOrder, byKey("$2", "rbac_members", "group_id", "ctid", tenants)), tenant, taken, owned); err != nil {
+			lockedAnyOf("rbac_members", "ctid", placeOrder, seekBy("$2", "rbac_members", "group_id", keyCols(placeOrder, "ctid"), tenants)), tenant, taken, owned); err != nil {
 			return ChangeEvent{}, err
 		}
 		e.Shortened, e.Revoked, err = a.unrest(ctx, tx, tenant, actor, r, now)
@@ -588,7 +593,7 @@ func (a *Authorizer) takenOver(ctx context.Context, tx pgx.Tx, tenant string, se
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	rows, err := tx.Query(ctx, `SELECT id FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source <> ALL($3::text[]) ORDER BY id`,
+	rows, err := a.queryIndexed(ctx, tx, `SELECT id FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source <> ALL($3::text[]) ORDER BY id`,
 		tenant, ids, slices.Sorted(maps.Keys(a.owned)))
 	if err != nil {
 		return nil, err
@@ -603,7 +608,7 @@ func upsertGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal
 	for i, g := range groups {
 		ids[i], names[i], descriptions[i], sources[i] = g.ID, g.Name, g.Description, g.Source
 	}
-	rows, err := tx.Query(ctx, `
+	rows, err := queryByIndexes(ctx, tx, `
 		INSERT INTO rbac_groups AS g (tenant, id, name, description, source, created_by, updated_by)
 		SELECT $1, i, n, d, s, $6, $6 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS t(i, n, d, s)
 		ON CONFLICT (tenant, id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
@@ -808,17 +813,15 @@ func (a *Authorizer) DeleteGroup(ctx context.Context, actor Subject, tenant, id 
 // sorted. Each group's are looked up by its key (groupsAbove), so a generic plan can't join them to
 // every member of the tenant.
 func upOf(ctx context.Context, q DB, tenant, id string, now time.Time) ([]string, error) {
-	rows, err := q.Query(ctx, `
+	var up []string
+	err := byIndexes(ctx, q, stmt(collecting(&up, collectStrings), `
 		WITH RECURSIVE up(id) AS (
 		  SELECT $2::text COLLATE "C"
 		  UNION
 		  SELECT m.group_id FROM up u `+groupsAbove("u.id", "$3", "group_id")+`
 		)
-		SELECT 'group:' || id FROM up ORDER BY 1`, tenant, id, now)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+		SELECT 'group:' || id FROM up ORDER BY 1`, tenant, id, now))
+	return up, err
 }
 
 // groupExists reports, on q, whether a tenant has a group. The id is given in a subquery, whose
@@ -829,7 +832,7 @@ func upOf(ctx context.Context, q DB, tenant, id string, now time.Time) ([]string
 // values, and a tenant has each at most once.
 func groupExists(ctx context.Context, q DB, tenant, id string) (bool, error) {
 	var exists bool
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = (SELECT $2::text))`, tenant, id).Scan(&exists)
+	err := byIndexes(ctx, q, stmt(into(&exists), `SELECT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = (SELECT $2::text))`, tenant, id))
 	return exists, err
 }
 
@@ -858,7 +861,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 	if len(a.owned) > 0 {
 		sources = "TRUE"
 	}
-	if err := tx.QueryRow(ctx, `
+	if err := byIndexes(ctx, tx, stmt(into(&held, &scoped, &denied, &approves, &owned), `
 		WITH named AS MATERIALIZED (SELECT FROM rbac_denies WHERE `+naming("principals", "$7")+` OR `+naming("exempt", "$7")+`),
 		  approving AS MATERIALIZED (SELECT FROM rbac_eligibilities WHERE `+naming("approvers", "$7")+`
 		    AND (expires_at IS NULL OR expires_at > $3))
@@ -880,7 +883,7 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 		    OR EXISTS (SELECT FROM (SELECT id FROM rbac_grants WHERE scope = $6 AND tenant = $1
 		        AND (expires_at IS NULL OR expires_at > $3) OFFSET 0) k
 		      JOIN rbac_grants g ON g.id = k.id WHERE g.source = ANY($5::text[])))`,
-		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id), above).Scan(&held, &scoped, &denied, &approves, &owned); err != nil {
+		tenant, groupPrincipal(id).key(), a.cfg.Now(), id, slices.Sorted(maps.Keys(a.owned)), groupKey(id), above)); err != nil {
 		return false, err
 	}
 	switch {
@@ -905,11 +908,11 @@ func (a *Authorizer) deletable(ctx context.Context, tx pgx.Tx, tenant, id string
 // Each identity's are found by its key, as restingOn finds those removeGroups would end.
 func (a *Authorizer) unrested(ctx context.Context, tx pgx.Tx, tenant, id string, above []string) error {
 	var resting bool
-	if err := tx.QueryRow(ctx, `
+	if err := byIndexes(ctx, tx, stmt(into(&resting), `
 		SELECT EXISTS (WITH RECURSIVE `+insideSQL("ARRAY[$2::text]", "$3", "NULL", false)+`
 		  `+byKey("ARRAY(SELECT DISTINCT principal FROM inside)", "rbac_grants", "principal", "1",
 		"tenant = $1 AND source = 'activation' AND expires_at > $3 AND activated_through = ANY($4::text[])")+`)`,
-		tenant, id, a.cfg.Now(), above).Scan(&resting); err != nil {
+		tenant, id, a.cfg.Now(), above)); err != nil {
 		return err
 	}
 	if resting {
@@ -969,37 +972,32 @@ func (a *Authorizer) holdGroups(ctx context.Context, tx pgx.Tx, tenant string, i
 	// DeleteScopes and DeletePrincipal hold other scopes' and principals' locks and change some of
 	// these rows too, so each table is changed in the order delete changes them, grants last, and
 	// the rows changed in it are locked in order first: otherwise they would deadlock. Each is found
-	// by key on its own (byKeys), or by the keys it names (naming), and deleted by key: ORed, the
-	// conditions are none an index seeks, and beside tenant = $1 a generic plan, costing the tenant
-	// as an average tenant's few rows, finds them by reading every row in the tenant. The
+	// by key on its own (byKeys), or by the keys it names (naming), and locked by key (lockedInOrder):
+	// ORed, the conditions are none an index seeks, and beside tenant = $1 a generic plan, costing the
+	// tenant as an average tenant's few rows, finds them by reading every row in the tenant. The
 	// eligibilities of the groups and on them, as their managers', which would pass to a group made
-	// later with an id of theirs, and those they approve.
-	if err := lockByKeys(ctx, tx, "rbac_eligibilities", "id", bindingOrder, []string{"principal", "scope"},
-		[]string{"SELECT id FROM rbac_eligibilities WHERE " + naming("approvers", "$2")}, tenant, principals, scopes); err != nil {
-		return resting{}, err
-	}
-	// The denies on the groups, and those that name or exempt them.
-	if err := lockDenies(ctx, tx, []string{
-		byKeys("rbac_denies", denyKey, "scope", "$2"),
-		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("principals", "$3"),
-		"SELECT " + denyKey + " FROM rbac_denies WHERE " + naming("exempt", "$3"),
-	}, tenant, scopes, principals); err != nil {
-		return resting{}, err
-	}
-	// The places in the groups and of them, and the grants of the groups and on them, so too. Places
-	// in groups have no id, so a ctid keys them: no change moves one meanwhile, as each takes its
-	// group's lock or its principal's, which this change holds. The places are held before the
-	// activations resting on them are read.
-	if err := lockByKeys(ctx, tx, "rbac_members", "ctid", placeOrder, []string{"group_id", "principal"}, nil, tenant, ids, principals); err != nil {
-		return resting{}, err
-	}
-	r, err := a.restingOn(ctx, tx, tenant, nil, ids, a.clock.earlier())
-	if err != nil {
+	// later with an id of theirs, and those they approve; the denies on the groups, and those that
+	// name or exempt them; and the places in the groups and of them. Places in groups have no id, so a
+	// ctid keys them: no change moves one meanwhile, as each takes its group's lock or its
+	// principal's, which this change holds. The places are held before the activations resting on
+	// them are read, in the same round trip.
+	var r resting
+	if err := byIndexes(ctx, tx,
+		stmt(nil, lockedInOrder("rbac_eligibilities", "id", bindingOrder, append(keyedBy("rbac_eligibilities", "id", bindingOrder, []string{"principal", "scope"}),
+			"SELECT "+keyCols(bindingOrder, "id")+" FROM rbac_eligibilities WHERE "+naming("approvers", "$2"))...), tenant, principals, scopes),
+		stmt(nil, lockedDenies(byKey("$2", "rbac_denies", "scope", denyKey, "tenant = $1"),
+			"SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("principals", "$3"),
+			"SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("exempt", "$3")), tenant, scopes, principals),
+		stmt(nil, lockedInOrder("rbac_members", "ctid", placeOrder, keyedBy("rbac_members", "ctid", placeOrder, []string{"group_id", "principal"})...),
+			tenant, ids, principals),
+		a.restingOnStmt(&r, tenant, nil, ids, a.clock.earlier()),
+	); err != nil {
 		return resting{}, err
 	}
 	// With the activations it may cut short, in one order.
-	return r, lockByKeys(ctx, tx, "rbac_grants", "id", bindingOrder, []string{"principal", "scope"}, []string{"SELECT unnest($4::text[]::uuid[])"},
-		tenant, principals, scopes, r.ids)
+	return r, byIndexes(ctx, tx, stmt(nil, lockedInOrder("rbac_grants", "id", bindingOrder,
+		append(keyedBy("rbac_grants", "id", bindingOrder, []string{"principal", "scope"}), byIDs("$4::text[]::uuid[]", "rbac_grants", keyCols(bindingOrder, "id")))...),
+		tenant, principals, scopes, r.ids))
 }
 
 // groupKeysOf returns the keys of groups as principals and as scopes.
@@ -1013,85 +1011,93 @@ func groupKeysOf(ids []string) (principals, scopes []string) {
 
 // removeGroups deletes groups with their grants and eligibilities, the members they have, their
 // places in other groups, in denies and among approvers, all of which holdGroups holds, and cuts
-// short r, the activations it found resting; it returns what it changed for OnChange.
+// short r, the activations it found resting; it returns what it changed for OnChange. Each row is
+// found by key and deleted by key, with sequential scans off, in one round trip (byIndexes); and the
+// groups too, which deletes their places by the foreign key's cascade, as its statement plans it
+// then, once the places are gone.
 func (a *Authorizer) removeGroups(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, ids []string, r resting) (ChangeEvent, error) {
 	var e ChangeEvent
 	principals, scopes := groupKeysOf(ids)
-	var err error
-	if e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities,
-		lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes); err != nil {
+	var ended, unapproved []Eligibility
+	var named []Deny
+	if err := byIndexes(ctx, tx, slices.Concat(
+		[]statement{removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ended,
+			lockedByKeys("rbac_eligibilities", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes)},
+		a.unapproving(tenant, principals, &unapproved, &e.Eligible),
+		[]statement{
+			removing(a, "rbac_denies", denyColumns, collectDenies, &e.DeletedDenies,
+				anyOf("ctid", byKey("$2", "rbac_denies", "scope", "ctid", "tenant = $1")), tenant, scopes),
+			// A deny that names or exempts the groups would name or exempt a group made later with one's
+			// id: one naming only them denies no one, and goes. Each found by the keys it names, so it
+			// names one of them: none of them is empty.
+			removing(a, "rbac_denies", denyColumns, collectDenies, &named,
+				naming("principals", "$2")+" AND principals <@ $2::text[]", tenant, principals),
+			unexempting(tenant, actor, principals, true, &e.Denies),
+			removing(a, "rbac_members", memberColumns, collectMembers, &e.Left,
+				lockedByKeys("rbac_members", "ctid", placeOrder, "group_id", "principal"), tenant, ids, principals),
+			removing(a, "rbac_groups", groupColumns, collectGroups, &e.DeletedGroups, "tenant = $1 AND id = ANY($2::text[])", tenant, ids),
+			removing(a, "rbac_grants", grantColumns, collectGrants, &e.Revoked,
+				lockedByKeys("rbac_grants", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes),
+		},
+	)...); err != nil {
 		return ChangeEvent{}, err
 	}
-	unapproved, changed, err := a.unapprove(ctx, tx, tenant, principals)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	e.Ineligible, e.Eligible = append(e.Ineligible, unapproved...), changed
-	if e.DeletedDenies, err = removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
-		anyOf("ctid", byKeys("rbac_denies", "ctid", "scope", "$2")), tenant, scopes); err != nil {
-		return ChangeEvent{}, err
-	}
-	// A deny that names or exempts the groups would name or exempt a group made later with one's
-	// id: one naming only them denies no one, and goes. Each found by the keys it names, so it names
-	// one of them: none of them is empty.
-	unnamed, err := removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
-		naming("principals", "$2")+" AND principals <@ $2::text[]", tenant, principals)
-	if err != nil {
-		return ChangeEvent{}, err
-	}
-	e.DeletedDenies = append(e.DeletedDenies, unnamed...)
-	if e.Denies, err = unexempt(ctx, tx, tenant, actor, principals, true); err != nil {
-		return ChangeEvent{}, err
-	}
-	if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers,
-		lockedByKeys("rbac_members", "ctid", placeOrder, "group_id", "principal"), tenant, ids, principals); err != nil {
-		return ChangeEvent{}, err
-	}
-	if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "id = ANY($2::text[])", ids); err != nil {
-		return ChangeEvent{}, err
-	}
-	if e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants,
-		lockedByKeys("rbac_grants", "id", bindingOrder, "principal", "scope"), tenant, principals, scopes); err != nil {
-		return ChangeEvent{}, err
-	}
-	short, ended, err := a.unrest(ctx, tx, tenant, actor, r, a.cfg.Now())
-	e.Shortened, e.Revoked = short, append(e.Revoked, ended...)
+	e.Ineligible = slices.Concat(ended, unapproved)
+	e.DeletedDenies = append(e.DeletedDenies, named...)
+	short, cut, err := a.unrest(ctx, tx, tenant, actor, r, a.cfg.Now())
+	e.Shortened, e.Revoked = short, append(e.Revoked, cut...)
 	return e, err
 }
 
 // lockedByKeys is SQL picking, by key, the rows of table in tenant $1 whose cols are each one of
 // the text array's keys from $2 on, the first col's from $2, once they are locked in order.
 func lockedByKeys(table, key, order string, cols ...string) string {
-	return lockedAnyOf(table, key, order, keyedBy(table, key, cols)...)
+	return lockedAnyOf(table, key, order, keyedBy(table, key, order, cols)...)
 }
 
-// lockByKeys locks, in tx, in order, the rows lockedByKeys picks and those more selects by key, for
-// a change that changes them in later statements.
-func lockByKeys(ctx context.Context, tx pgx.Tx, table, key, order string, cols, more []string, args ...any) error {
-	_, err := tx.Exec(ctx, lockedInOrder(table, "", order, anyOf(key, append(keyedBy(table, key, cols), more...)...)), args...)
-	return err
-}
-
-// lockedAnyOf is SQL picking, by key, the rows of table any of selects picks, once they are locked
-// in order.
+// lockedAnyOf is SQL picking, by key, the rows of table any of selects picks, each giving
+// keyCols(order, key), once they are locked in order.
 func lockedAnyOf(table, key, order string, selects ...string) string {
-	return anyOf(key, lockedInOrder(table, key, order, anyOf(key, selects...)))
+	return key + " = ANY(ARRAY(" + lockedInOrder(table, key, order, selects...) + "))"
 }
 
 // keyedBy is, for each of cols, byKeys of its rows by the text array's keys from $2 on, the first
 // col's from $2.
-func keyedBy(table, key string, cols []string) []string {
+func keyedBy(table, key, order string, cols []string) []string {
 	selects := make([]string, len(cols))
 	for i, col := range cols {
-		selects[i] = byKeys(table, key, col, fmt.Sprintf("$%d", i+2))
+		selects[i] = byKeys(table, key, order, col, fmt.Sprintf("$%d", i+2))
 	}
 	return selects
 }
 
-// byKeys is SQL selecting key of the rows of table in tenant $1 whose col is one of the text array
-// keys, each looked up on its own, as byKey looks them up.
-func byKeys(table, key, col, keys string) string {
-	return byKey(keys, table, col, key, "tenant = $1")
+// byKeys is SQL selecting keyCols(order, key) of the rows of table in tenant $1 whose col is one of
+// the text array keys, each looked up on its own (seekBy).
+func byKeys(table, key, order, col, keys string) string {
+	return seekBy(keys, table, col, keyCols(order, key), "tenant = $1")
+}
+
+// seekBy is byKey, but each key's rows read in the order of the index leading to the tenant and col
+// where another index leading to the tenant could be read for them by the tenant alone: statistics
+// from a near-empty table count every value as distinct, so a plan costs reading a tenant's rows by
+// such an index as reading a key's by the one leading to it, and picked the one with fewer
+// conditions to test, as rbac_members_principal for a group's places and rbac_eligibilities_scope
+// for a principal's eligibilities. Asked for the order only the index leading to the key gives
+// whole, a plan reads that one, as any other would have its rows sorted too.
+func seekBy(keys, table, col, cols, where string) string {
+	order, ok := seekOrders[table+"."+col]
+	if !ok {
+		return byKey(keys, table, col, cols, where)
+	}
+	return fmt.Sprintf(`SELECT r.* FROM unnest(%[1]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
+		SELECT %[4]s FROM %[2]s WHERE (%[5]s) AND %[3]s = keyed.k ORDER BY %[6]s) r`, keys, table, col, cols, where, order)
+}
+
+// seekOrders are, by table and column, the order seekBy reads a key's rows in: the primary key's for
+// a group's places, rbac_eligibilities_key's for a principal's eligibilities.
+var seekOrders = map[string]string{
+	"rbac_members.group_id":        "principal, source",
+	"rbac_eligibilities.principal": "scope, role",
 }
 
 // anyOf is SQL picking, by key, the rows any of selects picks.
@@ -1099,17 +1105,17 @@ func anyOf(key string, selects ...string) string {
 	return key + " = ANY(ARRAY(" + strings.Join(selects, " UNION ALL ") + "))"
 }
 
-// lockDenies locks, in tx, in order, the denies any of selects picks by denyKey, each looked up by
-// its primary key on its own, for a change that changes them in later statements, which can then
+// lockedDenies is SQL locking, in order, the denies any of selects picks by denyKey, each looked up
+// by its primary key on its own, for a change that changes them in later statements, which can then
 // find them by a ctid. A deny has no column of its own that keys it, and its ctid moves as a change
 // takes a principal out of its exemptions, which takes no lock of its scope's: a lock by ctid that
 // waited for that change would pass over it. Matched to the denies in a semi-join instead, a plan
-// can read the table whole.
-func lockDenies(ctx context.Context, tx pgx.Tx, selects []string, args ...any) error {
-	_, err := tx.Exec(ctx, `SELECT FROM (SELECT DISTINCT `+denyKey+` FROM (`+strings.Join(selects, " UNION ALL ")+`) u ORDER BY `+denyOrder+`) k
+// can read the table whole. Not by its scope too, which rbac_denies_scope would seek, reading every
+// deny on the scope for each.
+func lockedDenies(selects ...string) string {
+	return `SELECT FROM (SELECT DISTINCT ` + denyKey + ` FROM (` + strings.Join(selects, " UNION ALL ") + ` OFFSET 0) u ORDER BY ` + denyOrder + `) k
 		CROSS JOIN LATERAL (SELECT FROM rbac_denies d
-		  WHERE d.tenant = k.tenant AND d.scope_type = k.scope_type AND d.scope_id = k.scope_id AND d.id = k.id FOR UPDATE) d`, args...)
-	return err
+		  WHERE d.tenant = k.tenant AND d.scope_type = k.scope_type AND d.scope_id = k.scope_id AND d.id = k.id FOR UPDATE) d`
 }
 
 // denyKey is what keys a deny, its primary key, with its scope, which denyOrder sorts by: types sort
@@ -1122,7 +1128,7 @@ func (a *Authorizer) notOwnedGroups(ctx context.Context, q DB, tenant string, id
 		return nil
 	}
 	var id, source string
-	err := q.QueryRow(ctx, `SELECT id, source FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source = ANY($3::text[])
+	err := a.queryRowIndexed(ctx, q, `SELECT id, source FROM rbac_groups WHERE tenant = $1 AND id = ANY($2::text[]) AND source = ANY($3::text[])
 		ORDER BY id LIMIT 1`, tenant, ids, slices.Sorted(maps.Keys(a.owned))).Scan(&id, &source)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -1230,7 +1236,7 @@ func (a *Authorizer) Groups(ctx context.Context, tenant string) (_ []GroupDefini
 	if !validID(tenant) {
 		return nil, fmt.Errorf("%w: no tenant", ErrInvalid)
 	}
-	rows, err := a.db.Query(ctx, `SELECT `+groupColumns+` FROM rbac_groups WHERE tenant = $1 ORDER BY id`, tenant)
+	rows, err := a.queryIndexed(ctx, a.db, `SELECT `+groupColumns+` FROM rbac_groups WHERE tenant = $1 ORDER BY id`, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -1464,7 +1470,8 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 	}
 	// A place that has ended and is still stored gave nothing, so making it again records the new
 	// actor and time, as SetMemberships does a membership's.
-	rows, err := tx.Query(ctx, `
+	var joined []Member
+	if err := byIndexes(ctx, tx, stmt(collecting(&joined, collectMembers), `
 		INSERT INTO rbac_members AS m (tenant, group_id, principal_kind, principal_id, source, expires_at, note, created_by, updated_by)
 		SELECT $1, g, k, i, s, e, n, $8, $8 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
 		  AS t(g, k, i, s, e, n)
@@ -1474,12 +1481,7 @@ func (a *Authorizer) join(ctx context.Context, tx pgx.Tx, tenant string, actor P
 		  updated_by = EXCLUDED.updated_by, updated_at = now()
 		WHERE (m.expires_at, m.note) IS DISTINCT FROM (EXCLUDED.expires_at, EXCLUDED.note)
 		RETURNING `+memberColumns,
-		tenant, ids, kinds, pids, sources, expires, notes, actorKey(actor), now)
-	if err != nil {
-		return nil, err
-	}
-	joined, err := collectMembers(rows)
-	if err != nil {
+		tenant, ids, kinds, pids, sources, expires, notes, actorKey(actor), now)); err != nil {
 		return nil, err
 	}
 	if err := a.placesBounded(ctx, tx, tenant, kept.gaining(joined)); err != nil {
@@ -1505,30 +1507,32 @@ func (a *Authorizer) groupsBounded(ctx context.Context, tx pgx.Tx, tenant string
 		principals[i], sources[i] = m.Principal.key(), m.Source
 	}
 	// Each principal's places by source, the others' together, counted on its own, as byKey reads
-	// its rows, from the index on the principal alone, which holds their sources.
-	rows, err := tx.Query(ctx, `
+	// its rows, from the index on the principal alone, which holds their sources: in a subquery of
+	// its own, as counting them in order of their groups, a plan by statistics from a near-empty
+	// table read the primary key's entries of the whole tenant, which hold them in that order.
+	var over []error
+	if err := byIndexes(ctx, tx, stmt(func(rows pgx.Rows) error {
+		var err error
+		over, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
+			var principal, source string
+			if err := row.Scan(&principal, &source); err != nil {
+				return nil, err
+			}
+			if source != "" {
+				return fmt.Errorf("%w: %s is in at most %d groups from %s", ErrInvalid, principal, MaxGroupsOfPrincipal, source), nil
+			}
+			return fmt.Errorf("%w: %s is in at most %d groups", ErrInvalid, principal, MaxGroupsOfPrincipal), nil
+		})
+		return err
+	}, `
 		SELECT t.p, t.s FROM (SELECT DISTINCT p, CASE WHEN s = ANY($4::text[]) THEN s ELSE '' END
 		  FROM unnest($2::text[], $3::text[]) AS u(p, s)) AS t(p, s) CROSS JOIN LATERAL (
-		  SELECT count(DISTINCT group_id) AS n FROM rbac_members WHERE tenant = $1 AND principal = t.p
+		  SELECT count(DISTINCT group_id) AS n FROM (SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = t.p
 		    AND (expires_at IS NULL OR expires_at > $5)
-		    AND CASE WHEN t.s = '' THEN (source = ANY($4::text[])) IS NOT TRUE ELSE source = t.s END) m
+		    AND CASE WHEN t.s = '' THEN (source = ANY($4::text[])) IS NOT TRUE ELSE source = t.s END OFFSET 0) p) m
 		WHERE m.n > $6
 		ORDER BY t.p COLLATE "C", t.s COLLATE "C"`,
-		tenant, principals, sources, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxGroupsOfPrincipal)
-	if err != nil {
-		return err
-	}
-	over, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
-		var principal, source string
-		if err := row.Scan(&principal, &source); err != nil {
-			return nil, err
-		}
-		if source != "" {
-			return fmt.Errorf("%w: %s is in at most %d groups from %s", ErrInvalid, principal, MaxGroupsOfPrincipal, source), nil
-		}
-		return fmt.Errorf("%w: %s is in at most %d groups", ErrInvalid, principal, MaxGroupsOfPrincipal), nil
-	})
-	if err != nil {
+		tenant, principals, sources, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxGroupsOfPrincipal)); err != nil {
 		return err
 	}
 	return errors.Join(over...)
@@ -1550,24 +1554,24 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 		return nil
 	}
 	// Each counted on its own, as byKey reads its rows.
-	rows, err := tx.Query(ctx, `
+	var over []error
+	if err := byIndexes(ctx, tx, stmt(func(rows pgx.Rows) error {
+		var err error
+		over, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
+			var group, principal string
+			if err := row.Scan(&group, &principal); err != nil {
+				return nil, err
+			}
+			return fmt.Errorf("%w: %s is in group %q at most %d times, by source", ErrInvalid, principal, group, MaxPlacesInGroup), nil
+		})
+		return err
+	}, `
 		SELECT t.g, t.p FROM (SELECT DISTINCT * FROM unnest($2::text[], $3::text[])) AS t(g, p) CROSS JOIN LATERAL (
 		  SELECT count(*) AS n FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p
 		    AND (source = ANY($4::text[])) IS NOT TRUE AND (expires_at IS NULL OR expires_at > $5)) m
 		WHERE m.n > $6
 		ORDER BY t.g COLLATE "C", t.p COLLATE "C"`,
-		tenant, groups, principals, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxPlacesInGroup)
-	if err != nil {
-		return err
-	}
-	over, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (error, error) {
-		var group, principal string
-		if err := row.Scan(&group, &principal); err != nil {
-			return nil, err
-		}
-		return fmt.Errorf("%w: %s is in group %q at most %d times, by source", ErrInvalid, principal, group, MaxPlacesInGroup), nil
-	})
-	if err != nil {
+		tenant, groups, principals, slices.Sorted(maps.Keys(a.owned)), a.cfg.Now(), MaxPlacesInGroup)); err != nil {
 		return err
 	}
 	return errors.Join(over...)
@@ -1874,26 +1878,25 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		return r, nil
 	}
 	now := a.cfg.Now()
-	rows, err := q.Query(ctx, `
+	var root, id string
+	reached := map[string]bool{}
+	if err := byIndexes(ctx, q, stmt(func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&root, &id}, func() error {
+			k := groupPrincipal(id).key()
+			if r.up[root] == nil {
+				r.up[root] = map[string]bool{}
+			}
+			r.up[root][k], reached[k] = true, true
+			return nil
+		})
+		return err
+	}, `
 		WITH RECURSIVE up(root, id) AS (
 		  SELECT g, g COLLATE "C" FROM unnest($2::text[]) AS g
 		  UNION
 		  SELECT u.root, m.group_id FROM up u `+groupsAbove("u.id", "$3", "group_id")+`
 		)
-		SELECT root, id FROM up`, tenant, groups, now)
-	if err != nil {
-		return reach{}, err
-	}
-	var root, id string
-	reached := map[string]bool{}
-	if _, err := pgx.ForEachRow(rows, []any{&root, &id}, func() error {
-		k := groupPrincipal(id).key()
-		if r.up[root] == nil {
-			r.up[root] = map[string]bool{}
-		}
-		r.up[root][k], reached[k] = true, true
-		return nil
-	}); err != nil {
+		SELECT root, id FROM up`, tenant, groups, now)); err != nil {
 		return reach{}, err
 	}
 	r.stored, r.up = r.up, r.nested(add)
@@ -1954,6 +1957,7 @@ func (a *Authorizer) reachOf(ctx context.Context, q DB, tenant string, add, remo
 		return reach{}, err
 	}
 	if r.losing {
+		var err error
 		if r.activations, err = activationsLeaving(ctx, q, tenant, r.leaving(add, remove), keys, now); err != nil {
 			return reach{}, err
 		}
@@ -2011,7 +2015,15 @@ func activationsLeaving(ctx context.Context, q DB, tenant string, leaving []Memb
 	// activations once for each of them.
 	identities = slices.Compact(slices.Sorted(slices.Values(identities)))
 	groups = slices.Compact(slices.Sorted(slices.Values(groups)))
-	rows, err := q.Query(ctx, `
+	var found []activated
+	err := byIndexes(ctx, q, stmt(func(rows pgx.Rows) error {
+		var err error
+		found, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (activated, error) {
+			var x activated
+			return x, row.Scan(&x.member, &x.scope.Type, &x.scope.ID, &x.through)
+		})
+		return err
+	}, `
 		WITH RECURSIVE `+insideSQL("$3", "$5", "NULL", false)+`, holders(member, k) AS (
 		  SELECT k, k COLLATE "C" FROM unnest($2::text[]) AS k
 		  UNION ALL SELECT 'group:' || root, principal FROM inside
@@ -2019,14 +2031,8 @@ func activationsLeaving(ctx context.Context, q DB, tenant string, leaving []Memb
 		SELECT DISTINCT h.member, a.scope_type, a.scope_id, a.activated_through FROM (`+byKey("ARRAY(SELECT DISTINCT k FROM holders)",
 		"rbac_grants", "principal", "principal, scope_type, scope_id, activated_through",
 		"tenant = $1 AND source = 'activation' AND expires_at > $5 AND activated_through = ANY($4::text[])")+`) a
-		JOIN holders h ON h.k = a.principal`, tenant, identities, groups, keys, now)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (activated, error) {
-		var x activated
-		return x, row.Scan(&x.member, &x.scope.Type, &x.scope.ID, &x.through)
-	})
+		JOIN holders h ON h.k = a.principal`, tenant, identities, groups, keys, now))
+	return found, err
 }
 
 // naming is SQL for whether the array of keys col of a row holds one of the keys in the array keys
@@ -2103,30 +2109,29 @@ func (a *Authorizer) placesLeft(ctx context.Context, q DB, tenant string, add, r
 		groups, principals = append(groups, p.group), append(principals, p.principal)
 	}
 	now := a.cfg.Now()
-	// Each pair's found on its own, as leave finds its rows.
-	rows, err := q.Query(ctx, `
-		SELECT m.group_id, m.principal, m.source, m.expires_at FROM unnest($2::text[], $3::text[]) AS t(g, p) CROSS JOIN LATERAL (
-		  SELECT group_id, principal, source, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p
-		    AND (expires_at IS NULL OR expires_at > $4) AND (principal_kind = 'group' OR `+inTenant("t.p", "$4")+`) OFFSET 0) m`,
-		tenant, groups, principals, now)
-	if err != nil {
-		return placed{}, err
-	}
-	// Each pair's places, by source, as the change leaves them: until when, zero for never.
+	// Each pair's places, by source, as the change leaves them: until when, zero for never. Each
+	// pair's found on its own, as leave finds its rows.
 	places := map[pair]map[string]time.Time{}
 	var group, principal, source string
 	var expires *time.Time
-	if _, err := pgx.ForEachRow(rows, []any{&group, &principal, &source, &expires}, func() error {
-		p := pair{group, principal}
-		if places[p] == nil {
-			places[p] = map[string]time.Time{}
-		}
-		places[p][source] = time.Time{}
-		if expires != nil {
-			places[p][source] = *expires
-		}
-		return nil
-	}); err != nil {
+	if err := byIndexes(ctx, q, stmt(func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&group, &principal, &source, &expires}, func() error {
+			p := pair{group, principal}
+			if places[p] == nil {
+				places[p] = map[string]time.Time{}
+			}
+			places[p][source] = time.Time{}
+			if expires != nil {
+				places[p][source] = *expires
+			}
+			return nil
+		})
+		return err
+	}, `
+		SELECT m.group_id, m.principal, m.source, m.expires_at FROM unnest($2::text[], $3::text[]) AS t(g, p) CROSS JOIN LATERAL (
+		  SELECT group_id, principal, source, expires_at FROM rbac_members WHERE tenant = $1 AND group_id = t.g AND principal = t.p
+		    AND (expires_at IS NULL OR expires_at > $4) AND (principal_kind = 'group' OR `+inTenant("t.p", "$4")+`) OFFSET 0) m`,
+		tenant, groups, principals, now)); err != nil {
 		return placed{}, err
 	}
 	stored := maps.Clone(places)
@@ -2966,17 +2971,13 @@ func (a *Authorizer) storedWhole(s Scope) error {
 // the memberships the change holds (holdJoining). OFFSET 0 keeps a generic plan from reading the
 // tenant's every membership into a hash to look each identity up in.
 func (a *Authorizer) membersCanJoin(ctx context.Context, tx pgx.Tx, tenant string, groups, identities []string) error {
-	rows, err := tx.Query(ctx, `
+	var missing []string
+	if err := byIndexes(ctx, tx, stmt(collecting(&missing, collectStrings), `
 		SELECT 'group ' || g FROM unnest($2::text[]) AS g WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = g OFFSET 0)
 		UNION ALL
 		SELECT 'identity ' || p FROM unnest($3::text[]) AS p WHERE NOT EXISTS (
 		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $4) OFFSET 0)
-		ORDER BY 1`, tenant, groups, identities, a.cfg.Now())
-	if err != nil {
-		return err
-	}
-	missing, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
+		ORDER BY 1`, tenant, groups, identities, a.cfg.Now())); err != nil {
 		return err
 	}
 	var errs []error
@@ -3006,10 +3007,9 @@ func (a *Authorizer) holdJoining(ctx context.Context, tx pgx.Tx, tenant string, 
 	if len(identities) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `SELECT FROM unnest($2::text[]) AS p WHERE EXISTS (
+	return byIndexes(ctx, tx, stmt(nil, `SELECT FROM unnest($2::text[]) AS p WHERE EXISTS (
 		  SELECT FROM rbac_memberships WHERE tenant = $1 AND principal = p AND (expires_at IS NULL OR expires_at > $3) FOR KEY SHARE)`,
-		tenant, slices.Sorted(maps.Keys(identities)), a.clock.earlier())
-	return err
+		tenant, slices.Sorted(maps.Keys(identities)), a.clock.earlier()))
 }
 
 // nestable refuses each group nested in another, as stored, that makes a group contain itself, or a
@@ -3021,29 +3021,28 @@ func (a *Authorizer) nestable(ctx context.Context, tx pgx.Tx, tenant string, nes
 		return nil
 	}
 	now := a.cfg.Now()
-	b := &pgx.Batch{}
-	for _, m := range nested {
-		b.Queue(nestingDepths, tenant, m.Group, m.Principal.ID, now, MaxGroupDepth)
+	type depths struct {
+		below, above int
+		cycle        bool
 	}
-	br := tx.SendBatch(ctx, b)
-	for _, m := range nested {
-		var below, above int
-		var cycle bool
-		err := br.QueryRow().Scan(&below, &above, &cycle)
+	read := make([]depths, len(nested))
+	stmts := make([]statement, len(nested))
+	for i, m := range nested {
+		stmts[i] = stmt(into(&read[i].below, &read[i].above, &read[i].cycle), nestingDepths, tenant, m.Group, m.Principal.ID, now, MaxGroupDepth)
+	}
+	if err := byIndexes(ctx, tx, stmts...); err != nil {
+		return err
+	}
+	for i, m := range nested {
 		outer, inner := m.Group, m.Principal.ID
-		switch {
-		case err != nil:
-		case cycle:
-			err = fmt.Errorf("%w: group %q in %q would make a group contain itself", ErrInvalid, inner, outer)
-		case below+above+2 > MaxGroupDepth:
-			err = fmt.Errorf("%w: group %q in %q would make a chain of more than %d groups", ErrInvalid, inner, outer, MaxGroupDepth)
-		}
-		if err != nil {
-			_ = br.Close()
-			return err
+		switch d := read[i]; {
+		case d.cycle:
+			return fmt.Errorf("%w: group %q in %q would make a group contain itself", ErrInvalid, inner, outer)
+		case d.below+d.above+2 > MaxGroupDepth:
+			return fmt.Errorf("%w: group %q in %q would make a chain of more than %d groups", ErrInvalid, inner, outer, MaxGroupDepth)
 		}
 	}
-	return br.Close()
+	return nil
 }
 
 // nestingDepths walks down from a group, $3, to the groups in it (groupsIn), and up from another,
@@ -3183,12 +3182,8 @@ func (a *Authorizer) restingIn(ctx context.Context, tx pgx.Tx, tenant string, me
 // tenant's places would read every one; it returns the keys of the identities among them and the
 // ids of the groups.
 func endingPlaces(ctx context.Context, tx pgx.Tx, query string, args ...any) (identities, groups []string, err error) {
-	rows, err := tx.Query(ctx, query, args...)
-	if err != nil {
-		return nil, nil, err
-	}
-	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
+	var keys []string
+	if err := byIndexes(ctx, tx, stmt(collecting(&keys, collectStrings), query, args...)); err != nil {
 		return nil, nil, err
 	}
 	for _, k := range slices.Compact(slices.Sorted(slices.Values(keys))) {
@@ -3219,7 +3214,7 @@ func (a *Authorizer) Members(ctx context.Context, tenant, group string) (_ []Mem
 	if a.history == "" {
 		in = `m.principal IN (SELECT principal COLLATE "C" FROM rbac_group_members($1, ARRAY[$2::text], $3, NULL, true)) OR ` + in
 	}
-	rows, err := a.db.Query(ctx, `SELECT `+memberColumns+` FROM rbac_members m
+	rows, err := a.queryIndexed(ctx, a.db, `SELECT `+memberColumns+` FROM rbac_members m
 		WHERE tenant = $1 AND group_id = $2 AND (expires_at IS NULL OR expires_at > $3)
 		  AND (principal_kind = 'group' OR `+in+`)
 		ORDER BY principal, source`, tenant, group, a.cfg.Now())
@@ -3246,7 +3241,7 @@ func (a *Authorizer) GroupsOf(ctx context.Context, tenant string, p Principal) (
 	// the tenant's selectivity and the identity's apart, one in many tenants was counted in a large
 	// one as a thousand or more, and EXISTS, planned for the first, read every tenant's memberships
 	// to find it.
-	rows, err := a.db.Query(ctx, `
+	rows, err := a.queryIndexed(ctx, a.db, `
 		WITH RECURSIVE g(id) AS (
 		  SELECT group_id FROM rbac_members WHERE tenant = $1 AND principal = $2 AND (expires_at IS NULL OR expires_at > $3)
 		    AND ($4 OR `+inTenant("(SELECT $2::text)", "$3")+`)
@@ -3319,17 +3314,13 @@ func groupsExist(ctx context.Context, q DB, tenant string, keys []string) error 
 	if len(keys) == 0 {
 		return nil
 	}
-	var missing string
-	err := q.QueryRow(ctx, `SELECT k FROM unnest($2::text[]) AS k
+	var missing []string
+	if err := byIndexes(ctx, q, stmt(collecting(&missing, collectStrings), `SELECT k FROM unnest($2::text[]) AS k
 		WHERE NOT EXISTS (SELECT FROM rbac_groups WHERE tenant = $1 AND id = substr(k, length('group:') + 1) OFFSET 0)
-		ORDER BY k LIMIT 1`, tenant, keys).Scan(&missing)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return nil
-	case err != nil:
+		ORDER BY k LIMIT 1`, tenant, keys)); err != nil || len(missing) == 0 {
 		return err
 	}
-	return fmt.Errorf("%w: tenant %q has no %s", ErrInvalid, tenant, missing)
+	return fmt.Errorf("%w: tenant %q has no %s", ErrInvalid, tenant, missing[0])
 }
 
 // inTenant is SQL for whether an identity, by the SQL for its key, is a member or guest of the

@@ -281,17 +281,16 @@ func (a *Authorizer) stand(ctx context.Context, q DB, tenant string, principals 
 	if len(identities)+len(groups) == 0 {
 		return s, nil
 	}
-	rows, err := q.Query(ctx, standSQL, tenant, identities, groups, a.cfg.Now())
-	if err != nil {
-		return standing{}, err
-	}
 	s.by = map[string][]string{}
 	var root string
 	var members []string
-	_, err = pgx.ForEachRow(rows, []any{&root, &members}, func() error {
-		s.by[root] = members
-		return nil
-	})
+	err := byIndexes(ctx, q, stmt(func(rows pgx.Rows) error {
+		_, err := pgx.ForEachRow(rows, []any{&root, &members}, func() error {
+			s.by[root] = members
+			return nil
+		})
+		return err
+	}, standSQL, tenant, identities, groups, a.cfg.Now()))
 	return s, err
 }
 
@@ -2347,8 +2346,10 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 	// The same grant again changes only its note and its condition's title and description. The
 	// condition's length and hash pick it, and its text must match, so a hash shared by two
 	// conditions changes neither, and the grant is refused below. The statement's snapshot holds a
-	// grant it rewrites as it was, and none it adds.
-	rows, err := tx.Query(ctx, `
+	// grant it rewrites as it was, and none it adds: each counted by its id, as the primary key's
+	// index finds it, where a plan made while the table was small read every grant into a hash to
+	// look an EXISTS up in.
+	rows, err := a.queryIndexed(ctx, tx, `
 		INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at,
 		  condition_title, condition_description, condition, note, created_by, updated_by)
 		SELECT $1, st, si, pk, pi, r, src, e, ct, cd, c, n, $9, $9
@@ -2361,7 +2362,7 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		WHERE rbac_grants.condition = EXCLUDED.condition
 		  AND (rbac_grants.condition_title, rbac_grants.condition_description, rbac_grants.note)
 		  IS DISTINCT FROM (EXCLUDED.condition_title, EXCLUDED.condition_description, EXCLUDED.note)
-		RETURNING `+grantColumns+`, EXISTS (SELECT FROM rbac_grants o WHERE o.id = rbac_grants.id)`,
+		RETURNING `+grantColumns+`, (SELECT count(*) FROM rbac_grants o WHERE o.id = rbac_grants.id) = 1`,
 		tenant, scopeTypes, scopeIDs, kinds, ids, roles, sources, expires, actorKey(actor), titles, descriptions, conditions, notes)
 	if err != nil {
 		return nil, nil, err
@@ -2389,7 +2390,7 @@ func (a *Authorizer) upsert(ctx context.Context, tx pgx.Tx, tenant string, actor
 		}
 	}
 	if len(left) > 0 {
-		rows, err := tx.Query(ctx, `
+		rows, err := a.queryIndexed(ctx, tx, `
 			SELECT i FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::timestamptz[], $9::text[])
 			  WITH ORDINALITY AS t(st, si, pk, pi, r, src, e, c, i)
 			WHERE i = ANY($10::bigint[]) AND NOT EXISTS (SELECT FROM rbac_grants g WHERE g.tenant = $1
@@ -2650,7 +2651,7 @@ func (a *Authorizer) bounded(ctx context.Context, tx pgx.Tx, tenant string, stor
 	// Grants from each source the host owns count apart from the rest, so a tenant's admins can't
 	// fill the bound to keep the host's own from being made, nor the host fill theirs. Each is
 	// counted on its own, as byKey reads its rows.
-	rows, err := tx.Query(ctx, `
+	rows, err := a.queryIndexed(ctx, tx, `
 		SELECT t.s, t.p, t.r FROM (SELECT DISTINCT * FROM unnest($2::text[], $3::text[], $4::text[], $8::text[])) AS t(s, p, r, b)
 		CROSS JOIN LATERAL (
 		  SELECT count(*) AS n FROM rbac_grants WHERE tenant = $1 AND scope = t.s AND principal = t.p AND role = t.r
@@ -2681,11 +2682,9 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 	if len(bindings) == 0 {
 		return nil, nil
 	}
-	rows, err := tx.Query(ctx, revoking, revokeArgs(tenant, scope, bindings, kept)...)
-	if err != nil {
-		return nil, err
-	}
-	return collectGrants(rows)
+	var revoked []Grant
+	err := byIndexes(ctx, tx, stmt(collecting(&revoked, collectGrants), revoking, revokeArgs(tenant, scope, bindings, kept)...))
+	return revoked, err
 }
 
 // holdRevoked holds, in tx, in order, the grants revoke deletes, and those kept grants again
@@ -2693,7 +2692,7 @@ func (a *Authorizer) revoke(ctx context.Context, tx pgx.Tx, tenant string, scope
 // among them holds no lock of the scope, and a wait for it would leave that time behind.
 func holdRevoked(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, bindings, kept []Binding) error {
 	if len(bindings) > 0 {
-		if _, err := tx.Exec(ctx, revokedSQL, revokeArgs(tenant, scope, bindings, kept)...); err != nil {
+		if err := byIndexes(ctx, tx, stmt(nil, revokedSQL, revokeArgs(tenant, scope, bindings, kept)...)); err != nil {
 			return err
 		}
 	}
@@ -2705,7 +2704,7 @@ func holdRevoked(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, bin
 // lock, may be deleting one that has ended by its clock, which upsert would wait for once the
 // change has read its time. One for good no expiry deletes, and every other change holding it holds
 // a lock of its scope or its principal, which the change does. Each is looked up by its key, as
-// upsert finds it.
+// upsert finds it, and locked by its id (lockedInOrder).
 func holdGrantedAgain(ctx context.Context, tx pgx.Tx, tenant string, grants []Grant) error {
 	var scopes, principals, roles, sources, conditions []string
 	var expires []time.Time
@@ -2718,14 +2717,12 @@ func holdGrantedAgain(ctx context.Context, tx pgx.Tx, tenant string, grants []Gr
 	if len(scopes) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `SELECT FROM rbac_grants WHERE id = ANY(ARRAY(
-		  SELECT x.id FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
+	return byIndexes(ctx, tx, stmt(nil, lockedInOrder("rbac_grants", "id", bindingOrder, `
+		  SELECT x.* FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::text[])
 		    AS k(scope, principal, role, source, expires_at, condition) CROSS JOIN LATERAL (
-		    SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = k.principal AND scope = k.scope AND role = k.role
+		    SELECT `+keyCols(bindingOrder, "id")+` FROM rbac_grants WHERE tenant = $1 AND principal = k.principal AND scope = k.scope AND role = k.role
 		      AND source = k.source AND coalesce(expires_at, 'infinity') = k.expires_at AND condition = k.condition
-		    OFFSET 0) x))
-		ORDER BY `+bindingOrder+` FOR UPDATE`, tenant, scopes, principals, roles, sources, expires, conditions)
-	return err
+		    OFFSET 0) x`), tenant, scopes, principals, roles, sources, expires, conditions))
 }
 
 // holdEligible holds, in tx, the eligibilities on a scope a change sets or deletes, by their
@@ -2741,35 +2738,37 @@ func holdEligible(ctx context.Context, tx pgx.Tx, tenant string, scope Scope, de
 	for i, b := range bindings {
 		principals[i], roles[i] = b.Principal.key(), string(b.Role)
 	}
-	_, err := tx.Exec(ctx, `SELECT FROM unnest($3::text[], $4::text[]) AS b(p, r) CROSS JOIN LATERAL (
+	return byIndexes(ctx, tx, stmt(nil, `SELECT FROM unnest($3::text[], $4::text[]) AS b(p, r) CROSS JOIN LATERAL (
 		  SELECT FROM rbac_eligibilities WHERE tenant = $1 AND scope = $2 AND principal = b.p AND role = b.r FOR UPDATE) e`,
-		tenant, scope.Key(), principals, roles)
-	return err
+		tenant, scope.Key(), principals, roles))
 }
 
 // revoking is revoke's statement, deleting the grants revokedSQL picks.
 const revoking = `DELETE FROM rbac_grants WHERE id = ANY(ARRAY(` + revokedSQL + `)) RETURNING ` + grantColumns
 
-// revokedSQL picks the grants a revoke deletes. They are found from the bindings, each by its
-// principal, scope and role, which every index leading to them seeks: matched to the scope's grants
-// instead, a revoke reads every grant on it, which a busy scope holds thousands of, while it holds
-// the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into such a join. They
-// are locked in order (bindingOrder) before they are deleted: deleted as the plan finds them, by
-// their ids or where they are stored, they would deadlock with a change ending activations among
-// them, which holds no lock of the scope.
+// revokedSQL picks the grants a revoke deletes, selecting their ids. They are found from the
+// bindings, each by its principal, scope and role, which every index leading to them seeks: matched
+// to the scope's grants instead, a revoke reads every grant on it, which a busy scope holds thousands
+// of, while it holds the scope's lock. OFFSET 0 keeps the planner from flattening the lookup into
+// such a join. They are locked in order (bindingOrder) before they are deleted, each by its id once
+// those found are sorted, as lockedInOrder locks them: deleted as the plan finds them, by their ids
+// or where they are stored, they would deadlock with a change ending activations among them, which
+// holds no lock of the scope; and sorted as a scan of the table found them, a plan made while the
+// table was small read a whole index in that order. Those kept, which the change grants again, are
+// passed over as each is locked, as the version it locks holds them.
 const revokedSQL = `
-	SELECT id FROM rbac_grants g
-	  WHERE id = ANY(ARRAY(
-	      SELECT x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
-	      CROSS JOIN LATERAL (
-	        SELECT id FROM rbac_grants WHERE tenant = $1 AND principal = r.principal AND scope = $2 AND role = r.role
-	          AND (r.id = '' AND source = r.source OR id::text = r.id)
-	        OFFSET 0) x))
+	SELECT k.id FROM (SELECT DISTINCT x.scope, x.principal, x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
+	    CROSS JOIN LATERAL (
+	      SELECT scope, principal, id FROM rbac_grants WHERE tenant = $1 AND principal = r.principal AND scope = $2 AND role = r.role
+	        AND (r.id = '' AND source = r.source OR id::text = r.id)
+	      OFFSET 0) x
+	    ORDER BY ` + bindingOrder + `) k
+	  CROSS JOIN LATERAL (SELECT FROM rbac_grants g WHERE g.id = k.id
 	    AND NOT EXISTS (SELECT FROM unnest($7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[])
-	      AS k(principal, role, source, expires_at, condition)
-	      WHERE k.principal = g.principal AND k.role = g.role AND k.source = g.source
-	        AND k.expires_at IS NOT DISTINCT FROM g.expires_at AND k.condition = g.condition)
-	  ORDER BY ` + bindingOrder + ` FOR UPDATE`
+	      AS kept(principal, role, source, expires_at, condition)
+	      WHERE kept.principal = g.principal AND kept.role = g.role AND kept.source = g.source
+	        AND kept.expires_at IS NOT DISTINCT FROM g.expires_at AND kept.condition = g.condition)
+	    FOR UPDATE) t`
 
 // revokeArgs are revoking's arguments.
 func revokeArgs(tenant string, scope Scope, bindings, kept []Binding) []any {
@@ -2839,7 +2838,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	}
 	query, scopes, principals := f.sql("rbac_grants", grantColumns, grantColumns+", scope, principal",
 		"scope, principal, role, source, expires_at NULLS FIRST, condition, id")
-	rows, err := a.db.Query(ctx, query, tenant, scopes, principals, a.cfg.Now())
+	rows, err := a.queryIndexed(ctx, a.db, query, tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -2897,25 +2896,15 @@ func (a *Authorizer) DeleteGrants(ctx context.Context, actor Principal, tenant s
 			return ChangeEvent{}, err
 		}
 		// One round trip for every scope, rather than one each while the locks are held.
-		b := &pgx.Batch{}
-		for _, s := range scopes {
-			b.Queue(revoking, revokeArgs(tenant, s, byScope[s], nil)...)
+		revoked := make([][]Grant, len(scopes))
+		stmts := make([]statement, len(scopes))
+		for i, s := range scopes {
+			stmts[i] = stmt(collecting(&revoked[i], collectGrants), revoking, revokeArgs(tenant, s, byScope[s], nil)...)
 		}
-		br := tx.SendBatch(ctx, b)
-		var e ChangeEvent
-		for range scopes {
-			rows, err := br.Query()
-			if err == nil {
-				var revoked []Grant
-				revoked, err = collectGrants(rows)
-				e.Revoked = append(e.Revoked, revoked...)
-			}
-			if err != nil {
-				_ = br.Close()
-				return ChangeEvent{}, err
-			}
+		if err := byIndexes(ctx, tx, stmts...); err != nil {
+			return ChangeEvent{}, err
 		}
-		return e, br.Close()
+		return ChangeEvent{Revoked: slices.Concat(revoked...)}, nil
 	})
 }
 
@@ -3101,7 +3090,7 @@ func (a *Authorizer) DeleteTenant(ctx context.Context, actor Principal, tenant s
 //
 // With by, each key's rows are found on its own (byKeys) and locked in order before they are
 // deleted, places in groups by a ctid as removeGroups finds them, and denies by their keys
-// (lockDenies): DeleteScopes holds its scopes' locks, DeletePrincipal its principal's and
+// (lockedDenies): DeleteScopes holds its scopes' locks, DeletePrincipal its principal's and
 // DeleteGroups its groups', so none waits for another, and each deletes the grants of a principal
 // on a scope, which deleted in the order of the index each reads by would deadlock. Found beside
 // tenant = $1, or matched to the rows to delete in a semi-join, a generic plan, costing the tenant
@@ -3122,10 +3111,36 @@ const (
 	denyOrder    = "scope, id"
 )
 
-// lockedInOrder is SQL selecting cols of the rows of table that where picks, once they are locked
-// in order.
-func lockedInOrder(table, cols, order, where string) string {
-	return "SELECT " + cols + " FROM " + table + " WHERE " + where + " ORDER BY " + order + " FOR UPDATE"
+// lockedInOrder is SQL locking, in order, the rows of table that selects find, and selecting key of
+// each once it holds it. Each select gives keyCols(order, key) of the rows it finds by key, as the
+// indexes leading to the key hold them; those are sorted, and each row then locked by its key on its
+// own, so a plan reads no row it doesn't lock. Locked as a scan of the table found them, sorted in
+// order, a plan made while the table was small, with sequential scans off, read a whole index in
+// that order to pick them, and with them on, the whole table.
+func lockedInOrder(table, key, order string, selects ...string) string {
+	return lockedSelecting("k."+key, table, key, order, selects...)
+}
+
+// lockedSelecting is lockedInOrder selecting out of each row it locks, SQL of k, what a select gave
+// of it.
+func lockedSelecting(out, table, key, order string, selects ...string) string {
+	return `SELECT ` + out + ` FROM (SELECT DISTINCT ` + keyCols(order, key) + ` FROM (` + strings.Join(selects, " UNION ALL ") + ` OFFSET 0) u
+		ORDER BY ` + order + `) k CROSS JOIN LATERAL (SELECT FROM ` + table + ` WHERE ` + key + ` = k.` + key + ` FOR UPDATE) t`
+}
+
+// keyCols is what a select gives lockedInOrder: the columns of order, and key where order doesn't
+// hold it.
+func keyCols(order, key string) string {
+	if slices.Contains(strings.Split(order, ", "), key) {
+		return order
+	}
+	return order + ", " + key
+}
+
+// byIDs is SQL selecting cols of the rows of table whose ids are those of the array ids, each looked
+// up on its own.
+func byIDs(ids, table, cols string) string {
+	return `SELECT r.* FROM unnest(` + ids + `) AS keyed(i) CROSS JOIN LATERAL (SELECT ` + cols + ` FROM ` + table + ` WHERE id = keyed.i OFFSET 0) r`
 }
 
 // delete removes what del picks in a tenant as actor, by how, once lock holds.
@@ -3147,7 +3162,6 @@ func (a *Authorizer) delete(ctx context.Context, actor Principal, tenant, how st
 // deleteIn removes what del picks in a tenant as actor, in tx, under the delete's locks.
 func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, del deletion, args ...any) (ChangeEvent, error) {
 	var e ChangeEvent
-	var err error
 	// The rows of table del removes, by key, locked in order, or those where picks, and the
 	// arguments they are read with.
 	picked := func(table, key, order, where string) (string, []any) {
@@ -3157,70 +3171,57 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 		return lockedByKeys(table, key, order, del.by), []any{tenant, del.keys}
 	}
 	named := []string{del.named}
-	// The argument after args, for named or an array of activations' ids.
-	next := fmt.Sprintf("$%d", len(args)+2)
+	// What it changes before the places, each statement with sequential scans off (byIndexes), in one
+	// round trip.
+	var first []statement
 	// Those it approves with its own, in one order, as removeGroups locks them; those it approves by
-	// its key (naming), as no other index finds them.
+	// its key (naming), as no other index finds them. Only a principal's removal names one, by its key.
 	if del.named != "" {
-		if _, err := tx.Exec(ctx, lockedInOrder("rbac_eligibilities", "", bindingOrder, anyOf("id",
-			"SELECT id FROM rbac_eligibilities WHERE tenant = $1 AND "+del.where, "SELECT id FROM rbac_eligibilities WHERE "+naming("approvers", next))),
-			slices.Concat([]any{tenant}, args, []any{named})...); err != nil {
-			return ChangeEvent{}, err
-		}
+		first = append(first, stmt(nil, lockedInOrder("rbac_eligibilities", "id", bindingOrder,
+			byKeys("rbac_eligibilities", "id", bindingOrder, del.by, "$2"),
+			"SELECT "+keyCols(bindingOrder, "id")+" FROM rbac_eligibilities WHERE "+naming("approvers", "$3")), tenant, del.keys, named))
 	}
 	eligible, eligibleArgs := picked("rbac_eligibilities", "id", bindingOrder, del.where)
-	if e.Ineligible, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, eligible, eligibleArgs...); err != nil {
-		return ChangeEvent{}, err
-	}
+	var ineligible, unapproved []Eligibility
+	first = append(first, removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ineligible, eligible, eligibleArgs...))
 	if del.named != "" {
-		unapproved, changed, err := a.unapprove(ctx, tx, tenant, named)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		e.Ineligible, e.Eligible = append(e.Ineligible, unapproved...), changed
+		first = append(first, a.unapproving(tenant, named, &unapproved, &e.Eligible)...)
 	}
 	if del.roles {
-		rows, err := tx.Query(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant)
-		if err != nil {
-			return ChangeEvent{}, err
-		}
-		if e.DeletedRoles, err = pgx.CollectRows(rows, pgx.RowTo[Role]); err != nil {
-			return ChangeEvent{}, err
-		}
+		first = append(first, stmt(collecting(&e.DeletedRoles, func(rows pgx.Rows) ([]Role, error) { return pgx.CollectRows(rows, pgx.RowTo[Role]) }),
+			`DELETE FROM rbac_roles WHERE tenant = $1 RETURNING id`, tenant))
 	}
 	switch {
 	case del.denies && del.by != "":
-		if err := lockDenies(ctx, tx, []string{byKeys("rbac_denies", denyKey, del.by, "$2")}, tenant, del.keys); err != nil {
-			return ChangeEvent{}, err
-		}
-		if e.DeletedDenies, err = removedWhere(ctx, a, tx, "rbac_denies", denyColumns, collectDenies,
-			anyOf("ctid", byKeys("rbac_denies", "ctid", del.by, "$2")), tenant, del.keys); err != nil {
-			return ChangeEvent{}, err
-		}
+		first = append(first, stmt(nil, lockedDenies(byKey("$2", "rbac_denies", del.by, denyKey, "tenant = $1")), tenant, del.keys),
+			removing(a, "rbac_denies", denyColumns, collectDenies, &e.DeletedDenies,
+				anyOf("ctid", byKey("$2", "rbac_denies", del.by, "ctid", "tenant = $1")), tenant, del.keys))
 	case del.denies:
-		if e.DeletedDenies, err = removed(ctx, a, tx, "rbac_denies", denyColumns, collectDenies, tenant, del.where, args...); err != nil {
-			return ChangeEvent{}, err
-		}
+		first = append(first, removing(a, "rbac_denies", denyColumns, collectDenies, &e.DeletedDenies, "tenant = $1 AND "+del.where,
+			slices.Concat([]any{tenant}, args)...))
 	}
 	if del.named != "" {
-		if _, err := tx.Exec(ctx, lockedInOrder("rbac_denies", "", denyOrder, naming("exempt", "$2")), tenant, named); err != nil {
-			return ChangeEvent{}, err
-		}
-		if e.Denies, err = unexempt(ctx, tx, tenant, actor, named, false); err != nil {
-			return ChangeEvent{}, err
-		}
+		first = append(first, stmt(nil, lockedDenies("SELECT "+denyKey+" FROM rbac_denies WHERE "+naming("exempt", "$2")), tenant, named),
+			unexempting(tenant, actor, named, false, &e.Denies))
 	}
-	var r resting
+	// Memberships before the members they reach, as DeleteExpired takes them, so the two never
+	// deadlock.
 	if del.members != "" {
-		// Memberships before the members they reach, as DeleteExpired takes them, so the two never
-		// deadlock.
-		if e.EndedMemberships, err = removed(ctx, a, tx, "rbac_memberships", membershipColumns, collectMemberships, tenant, del.members, args...); err != nil {
-			return ChangeEvent{}, err
-		}
+		first = append(first, removing(a, "rbac_memberships", membershipColumns, collectMemberships, &e.EndedMemberships, "tenant = $1 AND "+del.members,
+			slices.Concat([]any{tenant}, args)...))
+	}
+	if err := byIndexes(ctx, tx, first...); err != nil {
+		return ChangeEvent{}, err
+	}
+	e.Ineligible = slices.Concat(ineligible, unapproved)
+	var r resting
+	var then []statement
+	if del.members != "" {
+		// A group in none ends no place its members' activations rest on. Only a group's removal
+		// names one, by its key.
 		if del.group != "" {
-			// A group in none ends no place its members' activations rest on.
-			_, held, err := endingPlaces(ctx, tx, lockedInOrder("rbac_members", "principal", placeOrder, "tenant = $1 AND "+del.members),
-				slices.Concat([]any{tenant}, args)...)
+			_, held, err := endingPlaces(ctx, tx, lockedSelecting("k.principal", "rbac_members", "ctid", placeOrder,
+				byKeys("rbac_members", "ctid", placeOrder, del.by, "$2")), tenant, del.keys)
 			if err != nil {
 				return ChangeEvent{}, err
 			}
@@ -3229,25 +3230,19 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 			}
 		}
 		places, placesArgs := picked("rbac_members", "ctid", placeOrder, del.members)
-		if e.Left, err = removedWhere(ctx, a, tx, "rbac_members", memberColumns, collectMembers, places, placesArgs...); err != nil {
-			return ChangeEvent{}, err
-		}
+		then = append(then, removing(a, "rbac_members", memberColumns, collectMembers, &e.Left, places, placesArgs...))
 	}
 	if del.groups {
-		if e.DeletedGroups, err = removed(ctx, a, tx, "rbac_groups", groupColumns, collectGroups, tenant, "TRUE"); err != nil {
-			return ChangeEvent{}, err
-		}
+		then = append(then, removing(a, "rbac_groups", groupColumns, collectGroups, &e.DeletedGroups, "tenant = $1", tenant))
 	}
+	// With the activations it may cut short, in one order, each by its key.
 	if len(r.ids) > 0 {
-		// With the activations it may cut short, in one order, each by its key.
-		if _, err := tx.Exec(ctx, lockedInOrder("rbac_grants", "", bindingOrder, anyOf("id",
-			"SELECT id FROM rbac_grants WHERE tenant = $1 AND "+del.where, "SELECT unnest("+next+"::text[]::uuid[])")),
-			slices.Concat([]any{tenant}, args, []any{r.ids})...); err != nil {
-			return ChangeEvent{}, err
-		}
+		then = append(then, stmt(nil, lockedInOrder("rbac_grants", "id", bindingOrder, byKeys("rbac_grants", "id", bindingOrder, del.by, "$2"),
+			byIDs("$3::text[]::uuid[]", "rbac_grants", keyCols(bindingOrder, "id"))), tenant, del.keys, r.ids))
 	}
 	granted, grantedArgs := picked("rbac_grants", "id", bindingOrder, del.where)
-	if e.Revoked, err = removedWhere(ctx, a, tx, "rbac_grants", grantColumns, collectGrants, granted, grantedArgs...); err != nil {
+	then = append(then, removing(a, "rbac_grants", grantColumns, collectGrants, &e.Revoked, granted, grantedArgs...))
+	if err := byIndexes(ctx, tx, then...); err != nil {
 		return ChangeEvent{}, err
 	}
 	if del.group == "" {
@@ -3260,51 +3255,46 @@ func (a *Authorizer) deleteIn(ctx context.Context, tx pgx.Tx, tenant string, act
 	return e, err
 }
 
-// unapprove deletes the eligibilities in a tenant that only principals, by key, approve, which
-// without them would need no approval, and takes them out of the others' approvers, keeping their
-// order; it returns those it deleted and those it changed. The change locks them in order first.
-func (a *Authorizer) unapprove(ctx context.Context, tx pgx.Tx, tenant string, keys []string) (ended, changed []Eligibility, err error) {
+// unapproving is the statements deleting the eligibilities in a tenant that only principals, by key,
+// approve, which without them would need no approval, and taking them out of the others' approvers,
+// keeping their order, collecting those it deleted into ended and those it changed into changed.
+// The change locks them in order first.
+func (a *Authorizer) unapproving(tenant string, keys []string, ended, changed *[]Eligibility) []statement {
 	// Each found by the keys it names (naming), so it names one of them: none of them is empty.
-	if ended, err = removedWhere(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities,
-		naming("approvers", "$2")+" AND approvers <@ $2::text[]", tenant, keys); err != nil {
-		return nil, nil, err
-	}
-	rows, err := tx.Query(ctx, `UPDATE rbac_eligibilities SET
+	return []statement{
+		removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, ended,
+			naming("approvers", "$2")+" AND approvers <@ $2::text[]", tenant, keys),
+		stmt(collecting(changed, collectEligibilities), `UPDATE rbac_eligibilities SET
 		  approvers = array(SELECT k FROM unnest(approvers) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)
 		WHERE `+naming("approvers", "$2")+`
-		RETURNING `+eligibilityColumns, tenant, keys)
-	if err != nil {
-		return nil, nil, err
+		RETURNING `+eligibilityColumns, tenant, keys),
 	}
-	changed, err = collectEligibilities(rows)
-	return ended, changed, err
 }
 
-// unexempt takes principals, by key, out of the exemptions of a tenant's denies, and with named out
-// of the principals they name too, keeping each list's order, as actor, and returns the denies it
-// changed. The change locks them in order first.
-func unexempt(ctx context.Context, tx pgx.Tx, tenant string, actor Principal, keys []string, named bool) ([]Deny, error) {
+// unexempting is the statement taking principals, by key, out of the exemptions of a tenant's
+// denies, and with named out of the principals they name too, keeping each list's order, as actor,
+// collecting the denies it changed into changed. The change locks them in order first.
+func unexempting(tenant string, actor Principal, keys []string, named bool, changed *[]Deny) statement {
 	// Each found by the keys it names (naming).
 	principals, where := "principals", naming("exempt", "$2")
 	if named {
 		principals = "array(SELECT k FROM unnest(principals) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i)"
 		where = naming("principals", "$2") + " OR " + where
 	}
-	rows, err := tx.Query(ctx, `UPDATE rbac_denies SET principals = `+principals+`,
+	return stmt(collecting(changed, collectDenies), `UPDATE rbac_denies SET principals = `+principals+`,
 		  exempt = array(SELECT k FROM unnest(exempt) WITH ORDINALITY AS t(k, i) WHERE k <> ALL($2::text[]) ORDER BY i),
 		  updated_by = $3, updated_at = now()
 		WHERE `+where+`
 		RETURNING `+denyColumns, tenant, keys, actorKey(actor))
-	if err != nil {
-		return nil, err
-	}
-	return collectDenies(rows)
 }
 
-// removeEligible deletes the eligibilities in a tenant that where picks, and returns them for
-// OnChange.
-func (a *Authorizer) removeEligible(ctx context.Context, tx pgx.Tx, tenant, where string, args ...any) ([]Eligibility, error) {
-	return removed(ctx, a, tx, "rbac_eligibilities", eligibilityColumns, collectEligibilities, tenant, where, args...)
+// collecting is a read collecting rows into got.
+func collecting[T any](got *[]T, collect func(pgx.Rows) ([]T, error)) func(pgx.Rows) error {
+	return func(rows pgx.Rows) error {
+		var err error
+		*got, err = collect(rows)
+		return err
+	}
 }
 
 // remove deletes the grants in a tenant that where picks, and returns them for OnChange.
@@ -3320,21 +3310,24 @@ func removed[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, column
 
 // removedWhere is removed of the rows where alone picks, its arguments from $1: rows picked by key,
 // in a tenant they were found in, which beside tenant = $1 a generic plan, costing a tenant's rows
-// by averages, would find by reading every row in the tenant.
+// by averages, would find by reading every row in the tenant. Deleted with sequential scans off
+// (byIndexes), as a plan made while the table was small read it whole.
 func removedWhere[T any](ctx context.Context, a *Authorizer, tx pgx.Tx, table, columns string, collect func(pgx.Rows) ([]T, error),
 	where string, args ...any,
 ) ([]T, error) {
+	var got []T
+	err := byIndexes(ctx, tx, removing(a, table, columns, collect, &got, where, args...))
+	return got, err
+}
+
+// removing is removedWhere's statement, collecting what it removes into got.
+func removing[T any](a *Authorizer, table, columns string, collect func(pgx.Rows) ([]T, error), got *[]T, where string, args ...any) statement {
 	query := `DELETE FROM ` + table + ` WHERE ` + where
 	// Only OnChange reads what was removed, which for a whole tenant can be every row it has.
 	if a.cfg.OnChange == nil {
-		_, err := tx.Exec(ctx, query, args...)
-		return nil, err
+		return stmt(nil, query, args...)
 	}
-	rows, err := tx.Query(ctx, query+` RETURNING `+columns, args...)
-	if err != nil {
-		return nil, err
-	}
-	return collect(rows)
+	return stmt(collecting(got, collect), query+` RETURNING `+columns, args...)
 }
 
 // DeleteExpired removes grants, eligibilities, group members and tenant memberships that have
@@ -3390,7 +3383,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	}
 	statement := func(sql string) func(pgx.Tx) (int64, int64, error) {
 		return func(tx pgx.Tx) (n, all int64, err error) {
-			err = tx.QueryRow(ctx, sql, now, expiryBatch).Scan(&n, &all)
+			err = byIndexes(ctx, tx, stmt(into(&n, &all), sql, now, expiryBatch))
 			return n, all, err
 		}
 	}
@@ -3444,7 +3437,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 // back the place's removal: it passes over that membership, for the next run.
 func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all int64, err error) {
 	// Ordered, so a generic plan finds the batch by the index of expiries, as deleteExpired's.
-	rows, err := tx.Query(ctx, `SELECT tenant, principal FROM rbac_memberships
+	rows, err := queryByIndexes(ctx, tx, `SELECT tenant, principal FROM rbac_memberships
 		WHERE expires_at <= least($1, statement_timestamp()) ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED`, now, expiryBatch)
 	if err != nil {
 		return 0, 0, err
@@ -3456,7 +3449,7 @@ func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all 
 	picked = int64(len(tenants))
 	// Those whose every place it now holds: no change can add one while it holds the membership,
 	// as a join holds the membership it joins with.
-	rows, err = tx.Query(ctx, `SELECT p.tenant, p.principal FROM unnest($1::text[], $2::text[]) AS p(tenant, principal)
+	rows, err = queryByIndexes(ctx, tx, `SELECT p.tenant, p.principal FROM unnest($1::text[], $2::text[]) AS p(tenant, principal)
 		WHERE (SELECT count(*) FROM rbac_members m WHERE m.tenant = p.tenant AND m.principal = p.principal) = (SELECT count(*) FROM (
 		  SELECT FROM rbac_members m WHERE m.tenant = p.tenant AND m.principal = p.principal FOR UPDATE SKIP LOCKED) held)`,
 		tenants, principals)
@@ -3467,7 +3460,7 @@ func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all 
 		return picked, 0, err
 	}
 	// Of the memberships alone: a place of an identity that is no member gives nothing, ended or not.
-	err = tx.QueryRow(ctx, `
+	err = byIndexes(ctx, tx, stmt(into(&all), `
 		WITH ended AS (
 		  DELETE FROM rbac_memberships ms USING unnest($1::text[], $2::text[]) AS p(tenant, principal)
 		  WHERE ms.tenant = p.tenant AND ms.principal = p.principal
@@ -3475,7 +3468,7 @@ func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all 
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
 		), `+expiredThroughSQL("ended")+`
-		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, tenants, principals).Scan(&all)
+		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, tenants, principals))
 	return picked, all, err
 }
 
