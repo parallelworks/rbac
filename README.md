@@ -526,7 +526,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   one array are, which a copy charged for each, past what converting them costs; and a hook's copy
   of a time in a zone of the host's own, as `time.FixedZone` and `time.LoadLocation` make, which
   shared that zone with the host, so a constraint writing through `Location()` wrote the host's, is
-  now in a copy of the zone, which `==` tells from the host's, though `Equal` doesn't; and
+  now in a copy of the zone, which `==` tells from the host's, though `Equal` doesn't, and so is the
+  expiry of a grant `ValidateGrant` is asked about, which was in the host's; and
   a condition building a list or a map
   holding attributes no condition can read, or reading the `subject`, the `resource` or the
   `request` holding them whole, as one
@@ -586,10 +587,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `Permissions` does for each permission and a check of a labeled resource for each value its label
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
-  `ValidateGrant` is given its copy of the actor's attributes once for a call too, and neither is
-  given what a copy can't hold (see What a hook's copy holds). What one removes from an actor the
-  actor can't hand on, but for a role a role it holds lists in `GrantableRoles`, which it grants
-  without holding. A freeze stops
+  `ValidateGrant` is given its copy of the actor's attributes once for a call too, and the grant's
+  expiry in a copy of its zone, as a copy holds a time, and neither is given what a copy can't
+  hold (see What a hook's copy holds). `OnChange` is told what a change wrote, not given copies:
+  its event's times are as PostgreSQL returns them, in none of the host's zones. What one removes
+  from an actor the actor can't hand on, but for a role a role it holds lists in `GrantableRoles`,
+  which it grants without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
   revoking there, and so it stops any change taking access away there, whatever the actor's grants,
@@ -636,7 +639,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   unexported field or a map's key too, and none of what follows. A zone's methods write none of it,
   but assigning through `Location()` writes it whole: shared, a constraint writing
   `*t.Location() = *time.UTC` wrote the host's zone, and every time in it. A time in UTC or the
-  local zone, which any code can reach, is as the host passed it. Where what a hook would be given
+  local zone, which any code can reach, is as the host passed it. `ValidateGrant` is given a grant's
+  expiry so too, apart from any copy: in the host's zone, a hook writing through it wrote the
+  host's. Where what a hook would be given
   holds any of it, the hook can't be asked, rather than be given part of it, and the call is
   refused as any other, a `DeniedError` of the permission on the resource asked about, or the
   tenant, whose `Reason` names the hook and whose message doesn't: a tenant's users can write what

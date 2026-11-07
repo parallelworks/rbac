@@ -655,8 +655,9 @@ type Constraint struct {
 // call is refused as above. A time in a zone of the host's own, as time.FixedZone and
 // time.LoadLocation make, is copied in a copy of the zone, one for each copy, a map's key too: a
 // zone's methods write none of it, but assigning through Location writes it whole, so a constraint
-// doing so wrote the host's. So such a time in a copy is == to none of the host's, though Equal to
-// it.
+// doing so wrote the host's. So such a time in a copy is == to none of the host's, nor to one in
+// another copy, as the subject's and the resource's are copied apart, though Equal to both, and a
+// map keyed by such times finds its entries by times in its copy's zone alone.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
@@ -1075,10 +1076,13 @@ type Config struct {
 	Labels []LabelDimension
 	// OnChange runs in the transaction of every change but DeleteExpired, whose grants already
 	// gave nothing, once the change is written; an error rolls the change back. History records
-	// what it writes as the host's, not as the change's. A delete's event holds every row it
-	// removes, in memory at once: for a tenant of millions of rows, remove them a part at a time
-	// first, its resources' grants with DeleteScopes, a batch of scopes at a time, and its
-	// identities' memberships, places in groups and grants on the tenant with DeletePrincipal.
+	// what it writes as the host's, not as the change's. It is told what the change wrote, not
+	// given copies as a hook is (ConstraintInput): the times its event holds are as PostgreSQL
+	// returns them, in the zone the connection reads them in, as Grants returns them, none in a
+	// zone the host passed. A delete's event holds every row it removes, in memory at once: for a
+	// tenant of millions of rows, remove them a part at a time first, its resources' grants with
+	// DeleteScopes, a batch of scopes at a time, and its identities' memberships, places in groups
+	// and grants on the tenant with DeletePrincipal.
 	OnChange func(ctx context.Context, tx pgx.Tx, e ChangeEvent) error
 	// OnRefused is told of every change refused as ErrDenied or ErrInvalid, as an attempt that
 	// failed, which history doesn't record, as nothing of it is written; but not of one on an
@@ -1486,10 +1490,14 @@ func (c *callClock) wentBack() error {
 	return fmt.Errorf("%w: the host's clock went back while this change took its locks; try again", ErrConflict)
 }
 
-// GrantInput is a grant Config.ValidateGrant is asked about.
+// GrantInput is a grant Config.ValidateGrant is asked about, the hook's own, as a constraint's input
+// is (ConstraintInput).
 type GrantInput struct {
-	Tenant  string
-	Scope   Scope
+	Tenant string
+	Scope  Scope
+	// Binding is the grant, its expiry in a copy of its zone where that is the host's own, as a
+	// hook's copy holds a time (ConstraintInput), so it is == to none of the host's, though Equal to
+	// it: given in the host's, ValidateGrant writing through its Location wrote the host's zone.
 	Binding Binding
 	// Role is what the grant gives: the role as defined now, or with ViaRedefinition, as it will be.
 	Role RoleDefinition

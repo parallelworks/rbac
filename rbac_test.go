@@ -3825,6 +3825,64 @@ func TestAHookWritingTheZoneOfItsTimeWritesNoneOfTheHosts(t *testing.T) {
 	}
 }
 
+// ValidateGrant is given a grant's expiry in a copy of its zone, as a constraint is given a time in
+// its copy, whether the host passed it, as Apply's grant, or its clock read it, as an activation's:
+// given as the host passed it, a hook writing `*t.Location() = *time.UTC` wrote the host's zone, so
+// the host's time, and every other in that zone, read an hour off. One in UTC is as the host passed
+// it.
+func TestValidateGrantWritingTheZoneOfAnExpiryWritesNoneOfTheHosts(t *testing.T) {
+	zone := time.FixedZone("host", 3600)
+	at := time.Date(2027, 1, 2, 3, 4, 5, 0, zone)
+	// given are the expiries ValidateGrant was given, as they read when it was asked, and their zones.
+	var given []string
+	var zones []*time.Location
+	h := setup(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			given, zones = append(given, in.Binding.ExpiresAt.Format(time.RFC3339)), append(zones, in.Binding.ExpiresAt.Location())
+			if z := in.Binding.ExpiresAt.Location(); z != time.UTC && z != time.Local {
+				*z = *time.UTC
+			}
+			return validate(ctx, q, in)
+		}
+		c.Now = func() time.Time { return time.Date(2026, 1, 1, 13, 0, 0, 0, zone) }
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	// Each in the order they run, as an activation needs the eligibility.
+	for _, c := range []struct {
+		name, want string
+		change     func() error
+	}{
+		{"a grant", "2027-01-02T03:04:05+01:00", func() error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("u"), ExpiresAt: at}}})
+		}},
+		{"an eligibility", "2027-01-02T03:04:05+01:00", func() error {
+			return h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: identity("v"), MaxDuration: time.Hour, ExpiresAt: at})
+		}},
+		{"an activation", "2026-01-01T14:00:00+01:00", func() error {
+			_, err := h.authz.Activate(ctx, h.as(t, "v"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "on call"})
+			return err
+		}},
+	} {
+		given, zones = nil, nil
+		if err := c.change(); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if len(given) == 0 || given[0] != c.want || zones[0] == zone {
+			t.Errorf("%s: ValidateGrant was given %v, the host's zone %t", c.name, given, len(zones) > 0 && zones[0] == zone)
+		}
+		if zone.String() != "host" || at.Format(time.RFC3339) != "2027-01-02T03:04:05+01:00" {
+			t.Fatalf("%s: writing the zone of ValidateGrant's expiry wrote the host's, so its time reads %s", c.name, at.Format(time.RFC3339))
+		}
+	}
+	given, zones = nil, nil
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("w"), ExpiresAt: at.UTC()}}}); err != nil ||
+		len(zones) != 1 || zones[0] != time.UTC {
+		t.Errorf("an expiry in UTC was given as %v: %v", given, err)
+	}
+}
+
 // A time in the local zone the process started in, where the host has since set time.Local to
 // another, is in a zone of the host's own, which a copy copies, loading it first: copied as it lay,
 // before anything had loaded it, it read as UTC where the host's read as the zone the process

@@ -572,7 +572,10 @@ sequenceDiagram
   it lies, an unexported field, which reflection reaches in the copy's struct (`rezone`), and a
   map's key, set anew (`ownKey`), among them: a zone's methods write none of it, but assigning
   through `Location()` writes it whole, so a constraint writing `*t.Location() = *time.UTC` wrote
-  the host's zone, and every time in it. A copy copies each value in place before what it holds,
+  the host's zone, and every time in it. `ValidateGrant` is given a grant's expiry so too
+  (`zonedApart`), apart from any copy, the rest of its input being values of its own, a role's
+  definition cloned; `OnChange` is told what a change wrote, its times as PostgreSQL returns them,
+  in none of the host's zones. A copy copies each value in place before what it holds,
   as setting it does, so it copies none holding a lock or an unsafe pointer there, nor a struct
   whose unexported field, which it can't set, holds a pointer, a slice, a map or an interface
   (`copyable`): the hook can't be asked. Such a value is another package's state, as protobuf's

@@ -2625,6 +2625,14 @@ func (c *copier) zone(t time.Time) time.Time {
 	return t.In(own)
 }
 
+// zonedApart is t, a time a hook is given apart from any copy, as ValidateGrant is given a grant's
+// expiry, in a zone of its own where its zone is the host's own (zone): given as the host passed
+// it, ValidateGrant writing through its Location wrote the host's zone.
+func zonedApart(t time.Time) time.Time {
+	var c copier
+	return c.zone(t)
+}
+
 // rezone moves v, an addressable time (zoned) of the copy's, set as the host's was, to a zone of
 // the copy's own (zone): in place, as v can be an unexported field of a struct of the copy's, which
 // a hook reaches through the type's methods and reflection can't set.
