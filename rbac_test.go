@@ -2855,15 +2855,22 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 // Converting and copying for a hook count alike, so a hook can be given a copy of whatever a check
 // converts: values of random shapes, nesting every type both handle in one another, cost a copy
 // what converting them costs, and no more where they hold JSON text or packed messages, which
-// converting decodes and a copy holds as bytes, or a value reached twice, which a copy copies once
-// where converting may count it again.
+// converting decodes and a copy holds as bytes, a value reached twice, which a copy copies once
+// where converting may count it again, or slices of one array, which a copy copies once for where
+// each starts and its capacity, and converting once for each length too.
 func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 	for _, mode := range []struct {
-		name             string
-		decoded, sharing bool
-	}{{"each value once", false, false}, {"decoded", true, false}, {"shared", false, true}, {"both", true, true}} {
+		name                      string
+		decoded, sharing, slicing bool
+	}{
+		{"each value once", false, false, false},
+		{"decoded", true, false, false},
+		{"shared", false, true, false},
+		{"both", true, true, false},
+		{"slices of one array", false, false, true},
+	} {
 		for seed := range uint64(1500) {
-			d := &copyDraw{rng: mathrand.New(mathrand.NewPCG(seed, 116)), decoded: mode.decoded, sharing: mode.sharing}
+			d := &copyDraw{rng: mathrand.New(mathrand.NewPCG(seed, 116)), decoded: mode.decoded, sharing: mode.sharing, slicing: mode.slicing}
 			attributes := map[string]any{}
 			for i := range d.rng.IntN(4) + 1 {
 				attributes[fmt.Sprint("a", i)] = d.value(3)
@@ -2873,7 +2880,7 @@ func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 			switch {
 			case !read || !ok:
 				t.Errorf("%s, seed %d: read %t, copied %t", mode.name, seed, read, ok)
-			case copied > converted || copied < converted && !mode.decoded && !mode.sharing:
+			case copied > converted || copied < converted && !mode.decoded && !mode.sharing && !mode.slicing:
 				t.Errorf("%s, seed %d: converting costs %d and copying %d: %#v", mode.name, seed, converted, copied, attributes)
 			}
 		}
@@ -2884,14 +2891,78 @@ func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 // and number Attributes names, CEL's own scalars, lists, arrays, maps keyed by each kind they may
 // be, some of values holding more in place than one unit covers, pointers, nil ones of each, and
 // every well-known message, through a pointer too, some holding fields they don't know. With
-// decoded, JSON text and packed messages, and with sharing, values it drew before.
+// decoded, JSON text and packed messages, with sharing, values it drew before, and with slicing,
+// slices of arrays it drew before (slice).
 type copyDraw struct {
-	rng              *mathrand.Rand
-	decoded, sharing bool
-	drawn            []any
+	rng                       *mathrand.Rand
+	decoded, sharing, slicing bool
+	drawn                     []any
+	// arrays are the slices drawn whole, of which slice draws others, and pointed the arrays held by
+	// a pointer among them.
+	arrays  []reflect.Value
+	pointed []any
+}
+
+// slice is a slice of an array drawn before, or of one drawn now, from anywhere in it, as long as
+// it may be, with room to grow or none, empty too: of values, of strings, of bytes, of CEL's bytes,
+// of JSON text, `"a"` again and again, each slice holding one, or of an array a pointer holds,
+// which value may draw beside its slices.
+func (d *copyDraw) slice(depth int) any {
+	if len(d.arrays) == 0 || d.rng.IntN(3) == 0 {
+		n := d.rng.IntN(6)
+		var array reflect.Value
+		switch d.rng.IntN(6) {
+		case 0:
+			array = reflect.ValueOf(make([]byte, n))
+		case 1:
+			text := make(json.RawMessage, 0, 3*n+3+d.rng.IntN(3))
+			for range n + 1 {
+				text = append(text, `"a"`...)
+			}
+			array = reflect.ValueOf(text)
+		case 2:
+			array = reflect.ValueOf(make(types.Bytes, n))
+		case 3:
+			s := make([]string, n)
+			for i := range s {
+				s[i] = d.text()
+			}
+			array = reflect.ValueOf(s)
+		case 4:
+			p := &[4]any{d.value(depth - 1), d.value(depth - 1), d.value(depth - 1), d.value(depth - 1)}
+			d.pointed = append(d.pointed, p)
+			array = reflect.ValueOf(p[:])
+		default:
+			l := make([]any, n)
+			for i := range l {
+				l[i] = d.value(depth - 1)
+			}
+			array = reflect.ValueOf(l)
+		}
+		d.arrays = append(d.arrays, array)
+	}
+	array := d.arrays[d.rng.IntN(len(d.arrays))]
+	if text, ok := array.Interface().(json.RawMessage); ok {
+		at := 3 * d.rng.IntN(len(text)/3)
+		return text[at : at+3 : at+3+d.rng.IntN(cap(text)-at-2)]
+	}
+	from := d.rng.IntN(array.Cap() + 1)
+	to := from + d.rng.IntN(array.Cap()-from+1)
+	if d.rng.IntN(3) == 0 {
+		return array.Slice3(from, to, to).Interface()
+	}
+	return array.Slice3(from, to, to+d.rng.IntN(array.Cap()-to+1)).Interface()
 }
 
 func (d *copyDraw) text() string { return strings.Repeat("s", d.rng.IntN(45)) }
+
+// bytes is a slice of bytes with an array of its own: Go starts every empty one with no room to
+// grow at one address, so a copy copies the second as the first, where converting counts each, as
+// with slicing, which draws them.
+func (d *copyDraw) bytes() []byte {
+	n := d.rng.IntN(45)
+	return make([]byte, n, n+1)
+}
 
 func (d *copyDraw) unknown(m proto.Message) proto.Message {
 	if d.rng.IntN(4) == 0 {
@@ -2976,6 +3047,12 @@ func (d *copyDraw) value(depth int) any {
 	if d.sharing && len(d.drawn) > 0 && d.rng.IntN(6) == 0 {
 		return d.drawn[d.rng.IntN(len(d.drawn))]
 	}
+	if d.slicing && d.rng.IntN(3) == 0 {
+		if len(d.pointed) > 0 && d.rng.IntN(4) == 0 {
+			return d.pointed[d.rng.IntN(len(d.pointed))]
+		}
+		return d.slice(depth)
+	}
 	n := 20
 	switch {
 	case d.decoded:
@@ -3000,13 +3077,13 @@ func (d *copyDraw) value(depth int) any {
 	case 5:
 		cels := []any{
 			types.String(d.text()), types.Int(1), types.Uint(2), types.Double(d.double()), types.Bool(true),
-			types.Bytes(make([]byte, d.rng.IntN(45))), types.NullValue,
+			types.Bytes(d.bytes()), types.NullValue,
 			types.Timestamp{Time: time.Unix(1, 0)},
 			types.Duration{Duration: time.Second},
 		}
 		v = cels[d.rng.IntN(len(cels))]
 	case 6:
-		v = []any{make([]byte, d.rng.IntN(45)), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
+		v = []any{d.bytes(), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
 	case 7:
 		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Struct)(nil), (*timestamppb.Timestamp)(nil)}[d.rng.IntN(5)]
 	case 8, 9:
@@ -3031,7 +3108,7 @@ func (d *copyDraw) value(depth int) any {
 	case 18:
 		v = []any{map[string]time.Time{d.text(): time.Unix(1, 0)}, map[string][64]int64{d.text(): {}}, map[string][64]int64{}}[d.rng.IntN(3)]
 	case 19:
-		v = [][]byte{make([]byte, d.rng.IntN(45))}
+		v = [][]byte{d.bytes()}
 	case 20, 21:
 		l := make([]any, d.rng.IntN(4))
 		for i := range l {
