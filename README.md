@@ -292,11 +292,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
   lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
-  struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
-  array, a map holding two keys read as the same value, as `1` and `1u`, and so JSON text naming a
-  member of an object twice, once unescaped, or an `Any` packing a message that sets a field twice,
-  as a `Struct` with two entries of `role`: each is read as the last, where a host reading the first
-  reads another. A `Struct` the host passes holds each key once, as a Go map does. So do invalid
+  struct, a channel, a func, any other message, a map of structs, or one keyed by anything else, as
+  a double or an array, holding none too, a map holding two keys read as the same value, as `1`
+  and `1u`, and so JSON text naming a member of an object twice, once unescaped, or an `Any`
+  packing a message that sets a field twice, as a `Struct` with two entries of `role`: each is read
+  as the last, where a host reading the first reads another. A `Struct` the host passes holds each
+  key once, as a Go map does. So do invalid
   JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which `encoding/json` reads as
   U+FFFD, a `json.Number` that isn't a number as JSON writes one, as `0x1p4` or `Inf`, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
@@ -311,7 +312,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
   for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
   a map of structs, which none reads and reading copies whole, is refused unread at 2 for each
-  entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms. That is about a map of
+  entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
+  another costs at least 1 for each 24 bytes its value holds in place, which reading it moves,
+  where 19,000 empty maps of a type of 64 KiB, charged 8 each, took 1.4 GB and 270 ms making room
+  for a value they didn't hold. That is about a map of
   50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
   may reading, about 20 ms: each map charged one, as a number is, a
@@ -419,7 +423,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
-  reading their kind. Attributes holding maps, lists, pointers or messages are charged what building
+  reading their kind, and so are ones holding an empty or nil map of structs, read as `{}` where one
+  holding a struct couldn't be read; and a map's values no condition reads, as a host's own array
+  saying it is a double, or nesting past 10,000 deep, each cost at least 1 for each 24 bytes they
+  hold in place, so the kinds converted after them can be past what a check converts. Attributes
+  holding maps, lists, pointers or messages are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused

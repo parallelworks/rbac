@@ -2871,9 +2871,9 @@ func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 
 // copyDraw draws values a check converts and a hook is given a copy of: every scalar, time, bytes
 // and number Attributes names, CEL's own scalars, lists, arrays, maps keyed by each kind they may
-// be, pointers, nil ones of each, and every well-known message, through a pointer too, some holding
-// fields they don't know. With decoded, JSON text and packed messages, and with sharing, values it
-// drew before.
+// be, some of values holding more in place than one unit covers, pointers, nil ones of each, and
+// every well-known message, through a pointer too, some holding fields they don't know. With
+// decoded, JSON text and packed messages, and with sharing, values it drew before.
 type copyDraw struct {
 	rng              *mathrand.Rand
 	decoded, sharing bool
@@ -3018,7 +3018,7 @@ func (d *copyDraw) value(depth int) any {
 	case 17:
 		v = []*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0)), nil}
 	case 18:
-		v = map[string]time.Time{d.text(): time.Unix(1, 0)}
+		v = []any{map[string]time.Time{d.text(): time.Unix(1, 0)}, map[string][64]int64{d.text(): {}}, map[string][64]int64{}}[d.rng.IntN(3)]
 	case 19:
 		v = [][]byte{make([]byte, d.rng.IntN(45))}
 	case 20, 21:

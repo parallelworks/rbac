@@ -203,6 +203,17 @@ func (d hostDouble) Compare(other ref.Val) ref.Val    { return types.Double(d).C
 func (d hostDouble) Type() ref.Type                   { return types.DoubleType }
 func (d hostDouble) Value() any                       { return float64(d) }
 
+// wideDouble is a host's own type CEL reads as a double, which holds 8 KiB in place.
+type wideDouble [1 << 10]float64
+
+func (d wideDouble) ConvertToNative(t reflect.Type) (any, error) {
+	return types.Double(d[0]).ConvertToNative(t)
+}
+func (d wideDouble) ConvertToType(t ref.Type) ref.Val { return types.Double(d[0]).ConvertToType(t) }
+func (d wideDouble) Equal(other ref.Val) ref.Val      { return types.Double(d[0]).Equal(other) }
+func (d wideDouble) Type() ref.Type                   { return types.DoubleType }
+func (d wideDouble) Value() any                       { return d[0] }
+
 // hostString is a host's own type CEL reads as a string, which compares as CEL's own does.
 type hostString string
 
@@ -331,6 +342,35 @@ func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T
 	for _, expr := range []string{`!([[0.0 / 0.0]] in [[[0.5]]])`, `!(dyn("a") in [[0.0 / 0.0]])`, `{[0.0 / 0.0]: 1} != {[0.5]: 1}`} {
 		if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, nil); err != nil || evaluated {
 			t.Errorf("%s: evaluated %t, %v", expr, evaluated, err)
+		}
+	}
+}
+
+// A map of structs, which no condition reads, is refused unread, and so is one holding none, as a
+// map keyed by a double is: read as {}, it left a kind readable until the map held a struct, and
+// converting made room for one of its values, so 19,000 empty maps of a struct of 64 KiB took a
+// check 1.4 GB. An empty map of times, or of arrays holding no struct, is read.
+func TestAMapOfStructsFailsItsConditionsEmptyToo(t *testing.T) {
+	type tag struct{ Name string }
+	for name, m := range map[string]any{
+		"one": map[string]tag{"a": {"a"}}, "none": map[string]tag{}, "nil": map[string]tag(nil),
+		"arrays of one": map[string][1]tag{}, "none keyed by an interface": map[any]tag{},
+	} {
+		for _, expr := range []string{
+			`request.attributes.m != 1`, `request.attributes.m == {}`, `size(request.attributes.m) == 0`,
+			`has(request.attributes.m.a)`, `request.attributes.ok == true`,
+		} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m, "ok": true}); err != nil || evaluated {
+				t.Errorf("%s of a map of structs holding %s: evaluated %t, %v", expr, name, evaluated, err)
+			}
+		}
+	}
+	for name, m := range map[string]any{
+		"times": map[string]time.Time{}, "CEL's timestamps": map[string]types.Timestamp{},
+		"CEL's durations": map[string]types.Duration{}, "arrays of no struct": map[string][0]tag{},
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.m == {}`, map[string]any{"m": m}); err != nil || !held {
+			t.Errorf("an empty map of %s: held %t, %v", name, held, err)
 		}
 	}
 }
@@ -2525,7 +2565,9 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // empty maps 108 ms. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy,
 // whatever holds it, where reading one in a condition takes 70 to 145. What each allocates stands in
 // for the time here, as -race and a slower machine change neither: no unit charged allocates more
-// than a few times what one of a string does, by count or by bytes.
+// than a few times what one of a string does, by count or by bytes. Converting an empty map made
+// room for one of its values, charged 8, so 19,000 empty maps of a type of 64 KiB took 1.4 GB and
+// 270 ms to convert, where as many maps of ints took 10 MB and 15 ms.
 func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	const n = 2000
 	listed := func(made func(i int) any) map[string]any {
@@ -2558,12 +2600,13 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	strs := least(rbac.ConvertingWork, listed(func(i int) any { return strconv.Itoa(i) }))
 	allocations, bytes := float64(strs.Allocations)/float64(strs.Charged), float64(strs.Bytes)/float64(strs.Charged)
 	for name, attributes := range map[string]map[string]any{
-		"ints":        listed(func(i int) any { return i + 1000 }),
-		"lists":       listed(func(i int) any { return []any{i} }),
-		"empty lists": listed(func(int) any { return make([]any, 0, 1) }),
-		"maps":        listed(func(i int) any { return map[string]any{"a": i} }),
-		"empty maps":  listed(func(int) any { return map[string]any{} }),
-		"pointers":    listed(func(i int) any { return &i }),
+		"ints":                             listed(func(i int) any { return i + 1000 }),
+		"lists":                            listed(func(i int) any { return []any{i} }),
+		"empty lists":                      listed(func(int) any { return make([]any, 0, 1) }),
+		"maps":                             listed(func(i int) any { return map[string]any{"a": i} }),
+		"empty maps":                       listed(func(int) any { return map[string]any{} }),
+		"empty maps of an array of 64 KiB": listed(func(int) any { return map[string][8 << 10]int64{} }),
+		"pointers":                         listed(func(i int) any { return &i }),
 		"Structs": listed(func(i int) any {
 			return &structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewNumberValue(float64(i))}}
 		}),
@@ -2596,7 +2639,11 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	// before copying it: converting a map of 2,000 structs of 64 KiB took 7 ms, charged 4,017, and
 	// copying a slice of 2,000 holding a map and 64 KiB took 38 ms, charged 4,013. Converting refuses
 	// a map of them unread, and copying charges a struct the bytes it moves, as it charges one holding
-	// no map, so neither allocates more for each unit charged than for a string.
+	// no map, so neither allocates more for each unit charged than for a string. Converting made room
+	// for a value of a map's type in an empty map too, and copied each value of the host's own
+	// saying it is one of CEL's, which it refuses, charged one: it makes no room in an empty map,
+	// refuses those by their type, unread, and charges each of a map's entries at least what its
+	// value holds in place, which reading the entry moves.
 	type hidden struct {
 		M map[string]int
 		_ [64 << 10]byte
@@ -2612,8 +2659,17 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		k[0], k[1] = byte(i), byte(i>>8)
 		arrayKeyed[k] = i
 	}
+	// Maps whose values lie past what a condition reads, each moved to be found so.
+	deep := listed(func(int) any { return map[string][1 << 10]float64{"a": {}} })["l"]
+	for range 10_000 - 2 {
+		deep = []any{deep}
+	}
 	for name, attributes := range map[string]map[string]any{
 		"maps of a struct of 64 KiB":                             listed(func(int) any { return map[string]wide{"a": {}} }),
+		"empty maps of a struct of 64 KiB":                       listed(func(int) any { return map[string]wide{} }),
+		"arrays of 8 KiB of the host's saying they are doubles":  {"l": make([]wideDouble, n)},
+		"maps of an array of 8 KiB of the host's":                listed(func(int) any { return map[string]wideDouble{"a": {}} }),
+		"maps of an array of 8 KiB nested past 10,000 deep":      {"l": deep},
 		"a map of structs of 64 KiB":                             {"m": widely},
 		"maps of a struct holding a map and 64 KiB":              listed(func(int) any { return map[string]hidden{"a": {}} }),
 		"structs holding a map and 64 KiB":                       listed(func(int) any { return hidden{} }),
@@ -2636,16 +2692,38 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	// charges what they hold in place first: one holding a struct of 4 MiB, past what a copy holds,
 	// moved it only to find so, and one holding an array of 4 MiB allocated 12 MB; and it moves a
 	// slice's elements before it copies each, so 2,000 arrays of 4,096 interfaces, 125 MiB, past what
-	// a copy holds, allocated 133 MB.
+	// a copy holds, allocated 133 MB. Nor does it make room for what a pointer points to, or an array
+	// whole, before it finds what they hold in place fits, nor make the zero value of one it finds
+	// past what a copy holds to set in its place: a pointer to an array of 128 MiB allocated 268 MB,
+	// an array of two structs each holding a map beside 64 MiB 335 MB, and a struct holding a map
+	// beside 4 MiB 4 MB, each only to be found past it.
 	type huge struct{ X [4 << 20]byte }
+	type heavy struct {
+		M map[string]int
+		_ [4 << 20]byte
+	}
 	for name, attributes := range map[string]map[string]any{
-		"a map holding a struct of 4 MiB":            {"m": map[string]huge{"a": {}}},
-		"a map holding an array of 4 MiB":            {"m": map[string][4 << 20]byte{"a": {}}},
-		"a map holding an array of 4 MiB of any":     {"m": map[string][256 << 10]any{"a": {}}},
-		"a list of 2,000 arrays of 4,096 interfaces": {"l": make([][4 << 10]any, 2000)},
+		"a map holding a struct of 4 MiB":                         {"m": map[string]huge{"a": {}}},
+		"a map holding an array of 4 MiB":                         {"m": map[string][4 << 20]byte{"a": {}}},
+		"a map holding an array of 4 MiB of any":                  {"m": map[string][256 << 10]any{"a": {}}},
+		"a list of 2,000 arrays of 4,096 interfaces":              {"l": make([][4 << 10]any, 2000)},
+		"a pointer to an array of 4 MiB":                          {"p": new([4 << 20]byte)},
+		"a struct holding a map beside 4 MiB":                     {"s": heavy{}},
+		"an array of two structs each holding a map beside 4 MiB": {"a": [2]heavy{}},
 	} {
 		if w := rbac.CopyingWork(attributes); w.Done || w.Bytes > 1<<20 {
 			t.Errorf("copying %s copied it %t, allocating %d bytes", name, w.Done, w.Bytes)
+		}
+	}
+	// Converting reads a map's entries into one value it makes room for, which reading each moves
+	// whole, so it makes none where what the map's values hold in place costs more than is left: it
+	// checked one for each, and a map holding an array of 4 MiB allocated 4 MB.
+	for name, attributes := range map[string]map[string]any{
+		"a map holding an array of 4 MiB":        {"m": map[string][4 << 20]byte{"a": {}}},
+		"a map holding an array of 4 MiB of any": {"m": map[string][256 << 10]any{"a": {}}},
+	} {
+		if w := rbac.ConvertingWork(attributes); w.Done || w.Bytes > 1<<20 {
+			t.Errorf("converting %s read it %t, allocating %d bytes", name, w.Done, w.Bytes)
 		}
 	}
 }

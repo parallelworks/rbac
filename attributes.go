@@ -380,16 +380,19 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	// double or a list, is read so by none. A pointer has the methods of what it points to, so one to
 	// CEL's own string is read as the string, as any other pointer is read as what it points to.
 	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
-		if v, ok := v.Interface().(ref.Val); ok && celScalar(v) {
-			switch s := v.(type) {
-			case types.Timestamp:
-				v = types.Timestamp{Time: s.UTC()}
-			case types.Double:
-				v = c.double(float64(s))
-			}
-			return c.spend(textSize(v)-1, v), 1
+		// Refused by its type, as reading one of the host's copies it whole: charged one each, a list
+		// of 2,000 arrays of 8 KiB saying they are doubles allocated 16 MB.
+		if !celScalar(t) {
+			return c.refuse(), 1
 		}
-		return c.refuse(), 1
+		v, _ := v.Interface().(ref.Val)
+		switch s := v.(type) {
+		case types.Timestamp:
+			v = types.Timestamp{Time: s.UTC()}
+		case types.Double:
+			v = c.double(float64(s))
+		}
+		return c.spend(textSize(v)-1, v), 1
 	}
 	if t.Implements(messageType) {
 		return c.message(v)
@@ -449,11 +452,12 @@ func (c *converter) double(d float64) ref.Val {
 	return types.Double(d)
 }
 
-// celScalar reports whether v is one of CEL's own values that holds no other.
-func celScalar(v ref.Val) bool {
-	switch v.(type) {
-	case types.Bool, types.Bytes, types.Double, types.Duration, types.Int, types.Null, types.String, types.Timestamp,
-		types.Uint:
+// celScalar reports whether t is one of CEL's own values that holds no other.
+func celScalar(t reflect.Type) bool {
+	switch t {
+	case reflect.TypeFor[types.Bool](), reflect.TypeFor[types.Bytes](), reflect.TypeFor[types.Double](), celDurationType,
+		reflect.TypeFor[types.Int](), reflect.TypeFor[types.Null](), reflect.TypeFor[types.String](), celTimestampType,
+		reflect.TypeFor[types.Uint]():
 		return true
 	}
 	return false
@@ -583,36 +587,53 @@ func (c *converter) list(v reflect.Value) (ref.Val, int) {
 }
 
 // dict is v, a map, as a map of what it holds by what its keys are read as, and how deep it nests.
-// No condition can read one keyed by another kind than Attributes names, nor one holding two keys
-// read as the same value.
+// No condition can read one keyed by another kind than Attributes names, nor one of values it
+// refuses whatever they hold (refusedWhole), empty or nil too, nor one holding two keys read as the
+// same value.
 func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	if kt := v.Type().Key(); kt.Kind() != reflect.Interface && !keyType(kt) {
+		return c.refuse(), 1
+	}
+	elem := v.Type().Elem()
+	// Reading an entry copies its value whole, though a struct is refused whatever it holds: a map of
+	// 2,000 structs of 64 KiB took 7 ms to convert, charged 4,017. One of them is refused unread, at
+	// the least its entries cost, and so is one holding none, as a map keyed by a double is: read as
+	// {}, it left whether its kind could be read to whether it held a struct at the time.
+	if refusedWhole(elem) {
+		if n := length(v.Len()); !v.IsNil() && (!c.building(mapCost-1, 2*n) || !c.pay(2*n)) {
+			return nil, 0
+		}
 		return c.refuse(), 1
 	}
 	if v.IsNil() {
 		return noAttributes, 1
 	}
-	if !c.building(mapCost-1, 2*length(v.Len())) {
+	// Reading an entry moves its value whole, so each costs at least its key and what its value holds
+	// in place (leastCopied), and no room is made for a value where that is more than is left, nor
+	// where the map is empty: room for one, charged 8 for an empty map, took 19,000 empty maps of a
+	// type of 64 KiB 1.4 GB and 270 ms to convert, where as many maps of ints took 10 MB and 15 ms.
+	least := leastCopied(elem)
+	if !c.building(mapCost-1, length(v.Len())*(1+least)) {
 		return nil, 0
 	}
-	// Reading an entry copies its value whole, though a struct is refused whatever it holds: a map of
-	// 2,000 structs of 64 KiB took 7 ms to convert, charged 4,017. One that holds any is refused once,
-	// unread, at the least its entries cost.
-	if v.Len() > 0 && refusedWhole(v.Type().Elem()) {
-		if !c.pay(2 * length(v.Len())) {
-			return nil, 0
-		}
-		return c.refuse(), 1
+	if v.Len() == 0 {
+		return noAttributes, 1
 	}
 	out, height := make(map[ref.Val]ref.Val, v.Len()), 0
 	// Each entry is read into the same two values, as reading it into new ones allocates for each,
 	// a string key or an interface value too: nothing converting reads keeps them.
-	key, value := reflect.New(v.Type().Key()).Elem(), reflect.New(v.Type().Elem()).Elem()
+	key, value := reflect.New(v.Type().Key()).Elem(), reflect.New(elem).Elem()
 	for it := v.MapRange(); it.Next(); {
 		key.SetIterKey(it)
 		value.SetIterValue(it)
 		k := c.key(key)
+		left := c.left
 		held, h := c.of(value)
+		// One converted for less than reading it moved, as one nested past maxNested, or a host's own
+		// array saying it is a double, refused by its type, costs what it holds in place.
+		if spent := left - c.left; spent < least && !c.over {
+			c.pay(least - spent)
+		}
 		if c.over {
 			return nil, 0
 		}
@@ -1370,11 +1391,12 @@ func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
 	out := reflect.ValueOf(&v).Elem()
-	out.Set(c.copy(out, 0))
+	copied := c.copy(out, 0)
 	if c.over {
 		var none T
 		return none, false
 	}
+	out.Set(copied)
 	return v, true
 }
 
@@ -1487,25 +1509,27 @@ func (c *copier) building(n, least uint64) bool {
 	return c.pay(n)
 }
 
-// copy is a copy of v, which is depth deep, or once c is over, the zero value: past maxCopied deep,
-// c is over.
+// copy is a copy of v, which is depth deep, or once c is over, none (the zero Value), which its
+// caller sets nowhere, as the copy is dropped: the zero value of v's type, made to set in its
+// place, took as much as v holds in place, 4 MB for a struct holding a map beside 4 MiB. Past
+// maxCopied deep, c is over.
 func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 	at := depth
 	if v.Kind() != reflect.Interface {
 		if depth >= maxCopied {
 			c.overflow()
-			return reflect.Zero(v.Type())
+			return reflect.Value{}
 		}
 		c.deepest = max(c.deepest, depth)
 		depth++
 		if !c.pay(1) {
-			return reflect.Zero(v.Type())
+			return reflect.Value{}
 		}
 	}
 	if shared(v.Type()) {
 		// Set whole where the copy holds it.
 		if !c.payWhole(v) {
-			return reflect.Zero(v.Type())
+			return reflect.Value{}
 		}
 		return v
 	}
@@ -1518,12 +1542,16 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		// holds: uncounted, an array of a million of them cost a copy one.
 		if unreachable(v) {
 			if !c.payHeld(v) {
-				return reflect.Zero(v.Type())
+				return reflect.Value{}
 			}
 			return v
 		}
+		held := c.copy(v.Elem(), depth)
+		if c.over {
+			return reflect.Value{}
+		}
 		out := reflect.New(v.Type()).Elem()
-		out.Set(c.copy(v.Elem(), depth))
+		out.Set(held)
 		return out
 	case reflect.Map:
 		if v.IsNil() {
@@ -1539,20 +1567,26 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		// Set whole, its unexported fields too, and so charged its bytes, as a flat one is (payWhole):
 		// charged one, a copy of 2,000 structs each holding a map and 64 KiB took 38 ms.
 		if !c.pay(tenths(v.Type()) / 10) {
-			return reflect.Zero(v.Type())
+			return reflect.Value{}
 		}
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
 		c.fields(out, v, depth)
 		return out
 	case reflect.Array:
-		// Each element costs at least one, so an array of more than is left isn't copied.
-		if !c.building(listCost-1, length(v.Len())) {
-			return reflect.Zero(v.Type())
+		// Each element costs at least what it holds in place (leastCopied), so an array of more than is
+		// left isn't made: checked for one each, two structs each holding a map beside 64 MiB were
+		// made, before the first was found past what a copy holds, allocating 335 MB.
+		if !c.building(listCost-1, length(v.Len())*leastCopied(v.Type().Elem())) {
+			return reflect.Value{}
 		}
 		out := reflect.New(v.Type()).Elem()
-		for i := 0; i < v.Len() && !c.over; i++ {
-			out.Index(i).Set(c.copy(v.Index(i), depth))
+		for i := range v.Len() {
+			held := c.copy(v.Index(i), depth)
+			if c.over {
+				return reflect.Value{}
+			}
+			out.Index(i).Set(held)
 		}
 		return out
 	case reflect.Pointer:
@@ -1578,7 +1612,7 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 	// of more than is left isn't made, nor an entry read, which moves it whole: a map holding an
 	// array of 4 MiB allocated 12 MB before being found past what a copy holds.
 	if !c.building(mapCost-1, length(v.Len())*(1+leastCopied(v.Type().Elem()))) {
-		return reflect.Zero(v.Type())
+		return reflect.Value{}
 	}
 	out := reflect.MakeMapWithSize(v.Type(), v.Len())
 	c.keep(k, out, false)
@@ -1596,7 +1630,9 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 		if !c.pay(textLength(textOf(key))) || hashed && !c.payHashed(key) {
 			break
 		}
-		out.SetMapIndex(key, c.copy(it.Value(), depth))
+		if held := c.copy(it.Value(), depth); !c.over {
+			out.SetMapIndex(key, held)
+		}
 	}
 	c.ascendFrom(k, at, outer)
 	return out
@@ -1617,13 +1653,18 @@ func (c *copier) pointer(v reflect.Value, at, depth int) reflect.Value {
 		c.hold()
 		return reflect.ValueOf(c.message(m.ProtoReflect(), depth).Interface())
 	}
-	if !c.pay(pointerCost - 1) {
-		return reflect.Zero(v.Type())
+	// What it points to costs at least what it holds in place (leastCopied), so no room is made for
+	// it where that is more than is left: a pointer to an array of 128 MiB allocated 268 MB before
+	// being found past what a copy holds.
+	if !c.building(pointerCost-1, leastCopied(v.Type().Elem())) {
+		return reflect.Value{}
 	}
 	out := reflect.New(v.Type().Elem())
 	c.keep(k, out, false)
 	outer := c.descend(at)
-	out.Elem().Set(c.copy(v.Elem(), depth))
+	if held := c.copy(v.Elem(), depth); !c.over {
+		out.Elem().Set(held)
+	}
 	c.ascendFrom(k, at, outer)
 	return out
 }
@@ -1739,7 +1780,7 @@ func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 	}
 	if s == nil || s.out.Len() < n {
 		if s = c.lengthen(v, k, s); s == nil {
-			return reflect.Zero(v.Type())
+			return reflect.Value{}
 		}
 		// Copying an element may reach a longer slice of v, which grows the copy, so each is set in
 		// the copy as it is once it is copied, and in those it outgrew.
@@ -1748,10 +1789,12 @@ func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 			case !unreachable(e):
 				s.filled = i + 1
 				outer := c.descend(at)
-				c.set(s, k, i, c.copy(e, depth))
+				if held := c.copy(e, depth); !c.over {
+					c.set(s, k, i, held)
+				}
 				s.reached(i, c.ascend(at, outer))
 			case !c.payHeld(e):
-				return reflect.Zero(v.Type())
+				return reflect.Value{}
 			default:
 				s.reached(i, 0)
 			}
@@ -2019,7 +2062,9 @@ func (c *copier) fields(out, v reflect.Value, depth int) {
 	for i := range v.NumField() {
 		switch f := out.Field(i); {
 		case f.CanSet():
-			f.Set(c.copy(v.Field(i), depth))
+			if held := c.copy(v.Field(i), depth); !c.over {
+				f.Set(held)
+			}
 		case v.Type().Field(i).Anonymous && f.Kind() == reflect.Struct:
 			c.fields(f, v.Field(i), depth)
 		}
@@ -2136,9 +2181,9 @@ func inlineTenths(t reflect.Type) uint64 {
 
 var celTimestampType, celDurationType = reflect.TypeFor[types.Timestamp](), reflect.TypeFor[types.Duration]()
 
-// leastCopied is what copying a value of type t costs at the least: one for each 24 bytes it holds
-// in place, and at least one, as each value it holds costs at least one and holds no more, and a
-// byte, or a struct's, a tenth of one (payWhole).
+// leastCopied is what copying a value of type t costs at the least, and converting one a condition
+// reads: one for each 24 bytes it holds in place, and at least one, as each value it holds costs at
+// least one and holds no more, and a byte, or a struct's, a tenth of one (payWhole).
 func leastCopied(t reflect.Type) uint64 { return max(1, uint64(t.Size())/24) }
 
 // keyTenths is what moving a map's key of type t whole costs past what converting a key costs, in
