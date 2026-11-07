@@ -380,7 +380,9 @@ flowchart BT
   20,000 read 80,000 pages of memberships that fill 900. It reads with sequential scans off, by its
   SET clause, whatever its caller's (`0029_member_reads`): the places a group at a time in the
   primary key's order, and the memberships by their keys, as `= ANY` of them, which a plan for many
-  reads through a bitmap, each page once. It sets nothing in its body, as the calling statement may
+  reads through a bitmap, each page once; counted, as the members were, by the tenant's selectivity
+  and the keys' apart, they are read each on its own in a tenant holding a small share of the table,
+  though none the keys don't name. It sets nothing in its body, as the calling statement may
   run in parallel mode, where only a function's SET clause changes a setting. `Members` takes
   the identities whose membership stands from it, and looks only the rest up by key.
 

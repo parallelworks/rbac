@@ -1173,7 +1173,9 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   `0029_member_reads` replaces `rbac_group_members` again, which keeps its owner and who may execute
   it and takes no lock on the tables, to plan its statements with sequential scans off, by its SET
   clause, whatever its caller's: it reads the groups' places a group at a time, in the order of the
-  primary key, and the members' memberships by their keys, through a bitmap where they are many.
+  primary key, and the members' memberships by their keys, through a bitmap where a plan counts
+  them as many, and each on its own where it counts them as few, as in a tenant holding a small share
+  of the table, though none the keys don't name.
   Code from this release runs every statement calling it with them off, so its join of a group of
   20,000 to their memberships, as before, looked each up on its own, 20,179 pages that fill 856, and
   code from before it reads the places by statistics alone, every place in the table by those from
