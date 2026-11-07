@@ -300,14 +300,18 @@ func (a *Authorizer) decidedSQL(now string) string {
 }
 
 // expiredUntil is SQL, of rbac_expired, for the latest time recorded there, but no later than the
-// database's clock as the statement began, null for none, which least would read as that clock:
-// DeleteExpired records none later, as each row it removes ended by then, and a statement that sees
-// a run's time began after the run's own statement did, so it takes nothing from a time
-// DeleteExpired recorded. One later, which only a role that may disable the table's triggers, or
-// the database's clock going back, can leave there, would otherwise have every call decide at it,
-// for good: a deny binding a subject through a place ending before then lifted, and a condition
-// reading request.time met.
-const expiredUntil = `CASE WHEN max(until) > statement_timestamp() THEN statement_timestamp() ELSE max(until) END`
+// database's clock as the statement reads it, null for none, which least alone would read as that
+// clock. No write records a time past the clock as its own statement began (rbac_expired_until),
+// which is before it commits, so before a snapshot that sees it is taken, and the clock read after:
+// so it takes nothing from a time DeleteExpired recorded. Not the clock as the statement began: a
+// statement of a simple query takes its snapshot after it is planned, once it has waited for the
+// locks it reads by, as do those after the first of several in one, so it could see a time a run
+// recorded after it began, and decide before the end of a row the run removed, by a state no moment
+// held. A time past the clock, which only a role that may disable the table's triggers, or the
+// database's clock going back, can leave there, would otherwise have every call decide at it, for
+// good: a deny binding a subject through a place ending before then lifted, and a condition reading
+// request.time met.
+const expiredUntil = `CASE WHEN max(until) IS NOT NULL THEN least(max(until), clock_timestamp()) END`
 
 // decidedAt is SQL for the time decidedSQL defines.
 const decidedAt = "(SELECT at FROM decided)"

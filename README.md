@@ -1448,8 +1448,13 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
   deletes the times no later than its own and adds its own, refusing one past the database's clock,
   and history records each write, as one of the package's tables (History). A read takes the latest
-  time no later than the database's clock as its statement began, which takes nothing from a time a
-  run recorded. So a role that may execute the function, as the application's may, can move what a
+  time no later than the database's clock as it reads it, which takes nothing from a time a run
+  recorded: no write records one past the clock as its own statement began, which is before it
+  commits, and so before a read that sees it takes its snapshot. Bounded by the clock as the read's
+  statement began, a statement sent in a simple query, as by a pool that prepares none, which takes
+  its snapshot once it is planned, after any lock it waited for, could find a run's removals and
+  decide before what they removed ended. So a role that may execute the function, as the
+  application's may, can move what a
   call decides no earlier than up to that clock and no further, as a run could, and never back, and
   history records each time it wrote; a time past the clock, which only a role that may disable the
   table's triggers can leave there, or the database's clock going back, has a call of a host behind

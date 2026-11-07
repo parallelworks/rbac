@@ -1185,8 +1185,11 @@ flowchart TB
   `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
   seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
   decides at the later of the call's time and the latest time recorded that its snapshot sees, but
-  no later than the database's clock as its statement began (`decidedSQL`, `expiredUntil`), which
-  takes nothing from a time a run recorded, every expiry it compares too: every
+  no later than the database's clock as it reads it (`decidedSQL`, `expiredUntil`), which takes
+  nothing from a time a run recorded, as none is past the clock as the run's statement began, before
+  the snapshot that sees it is taken; the clock as the read's own statement began can be before its
+  snapshot, as in a simple query, which plans a statement, and waits for its locks, first. Every
+  expiry it compares is decided so too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own

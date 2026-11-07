@@ -9859,7 +9859,7 @@ func TestACallDecidesByItsOwnClockWhereDeleteExpiredRemovedNothingEndingAfterIt(
 				return
 			}
 			// As the change reads, last, whether a run committed since it read its actor.
-			rbac.BeforeStatement(t, "THEN statement_timestamp() ELSE max(until) END FROM rbac_expired", false, expire)
+			rbac.BeforeStatement(t, "clock_timestamp()) END FROM rbac_expired", false, expire)
 			err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("v"), ExpiresAt: base.Add(30 * time.Minute)}}})
 			if !expired {
 				t.Fatal("DeleteExpired didn't run as the change ended")
@@ -10056,6 +10056,108 @@ func TestATimePastTheDatabasesClockInExpiredMovesNoCallPastIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	decided("once rbac_expired holds a time past the database's clock")
+}
+
+// A check decides no earlier than a time DeleteExpired recorded after its statement began, which a
+// statement sees where it takes its snapshot later, as one sent in a simple query does once it has
+// waited for a lock as it was planned: bounded by the clock as the statement began, it decided
+// before what the run removed had ended, by the state the run left, which no moment held. Here x
+// logs in on the tenant, by its membership, and a deny of login on w1 names frozen. The check waits
+// for a lock on the denies; meanwhile x's membership ends, and then its place in frozen, which
+// DeleteExpired removes, passing over the membership, which another transaction holds. Decided at
+// the time its statement began, x would hold login by its membership and escape the deny, though
+// at no moment was it a member out of frozen.
+func TestACheckDecidesNoEarlierThanATimeDeleteExpiredRecordedAfterItsStatementBegan(t *testing.T) {
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeCacheStatement} {
+		t.Run(mode.String(), func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			h.groups(t, "frozen")
+			x := h.as(t, "x", "frozen")
+			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "x"))
+			if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+				VALUES ('t1', 'workspace', 'w1', 'freeze', '{group:frozen}', ARRAY[$1::text])`, login); err != nil {
+				t.Fatal(err)
+			}
+			if allowed(t, h, x, login, cluster) {
+				t.Fatal("x may log in to c1 while it is in frozen, which the deny binds it by")
+			}
+			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			cfg := h.pool.Config()
+			cfg.ConnConfig.DefaultQueryExecMode = mode
+			pool, err := pgxpool.NewWithConfig(bounded, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			// By a clock behind every time below, so it decides at the time DeleteExpired recorded.
+			readerCfg, base := h.cfg, h.now
+			readerCfg.Now = func() time.Time { return base }
+			reader, err := rbac.New(pool, readerCfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			locker, err := h.pool.Begin(bounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = locker.Rollback(context.WithoutCancel(ctx)) }()
+			var pid int32
+			if _, err := locker.Exec(bounded, `LOCK TABLE rbac_denies IN ACCESS EXCLUSIVE MODE`); err != nil {
+				t.Fatal(err)
+			}
+			if err := locker.QueryRow(bounded, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- reader.Authorize(bounded, x, login, cluster) }()
+			for waiting := false; !waiting; {
+				select {
+				case err := <-done:
+					t.Fatalf("the check didn't wait for the lock on the denies: %v", err)
+				default:
+					if err := h.pool.QueryRow(bounded, `SELECT EXISTS (SELECT FROM pg_stat_activity
+						WHERE $1::int = ANY(pg_blocking_pids(pid)) AND query LIKE '%rbac_expired%')`, pid).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// The membership ends after the check's statement began, and the place after it.
+			var ended time.Time
+			if err := h.pool.QueryRow(bounded, `UPDATE rbac_memberships SET expires_at = clock_timestamp()
+				WHERE tenant = 't1' AND principal = 'user:x' RETURNING expires_at`).Scan(&ended); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.pool.Exec(bounded, `UPDATE rbac_members SET expires_at = $1
+				WHERE tenant = 't1' AND principal = 'user:x' AND group_id = 'frozen'`, ended.Add(time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			for passed := false; !passed; {
+				if err := h.pool.QueryRow(bounded, `SELECT clock_timestamp() > $1`, ended.Add(time.Millisecond)).Scan(&passed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			holder, err := h.pool.Begin(bounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = holder.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := holder.Exec(bounded, `SELECT FROM rbac_memberships WHERE tenant = 't1' AND principal = 'user:x' FOR UPDATE`); err != nil {
+				t.Fatal(err)
+			}
+			h.now = ended.Add(time.Hour)
+			if n, err := h.authz.DeleteExpired(bounded); err != nil || n != 1 {
+				t.Fatalf("DeleteExpired removed %d rows: %v", n, err)
+			}
+			if err := locker.Rollback(bounded); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; !errors.Is(err, rbac.ErrDenied) {
+				t.Errorf("x may log in to c1 by its membership, which ended before its place in frozen, which DeleteExpired removed after the check began: %v", err)
+			}
+		})
+	}
 }
 
 // rbac_expired refuses a time past the database's clock, whoever writes it, the table's owner too,

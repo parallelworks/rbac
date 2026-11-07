@@ -7,18 +7,20 @@
 -- recorded the write. DeleteExpired never removed it, as it deletes only times no later than its
 -- own. Deleting a time, unrecorded too, moved the latest back, and a read by an earlier clock could
 -- again find a place a deny binds by removed and one a power comes through still there. Each read
--- now takes the latest time no later than the database's clock as its statement began, which takes
--- nothing from a time DeleteExpired recorded, as each row it removes ended by then. And here:
+-- now takes the latest time no later than the database's clock as it reads it, which takes nothing
+-- from a time DeleteExpired recorded, as below no write records one past the clock as its statement
+-- began, before it commits and so before a snapshot that sees it is taken. And here:
 --
 -- History records every write to the table, as it does to the package's other tables: rbac_record
 -- records its rows as the entity 'expired', in no tenant, keyed by the time as JSON writes it in
 -- UTC, which the record's row holds too, so the chain covers it as every other field. A row there
 -- before is recorded as migrating finds it, its baseline, dated at its time, as it was written no
 -- earlier, or at the clock where that is earlier; one past the clock is then brought back to it,
--- recorded as an update, so neither the row nor the bound it broke is lost to an auditor. Widening
--- history's check of entities reads no record, but locks history against reads and writes until
--- migrating commits, as 0027's did: every change, as each writes history, waits for it, and every
--- read of history, as AsOf and an export.
+-- recorded as the delete of its time and the create of the clock's, as the time is its key, so
+-- neither the row nor the bound it broke is lost to an auditor. Two rows of one time, which two runs
+-- can each add, share a key. Widening history's check of entities reads no record, but locks
+-- history against reads and writes until migrating commits, as 0027's did: every change, as each
+-- writes history, waits for it, and every read of history, as AsOf and an export.
 --
 -- A trigger refuses a time past the database's clock as its statement began, whoever writes it, as
 -- a check can't read the clock. It reads no table, so it runs as whoever writes, its search_path

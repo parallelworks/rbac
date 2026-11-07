@@ -1745,10 +1745,11 @@ func (a *Authorizer) filterKeys(arg func(int) string, of string) string {
 // filterAt is SQL for the time Filter's statement decides at: the call's, or the later time
 // DeleteExpired deleted by that the host's statement sees, as decidedSQL decides a read of a
 // subject. The host runs it later than Filter read the time, by which a run can have removed what
-// ended since. Each use reads it in the statement's snapshot, so all read the same; one older than
-// Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees no run they
-// didn't, so it decides at the call's time, which no later run's removals it sees can mix with.
-// arg numbers Filter's arguments.
+// ended since. Each use reads it in the statement's snapshot, so all read the same, but for a time
+// past the database's clock, which each bounds by the clock as it reads it (expiredUntil); one
+// older than Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees
+// no run they didn't, so it decides at the call's time, which no later run's removals it sees can
+// mix with. arg numbers Filter's arguments.
 func (a *Authorizer) filterAt(arg func(int) string) string {
 	if a.asOf {
 		return arg(4)
