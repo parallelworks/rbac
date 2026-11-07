@@ -6,7 +6,8 @@
 -- the whole table's, it read every place in the table, 20 pages and 284 beside 20,000 others'. So it
 -- sets them off for itself, by its SET clause, which PostgreSQL puts back as it returns, and reads
 -- each group's places on its own, in the primary key's order, which only the index leading to the
--- group gives, so a plan can't read them by an index leading to the tenant alone. Its second, joining
+-- group gives, so a plan can't read them by an index leading to the tenant alone; and each group
+-- once however often it is named, as reading them by = ANY of the groups did. Its second, joining
 -- the members to their memberships, is planned for the members' number: as a join to the table, many
 -- were each looked up on its own with sequential scans off, 20,179 pages of memberships that fill
 -- 856 for a group of 20,000. So it reads the members' memberships by their keys, as = ANY of them,
@@ -20,7 +21,7 @@ CREATE OR REPLACE FUNCTION rbac_group_members(tenant text, groups text[], at tim
     RETURNS TABLE (group_id text, principal text, guest boolean) LANGUAGE plpgsql STABLE PARALLEL RESTRICTED
     SET enable_seqscan = off AS $$
 DECLARE
-    places CONSTANT text := ' FROM unnest($2::text[]) AS g(id) CROSS JOIN LATERAL (
+    places CONSTANT text := ' FROM (SELECT DISTINCT id COLLATE "C" AS id FROM unnest($2::text[]) AS u(id)) g CROSS JOIN LATERAL (
           SELECT p.group_id, p.principal FROM rbac_members p
           WHERE p.tenant = $1 AND p.group_id = g.id AND p.principal NOT LIKE ''group:%''
             AND (p.expires_at IS NULL OR p.expires_at > $3) AND ($4 IS NULL OR p.principal = ANY ($4))
