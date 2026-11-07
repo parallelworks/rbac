@@ -409,6 +409,12 @@ func SetMigrateAttempts(t *testing.T, n int, backoff time.Duration) {
 // Migrate refuses a host's transaction that has written history.
 const HistoryAltered = historyAltered
 
+// MigrateLock is the statement taking the lock Migrate takes on schema, which another replica's
+// migration holds until it ends, and its arguments.
+func MigrateLock(schema string) (string, []any) {
+	return advisory{kind: "migrate"}.taking(schema)
+}
+
 // SetMaxPrune bounds what one PruneHistory deletes to n until t ends.
 func SetMaxPrune(t *testing.T, n int) {
 	t.Helper()

@@ -1095,8 +1095,8 @@ package's uses foreign data, so none of the roles needs any.
   `0027_commit_dates` on, each record of history a change writes holds an event deferred to the
   commit, and PostgreSQL alters no table whose events are pending, as migrations up to
   `0029_commit_trigger` alter history, so where one of those is pending, `Migrate` refuses, as
-  `rbac.ErrInvalid`, a transaction holding such events, before it applies any. A tool of the host's
-  own applies them before any such change too.
+  `rbac.ErrInvalid`, a transaction holding such events, before it waits for another replica's
+  migration or applies any. A tool of the host's own applies them before any such change too.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a

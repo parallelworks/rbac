@@ -54,7 +54,7 @@ func Migrations() fs.FS {
 // each record of history a change writes holds an event deferred to the commit, and PostgreSQL
 // alters no table whose events are pending, as migrations up to 0029_commit_trigger alter history.
 // So where one of those is pending, it refuses, as ErrInvalid, a transaction holding such events,
-// before it applies any.
+// before it waits for another replica's migration or applies any.
 //
 // A migration waits at most 100 ms for any lock it takes on the package's tables, as it holds those
 // it took before meanwhile, which every statement reading them waits for: a change that reads them
@@ -132,24 +132,33 @@ var errReplica = errors.New("rbac: waiting for another migration of the schema")
 // TABLE or CREATE INDEX does, which PostgreSQL refuses in a transaction holding events of the
 // table's deferred triggers (SQLSTATE 55006), as one that wrote history holds those of its commit
 // record's until it commits. A test migrates such a host's transaction from the migration after it,
-// which a later one that alters history fails until this names it.
+// which a later one that alters history fails until this names it, and another finds each
+// migration altering history by its statements, failing until this names the last.
 const historyAltered = 29
 
 // historyUnwritten refuses, as ErrInvalid, a host's transaction tx that has written history in
 // schema while its commit record's trigger (rbac_history_committed, from 0027_commit_dates on) was
-// enabled, so that each record it wrote holds an event of it, which would fail a migration altering
-// history, before Migrate applies any. A record written before holds none, and doesn't. Firing them
-// early to let it through would write the commit record before the transaction commits, and AsOf
-// would count its changes from before any other session saw them.
+// enabled, where a migration pending alters history (historyAltered): each record it wrote holds an
+// event of that trigger, which would fail the migration. Migrate calls it before it takes any lock,
+// so a refusal doesn't wait for another replica's migration first: none altering history commits
+// while tx, which wrote history, holds its lock on it, so tx reads as applied what it would after
+// the wait. tx's records are those of its txid that rbac_record stamped with this cluster, and a
+// prune's, which names no cluster; one a restore carried from another cluster under a txid this
+// cluster has since given tx is another transaction's, holding no event, and isn't refused. Firing
+// the events early to let it through would write the commit record before the transaction commits,
+// and AsOf would count its changes from before any other session saw them.
 func historyUnwritten(ctx context.Context, tx pgx.Tx, schema string) error {
 	var wrote bool
 	if err := tx.QueryRow(ctx, `SELECT pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL
+		AND pg_catalog.to_regclass(pg_catalog.quote_ident($1) || '.rbac_migrations') IS NOT NULL
 		AND EXISTS (SELECT FROM pg_catalog.pg_trigger t WHERE t.tgrelid = pg_catalog.to_regclass(pg_catalog.quote_ident($1) || '.rbac_history')
 		  AND t.tgname = 'rbac_history_committed' AND t.tgenabled <> 'D')`, schema).Scan(&wrote); err != nil || !wrote {
 		return err
 	}
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM `+historyTable(schema)+` h
-		WHERE h.txid = pg_catalog.pg_current_xact_id_if_assigned())`).Scan(&wrote); err != nil || !wrote {
+	if err := tx.QueryRow(ctx, `SELECT (SELECT coalesce(max(m.version), 0) FROM `+pgx.Identifier{schema, "rbac_migrations"}.Sanitize()+` m) < $1
+		AND EXISTS (SELECT FROM `+historyTable(schema)+` h WHERE h.txid = pg_catalog.pg_current_xact_id_if_assigned()
+		  AND (h.cluster = (SELECT s.system_identifier FROM pg_catalog.pg_control_system() s)
+		    OR h.cluster IS NULL AND h.entity = 'history' AND h.op = 'prune'))`, historyAltered).Scan(&wrote); err != nil || !wrote {
 		return err
 	}
 	return fmt.Errorf("%w: Migrate on a host's transaction comes before the transaction changes the package's tables: this one has written history, whose events, deferred to its commit, keep a pending migration from altering it", ErrInvalid)
@@ -242,6 +251,11 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		if encoding != "UTF8" {
 			return fmt.Errorf("rbac: the database's encoding is %s, not UTF8", encoding)
 		}
+		if !own {
+			if err := historyUnwritten(ctx, tx, *schema); err != nil {
+				return err
+			}
+		}
 		// One migration at a time in the schema, under a lock named and keyed as the changes' are: by
 		// the schema it migrates, as the tables may not exist yet, which is the one they are in once
 		// they do.
@@ -257,11 +271,6 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		var applied int
 		if err := tx.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM rbac_migrations`).Scan(&applied); err != nil {
 			return err
-		}
-		if !own && applied < historyAltered {
-			if err := historyUnwritten(ctx, tx, *schema); err != nil {
-				return err
-			}
 		}
 		// From here, a lock it waits for is one the tables' readers and writers can hold. Bounded only
 		// in a transaction of its own, where giving way frees what it holds, and where the setting
