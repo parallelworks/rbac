@@ -560,6 +560,10 @@ sequenceDiagram
   keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types,
   a `Value` holding a nil `Struct` or `ListValue` read as an empty one, as CEL reads it and
   protobuf writes it: read as null, `request.attributes.v == null` held where CEL found it false.
+  A nil `Value` or wrapper the host passes is null, as CEL reads it and any nil pointer is read, and
+  a nil `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any` can't be read (`nilNull`): CEL reads
+  the first four as `{}`, `[]`, the epoch and zero, where a nil pointer is null, which no declared
+  type takes, and fails on the last.
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
   host's own, a list, map or optional of CEL's a host makes, a struct, a lock of the host's own, as

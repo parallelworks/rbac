@@ -426,7 +426,7 @@ func TestAListOrAPointerOfValuesNoConditionReadsFailsItsConditionsEmptyToo(t *te
 		"an empty slice of bytes saying they are ints": []intByte{}, "an empty slice of arrays of them": [][2]intByte{},
 		"an empty map of slices of them": map[string][]intByte{}, "a nil pointer to a slice of them": (*[]intByte)(nil),
 		"an empty slice of times": []time.Time{}, "an empty slice of CEL's strings": []types.String{},
-		"a nil pointer to CEL's timestamp": (*types.Timestamp)(nil), "a nil Struct": (*structpb.Struct)(nil),
+		"a nil pointer to CEL's timestamp": (*types.Timestamp)(nil), "a nil Value": (*structpb.Value)(nil),
 		"an empty slice of Values": []*structpb.Value{}, "a nil pointer to an int": (*int)(nil),
 		"an empty slice of interfaces": []any{}, "an empty slice of maps keyed by an interface": []map[any]int{},
 		"a nil list holding lists": list(nil), "an empty list holding lists": list{},
@@ -925,6 +925,37 @@ func TestADeclaredAttributePassedAsANilPointerFailsItsConditions(t *testing.T) {
 			if allowed(t, h, h.as(t, "denied-"+name), login, at(name, v)) {
 				t.Errorf("%s: a deny's condition was lifted for %#v", name, v)
 			}
+		}
+	}
+}
+
+// CEL reads a nil Struct, ListValue, Timestamp or Duration as {}, [], the epoch or zero, and fails
+// on a nil Any, where a nil pointer is null: read as null, a grant's `request.attributes.v == null`
+// gave its role, and a deny's `request.attributes.v != null` lifted, where CEL decided otherwise.
+// Each is refused wherever it lies, so every condition reading its kind fails, while a nil Value or
+// wrapper is null, as CEL reads it.
+func TestANilMessageCELReadsAsAValueFailsItsConditions(t *testing.T) {
+	for name, v := range map[string]proto.Message{
+		"Struct": (*structpb.Struct)(nil), "ListValue": (*structpb.ListValue)(nil), "Timestamp": (*timestamppb.Timestamp)(nil),
+		"Duration": (*durationpb.Duration)(nil), "Any": (*anypb.Any)(nil),
+	} {
+		if types.DefaultTypeAdapter.NativeToValue(v) == types.NullValue {
+			t.Errorf("CEL reads a nil %s as null", name)
+		}
+		for by, attribute := range map[string]any{"alone": v, "in a list": []any{v}, "in a map": map[string]proto.Message{"a": v}, "behind a pointer": &v} {
+			for _, expr := range []string{`request.attributes.v == null`, `request.attributes.v != null`, `request.attributes.ok == true`} {
+				if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": attribute, "ok": true}); err != nil || evaluated {
+					t.Errorf("a nil %s %s: %s evaluated %t, %v", name, by, expr, evaluated, err)
+				}
+			}
+		}
+	}
+	for name, v := range map[string]proto.Message{"Value": (*structpb.Value)(nil), "wrapper": (*wrapperspb.StringValue)(nil)} {
+		if read := types.DefaultTypeAdapter.NativeToValue(v); read != types.NullValue {
+			t.Errorf("CEL reads a nil %s as %v", name, read)
+		}
+		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.v == null && request.attributes.ok == true`, map[string]any{"v": v, "ok": true}); err != nil || !held {
+			t.Errorf("a nil %s: held %t, %v", name, held, err)
 		}
 	}
 }

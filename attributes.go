@@ -69,7 +69,8 @@ import (
 // bytes, a timestamp, a duration, null, and lists and maps of them. A host may pass, as an
 // attribute or within one:
 //
-//   - nil, and a nil pointer, read as null, but one to a value no condition reads (below);
+//   - nil, and a nil pointer, read as null, but one to a value no condition reads, or to a Struct,
+//     a ListValue, a Timestamp, a Duration or an Any (below);
 //   - a bool, a string, or an int, a uint or a float of any size, of a type of its own too, as a
 //     named string, read by its kind, as no method of the type runs;
 //   - a time.Time, a time.Duration, and CEL's own scalar values (types.String and the rest), a
@@ -105,9 +106,11 @@ import (
 // and 1u, or "a" twice of two string types, and so JSON text naming a member of an object twice, as
 // "role" and "r\u006fle" are once unescaped, or an Any packing a message that sets a field twice,
 // as a Struct with two entries of "role", which decoding reads as the last, where a reader of the
-// first reads another: a Struct the host passes holds each key once, as a Go map does. So are
-// invalid JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which encoding/json
-// reads as U+FFFD,
+// first reads another: a Struct the host passes holds each key once, as a Go map does. So are those
+// holding a nil Struct, ListValue, Timestamp, Duration or Any, which CEL reads as {}, [], the epoch
+// or zero, or fails on, where a nil pointer is null: `request.attributes.v == null` held where CEL
+// found it false. So are invalid JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair,
+// which encoding/json reads as U+FFFD,
 // a json.Number that isn't a number as JSON writes one, as "0x1p4" or "Inf", a value holding
 // itself, or holding one that does, however long the cycle, and a value nested deeper than JSON
 // text may, 10,000 deep, along the longest path through what the kind holds, wherever a value it
@@ -1046,7 +1049,14 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		return c.refuse(), 1
 	}
 	if v.IsNil() {
-		return types.NullValue, 1
+		// CEL reads a nil Value or wrapper as null, as a nil pointer is read, but a nil Struct,
+		// ListValue, Timestamp or Duration as an empty one, the epoch or zero, and fails on a nil
+		// Any. Read as null, `request.attributes.v == null` held where CEL found it false, and read as
+		// CEL reads it, a declared timestamp passed as one met a grant's condition, so none is read.
+		if nilNull[v.Type()] {
+			return types.NullValue, 1
+		}
+		return c.refuse(), 1
 	}
 	m, _ := v.Interface().(proto.Message)
 	unknown := length(len(m.ProtoReflect().GetUnknown())) / 10
@@ -1114,7 +1124,7 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		if k := reflect.ValueOf(m.GetKind()); k.IsValid() && k.IsNil() {
 			return types.NullValue, 1
 		}
-		var held reflect.Value
+		var held proto.Message
 		var empty ref.Val
 		switch k := m.GetKind().(type) {
 		case *structpb.Value_NumberValue:
@@ -1124,19 +1134,23 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		case *structpb.Value_BoolValue:
 			return types.Bool(k.BoolValue), 1
 		case *structpb.Value_StructValue:
-			held, empty = reflect.ValueOf(k.StructValue), noAttributes
+			held, empty = k.StructValue, noAttributes
 		case *structpb.Value_ListValue:
-			held, empty = reflect.ValueOf(k.ListValue), noValues
+			held, empty = k.ListValue, noValues
 		default:
 			return types.NullValue, 1
 		}
-		to, height := c.of(held)
 		// A nil Struct or ListValue it holds is an empty one, as CEL reads it, protobuf writes it, an
-		// Any packs it and a hook's copy holds it, rather than null, as a nil one the host passes is:
-		// read as null, `request.attributes.v == null` held where CEL found it false.
-		if held.IsNil() && to != nil {
-			to = empty
+		// Any packs it and a hook's copy holds it: read as null, `request.attributes.v == null` held
+		// where CEL found it false. It costs what a nil value does.
+		if !held.ProtoReflect().IsValid() {
+			to, height := c.of(reflect.Value{})
+			if to != nil {
+				to = empty
+			}
+			return to, height + 1
 		}
+		to, height := c.of(reflect.ValueOf(held))
 		return to, height + 1
 	case *wrapperspb.BoolValue:
 		return types.Bool(m.GetValue()), 1
@@ -1292,10 +1306,22 @@ var wellKnown = func() map[reflect.Type]bool {
 	return known
 }()
 
+// nilNull are the well-known messages whose nil one CEL reads as null, as a nil pointer is read: a
+// Value, and a wrapper, which holds a scalar or none.
+var nilNull = map[reflect.Type]bool{
+	reflect.TypeFor[*structpb.Value](): true, reflect.TypeFor[*wrapperspb.BoolValue](): true,
+	reflect.TypeFor[*wrapperspb.BytesValue](): true, reflect.TypeFor[*wrapperspb.DoubleValue](): true,
+	reflect.TypeFor[*wrapperspb.FloatValue](): true, reflect.TypeFor[*wrapperspb.Int32Value](): true,
+	reflect.TypeFor[*wrapperspb.Int64Value](): true, reflect.TypeFor[*wrapperspb.StringValue](): true,
+	reflect.TypeFor[*wrapperspb.UInt32Value](): true, reflect.TypeFor[*wrapperspb.UInt64Value](): true,
+}
+
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
 // other converted to that type (Attributes), such as a pointer to a string, number or bool, a
 // protobuf timestamp or duration, or a []any or map[string]any of strings. A nil pointer is null,
-// which is none.
+// which is none, and a nil Struct, ListValue, Timestamp, Duration or Any can't be read (Attributes):
+// CEL reads all but an Any as a value of its type, so read as CEL reads it, a declared timestamp
+// passed as one met a grant's condition.
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64

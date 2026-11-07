@@ -278,7 +278,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
   named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
   of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
-  reads, below; maps of these keyed by a bool, a
+  reads, or to a `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any`, below; maps of these keyed
+  by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them, a `Value` holding a nil `Struct`
@@ -310,7 +311,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   and `1u`, and so JSON text naming a member of an object twice, once unescaped, or an `Any`
   packing a message that sets a field twice, as a `Struct` with two entries of `role`: each is read
   as the last, where a host reading the first reads another. A `Struct` the host passes holds each
-  key once, as a Go map does. So do invalid
+  key once, as a Go map does. So do those holding a nil `Struct`, `ListValue`, `Timestamp`,
+  `Duration` or `Any`, which CEL reads as `{}`, `[]`, the epoch or zero, or fails on, where a nil
+  pointer is null: read as null, a grant's `request.attributes.v == null` held where CEL found it
+  false, and read as CEL reads it, a declared timestamp passed as one met a grant's condition. A nil
+  `Value` or wrapper is null, as CEL reads it. So do invalid
   JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which `encoding/json` reads as
   U+FFFD, a `json.Number` that isn't a number as JSON writes one, as `0x1p4` or `Inf`, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
@@ -446,7 +451,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   reading their kind, as no hook can be given them either, below; and a `Value` holding a nil
   `Struct` or `ListValue`, read as null, is now read as an empty map or list, as CEL reads it, so a
   condition comparing it with `null`, as a grant's `request.attributes.v == null`, no longer holds,
-  and one reading its size does. Attributes
+  and one reading its size does; but attributes holding a nil `Struct`, `ListValue`, `Timestamp`,
+  `Duration` or `Any` the host passes, read as null, now can't be read, failing every condition
+  reading their kind, a declared one's too, which failed only those reading it. Attributes
   holding maps, lists, pointers or messages are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a

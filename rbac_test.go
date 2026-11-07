@@ -2999,7 +2999,7 @@ func (d *copyDraw) value(depth int) any {
 	case 6:
 		v = []any{make([]byte, d.rng.IntN(45)), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
 	case 7:
-		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Struct)(nil), (*timestamppb.Timestamp)(nil)}[d.rng.IntN(5)]
+		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Value)(nil), (*wrapperspb.StringValue)(nil)}[d.rng.IntN(5)]
 	case 8, 9:
 		v = d.message(1)
 	case 10:
@@ -3018,7 +3018,7 @@ func (d *copyDraw) value(depth int) any {
 	case 16:
 		v = map[string]*structpb.Value{d.text(): d.protoValue(1)}
 	case 17:
-		v = []*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0)), nil}
+		v = []any{[]*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0))}, []*wrapperspb.Int64Value{wrapperspb.Int64(1), nil}}[d.rng.IntN(2)]
 	case 18:
 		v = []any{map[string]time.Time{d.text(): time.Unix(1, 0)}, map[string][64]int64{d.text(): {}}, map[string][64]int64{}}[d.rng.IntN(3)]
 	case 19:
