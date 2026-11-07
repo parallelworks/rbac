@@ -310,9 +310,8 @@ scopes conditional ones reach, to check one by one.
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
-  nor on the order of the kinds, but whether a hook can be given a copy of a value that holds
-  itself and nests near 20,000 deep around the cycle, below: a loop gives a map's keys in an order
-  of their own. The subject's, the
+  nor on the order of the kinds, whether a hook can be given a copy included, below: a loop gives a
+  map's keys in an order of their own. The subject's, the
   resource's and the request's attributes share what a check converts, so attributes a tenant's
   users write, as a resource's tags, can take every check of the resource past it, where a grant's
   condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
@@ -402,7 +401,8 @@ scopes conditional ones reach, to check one by one.
   each read, so one reading more than about sixteen in a loop, which held once the process had
   loaded them, fails. A loop over a map costs sorting its keys, so one over 500 short keys, which
   cost about half what a condition may, now costs about two thirds, and one over more than about
-  700 fails the same way, as does one over a map literal holding more than one key of another
+  700 fails the same way, or over more than about 580 keys of 36 bytes, as ids, each costing its
+  bytes once more, as does one over a map literal holding more than one key of another
   type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
   so they may be past a bound as an upgrade leaves them. Adding
   to `request.time`, or converting it, was bounded at all a condition
@@ -415,9 +415,12 @@ scopes conditional ones reach, to check one by one.
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, as it charged a struct
-  holding none, or maps keyed by arrays or structs, whose keys it is now charged the bytes of; and
-  so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as its zero
-  value; and a condition building a list or a map holding attributes no condition can
+  holding none, or maps keyed by arrays or structs, or by interfaces holding them, whose keys it is
+  now charged the bytes of, and of the strings they hold and what their interfaces hold, as hashing
+  them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as
+  its zero value, and ones holding themselves that reach 20,000 maps, lists, pointers, structs,
+  arrays and messages, counting each time one is reached, however shallow, which were copied
+  whole; and a condition building a list or a map holding attributes no condition can
   read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
@@ -477,8 +480,13 @@ scopes conditional ones reach, to check one by one.
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
   `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
   more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
-  condition reads, along any path, wherever a value reached twice is reached first: where the
-  attributes hold more, or nest deeper, the hook can't be asked, rather than be given part of them,
+  condition reads, along any path, wherever a value reached twice is reached first, nor a value
+  holding itself, as a graph of objects with links back can, that reaches 20,000 maps, lists,
+  pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
+  deep a path around the cycle nests turns on where the copy enters it, which the order a map's
+  entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
+  of them, were copied on one call and refused on the next. Where the attributes hold more, nest
+  deeper or hold themselves so, the hook can't be asked, rather than be given part of them,
   and the call is refused as any other, a `DeniedError` of the permission on the resource
   asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
   users can write what takes attributes past it, as a resource's tags, and the message named the

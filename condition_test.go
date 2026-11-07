@@ -2634,10 +2634,59 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	}
 	// A copy reads a map's entry, moving its key and its value whole, before it copies them, so it
 	// charges what they hold in place first: one holding a struct of 4 MiB, past what a copy holds,
-	// moved it only to find so.
+	// moved it only to find so, and one holding an array of 4 MiB allocated 12 MB; and it moves a
+	// slice's elements before it copies each, so 2,000 arrays of 4,096 interfaces, 125 MiB, past what
+	// a copy holds, allocated 133 MB.
 	type huge struct{ X [4 << 20]byte }
-	if w := rbac.CopyingWork(map[string]any{"m": map[string]huge{"a": {}}}); w.Done || w.Bytes > 1<<20 {
-		t.Errorf("copying a map holding a struct of 4 MiB copied it %t, allocating %d bytes", w.Done, w.Bytes)
+	for name, attributes := range map[string]map[string]any{
+		"a map holding a struct of 4 MiB":            {"m": map[string]huge{"a": {}}},
+		"a map holding an array of 4 MiB":            {"m": map[string][4 << 20]byte{"a": {}}},
+		"a map holding an array of 4 MiB of any":     {"m": map[string][256 << 10]any{"a": {}}},
+		"a list of 2,000 arrays of 4,096 interfaces": {"l": make([][4 << 10]any, 2000)},
+	} {
+		if w := rbac.CopyingWork(attributes); w.Done || w.Bytes > 1<<20 {
+			t.Errorf("copying %s copied it %t, allocating %d bytes", name, w.Done, w.Bytes)
+		}
+	}
+}
+
+// A copy sets each of a map's keys in a map of its own, which hashes the key whole: the strings an
+// array or a struct key holds, and what the interfaces it holds hold, as well as its bytes in place.
+// Charged those bytes alone, 50 entries keyed by structs each holding a string of 1 MiB took 1.4 ms
+// to copy, charged 167. Each such key costs at least what the string or the array it holds costs
+// as a key of its own.
+func TestCopyingAMapChargesWhatHashingItsKeysReads(t *testing.T) {
+	type text struct{ S string }
+	type held struct{ A any }
+	// keyed is a map of 100 entries keyed by key's values, as a key of type t.
+	keyed := func(t reflect.Type, key func(i int) any) map[string]any {
+		m := reflect.MakeMap(reflect.MapOf(t, reflect.TypeFor[int]()))
+		for i := range 100 {
+			m.SetMapIndex(reflect.ValueOf(key(i)), reflect.ValueOf(i))
+		}
+		return map[string]any{"m": m.Interface()}
+	}
+	long := func(i int) string { return fmt.Sprintf("%01024d", i) }
+	array := func(i int) (a [1 << 10]byte) {
+		a[0], a[1] = byte(i), byte(i>>8)
+		return a
+	}
+	anything := reflect.TypeFor[any]()
+	texts := keyed(reflect.TypeFor[string](), func(i int) any { return long(i) })
+	arrays := keyed(reflect.TypeFor[[1 << 10]byte](), func(i int) any { return array(i) })
+	for name, c := range map[string]struct{ attributes, least map[string]any }{
+		"structs holding a string":                     {keyed(reflect.TypeFor[text](), func(i int) any { return text{long(i)} }), texts},
+		"arrays of a string":                           {keyed(reflect.TypeFor[[1]string](), func(i int) any { return [1]string{long(i)} }), texts},
+		"structs holding a string in an interface":     {keyed(reflect.TypeFor[held](), func(i int) any { return held{long(i)} }), texts},
+		"interfaces holding a struct holding a string": {keyed(anything, func(i int) any { return text{long(i)} }), texts},
+		"structs holding an array in an interface":     {keyed(reflect.TypeFor[held](), func(i int) any { return held{array(i)} }), arrays},
+		"interfaces holding an array":                  {keyed(anything, func(i int) any { return array(i) }), arrays},
+	} {
+		charged, copied := rbac.CopyingCharge(c.attributes)
+		least, _ := rbac.CopyingCharge(c.least)
+		if !copied || charged < least {
+			t.Errorf("copying a map of 100 keyed by %s charged %d, copied %t, where keyed by what they hold it charged %d", name, charged, copied, least)
+		}
 	}
 }
 

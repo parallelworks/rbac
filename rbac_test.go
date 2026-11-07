@@ -3453,6 +3453,117 @@ func TestAHookIsGivenAValueReachedAtTwoDepthsAlikeOnEveryCall(t *testing.T) {
 	}
 }
 
+// ringed is attributes holding, each under four names, two values each holding the other, and a
+// chain of n values leading to the second of them: two links, two lists or two Structs.
+func ringed(shape string, n int) map[string]any {
+	var ring, chain any
+	switch shape {
+	case "links":
+		a := &link{Value: 1}
+		b := &link{Next: a, Value: 2}
+		a.Next = b
+		for ; n > 0; n-- {
+			b = &link{Next: b}
+		}
+		ring, chain = a, b
+	case "lists":
+		a := []any{nil}
+		b := []any{a}
+		a[0] = b
+		for ring, chain = a, b; n > 0; n-- {
+			chain = []any{chain}
+		}
+	case "messages":
+		a := &structpb.Struct{Fields: map[string]*structpb.Value{}}
+		b := &structpb.Struct{Fields: map[string]*structpb.Value{"a": structpb.NewStructValue(a)}}
+		a.Fields["b"] = structpb.NewStructValue(b)
+		held := structpb.NewStructValue(b)
+		for ; n > 0; n-- {
+			held = structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{held}})
+		}
+		ring, chain = a, held
+	}
+	attributes := map[string]any{}
+	for i := range 4 {
+		attributes[fmt.Sprint("ring", i)], attributes[fmt.Sprint("chain", i)] = ring, chain
+	}
+	return attributes
+}
+
+// A hook's copy of a value holding itself nested as deep as the path it took around the cycle,
+// which turned on where it entered it, and so on the order a map's entries came in: two links
+// holding each other, beside a chain of 9,998 links to the second, were copied whole on one call
+// and refused on the next, as were lists and Structs, so a constraint was asked on one call and
+// the call refused on the next. One holding itself is refused where it reaches 20,000 maps, lists,
+// pointers, structs, arrays and messages, counting each time it reaches one, and a message a
+// pointer reaches apart from the pointer, as a path around the cycle could nest that deep in some
+// order, in every order, shallow or not, and copied whole where it reaches fewer.
+func TestAHookIsGivenAValueHoldingItselfAlikeOnEveryCall(t *testing.T) {
+	for _, c := range []struct {
+		shape string
+		from  int
+	}{{"links", 9_997}, {"lists", 19_996}, {"messages", 9_996}} {
+		for n := c.from; n < c.from+3; n++ {
+			attributes := ringed(c.shape, n)
+			copies := rbac.Copies(attributes)
+			for range 12 {
+				if rbac.Copies(attributes) != copies {
+					t.Fatalf("%s holding each other, beside a chain of %d to them, were copied on one call and refused on another", c.shape, n)
+				}
+			}
+		}
+	}
+	if !rbac.Copies(ringed("links", 9_000)) {
+		t.Error("links holding each other, beside a chain of 9,000, weren't copied")
+	}
+	// The attributes, the list holding the rest, the Struct and the message it is, each time a
+	// pointer reaches it, the three Values it holds, and the list of lists and the lists it holds:
+	// 20,000 for 19,992 lists, whether the copy reaches them first or last, or 19,990 where it
+	// reaches the Struct twice.
+	self := holdingItself()
+	lists := func(n int) []any {
+		l := make([]any, n)
+		for i := range l {
+			l[i] = []any{}
+		}
+		return l
+	}
+	for _, c := range []struct {
+		name string
+		held func(lists []any) []any
+		past int
+	}{
+		{"after", func(l []any) []any { return []any{l, self} }, 19_992},
+		{"before", func(l []any) []any { return []any{self, l} }, 19_992},
+		{"twice before", func(l []any) []any { return []any{self, self, l} }, 19_990},
+	} {
+		for n := c.past - 1; n <= c.past; n++ {
+			if rbac.Copies(map[string]any{"held": c.held(lists(n))}) != (n < c.past) {
+				t.Errorf("a Struct holding itself %s a list of %d lists was copied %t", c.name, n, n >= c.past)
+			}
+		}
+	}
+	// Reached twice, a list or a map holds nothing of itself.
+	tags, labels := []string{"a"}, map[string]any{"b": 1}
+	if !rbac.Copies(map[string]any{"lists": lists(20_000), "tags": tags, "again": []any{tags, labels}, "labels": labels}) {
+		t.Error("a list and a map reached twice beside a list of 20,000 lists weren't copied")
+	}
+
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "none", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+			return false, nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	u := h.as(t, "u")
+	u.Attributes = ringed("links", 9_998)
+	for i := range 20 {
+		if allowed(t, h, u, login, cluster) {
+			t.Fatalf("call %d asking a constraint about links holding each other, beside a chain of 9,998, was allowed", i)
+		}
+	}
+}
+
 // session is a host's type embedding a generated message, as a host wraps one to add fields.
 type session struct {
 	*timestamppb.Timestamp

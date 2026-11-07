@@ -534,9 +534,9 @@ sequenceDiagram
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
   failing closed. A map of structs, which no condition reads, is refused unread at 2 for each entry
   (`refusedWhole`), as reading an entry copies it whole: a map of 2,000 structs of 64 KiB took 7 ms,
-  charged as much. Nothing else turns on map order, nor on the order of the kinds, but whether a
-  hook's copy of a value holding itself nests past `maxCopied` around the cycle, and a loop gives a
-  map's keys in an order of its own (`stepping.order`, below): JSON text
+  charged as much. Nothing else turns on map order, nor on the order of the kinds, whether a hook
+  can be given a copy included (below), and a loop gives a map's keys in an order of its own
+  (`stepping.order`, below): JSON text
   whose values may cost more than `maxConverted`, by its brackets, braces, commas and colons, each
   bracket and brace what building a list or an object costs (`jsonValues`), fails them all
   unparsed, where compared with
@@ -552,14 +552,26 @@ sequenceDiagram
   slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
   before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a
   struct, which reading an entry moves and setting it hashes (`keyTenths`), each before it moves
-  them: charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms, and of
-  2,000 entries keyed by arrays of 4 KiB 8 ms. A copy holds nothing nesting past `maxCopied`: it is
+  them, and of the strings such a key holds and what its interfaces hold, which hashing reads too
+  (`payHashed`): charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms,
+  and of 2,000 entries keyed by arrays of 4 KiB 8 ms, and charged their bytes in place alone, of 50
+  keyed by structs each holding a string of 1 MiB 1.4 ms, for 167. Nor does it move a slice's
+  elements or a map's values where what they hold in place, at least one for each 24 bytes, costs
+  more than is left (`leastCopied`): a map holding an array of 4 MiB allocated 12 MB, and 2,000
+  arrays of 4,096 interfaces 133 MB, before being found past what a copy holds. A copy holds
+  nothing nesting past `maxCopied`: it is
   refused there (`overflow`), where it held the zero value, or the copy of a value reached less
   deep before, as map order decided, so a constraint was given a value on one call and its zero
   value on the next. Each map, pointer and message it keeps how much deeper it reaches, copied
   whole, and each slice each prefix of its elements (`copied.reached`), so reaching one again
   deeper is refused where copying it there would be, and whether a value nests that deep is of what
-  it holds, but around a cycle, where only a longest simple path would be order-free. Reading one
+  it holds. Around a cycle it isn't: the path a copy takes around one nests as deep as where it
+  entered it, which map order picks, so two links each holding the other, beside a chain of 9,998
+  links to one, were copied on one call and refused on the next, and an order-free depth would be
+  a longest simple path. So a copy that reaches a value it is still copying (`around`) is refused
+  once it has reached 20,000 maps, lists, pointers, structs, arrays and messages, counting each
+  time it reaches one, and a message a pointer reaches apart from the pointer (`hold`), however
+  shallow the value: a path nests no deeper, in any order, than the values it reaches hold. Reading one
   in a condition takes 70 to 145 ns, and a check
   converts in about 20 ms at most what it may spend on a scope's grants' conditions, past which
   every condition reading an attribute fails: converting isn't charged to a condition, and charging
