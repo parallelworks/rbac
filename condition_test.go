@@ -2590,6 +2590,104 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 			}
 		}
 	}
+	// A struct no condition reads is refused whatever it holds, but converting a map of them read
+	// each entry into one value, moving it whole, charged two, and a hook's copy set a struct holding
+	// a map whole, its unexported fields too, charged one, and moved each of a slice's elements whole
+	// before copying it: converting a map of 2,000 structs of 64 KiB took 7 ms, charged 4,017, and
+	// copying a slice of 2,000 holding a map and 64 KiB took 38 ms, charged 4,013. Converting refuses
+	// a map of them unread, and copying charges a struct the bytes it moves, as it charges one holding
+	// no map, so neither allocates more for each unit charged than for a string.
+	type hidden struct {
+		M map[string]int
+		_ [64 << 10]byte
+	}
+	type wide struct{ X [64 << 10]byte }
+	widely := map[string]wide{}
+	// A copy shares a map's keys, but reading an entry moves its key whole, and setting it hashes it:
+	// copying 2,000 keyed by arrays of 4 KiB took 8 ms, charged 4,017.
+	arrayKeyed := map[[4 << 10]byte]int{}
+	for i := range n {
+		widely[strconv.Itoa(i)] = wide{}
+		var k [4 << 10]byte
+		k[0], k[1] = byte(i), byte(i>>8)
+		arrayKeyed[k] = i
+	}
+	for name, attributes := range map[string]map[string]any{
+		"maps of a struct of 64 KiB":                             listed(func(int) any { return map[string]wide{"a": {}} }),
+		"a map of structs of 64 KiB":                             {"m": widely},
+		"maps of a struct holding a map and 64 KiB":              listed(func(int) any { return map[string]hidden{"a": {}} }),
+		"structs holding a map and 64 KiB":                       listed(func(int) any { return hidden{} }),
+		"pointers to a struct holding a map and 64 KiB":          listed(func(int) any { return &hidden{} }),
+		"slices of a struct holding a map and 64 KiB":            listed(func(int) any { return []hidden{{}} }),
+		"arrays of two structs holding a map and 64 KiB":         listed(func(int) any { return [2]hidden{} }),
+		"slices of arrays of two holding a map and 64 KiB":       listed(func(int) any { return [][2]hidden{{}} }),
+		"maps of arrays of two structs holding a map and 64 KiB": listed(func(int) any { return map[string][2]hidden{"a": {}} }),
+		"a map keyed by arrays of 4 KiB":                         {"m": arrayKeyed},
+	} {
+		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
+			w := least(work, attributes)
+			if a, b := float64(w.Allocations)/float64(w.Charged), float64(w.Bytes)/float64(w.Charged); a > 2.5*allocations || b > 5*bytes {
+				t.Errorf("%s %s allocated %.2f times and %.0f bytes for each unit charged, where converting strings allocates %.2f times "+
+					"and %.0f bytes", doing, name, a, b, allocations, bytes)
+			}
+		}
+	}
+	// A copy reads a map's entry, moving its key and its value whole, before it copies them, so it
+	// charges what they hold in place first: one holding a struct of 4 MiB, past what a copy holds,
+	// moved it only to find so, and one holding an array of 4 MiB allocated 12 MB; and it moves a
+	// slice's elements before it copies each, so 2,000 arrays of 4,096 interfaces, 125 MiB, past what
+	// a copy holds, allocated 133 MB.
+	type huge struct{ X [4 << 20]byte }
+	for name, attributes := range map[string]map[string]any{
+		"a map holding a struct of 4 MiB":            {"m": map[string]huge{"a": {}}},
+		"a map holding an array of 4 MiB":            {"m": map[string][4 << 20]byte{"a": {}}},
+		"a map holding an array of 4 MiB of any":     {"m": map[string][256 << 10]any{"a": {}}},
+		"a list of 2,000 arrays of 4,096 interfaces": {"l": make([][4 << 10]any, 2000)},
+	} {
+		if w := rbac.CopyingWork(attributes); w.Done || w.Bytes > 1<<20 {
+			t.Errorf("copying %s copied it %t, allocating %d bytes", name, w.Done, w.Bytes)
+		}
+	}
+}
+
+// A copy sets each of a map's keys in a map of its own, which hashes the key whole: the strings an
+// array or a struct key holds, and what the interfaces it holds hold, as well as its bytes in place.
+// Charged those bytes alone, 50 entries keyed by structs each holding a string of 1 MiB took 1.4 ms
+// to copy, charged 167. Each such key costs at least what the string or the array it holds costs
+// as a key of its own.
+func TestCopyingAMapChargesWhatHashingItsKeysReads(t *testing.T) {
+	type text struct{ S string }
+	type held struct{ A any }
+	// keyed is a map of 100 entries keyed by key's values, as a key of type t.
+	keyed := func(t reflect.Type, key func(i int) any) map[string]any {
+		m := reflect.MakeMap(reflect.MapOf(t, reflect.TypeFor[int]()))
+		for i := range 100 {
+			m.SetMapIndex(reflect.ValueOf(key(i)), reflect.ValueOf(i))
+		}
+		return map[string]any{"m": m.Interface()}
+	}
+	long := func(i int) string { return fmt.Sprintf("%01024d", i) }
+	array := func(i int) (a [1 << 10]byte) {
+		a[0], a[1] = byte(i), byte(i>>8)
+		return a
+	}
+	anything := reflect.TypeFor[any]()
+	texts := keyed(reflect.TypeFor[string](), func(i int) any { return long(i) })
+	arrays := keyed(reflect.TypeFor[[1 << 10]byte](), func(i int) any { return array(i) })
+	for name, c := range map[string]struct{ attributes, least map[string]any }{
+		"structs holding a string":                     {keyed(reflect.TypeFor[text](), func(i int) any { return text{long(i)} }), texts},
+		"arrays of a string":                           {keyed(reflect.TypeFor[[1]string](), func(i int) any { return [1]string{long(i)} }), texts},
+		"structs holding a string in an interface":     {keyed(reflect.TypeFor[held](), func(i int) any { return held{long(i)} }), texts},
+		"interfaces holding a struct holding a string": {keyed(anything, func(i int) any { return text{long(i)} }), texts},
+		"structs holding an array in an interface":     {keyed(reflect.TypeFor[held](), func(i int) any { return held{array(i)} }), arrays},
+		"interfaces holding an array":                  {keyed(anything, func(i int) any { return array(i) }), arrays},
+	} {
+		charged, copied := rbac.CopyingCharge(c.attributes)
+		least, _ := rbac.CopyingCharge(c.least)
+		if !copied || charged < least {
+			t.Errorf("copying a map of 100 keyed by %s charged %d, copied %t, where keyed by what they hold it charged %d", name, charged, copied, least)
+		}
+	}
 }
 
 // A host can nest a value as deep as it likes, which converting it recurses into: a chain of
@@ -3006,6 +3104,348 @@ func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
 	} {
 		if limit, cost := rbac.ConditionCost(t, expr, nil); cost > limit {
 			t.Errorf("%s cost %d, past its bound, %d", expr, cost, limit)
+		}
+	}
+}
+
+// A loop gave a map's keys in the order Go ranges over the map, which changes from one evaluation
+// to the next, so the same check of the same request decided otherwise from call to call: a grant
+// whose condition read the first key map() made allowed in 55 of 100 calls, Explain disagreeing
+// with the check before it in 51, and a deny reading the first filter() kept lifted in 84, so a
+// requester could ask until it lifted. A loop gives a map's keys in one order, so each call decides
+// alike, and Explain as Authorize does.
+func TestALoopOverAMapDecidesAlikeOnEveryCall(t *testing.T) {
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole) })
+	ctx := t.Context()
+	given := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	given.Condition = rbac.Condition{Expression: `request.attributes.scopes.map(k, k)[0] == "admin"`}
+	h.seed(t, given, grant(cluster.Scope(), "cluster.login", rbac.User, "d"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "ordered", Principals: []rbac.Principal{identity("d")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `request.attributes.scopes.filter(k, true)[0] == "admin"`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := rbac.WithRequest(ctx, map[string]any{"scopes": map[string]any{"read": true, "write": true, "admin": true}})
+	for id, want := range map[string]bool{"u": true, "d": false} {
+		s := h.as(t, id)
+		for i := range 200 {
+			err := h.authz.Authorize(request, s, login, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			d, explained := h.authz.Explain(request, s, login, cluster)
+			if explained != nil {
+				t.Fatal(explained)
+			}
+			if (err == nil) != want || d.Allowed != want {
+				t.Fatalf("call %d: %s allowed %t, and by Explain %t", i, id, err == nil, d.Allowed)
+			}
+		}
+	}
+}
+
+// A loop gives a map's keys in one order, however the map was made: bools, ints, uints, doubles and
+// strings, each by its value, and a map keyed by anything else, as a list, a map literal can be,
+// has no order and fails a loop over it, but where it holds one key. So a loop over a map decides,
+// and costs, alike in each evaluation, and so does whatever reads a map whole, comparing it, `in`
+// and size(): over random maps, the host's and literals, keyed by values of each type, through
+// loops whose steps fail for some keys and decide for others, as all() and exists() take an error
+// from one key and a decision from another, each of 50 evaluations decides alike and costs alike.
+func TestALoopOverAMapGivesItsKeysInOneOrder(t *testing.T) {
+	scopes := map[string]bool{"read": true, "write": true, "admin": true}
+	packed := &structpb.Struct{Fields: map[string]*structpb.Value{"c": structpb.NewNullValue(), "a": structpb.NewNullValue(), "b": structpb.NewNullValue()}}
+	attributes := map[string]any{
+		"scopes": scopes, "mixed": map[any]any{"b": 1, uint(7): 2, "a": 3, 1: 4, true: 5, -2: 6},
+		"json": json.RawMessage(`{"c": 1, "a": 2, "b": 3}`), "packed": packed, "listed": map[string]any{"z": []any{1}, "y": []any{2}},
+	}
+	for _, c := range []struct {
+		expr            string
+		held, evaluated bool
+	}{
+		{`{"b": 0, 2: 0, true: 0, 1u: 0, 1.5: 0, "a": 0, false: 0, -1: 0, 0.5: 0}.map(k, k) == [false, true, -1, 2, 1u, 0.5, 1.5, "a", "b"]`, true, true},
+		{`request.attributes.mixed.map(k, k) == [true, -2, 1, 7u, "a", "b"]`, true, true},
+		{`request.attributes.scopes.map(k, k) == ["admin", "read", "write"]`, true, true},
+		{`request.attributes.scopes.filter(k, k != "admin")[0] == "read"`, true, true},
+		{`dyn(request.attributes.scopes).exists_one(k, k < "b") && request.attributes.scopes.map(k, k)[2] == "write"`, true, true},
+		{`(true ? request.attributes.scopes : {}).map(k, k)[0] == "admin"`, true, true},
+		{`request.attributes.json.map(k, k) == ["a", "b", "c"] && request.attributes.packed.map(k, k) == ["a", "b", "c"]`, true, true},
+		{`request.attributes.listed.map(k, request.attributes.listed[k][0]) == [2, 1]`, true, true},
+		{`subject.map(k, k) == ["attributes", "id", "kind"] && request.map(k, k) == ["attributes", "time"]`, true, true},
+		{`[request.attributes.scopes].all(m, m.map(k, k)[0] == "admin")`, true, true},
+		{`!request.attributes.mixed.all(k, k < 5) && request.attributes.mixed.exists(k, k > 5)`, true, true},
+		{`{[1]: 1}.all(k, k == [1])`, true, true},
+		{`{[1]: 1, [2]: 2}.all(k, true)`, false, false},
+		{`{null: 1, 1: 2}.exists(k, true)`, false, false},
+	} {
+		decided, err := rbac.Evaluations(t, c.expr, attributes, 50)
+		if err != nil {
+			t.Fatalf("%s: %v", c.expr, err)
+		}
+		for i, d := range decided {
+			if d.Held != c.held || d.Evaluated != c.evaluated {
+				t.Fatalf("%s, evaluation %d: held %t, evaluated %t", c.expr, i, d.Held, d.Evaluated)
+			}
+		}
+	}
+
+	rng := rand.New(rand.NewPCG(1, 15))
+	key := func() (literal string, host any) {
+		switch n := rng.IntN(9) - 4; rng.IntN(5) {
+		case 0:
+			return strconv.FormatBool(n > 0), n > 0
+		case 1:
+			return strconv.Itoa(n), n
+		case 2:
+			return fmt.Sprintf("%du", n+4), uint(n + 4)
+		case 3:
+			return fmt.Sprintf("%d.5", n), nil
+		default:
+			s := strings.Repeat("k", rng.IntN(3)) + string(rune('a'+n+4))
+			return strconv.Quote(s), s
+		}
+	}
+	for seed := range 120 {
+		var entries, keys []string
+		host := map[any]any{}
+		for i := range rng.IntN(7) + 2 {
+			k, v := key()
+			if slices.Contains(keys, k) {
+				continue
+			}
+			keys = append(keys, k)
+			entries = append(entries, fmt.Sprintf("%s: %d", k, i))
+			if v != nil {
+				host[v] = i
+			}
+		}
+		shuffled := slices.Clone(entries)
+		rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+		literal := "{" + strings.Join(entries, ", ") + "}"
+		k := keys[rng.IntN(len(keys))]
+		for _, m := range []string{literal, "request.attributes.m"} {
+			for _, expr := range []string{
+				m + ".map(k, k)[0] == " + k,
+				m + `.filter(k, k != ` + k + `)[0] == ` + keys[0],
+				m + ".map(k, [k, " + m + "[k]])[1][1] == 1",
+				m + ".all(k, k < 2)",
+				m + ".exists(k, k > 2)",
+				"!" + m + ".exists_one(k, k == " + k + " || k > 0)",
+				m + ".all(k, " + m + ".exists(j, j == k))",
+				m + ".exists(k, " + m + ".map(j, j)[0] == k && k != " + k + ")",
+				m + " == {" + strings.Join(shuffled, ", ") + "}",
+				k + " in " + m + " && size(" + m + ") == " + strconv.Itoa(len(entries)),
+			} {
+				attributes := map[string]any{"m": host}
+				// One CEL doesn't check, as one ordering strings by ints, isn't a condition.
+				decided, err := rbac.Evaluations(t, expr, attributes, 50)
+				if err != nil {
+					continue
+				}
+				if limit, cost := rbac.ConditionCost(t, expr, attributes); cost > limit {
+					t.Errorf("seed %d: %s cost %d, past its bound, %d", seed, expr, cost, limit)
+				}
+				for i, d := range decided {
+					if d != decided[0] {
+						t.Fatalf("seed %d: %s decided %+v, and in evaluation %d %+v", seed, expr, decided[0], i, d)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Every loop gives a map's keys in one order, however the condition reaches the map: random
+// conditions loop, nest loops, and reach maps the host passes, JSON objects, Structs, map literals,
+// the request and maps a loop's variable holds through selects, indexes, dyn() and choices, each
+// evaluated 50 times with its attributes converted afresh, decide alike and cost alike, within
+// their bounds, as do ones reaching only literals, which bound them below what any condition may.
+func TestEveryLoopOverAMapDecidesAndCostsAlike(t *testing.T) {
+	inner, err := structpb.NewStruct(map[string]any{"c": 1, "a": 2, "bb": 3, "d": 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes := map[string]any{
+		"m":      map[any]any{"b": 1, uint(7): 2, "a": 3, 1: 4, true: 5, -2: 6, "ccc": 7},
+		"s":      map[string]any{"read": 1, "write": 2, "admin": 3, "zz": 4},
+		"list":   []any{map[string]any{"c": 1, "a": 2, "b": 3}, map[string]any{"z": 1, "y": 2}},
+		"nested": map[string]any{"p": map[string]any{"c": 1, "a": 2}, "q": map[string]any{"z": 1, "y": 2, "x": 3}},
+		"json":   json.RawMessage(`{"o": {"c": 1, "a": 2, "b": 3}, "k": "a"}`),
+		"packed": &structpb.Struct{Fields: map[string]*structpb.Value{"o": structpb.NewStructValue(inner)}},
+	}
+	rng := rand.New(rand.NewPCG(15, 1))
+	pick := func(xs ...string) string { return xs[rng.IntN(len(xs))] }
+	literal := func() string {
+		var entries []string
+		for i := range rng.IntN(5) + 2 {
+			entries = append(entries, fmt.Sprintf("%s: %d", pick(`"a"`, `"bb"`, `"c"`, `"dddd"`, `"e"`, "1", "2u", "true", "-3", "0.5"), i))
+		}
+		return "{" + strings.Join(entries, ", ") + "}"
+	}
+	literals := false
+	var ranged func(depth int, bound string) string
+	ranged = func(depth int, bound string) string {
+		switch n := rng.IntN(14); {
+		case n == 0 && bound != "":
+			return bound
+		case n == 1 || literals && n < 9:
+			return literal()
+		case n == 2:
+			return "request.attributes." + pick("m", "s")
+		case n == 3:
+			return `request.attributes["` + pick("m", "s", "nested") + `"]`
+		case n == 4:
+			return "request.attributes.json.o"
+		case n == 5:
+			return "request.attributes.packed.o"
+		case n == 6:
+			return "request.attributes.nested." + pick("p", "q")
+		case n == 7:
+			return "request.attributes.list[" + pick("0", "1") + "]"
+		case n == 8:
+			return pick("request", "subject", "resource.attributes")
+		case n == 9 && depth > 0:
+			return "dyn(" + ranged(depth-1, bound) + ")"
+		case n == 10 && depth > 0:
+			return "(size(request.attributes.s) " + pick(">", "<") + " 2 ? dyn(" + ranged(depth-1, bound) + ") : dyn(" + ranged(depth-1, bound) + "))"
+		case n == 11 && depth > 0:
+			return `{"x": ` + ranged(depth-1, bound) + `}` + pick(`["x"]`, ".x")
+		case n == 12 && depth > 0:
+			return "[" + ranged(depth-1, bound) + "][0]"
+		default:
+			return "request.attributes.s"
+		}
+	}
+	var looped func(depth int, bound string) string
+	looped = func(depth int, bound string) string {
+		r := ranged(2, bound)
+		v := fmt.Sprintf("k%d", depth)
+		cond := func() string {
+			if depth > 0 && rng.IntN(3) == 0 {
+				return looped(depth-1, v)
+			}
+			return pick(v+` < "b"`, v+` == "a"`, v+" > 0", "true", "false", "string("+v+`) < "c"`, r+"["+v+"] == 2")
+		}
+		switch rng.IntN(6) {
+		case 0:
+			return r + ".map(" + v + ", " + v + ")[0] == " + pick(`"a"`, "true", "1", `"admin"`, `"attributes"`)
+		case 1:
+			return r + ".filter(" + v + ", " + cond() + ").map(" + v + ", string(" + v + ")).exists(x, x == " + pick(`"a"`, `"c"`, `"zz"`) + ")"
+		case 2:
+			return r + ".all(" + v + ", " + cond() + ")"
+		case 3:
+			return r + ".exists_one(" + v + ", " + cond() + ")"
+		case 4:
+			return r + ".map(" + v + ", " + cond() + ", string(" + v + "))[0] == " + pick(`"a"`, `"c"`, `"zz"`)
+		default:
+			return r + ".exists(" + v + ", " + cond() + ")"
+		}
+	}
+	conditions, bounded := 0, 0
+	for i := range 600 {
+		literals = i >= 400
+		expr := looped(2, "")
+		decided, err := rbac.Evaluations(t, expr, attributes, 50)
+		if err != nil {
+			continue
+		}
+		conditions++
+		for i, d := range decided {
+			if d != decided[0] {
+				t.Fatalf("%s decided %+v, and in evaluation %d %+v", expr, decided[0], i, d)
+			}
+		}
+		limit, cost := rbac.ConditionCost(t, expr, attributes)
+		if cost > limit {
+			t.Errorf("%s cost %d, past its bound, %d", expr, cost, limit)
+		}
+		if limit < 10000 {
+			bounded++
+		}
+	}
+	if conditions < 450 || bounded < 100 {
+		t.Errorf("of 600 random conditions, %d were conditions, %d bounded below what any may cost", conditions, bounded)
+	}
+}
+
+// Sorting a map's keys compares each with others at each of a few levels, reading as much of both
+// as they share, so a loop over a map is charged, before it starts, 1 for each two keys at each
+// level and what reading each costs past 1 once, as its bound counts it: charged 1 for each key and
+// its bytes at each level, a loop over 500 keys of 36 bytes, as ids, cost past what a condition
+// may, though sorting them took 64 µs. One over a map of long keys sharing all but their last
+// bytes, which would read them over and over, fails before it sorts them.
+func TestALoopOverAMapCostsSortingItsKeys(t *testing.T) {
+	keyed := func(n, length int) map[string]any {
+		m, l := map[string]any{}, []any{}
+		for i := range n {
+			k := fmt.Sprintf("%s%03d", strings.Repeat("k", length-3), i)
+			m[k], l = i, append(l, k)
+		}
+		return map[string]any{"m": m, "l": l}
+	}
+	for _, c := range []struct{ n, length, levels int }{{16, 300, 4}, {500, 36, 9}, {2, 5, 1}, {3, 40, 2}} {
+		attributes := keyed(c.n, c.length)
+		limit, cost := rbac.ConditionCost(t, `request.attributes.m.exists(k, k == "")`, attributes)
+		_, listed := rbac.ConditionCost(t, `request.attributes.l.exists(k, k == "")`, attributes)
+		// Each key 1 at the loop's first step, as before, each two 1 at each level, and its bytes once.
+		if want := uint64(c.n + (c.n+1)/2*c.levels + c.n*(c.length/10)); cost != listed+want || cost > limit {
+			t.Errorf("a loop over %d keys of %d bytes cost %d, bounded at %d, where over a list of them it cost %d, not %d less",
+				c.n, c.length, cost, limit, listed, want)
+		}
+		if held, evaluated, _, err := rbac.EvaluateCondition(t, `!request.attributes.m.exists(k, k == "")`, attributes); err != nil || !held || !evaluated {
+			t.Errorf("a loop over %d keys of %d bytes held %t, evaluated %t: %v", c.n, c.length, held, evaluated, err)
+		}
+	}
+	_, alone := rbac.ConditionCost(t, `request.attributes.m.exists(k, false)`, keyed(1, 300))
+	if alone > 10 {
+		t.Errorf("a loop over one key of 300 bytes cost %d", alone)
+	}
+	if held, evaluated, _, err := rbac.EvaluateCondition(t, `!request.attributes.m.exists(k, false)`, keyed(100, 1000)); err != nil || held || evaluated {
+		t.Errorf("a loop over 100 keys of a kilobyte held %t, evaluated %t: %v", held, evaluated, err)
+	}
+	literal := `{"aaaaaaaaaaaaaaaaaaaa": 1, "aaaaaaaaaaaaaaaaaaab": 2, "aaaaaaaaaaaaaaaaaaac": 3, "b": 4, "c": 5}`
+	for _, expr := range []string{
+		literal + `.map(k, k)[0] == "aaaaaaaaaaaaaaaaaaaa"`, `[1, 2].all(i, ` + literal + `.exists(k, k == "c"))`,
+		`(true ? dyn(` + literal + `) : dyn([1])).all(k, k != "")`,
+	} {
+		limit, cost := rbac.ConditionCost(t, expr, nil)
+		// Three for each of 3 levels, and 2 more for each key.
+		if cost > limit || limit < 3*3+5*2 {
+			t.Errorf("%s cost %d, bounded at %d", expr, cost, limit)
+		}
+	}
+}
+
+// Nothing but how deep a value nests turns on the order Go ranges over a map in, which changes from
+// one time to the next: converting a kind's attributes charges each map, and finds whether they can
+// be read, alike whatever order its entries come in, a hook's copy of them is charged alike, and
+// comparing maps, finding one in a list or a key in one, and size() decide and cost alike. Values
+// of random shapes, nesting every type both handle and sharing some, do so in each of 20 tries.
+func TestConvertingCopyingOrComparingAMapTurnsOnNoOrder(t *testing.T) {
+	const compared = `request.attributes.a0 == request.attributes.a1 || request.attributes.a0 == request.attributes.a0 && ` +
+		`request.attributes.a1 in [request.attributes.a0, request.attributes.a1] && "a1" in request.attributes && size(request.attributes) > 1`
+	for seed := range uint64(300) {
+		d := &copyDraw{rng: rand.New(rand.NewPCG(seed, 15)), decoded: seed%2 == 0, sharing: seed%3 == 0}
+		attributes := map[string]any{}
+		for i := range d.rng.IntN(4) + 2 {
+			attributes[fmt.Sprint("a", i)] = d.value(3)
+		}
+		converted, read := rbac.ConvertingCharge(attributes)
+		copied, ok := rbac.CopyingCharge(attributes)
+		decided, err := rbac.Evaluations(t, compared, attributes, 20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range 20 {
+			if again, readAgain := rbac.ConvertingCharge(attributes); again != converted || readAgain != read {
+				t.Fatalf("seed %d: converting cost %d, read %t, and in try %d %d, %t", seed, converted, read, i, again, readAgain)
+			}
+			if again, okAgain := rbac.CopyingCharge(attributes); again != copied || okAgain != ok {
+				t.Fatalf("seed %d: copying cost %d, copied %t, and in try %d %d, %t", seed, copied, ok, i, again, okAgain)
+			}
+			if decided[i] != decided[0] {
+				t.Fatalf("seed %d: comparing decided %+v, and in try %d %+v", seed, decided[0], i, decided[i])
+			}
 		}
 	}
 }
@@ -3953,8 +4393,17 @@ func (o otherwise) ID() int64 { return o.id }
 // A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
 // it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
 // dropped, so it would run unbounded. Nor is one whose range it plans under another id: its first
-// step wouldn't find the range, so a loop over a map would copy its keys uncharged.
+// step wouldn't find the range, so a loop over a map would copy its keys uncharged. Nor is one
+// whose range, which may be a map, it plans as something else, which nothing orders, so a loop
+// over it would give its keys as Go ranges over it, but where CEL checks the range as a list.
 func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
+	asIs := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} }
+	if err := rbac.PlanLoopsOtherwise(t, `request.attributes.m.exists(k, k == "a")`, true, asIs); err == nil {
+		t.Error("a loop over a map whose range is planned as something else is a condition")
+	}
+	if err := rbac.PlanLoopsOtherwise(t, `([1] + [2]).exists(y, y == 2)`, true, asIs); err != nil {
+		t.Errorf("a loop over a list whose range is planned as something else: %v", err)
+	}
 	somethingElse := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} }
 	anotherID := func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} }
 	for _, expr := range []string{`[1, 2].all(x, x > 0)`, `[1, 2].exists_one(x, x > 1)`, `{"a": 1}.exists(k, k == "a")`} {
@@ -4086,6 +4535,13 @@ func TestStoredConditionsKeepTheirBounds(t *testing.T) {
 		{rebuilt, 10000},
 		{`{"dev": 1, "prod": 2}[resource.attributes.env] <= request.attributes.n`, 10000},
 		{`request.attributes.tags.exists(t, t == "gpu")`, 10000},
+		// A loop over a map sorts its keys first: 1 for each two at each level, and what reading each
+		// costs past 1, once.
+		{`{"dev": 1, "prod": 2, "staging": 3}.exists(k, k == request.attributes.env)`, 93},
+		{`[1, 2, 3].all(i, {"b": i, "a": 2}.map(k, k)[0] == "a")`, 300},
+		{`{"a": {"y": 1, "x": 2}, "b": {"z": 3}}.all(k, {"a": {"y": 1, "x": 2}, "b": {"z": 3}}[k].exists(j, j != k))`, 881},
+		{`dyn({"b": 1, "a": 2}).map(k, k)[0] == "a"`, 88},
+		{`(request.attributes.mfa ? {"b": 1, "a": 2} : {"c": 3}).exists(k, k == "c")`, 98},
 	} {
 		if limit, _ := rbac.ConditionCost(t, c.expr, nil); limit != c.bound {
 			t.Errorf("%s is bounded at %d, not %d", c.expr, limit, c.bound)

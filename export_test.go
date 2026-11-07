@@ -1335,6 +1335,36 @@ func EvaluateConditionOf(t *testing.T, expr string, subject, resource, request m
 	return r.held, r.evaluated
 }
 
+// Decided is what an evaluation of a condition decided, and what it cost.
+type Decided struct {
+	Held, Evaluated bool
+	Cost            uint64
+}
+
+// Evaluations is what each of n evaluations of expr decides as a check does, the attributes
+// converted again for each, on a request with attributes, which the resource carries too, or why
+// expr isn't a condition.
+func Evaluations(t *testing.T, expr string, attributes map[string]any, n int) ([]Decided, error) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		return nil, err
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	decided := make([]Decided, n)
+	for i := range decided {
+		vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+			Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+		r := evaluate(prg, vars)
+		decided[i] = Decided{r.held, r.evaluated, r.cost}
+	}
+	return decided, nil
+}
+
 // EvaluateDeclared is EvaluateConditionOf under declares, the subject's attributes alone passed,
 // and false where expr is no condition under them, which a change refuses to store.
 func EvaluateDeclared(t *testing.T, declares Attributes, expr string, subject map[string]any) (held, evaluated, condition bool) {
