@@ -1575,9 +1575,12 @@ the package's uses foreign data, so none of the roles needs any.
   the database's clock from stepping back, and a standby's synchronized with its primary's, or make
   checks, and run `Filter`'s conditions, on the primary. A time a run recorded while the database's
   clock was set far ahead, which then went back, refuses every call reading it until the clock
-  passes it again, unless the table's owner brings it back to the clock, as migrating to
-  `0032_expired_writes` did, which history records, and from which reads can decide by the state the
-  run left. `AsOf`, which doesn't read the table, reads on a standby as before.
+  passes it again. The table's owner can bring it back to the clock, as migrating to
+  `0032_expired_writes` did, which history records, but reads then decide by the state the run left
+  until the clock passes the time: what the run removed that hadn't ended by the clock, as the place
+  a deny binds a subject by, gone, and what it passed over still there, a state no moment held. So
+  first restore what the run removed that hadn't ended by the clock, which history records with each
+  row, or wait for the clock. `AsOf`, which doesn't read the table, reads on a standby as before.
   A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
