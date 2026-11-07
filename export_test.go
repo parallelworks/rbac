@@ -1758,3 +1758,58 @@ func SetHoldingPlaces(t *testing.T, f func() func()) {
 	holdingPlaces = f
 	t.Cleanup(func() { holdingPlaces = old })
 }
+
+// AsOfView is the query of AsOf's view of table, one of the package's in schema with columns, as
+// byTime has AsOf and PruneHistory read history: what 0028_as_of_views makes it, for a test to hold
+// the view to. A grant, an eligibility, a deny, a membership, a group or a place in one reads the
+// columns history copies beside each version, as columns, by the table's column each copies.
+func AsOfView(schema, table string, columns []string) string {
+	entities := map[string]struct {
+		entity string
+		copied map[string]string
+	}{
+		"rbac_grants":        {"grant", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
+		"rbac_roles":         {"role", map[string]string{"tenant": "tenant", "id": "key"}},
+		"rbac_denies":        {"deny", map[string]string{"tenant": "tenant", "scope": "scope"}},
+		"rbac_eligibilities": {"eligibility", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
+		"rbac_memberships":   {"membership", map[string]string{"tenant": "tenant", "principal": "key"}},
+		"rbac_groups":        {"group", map[string]string{"tenant": "tenant", "id": "key"}},
+		"rbac_members":       {"member", map[string]string{"tenant": "tenant", "group_id": "group_id", "principal": "principal"}},
+	}
+	e, ok := entities[table]
+	if !ok {
+		return ""
+	}
+	s := pgx.Identifier{schema}.Sanitize()
+	selected := make([]string, len(columns))
+	for i, name := range columns {
+		selected[i] = "r." + pgx.Identifier{name}.Sanitize()
+		if h, ok := e.copied[name]; ok {
+			selected[i] = "h." + h + " AS " + pgx.Identifier{name}.Sanitize()
+		}
+		if table == "rbac_denies" && name == "principals" {
+			selected[i] = s + `.rbac_text_array(h.after -> 'principals') COLLATE "C" AS principals`
+		}
+		if name == "expires_at" {
+			selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
+		}
+	}
+	at := `pg_catalog.to_timestamp(pg_catalog.current_setting('rbac.as_of'), '` + asOfTime + `')`
+	tenant := `pg_catalog.current_setting('rbac.as_of_tenant')`
+	history := s + ".rbac_history"
+	b := byTime{history: history, at: at, cluster: `pg_catalog.current_setting('rbac.as_of_cluster')::pg_catalog.int8`}
+	entity := "'" + e.entity + "'"
+	from := ` h, LATERAL pg_catalog.jsonb_populate_record(NULL::` + s + `.` + pgx.Identifier{table}.Sanitize() + `, h.after) r`
+	if e.entity == "role" {
+		return `SELECT ` + strings.Join(selected, ", ") + ` FROM (SELECT DISTINCT ON (h.key) h.* FROM ` + history + ` h
+			WHERE h.tenant = ` + tenant + ` AND h.entity = ` + entity + ` AND ` + b.counts("h") + `
+			ORDER BY h.key, h.id DESC)` + from + `
+			WHERE h.op NOT IN ('delete', 'expire')`
+	}
+	return `SELECT ` + strings.Join(selected, ", ") + ` FROM ` + history + from + `
+		WHERE h.tenant = ` + tenant + ` AND h.entity = ` + entity + `
+		  AND h.op NOT IN ('delete', 'expire') AND h.effective_at <= ` + at + `
+		  AND ` + b.byAnother("h") + `
+		  AND CASE WHEN ` + b.later("h", entity) + ` IS NOT NULL THEN false
+		    ELSE ` + b.byCommit("h", "NOT "+b.writtenLater("h", entity), "c.at <= "+at) + ` END`
+}

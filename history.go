@@ -110,6 +110,15 @@ func packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
 	return schema, nil
 }
 
+// packageSchema is packageSchema of tx, but as of a time the package's schema, as the current one
+// is then that of history's views (AsOf).
+func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
+	if a.schema != "" {
+		return a.schema, nil
+	}
+	return packageSchema(ctx, tx)
+}
+
 // historyTable is history's table in schema, as packageSchema returns it.
 func historyTable(schema string) string {
 	return pgx.Identifier{schema, "rbac_history"}.Sanitize()
@@ -610,16 +619,16 @@ var maxUnsized = 100
 // caches one, as AsOf reads them and requires: a consumer replaying an export applies a row's
 // versions by ID, not in the order read, or it ends with one the row no longer held. Transaction
 // ids are the database cluster's, so a transaction running anywhere in it, in any database, that
-// has taken one holds the read back until it ends: a long one, an AsOf whose read runs long, or a
-// prepared transaction left open, delays the export. One that took it before a prune history holds
-// holds back a read from the start entirely: the export that read begins is told from one begun
-// before the prune by its Horizon, the oldest transaction running as it began, which would count
-// the prune as one since. So while prunes that delete records come faster than the longest such
-// transactions end, as a host's can while they work through a long backlog, no export from the
-// start begins. A session may turn off the timeouts that would end one it leaves open, so watch
-// pg_stat_activity for one held too long and end it, as the README says. A record can be read
-// twice, as when a host retries a read whose result it lost: dedupe on ID and RecordedAt, since a
-// restore can give another record the ID of one it lost.
+// has taken one holds the read back until it ends: a long one, or a prepared transaction left
+// open, delays the export. One that took it before a prune history holds holds back a read from
+// the start entirely: the export that read begins is told from one begun before the prune by its
+// Horizon, the oldest transaction running as it began, which would count the prune as one since.
+// So while prunes that delete records come faster than the longest such transactions end, as a
+// host's can while they work through a long backlog, no export from the start begins. A session
+// may turn off the timeouts that would end one it leaves open, so watch pg_stat_activity for one
+// held too long and end it, as the README says. A record can be read twice, as when a host retries
+// a read whose result it lost: dedupe on ID and RecordedAt, since a restore can give another record
+// the ID of one it lost.
 //
 // A transaction's commit record it returns as each of the transaction's records' CommittedAt, not
 // as a record.
@@ -656,7 +665,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	// reach both an old primary and the new one. Not a.begin, which refuses changes as of a time:
 	// this only reads.
 	err := begin(ctx, a.db, func(tx pgx.Tx) error {
-		schema, err := packageSchema(ctx, tx)
+		schema, err := a.packageSchema(ctx, tx)
 		if err != nil {
 			return err
 		}
