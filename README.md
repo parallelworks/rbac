@@ -123,8 +123,11 @@ scopes conditional ones reach, to check one by one. The condition reads the pack
 host's statement, which the host plans, so the package can't pin its plan as it pins its own reads
 (Planner settings): a plan the host's session made while those tables were small, and keeps, reads
 each of them whole, once for each type and key the condition looks up, as a page read whole costs
-less than descending any index. Run the query with sequential scans off for it alone, as in
-`SET LOCAL enable_seqscan = off` before it and `RESET enable_seqscan` after, in its transaction, or
+less than descending any index. Run the query with sequential scans off for it alone, as
+`SET LOCAL enable_seqscan = off` before it does in a transaction of its own, whose end puts the
+setting back as the session had it, or in a savepoint rolled back to after it, which puts it back
+as the transaction had it; not `RESET enable_seqscan` after it, which sets the session's own to what
+it started with, dropping a value the session set, as a pool can for each connection it opens. Or
 plan it again once the tables have grown, as an analysis of them does: under a plan cached while
 they held a few rows, a list read 43,736 pages of grants and 4,502 of denies beside 20,000 of each.
 
@@ -193,7 +196,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
-  a labeled resource asks it once about each value the label asks for that the subject's grants
+  a labeled resource, once a grant allows, and `Permissions` of one, once it would list anything
+  the label decides, asks it once about each value the label asks for that the subject's grants
   give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
   change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
   test any label, ask about every one, as do `SetRole` and `DeleteRole`, and `ChangeMembers` taking
@@ -319,18 +323,22 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   them, and a value the resource's share with them included again, as the resource's are converted
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
-  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
+  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, 4
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message,
+  and 3 for each slice of bytes or JSON text, which a hook's copy keeps apart and converting parses;
   a map of values none reads, as structs, which reading copies whole, is refused unread at 2 for
   each entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
   another costs at least 1 for each 24 bytes its value holds in place, which reading it moves,
   where 19,000 empty maps of a type of 64 KiB, charged 8 each, took 1.4 GB and 270 ms making room
   for a value they didn't hold. That is about a map of
-  50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
+  50,000 short strings, nearly 16,000 maps of one entry each, nearly 40,000 timestamps or JSON texts
+  of a byte, or 53,000 slices of a byte, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
   may reading, about 20 ms: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
-  empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
+  empty maps took 108 ms, and each JSON text or slice of bytes charged as one value and a tenth of
+  its length, a check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy
+  150,000 slices of a byte. Past that every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
@@ -463,9 +471,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
   for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
   converts. Attributes
-  holding maps, lists, pointers or messages are charged what building
+  holding maps, lists, pointers, messages, slices of bytes or JSON text are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
+  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are, or lists and JSON texts that
+  are slices of one array, one with room to grow, now each converted, as a hook's copy copies each,
+  failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
@@ -1062,8 +1072,10 @@ have the server load a library or run a program of its choosing; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
-   disable the triggers that record them. A later migration can change history too, so the
-   administrator's role keeps both owners' rights. It owns the schema of `AsOf`'s views too, named
+   disable the triggers that record them. Once they are made, `Migrate` as another role is refused,
+   but as a superuser, which migrates as that role ([Running it](#running-it), Tables). A later
+   migration can change history too, so the administrator's role keeps both owners' rights. It
+   owns the schema of `AsOf`'s views too, named
    as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
    database, which a role that doesn't own it hasn't by default, so a superuser makes it first,
    empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
@@ -1162,6 +1174,34 @@ the package's uses foreign data, so none of the roles needs any.
   failure leaves the database at the last migration recorded, from which migrating again goes on.
   The package's calls don't check what the database was migrated to: make them from a replica only
   once its own migrations are applied, as `Migrate` returning nil says.
+  Only the role owning the package's tables migrates them, the administrator's of
+  [History](#history): a migration makes what it makes its maker's, and from `0028_as_of_views` on
+  checks the schema of `AsOf`'s views against it, which `AsOf` finds among that role's views. So
+  once the tables are made, `Migrate` as another role is refused, as `rbac.ErrInvalid` naming the
+  role owning them, before it applies anything or takes any lock, but as a superuser, which runs
+  each migration as that role, by `SET LOCAL ROLE`, and is itself again after: a superuser's
+  migration makes and checks what that role's own would, and fails where that one's would, as
+  where it may not make the views' schema or give `rbac_history_commit` to history's role, saying
+  what to do. A tool of the host's own applies them as that role too. Before this release, a
+  superuser's migration of tables another role owned ran as itself: from before `0028_as_of_views`,
+  it made the views' schema, the views and `rbac_as_of_views` its own, so `AsOf` refuses every read,
+  saying what to run, as it reads only the views of the role owning the tables; from `0028` on, it
+  failed at `0033_view_seeks_and_hints`, as the views' schema was that role's; and it made
+  `rbac_expired`, `rbac_expired_until` and `rbac_expired_through` its own where it made them, as it
+  made its own whatever else a migration it applied made, as `rbac_changes_grants` where it applied
+  `0021_grant_denies`, which a later migration, as that role, can't alter. To give them
+  back, a superuser, with the package's schema first on its search_path, runs
+  `ALTER TABLE rbac_expired OWNER TO <administrator>`,
+  `ALTER FUNCTION rbac_expired_until() OWNER TO <administrator>` and
+  `ALTER FUNCTION rbac_expired_through(timestamptz) OWNER TO <administrator>`, and the same,
+  `ALTER TABLE`, `ALTER FUNCTION` or `ALTER STATISTICS`, for each other table, function or
+  statistics object in that schema that is still the superuser's, but history's table and
+  functions, which go to history's role, as [History](#history) says; where `AsOf` refuses
+  every read, as its error says, `ALTER FUNCTION rbac_as_of_views() OWNER TO <administrator>`,
+  `DROP SCHEMA IF EXISTS <schema>_as_of CASCADE` and
+  `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>`, and then the administrator's role
+  runs `SELECT rbac_as_of_views()`, which makes the views again and gives them to each role that
+  may read history; and where `0033` failed, migrate again.
   On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
   them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
   would miss the writes it waits for. Call it there before any change to the package's tables: from
@@ -1369,12 +1409,14 @@ the package's uses foreign data, so none of the roles needs any.
   of history, as `AsOf` and an export, waits for it, and a transaction under way as it starts that
   made a change can make it give way. The role migrating makes the function, which writes history as
   its owner, and gives it to `rbac_record`'s owner, history's role where the roles are set up as
-  [History](#history) says: as a superuser, or as a role that may `SET ROLE` to history's role,
-  where that role has `CREATE` on the schema or the role migrating may grant it that, as the
-  schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
-  42501, having changed nothing, rather than leave the function to another role: grant history's
-  role `CREATE` on the schema, or history's role to the role migrating with the `SET` option, as its
-  hint says, or migrate as a superuser, and migrate again. No role but its owner may execute it, nor
+  [History](#history) says: as a role that may `SET ROLE` to history's role, as the administrator's
+  may, where that role has `CREATE` on the schema or the role migrating may grant it that, as the
+  schema's owner can, which it does for the migration alone, or as a superuser owning the tables.
+  Otherwise migrating fails with SQLSTATE 42501, having changed nothing, rather than leave the
+  function to another role: grant history's role `CREATE` on the schema, or history's role to the
+  role migrating with the `SET` option, as its hint says, and migrate again. A superuser's migration
+  of tables another role owns runs as that role, as above, so it fails alike, and the hint no
+  longer offers one. No role but its owner may execute it, nor
   `rbac_record`, which writes history as its owner too, as only their triggers call them: migrating
   revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the schema's default
   privileges can grant it as each is made, where `0003_history` revoked it on `rbac_record` from

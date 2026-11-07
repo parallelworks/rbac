@@ -2686,9 +2686,10 @@ func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
 // Value, or a message a pointer reaches once for the pointer and again for the message, attributes
 // a check converts couldn't be copied, so a constrained check of them was refused, whoever asked,
 // as of a resource holding nearly 40,000 timestamps, which a check converts. Converting counts what JSON
-// text and a packed message decode to as well, which a copy holds as bytes. And an array of
-// interfaces costs what it holds, as a slice does: uncounted, a copy of one holding more values
-// than a check converts cost one.
+// text and a packed message decode to as well, which a copy holds as bytes. An array of interfaces
+// costs what it holds, as a slice does: uncounted, a copy of one holding more values than a check
+// converts cost one. And converting counts two slices of one array, one with room to grow, apart,
+// as a copy copies them apart: counted once, lists of them a check converted couldn't be copied.
 func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 	type level int
 	type named string
@@ -2762,6 +2763,10 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 		"a pointer":                      func(i int) any { return &i },
 		"a pointer to a pointer":         func(i int) any { p := &i; return &p },
 		"a pointer to a map":             func(i int) any { m := map[string]any{long: i}; return &m },
+		// Two slices of one array, one with room to grow, which a copy copies apart, as appending to
+		// it writes to the array and appending to the other doesn't.
+		"lists of one array": func(i int) any { l := []any{i, long, nil}; return [2]any{l[:2:2], l[:2]} },
+		"bytes of one array": func(int) any { b := make([]byte, 33, 40); return [2]any{b[:33:33], b} },
 	}
 	for name, made := range messages {
 		values[name] = func(i int) any { return made(i) }
@@ -2776,6 +2781,10 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 	// What these decode to, converting counts and a copy doesn't.
 	decoded := map[string]func(i int) any{
 		"JSON text": func(int) any { return json.RawMessage(`{"a": [1, "b"]}`) },
+		"JSON text of one array": func(int) any {
+			text := append(make([]byte, 0, 8), `"a"`...)
+			return [2]json.RawMessage{text[:3:3], text}
+		},
 	}
 	for name, made := range messages {
 		packed := func(i int) *anypb.Any {
@@ -2846,15 +2855,22 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 // Converting and copying for a hook count alike, so a hook can be given a copy of whatever a check
 // converts: values of random shapes, nesting every type both handle in one another, cost a copy
 // what converting them costs, and no more where they hold JSON text or packed messages, which
-// converting decodes and a copy holds as bytes, or a value reached twice, which a copy copies once
-// where converting may count it again.
+// converting decodes and a copy holds as bytes, a value reached twice, which a copy copies once
+// where converting may count it again, or slices of one array, which a copy copies once for where
+// each starts and its capacity, and converting once for each length too.
 func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 	for _, mode := range []struct {
-		name             string
-		decoded, sharing bool
-	}{{"each value once", false, false}, {"decoded", true, false}, {"shared", false, true}, {"both", true, true}} {
+		name                      string
+		decoded, sharing, slicing bool
+	}{
+		{"each value once", false, false, false},
+		{"decoded", true, false, false},
+		{"shared", false, true, false},
+		{"both", true, true, false},
+		{"slices of one array", false, false, true},
+	} {
 		for seed := range uint64(1500) {
-			d := &copyDraw{rng: mathrand.New(mathrand.NewPCG(seed, 116)), decoded: mode.decoded, sharing: mode.sharing}
+			d := &copyDraw{rng: mathrand.New(mathrand.NewPCG(seed, 116)), decoded: mode.decoded, sharing: mode.sharing, slicing: mode.slicing}
 			attributes := map[string]any{}
 			for i := range d.rng.IntN(4) + 1 {
 				attributes[fmt.Sprint("a", i)] = d.value(3)
@@ -2864,7 +2880,7 @@ func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 			switch {
 			case !read || !ok:
 				t.Errorf("%s, seed %d: read %t, copied %t", mode.name, seed, read, ok)
-			case copied > converted || copied < converted && !mode.decoded && !mode.sharing:
+			case copied > converted || copied < converted && !mode.decoded && !mode.sharing && !mode.slicing:
 				t.Errorf("%s, seed %d: converting costs %d and copying %d: %#v", mode.name, seed, converted, copied, attributes)
 			}
 		}
@@ -2875,14 +2891,78 @@ func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 // and number Attributes names, CEL's own scalars, lists, arrays, maps keyed by each kind they may
 // be, some of values holding more in place than one unit covers, pointers, nil ones of each, and
 // every well-known message, through a pointer too, some holding fields they don't know. With
-// decoded, JSON text and packed messages, and with sharing, values it drew before.
+// decoded, JSON text and packed messages, with sharing, values it drew before, and with slicing,
+// slices of arrays it drew before (slice).
 type copyDraw struct {
-	rng              *mathrand.Rand
-	decoded, sharing bool
-	drawn            []any
+	rng                       *mathrand.Rand
+	decoded, sharing, slicing bool
+	drawn                     []any
+	// arrays are the slices drawn whole, of which slice draws others, and pointed the arrays held by
+	// a pointer among them.
+	arrays  []reflect.Value
+	pointed []any
+}
+
+// slice is a slice of an array drawn before, or of one drawn now, from anywhere in it, as long as
+// it may be, with room to grow or none, empty too: of values, of strings, of bytes, of CEL's bytes,
+// of JSON text, `"a"` again and again, each slice holding one, or of an array a pointer holds,
+// which value may draw beside its slices.
+func (d *copyDraw) slice(depth int) any {
+	if len(d.arrays) == 0 || d.rng.IntN(3) == 0 {
+		n := d.rng.IntN(6)
+		var array reflect.Value
+		switch d.rng.IntN(6) {
+		case 0:
+			array = reflect.ValueOf(make([]byte, n))
+		case 1:
+			text := make(json.RawMessage, 0, 3*n+3+d.rng.IntN(3))
+			for range n + 1 {
+				text = append(text, `"a"`...)
+			}
+			array = reflect.ValueOf(text)
+		case 2:
+			array = reflect.ValueOf(make(types.Bytes, n))
+		case 3:
+			s := make([]string, n)
+			for i := range s {
+				s[i] = d.text()
+			}
+			array = reflect.ValueOf(s)
+		case 4:
+			p := &[4]any{d.value(depth - 1), d.value(depth - 1), d.value(depth - 1), d.value(depth - 1)}
+			d.pointed = append(d.pointed, p)
+			array = reflect.ValueOf(p[:])
+		default:
+			l := make([]any, n)
+			for i := range l {
+				l[i] = d.value(depth - 1)
+			}
+			array = reflect.ValueOf(l)
+		}
+		d.arrays = append(d.arrays, array)
+	}
+	array := d.arrays[d.rng.IntN(len(d.arrays))]
+	if text, ok := array.Interface().(json.RawMessage); ok {
+		at := 3 * d.rng.IntN(len(text)/3)
+		return text[at : at+3 : at+3+d.rng.IntN(cap(text)-at-2)]
+	}
+	from := d.rng.IntN(array.Cap() + 1)
+	to := from + d.rng.IntN(array.Cap()-from+1)
+	if d.rng.IntN(3) == 0 {
+		return array.Slice3(from, to, to).Interface()
+	}
+	return array.Slice3(from, to, to+d.rng.IntN(array.Cap()-to+1)).Interface()
 }
 
 func (d *copyDraw) text() string { return strings.Repeat("s", d.rng.IntN(45)) }
+
+// bytes is a slice of bytes with an array of its own: Go starts every empty one with no room to
+// grow at one address, so a copy copies the second as the first, where converting counts each, as
+// with slicing, which draws them.
+func (d *copyDraw) bytes() []byte {
+	n := d.rng.IntN(45)
+	return make([]byte, n, n+1)
+}
 
 func (d *copyDraw) unknown(m proto.Message) proto.Message {
 	if d.rng.IntN(4) == 0 {
@@ -2967,6 +3047,12 @@ func (d *copyDraw) value(depth int) any {
 	if d.sharing && len(d.drawn) > 0 && d.rng.IntN(6) == 0 {
 		return d.drawn[d.rng.IntN(len(d.drawn))]
 	}
+	if d.slicing && d.rng.IntN(3) == 0 {
+		if len(d.pointed) > 0 && d.rng.IntN(4) == 0 {
+			return d.pointed[d.rng.IntN(len(d.pointed))]
+		}
+		return d.slice(depth)
+	}
 	n := 20
 	switch {
 	case d.decoded:
@@ -2991,13 +3077,13 @@ func (d *copyDraw) value(depth int) any {
 	case 5:
 		cels := []any{
 			types.String(d.text()), types.Int(1), types.Uint(2), types.Double(d.double()), types.Bool(true),
-			types.Bytes(make([]byte, d.rng.IntN(45))), types.NullValue,
+			types.Bytes(d.bytes()), types.NullValue,
 			types.Timestamp{Time: time.Unix(1, 0)},
 			types.Duration{Duration: time.Second},
 		}
 		v = cels[d.rng.IntN(len(cels))]
 	case 6:
-		v = []any{make([]byte, d.rng.IntN(45)), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
+		v = []any{d.bytes(), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
 	case 7:
 		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Struct)(nil), (*timestamppb.Timestamp)(nil)}[d.rng.IntN(5)]
 	case 8, 9:
@@ -3022,7 +3108,7 @@ func (d *copyDraw) value(depth int) any {
 	case 18:
 		v = []any{map[string]time.Time{d.text(): time.Unix(1, 0)}, map[string][64]int64{d.text(): {}}, map[string][64]int64{}}[d.rng.IntN(3)]
 	case 19:
-		v = [][]byte{make([]byte, d.rng.IntN(45))}
+		v = [][]byte{d.bytes()}
 	case 20, 21:
 		l := make([]any, d.rng.IntN(4))
 		for i := range l {
@@ -12775,6 +12861,94 @@ func TestPermissionsReadEachDenysListOnce(t *testing.T) {
 	if more := (reads(m, len(held)) - reads(f, few)) / (len(held) - few); more > n*rbac.MaxDenyEntries/4 {
 		t.Errorf("Permissions reads %d entries of denies more for each permission beside %d denies of %d", more, n, rbac.MaxDenyEntries)
 	}
+}
+
+// Permissions walks a role's permissions once for each carrier its unconditional grants have, and
+// once for each carrier and condition its conditional ones have, however many grants hold it: for a
+// subject in a thousand groups each granted a role of a thousand permissions on each scope of a
+// cluster's path, it walked the role once for each grant, 4 million entries in 180 ms, where
+// Authorize took 15. What it lists is still what Authorize allows, under the condition or not, of
+// a role granted to the tenant's members too, and of a privileged one granted to them, which gives
+// them nothing.
+func TestPermissionsWalkARoleOnceHoweverManyGrantsHoldIt(t *testing.T) {
+	var given, conditioned []rbac.Permission
+	for i := range 500 {
+		given = append(given, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+		conditioned = append(conditioned, rbac.Permission(fmt.Sprintf("cluster:q%03d", i)))
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "given", Permissions: given, ResourceTypes: []string{"cluster"}},
+			rbac.RoleDefinition{ID: "conditioned", Permissions: conditioned, ResourceTypes: []string{"cluster"}, Privileged: true},
+		)
+	})
+	ctx := t.Context()
+	u := h.as(t, "u")
+	mfa := `request.attributes.mfa == true`
+	// Written around the package, as one made before the role was privileged stays.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		VALUES ('t1', 'cluster', 'c1', 'members', 't1', 'given', ''), ('t1', 'cluster', 'c1', 'members', 't1', 'conditioned', $1)`, mfa); err != nil {
+		t.Fatal(err)
+	}
+	// u in groups from to to, each granted the one role on every scope of the cluster's path, and the
+	// other on the cluster under the condition.
+	inGroups := func(from, to int) {
+		t.Helper()
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', s.type, s.id, 'group', 'g' || i, 'given' FROM generate_series($1::int, $2) AS i,
+				  (VALUES ('cluster', 'c1'), ('workspace', 'w1'), ('org', 'o1'), ('tenant', 't1')) AS s(type, id)`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+				SELECT 't1', 'cluster', 'c1', 'group', 'g' || i, 'conditioned', $3 FROM generate_series($1::int, $2) AS i`, []any{mfa}},
+		} {
+			if _, err := h.pool.Exec(ctx, q.sql, append([]any{from, to}, q.args...)...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(k int) { read += k })
+	// lists lists u's permissions on the cluster with mfa or without, checking a few against
+	// Authorize, and returns how many entries the listing read.
+	lists := func(withMFA bool) int {
+		t.Helper()
+		c := rbac.WithRequest(ctx, map[string]any{"mfa": withMFA})
+		read = 0
+		perms, err := h.authz.Permissions(c, u, cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := read
+		want := len(given)
+		if withMFA {
+			want += len(conditioned)
+		}
+		if len(perms) != want {
+			t.Errorf("with mfa %t, Permissions lists %d permissions, not %d", withMFA, len(perms), want)
+		}
+		for _, p := range []rbac.Permission{given[0], given[len(given)-1], conditioned[0], conditioned[len(conditioned)-1], view, root} {
+			err := h.authz.Authorize(c, u, p, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			if listed := slices.Contains(perms, p); listed != (err == nil) {
+				t.Errorf("with mfa %t, Permissions lists %s: %t, Authorize: %v", withMFA, p, listed, err)
+			}
+		}
+		return entries
+	}
+	inGroups(1, 1)
+	one := lists(true)
+	inGroups(2, 100)
+	if each := (lists(true) - one) / 99; each >= len(given) {
+		t.Errorf("Permissions read %d entries more for each group granted a role of %d permissions on 4 scopes, and another under a condition", each, len(given))
+	}
+	lists(false)
 }
 
 // A change's read of its actor's authority decides each permission the actor hands on by the

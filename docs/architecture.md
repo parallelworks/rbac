@@ -179,15 +179,20 @@ erDiagram
     rbac_history {
         bigint id PK
         xid8 txid
+        bigint cluster "the cluster that wrote it, system_identifier"
         timestamptz effective_at
         text tenant
         text entity
         text key
-        text op "create, update, delete, expire, baseline, prune"
+        text op "create, update, delete, expire, baseline, prune, commit"
         jsonb before
         jsonb after
         text actor
         text how
+    }
+    rbac_expired {
+        bigint id PK
+        timestamptz until "a time DeleteExpired deleted by"
     }
     rbac_roles ||--o{ rbac_grants : "a custom role's grants"
     rbac_roles ||--o{ rbac_eligibilities : "a custom role's eligibilities"
@@ -198,6 +203,7 @@ erDiagram
     rbac_groups ||--o{ rbac_grants : "granted to"
     rbac_grants ||--o{ rbac_history : "recorded"
     rbac_members ||--o{ rbac_history : "recorded"
+    rbac_expired ||--o{ rbac_history : "recorded, in no tenant"
 ```
 
 - **Built-in roles are not stored.** They are the host's `Config.Catalog`, so a deploy changes
@@ -451,6 +457,12 @@ flowchart LR
 statement, the grants and denies on the tenant its label values are decided by too, apart from the
 conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
 something allows. So a label is decided by the values the subject held as it held its grants.
+`Permissions` decides each permission as a check of it would, by one such read, and the label only
+once the grants give something it decides, so it asks the constraints about values only where a
+check would; and it walks a role's permissions once for each carrier its grants have, and once for
+each carrier and condition its conditional ones have (`permissionsOf`), however many groups grant
+it: once for each grant, a subject in 1,000 groups each granted a role of 1,000 permissions on the
+4 scopes of a path had it read 4 million entries, in 180 ms, against 2,000 in 17.
 
 ```mermaid
 flowchart TB
@@ -521,10 +533,16 @@ sequenceDiagram
   ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
   hook does. A copy holds no more than a check converts (`maxConverted`), counted as converting
-  counts it, each value, map, list, pointer and message what converting it costs (`mapCost`),
+  counts it, each value, map, list, pointer, message and slice of bytes what converting it costs
+  (`mapCost`),
   whatever the copy shares or moves whole, so it counts what converting the same does, but for what
   JSON text and packed messages decode to, which it holds as bytes, and for a message, or a longer
-  length of a slice, reached twice, which it copies once where converting counts it again: past it
+  length of a slice, reached twice, which it copies once where converting counts it again. Two
+  slices of one array, one with room to grow, a copy copies apart, as appending to one writes to the
+  array and appending to the other doesn't, and so converting converts each (`copiedKeyOf`): known
+  by their length alone, converting counted them once, so lists of them a check converted were
+  past what a copy holds, and so was every JSON text of them once it cost what a slice of bytes
+  does. Past what a copy holds
   the hook can't be asked, and the call is refused (`uncopied`) as any other, a `DeniedError` of the
   permission on the resource asked about, or the tenant, whose `Reason` names the hook and whose
   message only the permission. Counting a list's elements twice, a string by the bytes of its
@@ -561,7 +579,8 @@ sequenceDiagram
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
   host's own, a list, map or optional of CEL's a host makes, a struct, another message, a map keyed
   by a double or holding two keys read as the same value, and so JSON text naming a member twice
-  once unescaped, read through `json.Decoder`'s tokens (`parseJSON`), or a packed message setting a
+  once unescaped, read by the package's own parser as `encoding/json` reads it (`parseJSON`), or a
+  packed message setting a
   field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the
   last where a reader of the first reads another, JSON text that isn't UTF-8 or escapes half a
   surrogate pair, a `json.Number` JSON doesn't write, a value holding itself, or nesting past
@@ -625,8 +644,15 @@ sequenceDiagram
   condition reads, but each map, `Struct` or JSON object 8, and each list, `ListValue` or JSON
   array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
   times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
-  as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
-  for a hook, whatever held it, a copy charging a struct a tenth of the bytes it sets whole, and a
+  as many ints took 12 ms. Each slice of bytes and JSON text costs 3 (`bytesCost`), as a copy keeps
+  each slice it copies apart (`copied`) and converting keeps each text it parses (`once`): charged
+  one and a tenth of its length, 150,000 slices of a byte took 76 ms to copy, and 79,000 JSON texts
+  of a byte 80 ms to convert, each read through a `json.Decoder` of its own, which took most of a
+  microsecond for each text, so converting parses JSON itself (`jsonParser`). So weighed, a unit
+  took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
+  dynamic one of the host's up to 361, but a microsecond for a message of the host's own type whose
+  reflection panics, which a copy asks of each (`itself`), whatever held it, a copy
+  charging a struct a tenth of the bytes it sets whole, and a
   slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
   before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a
   struct, which reading an entry moves and setting it hashes (`keyTenths`), each before it moves
@@ -668,8 +694,14 @@ sequenceDiagram
   every condition reading an attribute fails: converting isn't charged to a condition, and charging
   the check would let what one condition reads fail the others. A message the host passes is known
   by its type among those conditions read (`wellKnown`), as finding it one by reflection's
-  `Implements` took five times what converting a number does. The subject's and the request's
-  attributes are converted once for a call, by one converter (`askingOf`), as a change checks them
+  `Implements` took five times what converting a number does, and so is one of CEL's own scalars
+  (`celScalar`), which took three times what converting a string does; what reflection finds of
+  another type with methods is kept for the type (`methodsOf`), a map's key's too (`keyType`), as
+  asked of each value, converting the host's messages, which no condition reads, took four times
+  what converting a list does, and asked of each key, a map of interfaces holding CEL's timestamps
+  as keys, which no condition keys one by, 335 ns a unit.
+  The subject's and the request's attributes are converted once for a call, by one converter
+  (`askingOf`), as a change checks them
   on each scope it reaches, before its transaction and in it, and each check converts its resource's
   apart, on a converter spending what that one left (`rest`): so each check counts all three, in the
   order request, subject, resource, and a value the resource's share with them twice. Counting it
@@ -1401,7 +1433,11 @@ flowchart TB
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
   the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
-  is named and keyed as a tenant's own is (above), by the schema it migrates.
+  is named and keyed as a tenant's own is (above), by the schema it migrates. Only the role owning
+  the tables migrates them, as a migration makes what it makes its maker's, and from
+  `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
+  role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
 
 ```mermaid
 flowchart TB
@@ -1412,6 +1448,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
+    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
@@ -1701,14 +1738,17 @@ transactions commit after the commit record. The README's
 
 ```mermaid
 flowchart LR
-    admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
+    admin["Administrator's role<br/>runs Migrate, a superuser's as it,<br/>owns the tables, rbac_expired_through<br/>and AsOf's views"]
     histrole["History's role<br/>owns rbac_history, rbac_record<br/>and rbac_history_commit"]
-    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
+    app["Application's role<br/>USAGE on the schema; SELECT, INSERT,<br/>UPDATE and DELETE on the tables but<br/>rbac_history, rbac_expired and rbac_migrations;<br/>EXECUTE on rbac_group_members, rbac_tenant_keys,<br/>rbac_text_array, rbac_changes_grants<br/>and rbac_expired_through; USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
     histrole -->|"inserts"| hist[("rbac_history")]
     app -.->|"SELECT only"| hist
+    app -.->|"SELECT only"| expired[("rbac_expired")]
+    app -->|"DeleteExpired, through<br/>rbac_expired_through, as its owner"| expired
+    expired -->|"rbac_record runs as"| histrole
     admin -->|"PruneHistory"| hist
 ```
 
