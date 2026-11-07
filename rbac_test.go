@@ -3370,6 +3370,16 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		A int
 		_ [0]sync.Mutex
 	}
+	// An empty array of an unsafe pointer, or of a struct embedding a mutex, which is a lock itself,
+	// marks one too.
+	type unsafeMarked struct {
+		A int
+		_ [0]unsafe.Pointer
+	}
+	type embeddingMarked struct {
+		A int
+		_ [0]struct{ sync.Mutex }
+	}
 	type keyed struct {
 		Mu sync.Mutex
 		K  string
@@ -3378,6 +3388,7 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		"a struct holding a mutex beside a map": locked{}, "a pointer to a mutex": &sync.Mutex{}, "a mutex": sync.Mutex{},
 		"a slice of mutexes": []sync.Mutex{{}}, "an array of a struct holding a WaitGroup": [1]struct{ W sync.WaitGroup }{},
 		"an atomic int": &atomic.Int64{}, "a struct marked never to be copied": marked{A: 1},
+		"one marked by an empty array of unsafe pointers": unsafeMarked{A: 1}, "one marked by one of locks it embeds": embeddingMarked{A: 1},
 		"a map keyed by a struct holding a mutex": map[keyed]int{{K: "a"}: 1}, "a message held by value": []structpb.Value{{}},
 		"a reflect.Value": reflect.ValueOf(1), "an unsafe pointer": unsafe.Pointer(&x),
 		"a map keyed by a struct holding an unsafe pointer": map[struct{ P unsafe.Pointer }]int{{unsafe.Pointer(&x)}: 1},
@@ -3544,6 +3555,319 @@ func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing
 		}
 		if !rbac.Copies(attributes) {
 			t.Errorf("the host's own integer %s: no hook was given a copy", by)
+		}
+	}
+}
+
+// Types of the host's own a draw holds: a lock that is a map, structs marked never to be copied, by
+// an empty array of a mutex, or never to be compared, by one of funcs, one holding an empty array
+// of what holds a lock, one embedding a mutex, and one that is a message by the Struct it embeds.
+type (
+	spinLockMap  map[string]int
+	markedStruct struct {
+		_ [0]sync.Mutex
+		A int
+	}
+	uncomparedStruct struct {
+		_ [0]func()
+		A int
+	}
+	waitMarkedStruct struct {
+		_ [0]sync.WaitGroup
+		A int
+	}
+	lockingStruct struct {
+		sync.Mutex
+		A int
+	}
+	embeddedMessage struct {
+		*structpb.Struct
+		C chan int
+	}
+)
+
+func (*spinLockMap) Lock()   {}
+func (*spinLockMap) Unlock() {}
+
+// shapeDraw draws a type a host may pass, and values of it, from drawnLeaves, held alone, in arrays
+// of none, one or two, arrays of arrays, slices, pointers, maps keyed by each of drawnKeys, structs,
+// and interfaces holding any of them.
+type shapeDraw struct{ rng *mathrand.Rand }
+
+var drawnLeaves = []reflect.Type{
+	reflect.TypeFor[int](), reflect.TypeFor[string](), reflect.TypeFor[bool](), reflect.TypeFor[float64](), reflect.TypeFor[uint8](),
+	reflect.TypeFor[complex128](), reflect.TypeFor[uintptr](), reflect.TypeFor[[]byte](), reflect.TypeFor[[2]byte](),
+	reflect.TypeFor[time.Time](), reflect.TypeFor[any](), reflect.TypeFor[chan int](), reflect.TypeFor[func()](),
+	reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[sync.Mutex](), reflect.TypeFor[atomic.Int64](), reflect.TypeFor[struct{ A int }](),
+	reflect.TypeFor[struct{ L sync.Locker }](), reflect.TypeFor[spinLock](), reflect.TypeFor[spinLocks](), reflect.TypeFor[spinLockMap](),
+	reflect.TypeFor[byteLock](),
+	reflect.TypeFor[markedStruct](), reflect.TypeFor[uncomparedStruct](), reflect.TypeFor[waitMarkedStruct](),
+	reflect.TypeFor[lockingStruct](), reflect.TypeFor[*embeddedMessage](), reflect.TypeFor[*structpb.Struct](),
+	reflect.TypeFor[*structpb.ListValue](), reflect.TypeFor[*structpb.Value](), reflect.TypeFor[*timestamppb.Timestamp](),
+	reflect.TypeFor[*durationpb.Duration](), reflect.TypeFor[*wrapperspb.StringValue](), reflect.TypeFor[*anypb.Any](),
+	reflect.TypeFor[*dynamicpb.Message](),
+}
+
+var drawnKeys = []reflect.Type{
+	reflect.TypeFor[string](), reflect.TypeFor[int](), reflect.TypeFor[bool](), reflect.TypeFor[float64](), reflect.TypeFor[any](),
+	reflect.TypeFor[spinLock](), reflect.TypeFor[[1]int](), reflect.TypeFor[[1]spinLock](), reflect.TypeFor[struct{ A int }](),
+	reflect.TypeFor[chan int](), reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[byteLock](),
+}
+
+func (d *shapeDraw) typ(depth int) reflect.Type {
+	if depth == 0 || d.rng.IntN(4) == 0 {
+		return drawnLeaves[d.rng.IntN(len(drawnLeaves))]
+	}
+	held := d.typ(depth - 1)
+	switch d.rng.IntN(7) {
+	case 0:
+		return reflect.ArrayOf(d.rng.IntN(3), held)
+	case 1:
+		return reflect.ArrayOf(d.rng.IntN(2)+1, reflect.ArrayOf(d.rng.IntN(3), held))
+	case 2:
+		return reflect.SliceOf(held)
+	case 3:
+		return reflect.PointerTo(held)
+	case 4:
+		return reflect.MapOf(reflect.TypeFor[string](), held)
+	case 5:
+		return reflect.MapOf(drawnKeys[d.rng.IntN(len(drawnKeys))], held)
+	default:
+		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: held}})
+	}
+}
+
+// value is a value of t, its zero value at times, as nil slices, maps, pointers and interfaces.
+func (d *shapeDraw) value(t reflect.Type, depth int) reflect.Value {
+	v := reflect.New(t).Elem()
+	if d.rng.IntN(5) == 0 {
+		return v
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int64:
+		v.SetInt(int64(d.rng.IntN(3)))
+	case reflect.Uint8, reflect.Uint32, reflect.Uintptr:
+		v.SetUint(uint64(d.rng.IntN(3)))
+	case reflect.String:
+		v.SetString([]string{"a", "b", ""}[d.rng.IntN(3)])
+	case reflect.Bool:
+		v.SetBool(true)
+	case reflect.Float64:
+		v.SetFloat(0.5)
+	case reflect.Complex128:
+		v.SetComplex(1i)
+	case reflect.Chan:
+		v.Set(reflect.MakeChan(t, 1))
+	case reflect.Func:
+		v.Set(reflect.MakeFunc(t, func([]reflect.Value) []reflect.Value { return nil }))
+	case reflect.UnsafePointer:
+		v.SetPointer(unsafe.Pointer(new(int)))
+	case reflect.Interface:
+		held := append(drawnLeaves[:len(drawnLeaves):len(drawnLeaves)], drawnKeys...)[d.rng.IntN(len(drawnLeaves)+len(drawnKeys))]
+		if held.Kind() != reflect.Interface && held.AssignableTo(t) && depth > 0 {
+			v.Set(d.value(held, depth-1))
+		}
+	case reflect.Array:
+		for i := range t.Len() {
+			v.Index(i).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Slice:
+		n := d.rng.IntN(3)
+		v.Set(reflect.MakeSlice(t, n, n))
+		for i := range n {
+			v.Index(i).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Map:
+		v.Set(reflect.MakeMap(t))
+		for range d.rng.IntN(3) {
+			if k := d.value(t.Key(), depth-1); k.Kind() != reflect.Interface || k.IsNil() || k.Elem().Type().Comparable() {
+				v.SetMapIndex(k, d.value(t.Elem(), depth-1))
+			}
+		}
+	case reflect.Pointer:
+		if m := d.message(t); m != nil {
+			v.Set(reflect.ValueOf(m))
+		} else {
+			v.Set(reflect.New(t.Elem()))
+			v.Elem().Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Struct:
+		if t == reflect.TypeFor[time.Time]() {
+			v.Set(reflect.ValueOf(time.Unix(int64(d.rng.IntN(100)), 0)))
+			break
+		}
+		for i := range t.NumField() {
+			if f := v.Field(i); f.CanSet() {
+				f.Set(d.value(t.Field(i).Type, depth-1))
+			}
+		}
+	default:
+	}
+	return v
+}
+
+// message is a message of type t, a Struct and a ListValue holding a nil Value, a Value of each
+// kind but a number, and one of a nil Struct or ListValue, or nil where t isn't a message's type.
+func (d *shapeDraw) message(t reflect.Type) proto.Message {
+	switch t {
+	case reflect.TypeFor[*structpb.Struct]():
+		return &structpb.Struct{Fields: map[string]*structpb.Value{"a": nil}}
+	case reflect.TypeFor[*structpb.ListValue]():
+		return &structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("a"), nil}}
+	case reflect.TypeFor[*structpb.Value]():
+		return []*structpb.Value{
+			structpb.NewNullValue(), {Kind: &structpb.Value_StructValue{}}, {Kind: &structpb.Value_ListValue{}}, structpb.NewBoolValue(true),
+		}[d.rng.IntN(4)]
+	case reflect.TypeFor[*timestamppb.Timestamp]():
+		return timestamppb.New(time.Unix(5, 0))
+	case reflect.TypeFor[*durationpb.Duration]():
+		return durationpb.New(time.Second)
+	case reflect.TypeFor[*wrapperspb.StringValue]():
+		return wrapperspb.String("a")
+	case reflect.TypeFor[*anypb.Any]():
+		packed, err := anypb.New(structpb.NewStringValue("a"))
+		if err != nil {
+			panic(err)
+		}
+		return packed
+	case reflect.TypeFor[*embeddedMessage]():
+		return &embeddedMessage{Struct: &structpb.Struct{}}
+	case reflect.TypeFor[*dynamicpb.Message]():
+		return dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())
+	}
+	return nil
+}
+
+// nilUnread reports whether the zero value of t is, or holds in place, a nil message no condition
+// reads, as CEL reads it as another value than null.
+func nilUnread(t reflect.Type) bool {
+	switch t {
+	case reflect.TypeFor[*structpb.Struct](), reflect.TypeFor[*structpb.ListValue](), reflect.TypeFor[*timestamppb.Timestamp](),
+		reflect.TypeFor[*durationpb.Duration](), reflect.TypeFor[*anypb.Any]():
+		return true
+	}
+	return t.Kind() == reflect.Array && t.Len() > 0 && nilUnread(t.Elem())
+}
+
+// generated reports whether t is the type of a message protobuf makes, whose state is protobuf's.
+func generated(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer && t.Implements(reflect.TypeFor[proto.Message]()) && t != reflect.TypeFor[*embeddedMessage]()
+}
+
+// holdsAny reports whether v holds an Any, which a copy holds as bytes, so charged less.
+func holdsAny(v reflect.Value) bool {
+	if !v.IsValid() {
+		return false
+	}
+	if generated(v.Type()) {
+		return v.Type() == reflect.TypeFor[*anypb.Any]()
+	}
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		return !v.IsNil() && holdsAny(v.Elem())
+	case reflect.Array, reflect.Slice:
+		for i := range v.Len() {
+			if holdsAny(v.Index(i)) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if holdsAny(it.Value()) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if holdsAny(v.Field(i)) {
+				return true
+			}
+		}
+	default:
+	}
+	return false
+}
+
+// unshared is the channel, func, unsafe pointer or lock v, a hook's copy, holds, or empty for none:
+// a map's key is given as it is, so what a pointer key reaches is the host's, and a message's own
+// state is protobuf's.
+func unshared(v reflect.Value, key bool, seen map[uintptr]bool) string {
+	if !v.IsValid() {
+		return ""
+	}
+	t, locker := v.Type(), reflect.TypeFor[sync.Locker]()
+	switch {
+	case t.Kind() == reflect.Chan || t.Kind() == reflect.Func || t.Kind() == reflect.UnsafePointer:
+		return t.String()
+	case reflect.PointerTo(t).Implements(locker) && !t.Implements(locker):
+		return "a lock, " + t.String()
+	case t.Kind() == reflect.Pointer && (key || v.IsNil() || seen[v.Pointer()] || generated(t)):
+		return ""
+	}
+	switch v.Kind() {
+	case reflect.Pointer:
+		seen[v.Pointer()] = true
+		return unshared(v.Elem(), key, seen)
+	case reflect.Interface:
+		if v.IsNil() {
+			return ""
+		}
+		return unshared(v.Elem(), key, seen)
+	case reflect.Array, reflect.Slice:
+		for i := range v.Len() {
+			if held := unshared(v.Index(i), key, seen); held != "" {
+				return held
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if held := cmp.Or(unshared(it.Key(), true, seen), unshared(it.Value(), key, seen)); held != "" {
+				return held
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if held := unshared(v.Field(i), key, seen); held != "" {
+				return held
+			}
+		}
+	default:
+	}
+	return ""
+}
+
+// Converting and copying agree on every type a host may pass, a channel, a func, a lock, a mark
+// never to copy or compare and a nil message among them, wherever it lies: no condition reads a
+// value of a type a check refuses by its type, empty or nil too, and a condition reads the zero
+// value of any other, but where it is or holds in place a nil message CEL reads as another value;
+// a hook is given a copy of every value a condition reads, charged as converting it is, or less
+// where it holds an Any, whose packed bytes it holds; and no copy holds a channel, a func, an
+// unsafe pointer or a lock, but where a pointer key reaches it. An interface holding a nil lock of
+// the host's own that is a slice gave a hook the lock, where one held directly was refused.
+func TestConvertingAndCopyingAgreeOnEveryShape(t *testing.T) {
+	for seed := range uint64(4000) {
+		d := &shapeDraw{rng: mathrand.New(mathrand.NewPCG(seed, 138))}
+		typ := d.typ(3)
+		_, zeroRead := rbac.ConvertingCharge(map[string]any{"v": reflect.New(typ).Elem().Interface()})
+		if refused := typ.Kind() != reflect.Interface && (rbac.RefusedWhole(typ) || nilUnread(typ)); refused == zeroRead {
+			t.Errorf("seed %d, %v: refused by its type %t, its zero value read %t", seed, typ, refused, zeroRead)
+		}
+		for range 4 {
+			v := d.value(typ, 4)
+			attributes := map[string]any{"v": v.Interface()}
+			converted, read := rbac.ConvertingCharge(attributes)
+			copied, ok := rbac.CopyingCharge(attributes)
+			switch {
+			case read && typ.Kind() != reflect.Interface && rbac.RefusedWhole(typ):
+				t.Errorf("seed %d, %v: refused by its type, %#v was read", seed, typ, v.Interface())
+			case read && !ok:
+				t.Errorf("seed %d, %v: %#v was read, and no hook could be given a copy", seed, typ, v.Interface())
+			case read && (copied > converted || copied < converted && !holdsAny(v)):
+				t.Errorf("seed %d, %v: converting %#v charged %d, and copying it %d", seed, typ, v.Interface(), converted, copied)
+			}
+			if held := unshared(reflect.ValueOf(rbac.DeepCopy(attributes)["v"]), false, map[uintptr]bool{}); ok && held != "" {
+				t.Errorf("seed %d, %v: a hook's copy of %#v holds %s", seed, typ, v.Interface(), held)
+			}
 		}
 	}
 }

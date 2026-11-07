@@ -1209,6 +1209,9 @@ func DeepCopy(attributes map[string]any) map[string]any {
 	return copied
 }
 
+// RefusedWhole reports whether a check refuses every value of type t by its type, empty or nil too.
+func RefusedWhole(t reflect.Type) bool { return refusedWhole(t) }
+
 // Copies reports whether attributes can be copied for a hook, within what a check converts.
 func Copies(attributes map[string]any) bool {
 	_, ok := deepCopy(attributes)
