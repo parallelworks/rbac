@@ -3712,6 +3712,88 @@ func TestAChangesAuthorityIsReadWithItsCustomRolesAsOfOneMoment(t *testing.T) {
 	}
 }
 
+// A change granting a custom role reads each role it lists, through others too, once however many
+// list it: granting one of 64 roles of 1,000 permissions that each list the next 32 reads as many
+// entries of the roles' indexes, and as many pages of the permissions stored outside their rows, as
+// granting one of 64 that each list the next. Walking whole rows, the read fetched, detoasted and
+// hashed a role's permissions once for each role listing it: beside 300 roles each listing 64, a
+// refused Apply took 1.3 s, against 40 ms where each listed the next, and one granting the role
+// 2.6 s, half of it under its locks; they take 35 and 83 ms.
+func TestAChangeReadsEachRoleItsRolesListOnceHoweverManyListIt(t *testing.T) {
+	var perms []rbac.Permission
+	var types []string
+	for i := range 50 {
+		types = append(types, fmt.Sprintf("t%02d", i))
+		for j := range 20 {
+			perms = append(perms, rbac.Permission(fmt.Sprintf("t%02d:v%02d", i, j)))
+		}
+	}
+	big := rbac.RoleDefinition{ID: "big", Permissions: perms, ResourceTypes: types}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), big)
+		c.OnChange = nil
+	})
+	ctx := t.Context()
+	// Each gives 1,000 permissions on 50 types, the power to grant on clusters among them.
+	custom := []string{string(view), string(grantC)}
+	for _, p := range perms[:998] {
+		custom = append(custom, string(p))
+	}
+	customTypes := append(slices.Clone(types[:49]), "cluster")
+	// Two rings of 64 roles, in one of which each lists the next, and in the other the next 32.
+	for _, ring := range []struct {
+		prefix string
+		lists  int
+	}{{"custom.next", 1}, {"custom.many", 32}} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+			SELECT 't1', $1::text || i, $2, $3, ARRAY(SELECT $1::text || ((i + k - 1) % 64 + 1) FROM generate_series(1, $4::int) k)
+			FROM generate_series(1, 64) i`, ring.prefix, custom, customTypes, ring.lists); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.seed(t, grant(rbac.TenantRoot("t1"), "custom.next64", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "custom.many64", rbac.User, "u"))
+	u := h.as(t, "u")
+	h.as(t, "w")
+	// The entries and pages granting the first role of a ring reads, in a transaction it rolls back.
+	read := func(role rbac.Role) (entries, toasted int64) {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		startEntries, startPages := rolesRead(ctx, t, tx)
+		if err := h.authz.WithTx(tx).Apply(ctx, u, cluster, rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: identity("w")}}}); err != nil {
+			t.Fatal(err)
+		}
+		entries, toasted = rolesRead(ctx, t, tx)
+		return entries - startEntries, toasted - startPages
+	}
+	nextEntries, nextPages := read("custom.next1")
+	if nextPages == 0 {
+		t.Fatal("granting a role read no page of permissions stored outside the roles' rows")
+	}
+	if entries, pages := read("custom.many1"); entries > nextEntries*3/2 || pages > nextPages*3/2 {
+		t.Errorf("granting a role of 64 each listing the next read %d entries of the roles' indexes and %d pages of their permissions, "+
+			"and one of 64 each listing the next 32 read %d and %d", nextEntries, nextPages, entries, pages)
+	}
+}
+
+// rolesRead is how many entries of rbac_roles' indexes, and rows of it scanned whole, tx has read,
+// and how many pages of the TOAST table and index holding the values too large for its rows.
+func rolesRead(ctx context.Context, t *testing.T, tx pgx.Tx) (entries, toasted int64) {
+	t.Helper()
+	if err := tx.QueryRow(ctx, `SELECT
+		  (SELECT sum(pg_stat_get_xact_tuples_returned(oid)) FROM pg_class
+		   WHERE oid = r.oid OR oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = r.oid)),
+		  (SELECT sum(pg_stat_get_xact_blocks_fetched(oid)) FROM pg_class
+		   WHERE oid = r.reltoastrelid OR oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = r.reltoastrelid))
+		FROM pg_class r WHERE r.oid = 'rbac_roles'::regclass`).Scan(&entries, &toasted); err != nil {
+		t.Fatal(err)
+	}
+	return entries, toasted
+}
+
 // What a change rests on is read by the memberships it names, however many others the tenant has
 // in its groups.
 func TestAChangeReadsTheStandingOfOnlyWhomItNames(t *testing.T) {
