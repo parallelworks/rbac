@@ -2143,9 +2143,10 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 // them where it failed them before.
 func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
 	// A kind's map costs what building one does, a string's name and value two, and a tenth of its
-	// length, and `[]`'s name, text and list two and what building a list costs.
+	// length, and `[]`'s name, text and list two, what a slice of bytes costs past its one, and what
+	// building a list costs.
 	exact := func(kinds int) string {
-		return strings.Repeat("x", 10*(rbac.MaxConverted-kinds*rbac.MapCost-4-rbac.ListCost))
+		return strings.Repeat("x", 10*(rbac.MaxConverted-kinds*rbac.MapCost-4-(rbac.BytesCost-1)-rbac.ListCost))
 	}
 	empty := json.RawMessage("[]")
 	if held, _ := rbac.EvaluateConditionOf(t, `has(subject.attributes.s) && size(resource.attributes.j) == 0`,
@@ -2692,9 +2693,12 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // (MapCost): each map, Struct and JSON object was charged one, as a number is, though it allocates
 // several times, so 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where
 // as many ints took 12 ms and 6 ms, and a check of a resource whose user-written tags held 156,000
-// empty maps 108 ms. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy,
-// whatever holds it, where reading one in a condition takes 70 to 145. What each allocates stands in
-// for the time here, as -race and a slower machine change neither: no unit charged allocates more
+// empty maps 108 ms; and each JSON text and slice of bytes was charged one and a tenth of its
+// length, though converting a text made a json.Decoder and a copy keeps each slice apart, so a
+// check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy 150,000 slices of a
+// byte. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy, whatever holds
+// it, where reading one in a condition takes 70 to 145. What each allocates stands in for the time
+// here, as -race and a slower machine change neither: no unit charged allocates more
 // than a few times what one of a string does, by count or by bytes. Converting an empty map made
 // room for one of its values, charged 8, so 19,000 empty maps of a type of 64 KiB took 1.4 GB and
 // 270 ms to convert, where as many maps of ints took 10 MB and 15 ms.
@@ -2751,6 +2755,8 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		"JSON objects":            text(func(int) string { return "{}" }),
 		"JSON objects of a value": text(func(i int) string { return fmt.Sprintf(`{"a":%d}`, i) }),
 		"JSON lists":              text(func(i int) string { return fmt.Sprintf("[%d]", i) }),
+		"JSON texts":              listed(func(i int) any { return json.RawMessage(strconv.Itoa(i)) }),
+		"slices of bytes":         listed(func(i int) any { return []byte{byte(i)} }),
 	} {
 		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
 			w := least(work, attributes)
@@ -2891,15 +2897,134 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	}
 }
 
+// JSON text is read as encoding/json reads it into an any, where a condition can read it at all:
+// converting parses it itself, as a json.Decoder made for each text, and read a token at a time,
+// took a microsecond for a text of one byte. Texts drawn at random are read so, each naming a
+// member of an object once, and a text a byte or three from one is read so too or refused.
+func TestJSONTextIsReadAsEncodingJSONReadsIt(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	bytes := []byte(" \t\n\r[]{},:\"\\/-+.0123456789eEtrufalsnbu\x00\x01\x7f\xc3\xa9\xff")
+	for i := range 50_000 {
+		var b strings.Builder
+		jsonDraw(rng, 4, &b)
+		text, whole := []byte(b.String()), i%2 == 0
+		for j := 0; !whole && j < rng.IntN(3)+1; j++ {
+			switch at := rng.IntN(len(text) + 1); {
+			case at == len(text):
+				text = append(text, bytes[rng.IntN(len(bytes))])
+			case rng.IntN(2) == 0:
+				text = append(text[:at], text[at+1:]...)
+			default:
+				text[at] = bytes[rng.IntN(len(bytes))]
+			}
+		}
+		read, ok := rbac.ParseJSON(text)
+		var want any
+		err := json.Unmarshal(text, &want)
+		if ok && (err != nil || !reflect.DeepEqual(read, want)) || !ok && whole {
+			t.Fatalf("%q read %t as %#v, where encoding/json reads %#v, %v", text, ok, read, want, err)
+		}
+	}
+}
+
+// jsonNumbers and jsonCharacters are what jsonDraw writes numbers and strings of.
+var (
+	jsonNumbers    = []string{"0", "-0", "7", "-12", "1.5", "-1.25e-3", "1E+2", "123456789012345678901234567890", "1e308", "5e-324", "0.1"}
+	jsonCharacters = []string{
+		"a", "é", "日本", "😀", " ", "\x7f", `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\u0041`, `\u00E9`, `\ud83d\ude00`, `\u0000`, `\uFFFF`,
+	}
+)
+
+// jsonDraw writes JSON text of values nested no more than depth deep, with whitespace around them.
+func jsonDraw(rng *rand.Rand, depth int, b *strings.Builder) {
+	space := func() {
+		for range rng.IntN(3) {
+			b.WriteByte(" \t\n\r"[rng.IntN(4)])
+		}
+	}
+	space()
+	switch k := rng.IntN(10); {
+	case k == 0:
+		b.WriteString([]string{"true", "false", "null"}[rng.IntN(3)])
+	case k < 3:
+		b.WriteString(jsonNumbers[rng.IntN(len(jsonNumbers))])
+	case k < 7 || depth == 0:
+		b.WriteByte('"')
+		for range rng.IntN(5) {
+			b.WriteString(jsonCharacters[rng.IntN(len(jsonCharacters))])
+		}
+		b.WriteByte('"')
+	case k < 9:
+		b.WriteByte('[')
+		for i := range rng.IntN(4) {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			jsonDraw(rng, depth-1, b)
+		}
+		space()
+		b.WriteByte(']')
+	default:
+		b.WriteByte('{')
+		names := []string{"a", "b", "", "é", `k\n`}
+		rng.Shuffle(len(names), func(i, j int) { names[i], names[j] = names[j], names[i] })
+		for i := range rng.IntN(4) {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			space()
+			b.WriteString(`"` + names[i] + `"`)
+			space()
+			b.WriteByte(':')
+			jsonDraw(rng, depth-1, b)
+		}
+		space()
+		b.WriteByte('}')
+	}
+	space()
+}
+
+// Converting one of CEL's own values takes a check what converting Go's does, as each is charged
+// alike: told one by reflection's Implements, which reads the methods of its type, a list of CEL's
+// strings, and a map keyed by them, took three times what Go's did.
+func TestConvertingCELsOwnValuesTakesWhatConvertingGosDoes(t *testing.T) {
+	const n = 60_000
+	gos, cels := make([]any, 2*n), make([]any, 2*n)
+	for i := range gos {
+		gos[i], cels[i] = strconv.Itoa(i%10), types.String(strconv.Itoa(i%10))
+	}
+	goKeyed, celKeyed := make(map[string]int, n), make(map[types.String]int, n)
+	for i := range n {
+		goKeyed[strconv.Itoa(i)], celKeyed[types.String(strconv.Itoa(i))] = i, i
+	}
+	// The least of a few, as another goroutine can run meanwhile.
+	took := func(v any) time.Duration {
+		least := time.Duration(math.MaxInt64)
+		for range 5 {
+			start := time.Now()
+			if _, read := rbac.ConvertingCharge(map[string]any{"v": v}); !read {
+				t.Fatalf("%T: not read", v)
+			}
+			least = min(least, time.Since(start))
+		}
+		return least
+	}
+	for name, c := range map[string]struct{ gos, cels any }{"a list of strings": {gos, cels}, "a map keyed by strings": {goKeyed, celKeyed}} {
+		if g, cel := took(c.gos), took(c.cels); cel > 2*g {
+			t.Errorf("%s: converting CEL's took %v, and Go's %v", name, cel, g)
+		}
+	}
+}
+
 // Converting a value, or copying it for a hook, allocates no more for each unit it charges than a
 // few times what converting a string does, whatever types the host passes: nothing is made, read or
 // moved whole before what it holds in place is charged, nor made once either is past what it may
 // spend. Values of types drawn by reflection, arrays narrow and wide, structs, pointers, slices and
 // maps of them, interfaces holding them, and the host's own types and messages, nested in one
 // another, many of one type, empty, nil or full, and some of a mebibyte or more, each allocate
-// within that. JSON text and slices of bytes, each charged as one value and a tenth of its length,
-// aren't drawn: parsing a short text, and keeping a short slice a copy makes, each allocate several
-// hundred bytes.
+// within that, slices of bytes and JSON text among them: charged as one value and a tenth of its
+// length, parsing a short text made a decoder, 950 bytes, and a copy kept each short slice apart,
+// 290 bytes.
 func TestConvertingOrCopyingAValueOfAnyTypeAllocatesWhatItCharges(t *testing.T) {
 	l := make([]any, 2000)
 	for i := range l {
@@ -2917,25 +3042,35 @@ func TestConvertingOrCopyingAValueOfAnyTypeAllocatesWhatItCharges(t *testing.T) 
 	}
 	strs := least(rbac.ConvertingWork, map[string]any{"l": l})
 	bytes := float64(strs.Bytes) / float64(strs.Charged)
+	within := func(drawn string, attributes map[string]any, of string) {
+		t.Helper()
+		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
+			// A few kibibytes a kind, made whatever it holds.
+			if w := least(work, attributes); float64(w.Bytes) > 5*bytes*float64(w.Charged)+(16<<10) {
+				t.Errorf("%s: %s %s allocated %d bytes, charged %d, %.0f for each unit, where converting strings allocates %.0f",
+					drawn, doing, of, w.Bytes, w.Charged, float64(w.Bytes)/float64(w.Charged), bytes)
+			}
+		}
+	}
 	for seed := range uint64(160) {
 		d := &typeDraw{rng: rand.New(rand.NewPCG(seed, 127)), empty: int(seed % 4), most: 64 << 10, all: 4 << 20}
 		if seed%8 == 7 {
 			d.most, d.all = 48<<20, 48<<20
 		}
 		attributes, of := d.attributes()
-		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
-			// A few kibibytes a kind, made whatever it holds.
-			if w := least(work, attributes); float64(w.Bytes) > 5*bytes*float64(w.Charged)+(16<<10) {
-				t.Errorf("seed %d: %s %s allocated %d bytes, charged %d, %.0f for each unit, where converting strings allocates %.0f",
-					seed, doing, of, w.Bytes, w.Charged, float64(w.Bytes)/float64(w.Charged), bytes)
-			}
-		}
+		within(fmt.Sprint("seed ", seed), attributes, of)
+	}
+	// And 2,000 of each type drawn alone, which a type holding few among others may not show.
+	for i, typ := range drawnTypes {
+		d := &typeDraw{rng: rand.New(rand.NewPCG(uint64(i), 127)), most: 64 << 10, all: 4 << 20}
+		attributes, of := d.many(typ, 2000)
+		within(fmt.Sprint("type ", i), attributes, of)
 	}
 }
 
 // typeDraw draws types a host may pass, by reflection, and values of them: Go's and the host's own
-// scalars, times, interfaces, the host's own messages and the well-known ones, and arrays, structs,
-// pointers, slices and maps of them, nested.
+// scalars, times, bytes, JSON text, interfaces, the host's own messages and the well-known ones,
+// and arrays, structs, pointers, slices and maps of them, nested.
 type typeDraw struct {
 	rng *rand.Rand
 	// empty is how often, in sixths, a map, slice, pointer or interface drawn holds nothing.
@@ -2951,13 +3086,23 @@ var drawnTypes = []reflect.Type{
 	reflect.TypeFor[hostDouble](), reflect.TypeFor[wideDouble](), reflect.TypeFor[hostString](), reflect.TypeFor[intByte](),
 	reflect.TypeFor[types.String](), reflect.TypeFor[*structpb.Struct](),
 	reflect.TypeFor[*timestamppb.Timestamp](), reflect.TypeFor[*descriptorpb.FileOptions](), reflect.TypeFor[*wideMessage](),
+	reflect.TypeFor[[]byte](), reflect.TypeFor[json.RawMessage](),
 }
+
+// drawnTexts are the JSON texts typeDraw draws, short, as a value of each kind takes.
+var drawnTexts = []string{`1`, `-2.5e3`, `"s"`, `true`, `null`, `[]`, `{}`, ` [1, "a"] `, `{"a": {}}`, `"\u00e9"`}
 
 // attributes are many values of one type drawn, in a list, a slice or a map of their type, or a few
 // where it is wide, and what they are.
 func (d *typeDraw) attributes() (map[string]any, string) {
 	t := d.typ(3)
-	n := min(d.rng.IntN(2000)+1, int(d.all/max(t.Size(), 1)))
+	return d.many(t, d.rng.IntN(2000)+1)
+}
+
+// many are n values of t, or as many as d.all holds, in a list, a slice or a map of t, and what
+// they are.
+func (d *typeDraw) many(t reflect.Type, n int) (map[string]any, string) {
+	n = min(n, int(d.all/max(t.Size(), 1)))
 	switch d.rng.IntN(3) {
 	case 0:
 		l := make([]any, n)
@@ -2980,11 +3125,10 @@ func (d *typeDraw) attributes() (map[string]any, string) {
 	}
 }
 
-// typ is a type nesting no more than depth deep, holding no more than d.most in place, and no
-// slice of bytes.
+// typ is a type nesting no more than depth deep, holding no more than d.most in place.
 func (d *typeDraw) typ(depth int) reflect.Type {
 	for {
-		if t := d.draw(depth); t.Size() <= d.most && (t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8) {
+		if t := d.draw(depth); t.Size() <= d.most {
 			return t
 		}
 	}
@@ -3024,6 +3168,12 @@ func (d *typeDraw) value(t reflect.Type, depth int) reflect.Value {
 	v := reflect.New(t).Elem()
 	d.held += t.Size()
 	empty := d.rng.IntN(6) < d.empty || depth <= 0 || d.held > d.all
+	if t == reflect.TypeFor[json.RawMessage]() {
+		if !empty {
+			v.SetBytes([]byte(drawnTexts[d.rng.IntN(len(drawnTexts))]))
+		}
+		return v
+	}
 	switch t.Kind() {
 	case reflect.Bool:
 		v.SetBool(d.rng.IntN(2) == 0)
