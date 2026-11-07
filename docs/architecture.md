@@ -1257,16 +1257,18 @@ flowchart TB
   `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), through
   `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
   seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
-  decides at the later of the call's time and the latest time recorded that its snapshot sees, but
-  no later than the database's clock as it reads it (`decidedSQL`, `expiredUntil`), which takes
-  nothing from a time a run recorded, as none is past the clock as the run's statement began, before
-  the snapshot that sees it is taken; the clock as the read's own statement began can be before its
-  snapshot, as in a simple query, which plans a statement, and waits for its locks, first. Every
+  decides at the later of the call's time and the latest time recorded that its snapshot sees
+  (`decidedSQL`), and refuses where that is past the database's clock as it reads it once it has
+  its snapshot (`expiredAhead`, `callClock.passed`), which no time a run recorded is while the clock
+  doesn't go back, as none is past the clock as the run's statement began, before the snapshot that
+  sees it is taken; the clock as the read's own statement began can be before its snapshot, as in a
+  simple query, which plans a statement, and waits for its locks, first. Every
   expiry it compares is decided so too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
-  statement (`filterAt`), which runs later than `Filter` read the time. The call then decides at that
+  statement (`filterAt`), which runs later than `Filter` read the time, and keeps no row where the
+  time is past the clock (`filterHolding`). The call then decides at that
   time (`callClock.passed`): the conditions it evaluates, the label values the read decides and its
   statements after it read it as their time, `Explain` building what conditions read only once it
   has read the subject's keys. `Holders` reads the latest time first in its snapshot
@@ -1316,17 +1318,22 @@ flowchart TB
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
   records each write to the table, as the entity `expired`, and `AsOf` doesn't read it: as of a
-  time, a read decides at that time. Without the bound on what a read takes, one row of a time far
-  ahead, which the application's role could write around the package, had every later call of every
-  host decide then, for good, a deny binding through a place that ends before then lifted, and a
-  condition reading `request.time` met. A time past the clock now only the table's owner disabling
-  its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
-  a host behind the clock then decides at it as each statement reads it, and that host's changes are
-  tried again until the clock passes the time. The bound leaves a run's time whole only where a
-  read bounds it by the clock the run recorded it by, which hasn't gone back since: a clock gone
-  back, or a hot standby's own clock behind the primary's, cuts it to before what the run removed
-  ended, and a read then decides by the state the run left, which no moment held, until the clock
-  passes it.
+  time, a read decides at that time. Deciding at the latest time, unbounded, one row of a time far
+  ahead, which the application's role could once write around the package, had every later call of
+  every host decide then, for good, a deny binding through a place that ends before then lifted, and
+  a condition reading `request.time` met; and bounded by the clock as a read reads it, as code
+  before bounded it, a clock behind the one a run recorded the time by cut it to before what the run
+  removed ended, and a read decided by the state the run left, which no moment held. So a read that
+  finds the time past the clock refuses, as `ErrConflict`: a check, a list, `Holders`' snapshot
+  (`expiredBy`) and a change alike; and `Filter`'s condition keeps no row, in the one test that
+  keeps none past the holding's lapse too, which reads the clock once, while each use of the time
+  (`filterAt`), reading only the snapshot, reads the same. A time is past the clock only where the
+  table's owner disabled its trigger (`rbac_expired_until`), where the database's clock went back
+  since a run recorded it, or on a hot standby whose clock is behind its primary's: there every call
+  reading it is refused until the clock passes the time, and then decides at it. The comparison is
+  exact, with no margin for drift between the clocks: however little the clock is behind the time, a
+  row the run passed over could have ended between them, and deciding at the clock lets that through
+  as any cut does.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
