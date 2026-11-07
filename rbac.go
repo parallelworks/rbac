@@ -341,7 +341,7 @@ func (a *Authorizer) expiredBy(ctx context.Context, q DB) error {
 		return nil
 	}
 	var expired *time.Time
-	if err := q.QueryRow(ctx, `SELECT `+expiredUntil+` FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
+	if err := a.queryRowIndexed(ctx, q, `SELECT `+expiredUntil+` FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
 		return err
 	}
 	return a.clock.passed(*expired, false)
