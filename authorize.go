@@ -297,6 +297,22 @@ func (h holding) carries(def RoleDefinition, p Permission) bool {
 	return h.Principal.carries(def, p) && (h.Principal.carrier() == "" || !def.Privileged)
 }
 
+// roleCarrier is a grant's role and all carries reads of its principal (Principal.carrier), so
+// grants of one give alike.
+type roleCarrier struct {
+	role    Role
+	carrier PrincipalKind
+}
+
+func (h holding) roleCarrier() roleCarrier { return roleCarrier{h.Role, h.Principal.carrier()} }
+
+// underCondition is a roleCarrier and a condition's expression, so conditional grants of one decide
+// alike on a request.
+type underCondition struct {
+	roleCarrier
+	expression string
+}
+
 // Permissions lists what the subject may do to r, sorted: the AuthZEN action search.
 func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ []Permission, err error) {
 	defer conflicting(&err)
@@ -317,27 +333,28 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 		return nil, err
 	}
 	readingRoles()
-	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give, but on the
-	// tenant the label values and powers to release it holds, which no label of the tenant's decides
-	// (decidedOn).
-	var only func(Permission) bool
-	if r.Labels.asks() {
-		h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels)
-		switch {
-		case err != nil:
-			return nil, err
-		case h.Unsatisfied(r.Labels) == "":
-		case r.Type != TenantScope:
-			return nil, nil
-		default:
-			only = a.labelPermission
-		}
-	}
-	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, only, a.constrain(ctx, s, r), held, ds, roles, nil)
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, nil, a.constrain(ctx, s, r), held, ds, roles, nil)
 	if err != nil {
 		return nil, err
 	}
-	return slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] }), nil
+	perms = slices.DeleteFunc(perms, func(p Permission) bool { t, ok := a.exclusiveValue(p); return ok && excluded[t] })
+	// A label the subject doesn't satisfy leaves it nothing, whatever its grants give, but on the
+	// tenant the label values and powers to release it holds, which no label of the tenant's decides
+	// (decidedOn). Decided, as a check decides it, only once a grant gives something the label
+	// decides: so a constraint is asked about the values only where a check would ask too.
+	if !slices.ContainsFunc(perms, func(p Permission) bool { return a.decidedOn(p, r).Labels.asks() }) {
+		return perms, nil
+	}
+	h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels)
+	switch {
+	case err != nil:
+		return nil, err
+	case h.Unsatisfied(r.Labels) == "":
+		return perms, nil
+	case r.Type != TenantScope:
+		return nil, nil
+	}
+	return slices.DeleteFunc(perms, func(p Permission) bool { return !a.labelPermission(p) }), nil
 }
 
 // deciding is what conditions read deciding permissions on a resource for a request, but for its
@@ -406,8 +423,11 @@ func (rs *runs) of(ctx context.Context, a *Authorizer, s Subject, r Resource, he
 // a change reads them back in its transaction. It shares shared, where not nil, with the decisions
 // before and after it by the same grants and denies on the same request (runs), and where shared is
 // unevaluated, evaluates no condition: what one decides is in byCondition all the same, as it is
-// whatever the conditions come to. A holding passes held and roles narrowed to what gives values
-// (labeling), so its walk reads each role once.
+// whatever the conditions come to. It walks a role's permissions once for each carrier its
+// unconditional grants have (roleCarrier), and once for each carrier and condition its conditional
+// ones have (underCondition), however many grants hold it, as a subject in a thousand groups each
+// granted the role does. A holding passes held and roles narrowed to what gives values (labeling),
+// so its walk reads those alone.
 func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resource, only func(Permission) bool, cs *constrained,
 	held []holding, ds []denial, roles book, shared *runs,
 ) ([]Permission, map[Permission]bool, map[string]bool, error) {
@@ -417,22 +437,30 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	// What the grants give, under a condition or not: all a deny is asked about (listDenies).
 	asked := map[Permission]bool{}
 	var conditional []holding
+	walked := map[roleCarrier]bool{}
+	// Whether a role gives anything kept, read once for all its conditional grants, whatever their
+	// carrier.
+	givesKept := map[Role]bool{}
 	for _, h := range held {
 		def, ok := roles.role(h.Role)
 		switch {
 		case !ok || !def.GrantableOn(r.Type):
 		case h.conditional:
-			readingEntries(len(def.Permissions))
-			gives := false
-			for _, p := range def.Permissions {
-				if kept(p) {
-					gives, asked[p] = true, true
+			gives, read := givesKept[h.Role]
+			if !read {
+				readingEntries(len(def.Permissions))
+				for _, p := range def.Permissions {
+					if kept(p) {
+						gives, asked[p] = true, true
+					}
 				}
+				givesKept[h.Role] = gives
 			}
 			if gives {
 				conditional = append(conditional, h)
 			}
-		default:
+		case !walked[h.roleCarrier()]:
+			walked[h.roleCarrier()] = true
 			readingEntries(len(def.Permissions))
 			for _, p := range def.Permissions {
 				if kept(p) {
@@ -501,7 +529,16 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)
+	// A grant of the role, carrier and condition of one before it decides nothing that one didn't:
+	// it gives the same, its condition has decided each permission on that permission's budget,
+	// which pays for it once (budget.decided), and the constraints and denies were asked.
+	decided := map[underCondition]bool{}
 	for _, h := range conditional {
+		k := underCondition{h.roleCarrier(), h.Condition.Expression}
+		if decided[k] {
+			continue
+		}
+		decided[k] = true
 		def, _ := roles.role(h.Role)
 		readingEntries(len(def.Permissions))
 		for _, p := range def.Permissions {
@@ -1409,22 +1446,24 @@ type Predicate struct {
 // keeps rows Authorize then refuses, as once a grant it counted has expired, and leaves out what a
 // custom role first granted to them since gives, or one granted to the members gives a subject
 // that has since become one. The query decides no earlier than the latest time DeleteExpired
-// deleted by that it sees, as a check does; with the label column, where that is as late as a time
-// the subject's membership, or a place in a group of its own or of a group it is in, ended after
-// the holding was read, it keeps no row, so a query run once DeleteExpired has deleted by such a
-// time since Filter comes back empty. Build one for each query. The host's query must reach this package's
-// tables and call its function rbac_tenant_keys (they are in the pool's schema), and column names
-// are trusted host code; every value is an argument. It counts only unconditional grants, and
-// leaves out every resource a deny covers, conditional ones included, so it never keeps one
-// Authorize refuses: Reachable's Conditional and ConditionalExcept name the scopes where that may
-// be too strict. It keeps only the rows whose own key, their path's first, is of the type, so the
-// host's table can hold resources of several types, as one store of every resource does, where a
-// grant on a container reaches every row under it. The planner can't tell how many of a table's
-// rows are of a type, and counts the condition as keeping as many as of a table of one type: a host
-// listing a type from a table of several tests its own column of the type too, whose statistics
-// count them, and indexes it after the tenant and before what a page sorts by, as
-// (tenant, type, id): with an index of the tenant alone, a sorted page of a type of few rows reads
-// the rows of every type until it is full.
+// deleted by that it sees, as a check does, and keeps no row where that is past the database's
+// clock, where a check is refused (ErrConflict); with the label column it keeps none once that is
+// as late as the first time after the holding was read that the subject's membership, or its last
+// path to one of its groups, ended, so a query run once DeleteExpired has deleted by such a time
+// since Filter comes back empty, but not by a place that ended while another, from another source
+// or through another group, kept the subject in the group. Build one for each query. The host's
+// query must reach this package's tables and call its function rbac_tenant_keys (they are in the
+// pool's schema), and column names are trusted host code; every value is an argument. It counts
+// only unconditional grants, and leaves out every resource a deny covers, conditional ones
+// included, so it never keeps one Authorize refuses: Reachable's Conditional and ConditionalExcept
+// name the scopes where that may be too strict. It keeps only the rows whose own key, their path's
+// first, is of the type, so the host's table can hold resources of several types, as one store of
+// every resource does, where a grant on a container reaches every row under it. The planner can't
+// tell how many of a table's rows are of a type, and counts the condition as keeping as many as of
+// a table of one type: a host listing a type from a table of several tests its own column of the
+// type too, whose statistics count them, and indexes it after the tenant and before what a page
+// sorts by, as (tenant, type, id): with an index of the tenant alone, a sorted page of a type of
+// few rows reads the rows of every type until it is full.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (_ Predicate, err error) {
 	defer conflicting(&err)
 	a = a.still()
@@ -1561,13 +1600,12 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		Args: filterArgs(above),
 	}
 	// With no dimension declared too, as then any label is invalid, and Authorize refuses it.
-	if cols.Labels == "" {
-		return pred, nil
+	if cols.Labels != "" {
+		labels, args := a.listedBy(h, p, resourceType).labelColumn(cols.Labels, arg, len(pred.Args))
+		pred.SQL, pred.Args = pred.SQL+" AND "+labels, append(pred.Args, args...)
 	}
-	labels, args := a.listedBy(h, p, resourceType).labelColumn(cols.Labels, arg, len(pred.Args))
-	pred.Args = append(pred.Args, args...)
-	lapsed, args := a.filterHolding(arg, len(pred.Args), held.lapses)
-	pred.SQL = "(" + pred.SQL + " AND " + labels + lapsed + ")"
+	kept, args := a.filterHolding(arg, len(pred.Args), held.lapses)
+	pred.SQL = "(" + pred.SQL + kept + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
 }
@@ -1751,35 +1789,43 @@ func (a *Authorizer) filterKeys(arg func(int) string, of string) string {
 // filterAt is SQL for the time Filter's statement decides at: the call's, or the later time
 // DeleteExpired deleted by that the host's statement sees, as decidedSQL decides a read of a
 // subject. The host runs it later than Filter read the time, by which a run can have removed what
-// ended since. Each use reads it in the statement's snapshot, so all read the same, but for a time
-// past the database's clock, which each bounds by the clock as it reads it (expiredUntil); one
-// older than Filter's reads, as a host's REPEATABLE READ transaction begun before them takes, sees
-// no run they didn't, so it decides at the call's time, which no later run's removals it sees can
-// mix with. arg numbers Filter's arguments.
+// ended since. Each use reads it in the statement's snapshot, so all read the same, and none reads
+// the clock: where the time is past it, the condition keeps no row (filterHolding), whose test
+// reads it once, so no use decides at the time cut to a clock it read apart, before the time, as
+// the test, reading it later, finds it past. One older than Filter's reads, as a host's REPEATABLE
+// READ transaction begun before them takes, sees no run they didn't, so it decides at the call's
+// time, which no later run's removals it sees can mix with. arg numbers Filter's arguments.
 func (a *Authorizer) filterAt(arg func(int) string) string {
 	if a.asOf {
 		return arg(4)
 	}
-	return "greatest(" + arg(4) + "::timestamptz, (SELECT " + expiredUntil + " FROM rbac_expired))"
+	return "greatest(" + arg(4) + "::timestamptz, (SELECT max(until) FROM rbac_expired))"
 }
 
-// filterHolding is SQL, after the label's test, and its argument, numbered from arg's first,
-// keeping a row only where Filter's statement decides before lapses, the earliest time after
-// Filter's that the subject's keys differ by time alone, as its membership or the latest path to
-// one of its groups ends (alsoRead.lapse); zero is never. The holding is Filter's, which the
-// statement doesn't read. Before then, the subject's keys, and the denies binding and exempting it
-// by them, are at the time the statement decides at (filterAt) what they were at Filter's, and the
-// grants in force then are no more than at Filter's: so a row it keeps, the subject could do p to
-// at Filter's time by the holding and by the grants and denies the statement reads, with what
-// DeleteExpired removed since, which had all ended by then. From then on, as once DeleteExpired has
-// removed the place a deny binds it by and passed over the one that gave it a value, it keeps none,
-// rather than a row its label kept by the holding of one moment and its grants and denies of
-// another: build the condition again. As of a time, it decides at that time.
+// filterHolding is SQL, after the label's test where there is one, and its argument, numbered from
+// arg's first, keeping a row only where the latest time DeleteExpired deleted by that Filter's
+// statement sees is no later than the database's clock (expiredAhead), where a check is refused
+// (callClock.passed), and, with the label column, where the statement decides before lapses, the
+// earliest time after Filter's that the subject's keys differ by time alone, as its membership or
+// the latest path to one of its groups ends (alsoRead.lapse); zero is never. One test reads both,
+// and the clock once. The holding is Filter's, which the statement doesn't read. Before then, the
+// subject's keys, and the denies binding and exempting it by them, are at the time the statement
+// decides at (filterAt) what they were at Filter's, and the grants in force then are no more than
+// at Filter's: so a row it keeps, the subject could do p to at Filter's time by the holding and by
+// the grants and denies the statement reads, with what DeleteExpired removed since, which had all
+// ended by then. From then on, as once DeleteExpired has removed the place a deny binds it by and
+// passed over the one that gave it a value, it keeps none, rather than a row its label kept by the
+// holding of one moment and its grants and denies of another: build the condition again. As of a
+// time, it decides at that time.
 func (a *Authorizer) filterHolding(arg func(int) string, first int, lapses time.Time) (string, []any) {
-	if a.asOf || lapses.IsZero() {
+	if a.asOf {
 		return "", nil
 	}
-	return " AND (SELECT coalesce(" + expiredUntil + " < " + arg(first) + "::timestamptz, true) FROM rbac_expired)", []any{lapses}
+	kept, args := "NOT "+expiredAhead, []any(nil)
+	if !lapses.IsZero() {
+		kept, args = kept+" AND coalesce(max(until) < "+arg(first)+"::timestamptz, true)", []any{lapses}
+	}
+	return " AND (SELECT " + kept + " FROM rbac_expired)", args
 }
 
 // filterGrants is SQL selecting the scopes of the grants Filter's condition counts for its subject
@@ -2081,10 +2127,11 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	// A deny's keys are looked up only once it is one the statement reads (bindsIfRead).
 	matched := bindsIfRead(forP+` OR `+values+` AND scope = 'tenant:' || $1`, keyed("principals", "SELECT k FROM bound")+exempt)
 	// Grants, denies, roles, keys, the powers to change grants denied, the denies below, the time
-	// DeleteExpired deleted by and when the keys lapse in that order; grants by principal, scope, role
-	// and id, denies by id and scope, as deniesOn.
+	// DeleteExpired deleted by, with whether it is past the database's clock, and when the keys lapse
+	// in that order; grants by principal, scope, role and id, denies by id and scope, as deniesOn.
 	const deny, role, end, key, changing, below, expiry, lapse = 1, 2, 3, 4, 5, 6, 7, 8
 	var expired *time.Time
+	var ahead bool
 	var custom []RoleDefinition
 	placeEnds := map[string]time.Time{}
 	tenantKey := TenantRoot(tenant).Key()
@@ -2133,7 +2180,7 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 			case expiry:
 				if expires != nil {
 					t := *expires
-					expired = &t
+					expired, ahead = &t, conditional
 				}
 			case lapse:
 				if expires != nil {
@@ -2178,12 +2225,12 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 		UNION ALL
 		SELECT 4, k, '', '', '', NULL, false, NULL, '', NULL, false, false, NULL, '', '', false FROM keys WHERE `+ownKeys+changes+`
 		UNION ALL
-		SELECT 7, '', '', '', '', expired, false, NULL, '', NULL, false, false, NULL, '', '', false FROM decided WHERE expired IS NOT NULL
+		SELECT 7, '', '', '', '', expired, ahead, NULL, '', NULL, false, false, NULL, '', '', false FROM decided WHERE expired IS NOT NULL
 		ORDER BY 1, 3, 4, 5, 2`, append([]any{tenant, s.identityKey(), scopes, now, perm, wildcard, counts.public, counts.members}, named...)...); err != nil {
 		return grantsRead{}, err
 	}
 	if expired != nil {
-		if err := a.clock.passed(*expired, first); err != nil {
+		if err := a.clock.passed(*expired, ahead, first); err != nil {
 			return grantsRead{}, err
 		}
 	}

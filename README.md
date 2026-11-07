@@ -102,10 +102,10 @@ a column of the type too, whose statistics count them, and index it after the te
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
 the subject's label holding and what the constraints answered, so build one for each query; the
-query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, taken no
-later than the database's clock, and with the label column keeps no row once that is as late as the
-first time after `Filter` read the holding that the subject's membership, or its last path to one of
-its groups, ended. It compares the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, keeps no row
+where that is past the database's clock, where a check is refused (Expiry), and with the label
+column keeps no row once that is as late as the first time after `Filter` read the holding that the
+subject's membership, or its last path to one of its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
@@ -123,8 +123,11 @@ scopes conditional ones reach, to check one by one. The condition reads the pack
 host's statement, which the host plans, so the package can't pin its plan as it pins its own reads
 (Planner settings): a plan the host's session made while those tables were small, and keeps, reads
 each of them whole, once for each type and key the condition looks up, as a page read whole costs
-less than descending any index. Run the query with sequential scans off for it alone, as in
-`SET LOCAL enable_seqscan = off` before it and `RESET enable_seqscan` after, in its transaction, or
+less than descending any index. Run the query with sequential scans off for it alone, as
+`SET LOCAL enable_seqscan = off` before it does in a transaction of its own, whose end puts the
+setting back as the session had it, or in a savepoint rolled back to after it, which puts it back
+as the transaction had it; not `RESET enable_seqscan` after it, which sets the session's own to what
+it started with, dropping a value the session set, as a pool can for each connection it opens. Or
 plan it again once the tables have grown, as an analysis of them does: under a plan cached while
 they held a few rows, a list read 43,736 pages of grants and 4,502 of denies beside 20,000 of each.
 
@@ -172,7 +175,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access. A check, `Activate`
   and a change read only the custom roles they and the grants they read name, a change with those
-  the roles it grants list, through others too, so the tenant's other roles cost them nothing;
+  the roles it grants list, through others too, each once however many roles list it, at two
+  lookups by its key and one read of its permissions, so the tenant's other roles cost them nothing;
   `CustomRoles`, `Roles`, `Grantable`, `SetRole` and `DeleteRole` read every one, which
   `rbac.MaxCustomRoles` bounds.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
@@ -192,7 +196,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
-  a labeled resource asks it once about each value the label asks for that the subject's grants
+  a labeled resource, once a grant allows, and `Permissions` of one, once it would list anything
+  the label decides, asks it once about each value the label asks for that the subject's grants
   give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
   change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
   test any label, ask about every one, as do `SetRole` and `DeleteRole`, and `ChangeMembers` taking
@@ -327,18 +332,22 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   them, and a value the resource's share with them included again, as the resource's are converted
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
-  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
+  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, 4
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message,
+  and 3 for each slice of bytes or JSON text, which a hook's copy keeps apart and converting parses;
   a map of values none reads, as structs, which reading copies whole, is refused unread at 2 for
   each entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
   another costs at least 1 for each 24 bytes its value holds in place, which reading it moves,
   where 19,000 empty maps of a type of 64 KiB, charged 8 each, took 1.4 GB and 270 ms making room
   for a value they didn't hold. That is about a map of
-  50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
+  50,000 short strings, nearly 16,000 maps of one entry each, nearly 40,000 timestamps or JSON texts
+  of a byte, or 53,000 slices of a byte, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
   may reading, about 20 ms: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
-  empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
+  empty maps took 108 ms, and each JSON text or slice of bytes charged as one value and a tenth of
+  its length, a check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy
+  150,000 slices of a byte. Past that every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
@@ -438,7 +447,31 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
   so they may be past a bound as an upgrade leaves them. Adding
   to `request.time`, or converting it, was bounded at all a condition
-  may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
+  may cost and is now bounded as the timestamp it is, a few units. CEL now refuses ordering numbers
+  of different types, as `[1, 2].exists(i, i < 2u)`, which it accepted before once it had checked a
+  loop, so a condition stored so no longer compiles: a grant's gives nothing and a deny's applies;
+  and where `Config.Attributes` declares a number, so does one ordering it against a number of
+  another type past a loop, as `[1].all(v, true) && request.attributes.n < 2u` for an int `n`, though
+  it compiles where none is declared. To find those stored, list each condition stored, `SELECT
+  condition FROM rbac_grants UNION SELECT condition FROM rbac_denies UNION SELECT requires FROM
+  rbac_eligibilities`, and compile each but the empty one with CEL's `cel.NewEnv` declaring
+  `subject`, `resource` and `request` as `cel.MapType(cel.StringType, cel.DynType)` and `action` as
+  `cel.StringType`, as the package compiles them: one whose `Compile` gives issues no longer
+  compiles. Storing one again is refused with what CEL found (`rbac.ErrInvalid`), one failing
+  against the declarations too, which compiling so doesn't find. `AsOf` compiles those history
+  holds too, `SELECT after->>'condition' FROM rbac_history WHERE entity IN ('grant', 'deny') UNION
+  SELECT after->>'requires' FROM rbac_history WHERE entity = 'eligibility'`, which can't be stored
+  again, so a check of a time one of them was stored decides it as failing. A condition naming a
+  variable from the root where a loop's variable of the same name hides it, as `.request` in
+  `l.all(request, ...)`, read a key indexing it outside the loop, so one naming a loop's variable
+  of another name, as `k` in `.request.attributes.m.exists(k, .request.attributes.m[k] > 0)`,
+  failed, and one naming the loop's variable that hides it, as `request.attributes.k` in
+  `l.all(request, .request.attributes.m[request.attributes.k] > 0)`, read the variable instead: each
+  is now read in the loop. Each field or key such a variable is read by costs 1, as it does of any
+  other, and so does what computing such a key evaluates, which CEL charged nothing for, though its
+  bound counted it, so one whose key searches or loops over what the request passes can now cost
+  past what a condition may, and fails the same way.
+  Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
   reading their kind, and so are ones holding an empty or nil slice, map or pointer of values no
@@ -458,9 +491,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `ListValue`, `Timestamp`, `Duration` or `Any` the host passes, read as null, now can't be read,
   failing every condition reading their kind, a declared one's too, which failed only those reading
   it. Attributes
-  holding maps, lists, pointers or messages are charged what building
+  holding maps, lists, pointers, messages, slices of bytes or JSON text are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
+  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are,
+  failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
@@ -1100,8 +1134,10 @@ have the server load a library or run a program of its choosing; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
-   disable the triggers that record them. A later migration can change history too, so the
-   administrator's role keeps both owners' rights. It owns the schema of `AsOf`'s views too, named
+   disable the triggers that record them. Once they are made, `Migrate` as another role is refused,
+   but as a superuser, which migrates as that role ([Running it](#running-it), Tables). A later
+   migration can change history too, so the administrator's role keeps both owners' rights. It
+   owns the schema of `AsOf`'s views too, named
    as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
    database, which a role that doesn't own it hasn't by default, so a superuser makes it first,
    empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
@@ -1200,6 +1236,34 @@ the package's uses foreign data, so none of the roles needs any.
   failure leaves the database at the last migration recorded, from which migrating again goes on.
   The package's calls don't check what the database was migrated to: make them from a replica only
   once its own migrations are applied, as `Migrate` returning nil says.
+  Only the role owning the package's tables migrates them, the administrator's of
+  [History](#history): a migration makes what it makes its maker's, and from `0028_as_of_views` on
+  checks the schema of `AsOf`'s views against it, which `AsOf` finds among that role's views. So
+  once the tables are made, `Migrate` as another role is refused, as `rbac.ErrInvalid` naming the
+  role owning them, before it applies anything or takes any lock, but as a superuser, which runs
+  each migration as that role, by `SET LOCAL ROLE`, and is itself again after: a superuser's
+  migration makes and checks what that role's own would, and fails where that one's would, as
+  where it may not make the views' schema or give `rbac_history_commit` to history's role, saying
+  what to do. A tool of the host's own applies them as that role too. Before this release, a
+  superuser's migration of tables another role owned ran as itself: from before `0028_as_of_views`,
+  it made the views' schema, the views and `rbac_as_of_views` its own, so `AsOf` refuses every read,
+  saying what to run, as it reads only the views of the role owning the tables; from `0028` on, it
+  failed at `0033_view_seeks_and_hints`, as the views' schema was that role's; and it made
+  `rbac_expired`, `rbac_expired_until` and `rbac_expired_through` its own where it made them, as it
+  made its own whatever else a migration it applied made, as `rbac_changes_grants` where it applied
+  `0021_grant_denies`, which a later migration, as that role, can't alter. To give them
+  back, a superuser, with the package's schema first on its search_path, runs
+  `ALTER TABLE rbac_expired OWNER TO <administrator>`,
+  `ALTER FUNCTION rbac_expired_until() OWNER TO <administrator>` and
+  `ALTER FUNCTION rbac_expired_through(timestamptz) OWNER TO <administrator>`, and the same,
+  `ALTER TABLE`, `ALTER FUNCTION` or `ALTER STATISTICS`, for each other table, function or
+  statistics object in that schema that is still the superuser's, but history's table and
+  functions, which go to history's role, as [History](#history) says; where `AsOf` refuses
+  every read, as its error says, `ALTER FUNCTION rbac_as_of_views() OWNER TO <administrator>`,
+  `DROP SCHEMA IF EXISTS <schema>_as_of CASCADE` and
+  `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>`, and then the administrator's role
+  runs `SELECT rbac_as_of_views()`, which makes the views again and gives them to each role that
+  may read history; and where `0033` failed, migrate again.
   On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
   them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
   would miss the writes it waits for. Call it there before any change to the package's tables: from
@@ -1407,12 +1471,14 @@ the package's uses foreign data, so none of the roles needs any.
   of history, as `AsOf` and an export, waits for it, and a transaction under way as it starts that
   made a change can make it give way. The role migrating makes the function, which writes history as
   its owner, and gives it to `rbac_record`'s owner, history's role where the roles are set up as
-  [History](#history) says: as a superuser, or as a role that may `SET ROLE` to history's role,
-  where that role has `CREATE` on the schema or the role migrating may grant it that, as the
-  schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
-  42501, having changed nothing, rather than leave the function to another role: grant history's
-  role `CREATE` on the schema, or history's role to the role migrating with the `SET` option, as its
-  hint says, or migrate as a superuser, and migrate again. No role but its owner may execute it, nor
+  [History](#history) says: as a role that may `SET ROLE` to history's role, as the administrator's
+  may, where that role has `CREATE` on the schema or the role migrating may grant it that, as the
+  schema's owner can, which it does for the migration alone, or as a superuser owning the tables.
+  Otherwise migrating fails with SQLSTATE 42501, having changed nothing, rather than leave the
+  function to another role: grant history's role `CREATE` on the schema, or history's role to the
+  role migrating with the `SET` option, as its hint says, and migrate again. A superuser's migration
+  of tables another role owns runs as that role, as above, so it fails alike, and the hint no
+  longer offers one. No role but its owner may execute it, nor
   `rbac_record`, which writes history as its owner too, as only their triggers call them: migrating
   revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the schema's default
   privileges can grant it as each is made, where `0003_history` revoked it on `rbac_record` from
@@ -1527,10 +1593,10 @@ the package's uses foreign data, so none of the roles needs any.
   History), or where constraints were set immediate, as the statement that did, or the first change
   after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
   where its `lock_timeout` is longer.
-- **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
-  conditions are cached. Read a resource's ancestors and attributes from where they are stored,
-  never from request input, no earlier than the content they protect, and from the primary. A
-  deny is only as complete as the ancestors passed.
+- **What the host passes:** a check reads grants, memberships and groups as they are; only
+  conditions, compiled or found not to compile, are cached. Read a resource's ancestors and
+  attributes from where they are stored, never from request input, no earlier than the content
+  they protect, and from the primary. A deny is only as complete as the ancestors passed.
 - **Ids:** an id names its identity, group or resource for good. Never reuse one, or a new
   resource or account inherits the grants of the one before it. Delete a resource's grants with
   `DeleteScopes` in the transaction that deletes it, in one call with every scope under it too,
@@ -1615,26 +1681,35 @@ the package's uses foreign data, so none of the roles needs any.
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
   a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
   deletes the times no later than its own and adds its own, refusing one past the database's clock,
-  and history records each write, as one of the package's tables (History). A read takes the latest
-  time no later than the database's clock as it reads it, which takes nothing from a time a run
-  recorded: no write records one past the clock as its own statement began, which is before it
-  commits, and so before a read that sees it takes its snapshot. Bounded by the clock as the read's
-  statement began, a statement sent in a simple query, as by a pool that prepares none, which takes
-  its snapshot once it is planned, after any lock it waited for, could find a run's removals and
-  decide before what they removed ended. So a role that may execute the function, as the
-  application's may, can move what a
-  call decides no earlier than up to that clock and no further, as a run could, and never back, and
-  history records each time it wrote; a time past the clock, which only a role that may disable the
-  table's triggers can leave there, or the database's clock going back, has a call of a host behind
-  that clock decide at it as each of its statements reads it, and such a host's changes tried again
-  (`rbac.ErrConflict`) until the clock passes the time. The bound takes nothing from a time a run
-  recorded only where a read bounds it by the clock the run recorded it by, which hasn't gone back
-  since: where that clock has gone back, or on a hot standby, whose own clock can be behind the
-  primary's, a read can cut a run's time to before what the run removed ended, and until the clock
-  passes that time decide by the state the run left, which no moment held. Keep the database's
-  clock from stepping back, and make checks, and run `Filter`'s conditions, on the primary, or on a
-  standby whose clock is kept with it; `AsOf`, which doesn't read the table, reads on a standby as
-  before.
+  and history records each write, as one of the package's tables (History). So a role that may
+  execute the function, as the application's may, can move what a call decides no earlier than up to
+  that clock and no further, as a run could, and never back, and history records each time it wrote.
+  A read that finds the latest time past the database's clock, as it reads the clock once it has its
+  snapshot, decides neither at that time nor at the clock, but is refused (`rbac.ErrConflict`), a
+  check and a list too, and `Filter`'s condition keeps no row: decided at that time, it would lift a
+  deny binding through a place that ends before then, and meet a condition reading `request.time`,
+  and decided at the clock, find the place a deny binds by, which a run removed, gone, and the
+  membership or place a power comes through, which ended sooner and the run passed over, still
+  there, a state no moment held. On a primary whose clock doesn't go back, no read is refused so: no
+  write records a time past the clock as its own statement began, which is before it commits, and so
+  before a read that sees it takes its snapshot. Compared with the clock as the read's statement
+  began, a statement sent in a simple query, as by a pool that prepares none, which takes its
+  snapshot once it is planned, after any lock it waited for, could find a time a run recorded after
+  that, and be refused. A time is past the clock on a hot standby whose clock is behind its
+  primary's, which replays what a run on the primary recorded, where the database's clock has gone
+  back since a run recorded it, or where a role that may disable the table's triggers wrote it:
+  there every check, list and change that reads it is refused until the clock passes the time, and
+  from then on decides at it, as before. The comparison has no margin for the clocks' drift: however
+  little the clock is behind the time, a row the run passed over could have ended between them. Keep
+  the database's clock from stepping back, and a standby's synchronized with its primary's, or make
+  checks, and run `Filter`'s conditions, on the primary. A time a run recorded while the database's
+  clock was set far ahead, which then went back, refuses every call reading it until the clock
+  passes it again. The table's owner can bring it back to the clock, as migrating to
+  `0032_expired_writes` did, which history records, but reads then decide by the state the run left
+  until the clock passes the time: what the run removed that hadn't ended by the clock, as the place
+  a deny binds a subject by, gone, and what it passed over still there, a state no moment held. So
+  first restore what the run removed that hadn't ended by the clock, which history records with each
+  row, or wait for the clock. `AsOf`, which doesn't read the table, reads on a standby as before.
   A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the

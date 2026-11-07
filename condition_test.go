@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -2196,9 +2197,10 @@ func TestAttributesLargerThanACheckConvertsFailEveryCondition(t *testing.T) {
 // them where it failed them before.
 func TestWhetherAttributesFitTurnsOnNoOrder(t *testing.T) {
 	// A kind's map costs what building one does, a string's name and value two, and a tenth of its
-	// length, and `[]`'s name, text and list two and what building a list costs.
+	// length, and `[]`'s name, text and list two, what a slice of bytes costs past its one, and what
+	// building a list costs.
 	exact := func(kinds int) string {
-		return strings.Repeat("x", 10*(rbac.MaxConverted-kinds*rbac.MapCost-4-rbac.ListCost))
+		return strings.Repeat("x", 10*(rbac.MaxConverted-kinds*rbac.MapCost-4-(rbac.BytesCost-1)-rbac.ListCost))
 	}
 	empty := json.RawMessage("[]")
 	if held, _ := rbac.EvaluateConditionOf(t, `has(subject.attributes.s) && size(resource.attributes.j) == 0`,
@@ -2745,9 +2747,12 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // (MapCost): each map, Struct and JSON object was charged one, as a number is, though it allocates
 // several times, so 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where
 // as many ints took 12 ms and 6 ms, and a check of a resource whose user-written tags held 156,000
-// empty maps 108 ms. Timed, a unit now takes 20 to 115 ns to convert and 25 to 200 ns to copy,
-// whatever holds it, where reading one in a condition takes 70 to 145. What each allocates stands in
-// for the time here, as -race and a slower machine change neither: no unit charged allocates more
+// empty maps 108 ms; and each JSON text and slice of bytes was charged one and a tenth of its
+// length, though converting a text made a json.Decoder and a copy keeps each slice apart, so a
+// check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy 150,000 slices of a
+// byte. Timed, a unit now takes 20 to 145 ns to convert and 25 to 400 ns to copy, whatever holds
+// it, where reading one in a condition takes 70 to 145. What each allocates stands in for the time
+// here, as -race and a slower machine change neither: no unit charged allocates more
 // than a few times what one of a string does, by count or by bytes. Converting an empty map made
 // room for one of its values, charged 8, so 19,000 empty maps of a type of 64 KiB took 1.4 GB and
 // 270 ms to convert, where as many maps of ints took 10 MB and 15 ms.
@@ -2804,6 +2809,8 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		"JSON objects":            text(func(int) string { return "{}" }),
 		"JSON objects of a value": text(func(i int) string { return fmt.Sprintf(`{"a":%d}`, i) }),
 		"JSON lists":              text(func(i int) string { return fmt.Sprintf("[%d]", i) }),
+		"JSON texts":              listed(func(i int) any { return json.RawMessage(strconv.Itoa(i)) }),
+		"slices of bytes":         listed(func(i int) any { return []byte{byte(i)} }),
 	} {
 		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
 			w := least(work, attributes)
@@ -2993,15 +3000,199 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 	}
 }
 
+// JSON text is read as encoding/json reads it into an any, where a condition can read it at all:
+// converting parses it itself, as a json.Decoder made for each text, and read a token at a time,
+// took a microsecond for a text of one byte. Texts drawn at random are read so, each naming a
+// member of an object once, and a text a byte or three from one is read so too or refused, a
+// number to its bits: compared by reflect.DeepEqual, -0 read as 0 passed, which a condition tells
+// apart, as string() does.
+func TestJSONTextIsReadAsEncodingJSONReadsIt(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	bytes := []byte(" \t\n\r[]{},:\"\\/-+.0123456789eEtrufalsnbu\x00\x01\x7f\xc3\xa9\xff")
+	for i := range 50_000 {
+		var b strings.Builder
+		jsonDraw(rng, 4, &b)
+		text, whole := []byte(b.String()), i%2 == 0
+		for j := 0; !whole && j < rng.IntN(3)+1; j++ {
+			switch at := rng.IntN(len(text) + 1); {
+			case at == len(text):
+				text = append(text, bytes[rng.IntN(len(bytes))])
+			case rng.IntN(2) == 0:
+				text = append(text[:at], text[at+1:]...)
+			default:
+				text[at] = bytes[rng.IntN(len(bytes))]
+			}
+		}
+		read, ok := rbac.ParseJSON(text)
+		var want any
+		err := json.Unmarshal(text, &want)
+		if ok && (err != nil || !sameJSON(read, want)) || !ok && whole {
+			t.Fatalf("%q read %t as %#v, where encoding/json reads %#v, %v", text, ok, read, want, err)
+		}
+	}
+}
+
+// Text a fuzzer writes, where a condition can read it, is read as encoding/json reads it: any it
+// reads otherwise, or that encoding/json refuses, a condition would read as a value the host
+// doesn't.
+func FuzzJSONTextIsReadAsEncodingJSONReadsIt(f *testing.F) {
+	for _, text := range []string{
+		``, ` `, `0`, `-0`, `01`, `1.`, `.1`, `+1`, `0x10`, `1e`, `1E+2`, `1e400`, `1e-400`, `123456789012345678901234567890`,
+		`4.9e-324`, `NaN`, `-`, `true`, `tru`, `truex`, `null`, `""`, `"\"\\\/\b\f\n\r\t"`, `"\u00e9\uD83D\ude00"`, `"\ud83d"`,
+		`"\ude00\ud83d"`, `"\ud83d\u0041"`, `"\u0000"`, `"\x41"`, "\"\x00\"", "\"\x7f\"", "\"\xff\"", "\"\xed\xa0\x80\"",
+		"\xef\xbb\xbf1", "\f1", `[]`, `{}`, `[1,]`, `[1 2]`, `{"a":1,}`, `{"a":1,"\u0061":2}`, `[1] [2]`, `[[]`, "[1]\x00",
+		` {"a": [true, false, null, -1.5e3, "b"], "": {}} `,
+	} {
+		f.Add([]byte(text))
+	}
+	f.Fuzz(func(t *testing.T, text []byte) {
+		read, ok := rbac.ParseJSON(text)
+		var want any
+		if err := json.Unmarshal(text, &want); ok && (err != nil || !sameJSON(read, want)) {
+			t.Fatalf("%q read as %#v, where encoding/json reads %#v, %v", text, read, want, err)
+		}
+	})
+}
+
+// sameJSON reports whether a and b, read from JSON text into an any, are the same value, a number
+// to its bits, as reflect.DeepEqual finds -0 and 0 equal.
+func sameJSON(a, b any) bool {
+	switch a := a.(type) {
+	case float64:
+		b, ok := b.(float64)
+		return ok && math.Float64bits(a) == math.Float64bits(b)
+	case []any:
+		b, ok := b.([]any)
+		return ok && (a == nil) == (b == nil) && slices.EqualFunc(a, b, sameJSON)
+	case map[string]any:
+		b, ok := b.(map[string]any)
+		return ok && (a == nil) == (b == nil) && maps.EqualFunc(a, b, sameJSON)
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// jsonNumbers and jsonCharacters are what jsonDraw writes numbers and strings of.
+var (
+	jsonNumbers    = []string{"0", "-0", "7", "-12", "1.5", "-1.25e-3", "1E+2", "123456789012345678901234567890", "1e308", "5e-324", "0.1"}
+	jsonCharacters = []string{
+		"a", "é", "日本", "😀", " ", "\x7f", `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\u0041`, `\u00E9`, `\ud83d\ude00`, `\u0000`, `\uFFFF`,
+	}
+)
+
+// jsonDraw writes JSON text of values nested no more than depth deep, with whitespace around them.
+func jsonDraw(rng *rand.Rand, depth int, b *strings.Builder) {
+	space := func() {
+		for range rng.IntN(3) {
+			b.WriteByte(" \t\n\r"[rng.IntN(4)])
+		}
+	}
+	space()
+	switch k := rng.IntN(10); {
+	case k == 0:
+		b.WriteString([]string{"true", "false", "null"}[rng.IntN(3)])
+	case k < 3:
+		b.WriteString(jsonNumbers[rng.IntN(len(jsonNumbers))])
+	case k < 7 || depth == 0:
+		b.WriteByte('"')
+		for range rng.IntN(5) {
+			b.WriteString(jsonCharacters[rng.IntN(len(jsonCharacters))])
+		}
+		b.WriteByte('"')
+	case k < 9:
+		b.WriteByte('[')
+		for i := range rng.IntN(4) {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			jsonDraw(rng, depth-1, b)
+		}
+		space()
+		b.WriteByte(']')
+	default:
+		b.WriteByte('{')
+		names := []string{"a", "b", "", "é", `k\n`}
+		rng.Shuffle(len(names), func(i, j int) { names[i], names[j] = names[j], names[i] })
+		for i := range rng.IntN(4) {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			space()
+			b.WriteString(`"` + names[i] + `"`)
+			space()
+			b.WriteByte(':')
+			jsonDraw(rng, depth-1, b)
+		}
+		space()
+		b.WriteByte('}')
+	}
+	space()
+}
+
+// Converting one of CEL's own values reads none of its type's methods, nor does converting a value
+// of a type without methods: told one of CEL's by reflection's Implements, which reads them, a list
+// of CEL's strings, and a map keyed by them, took a check three times what Go's did, charged alike;
+// timed against Go's, CEL's took 2.8 times as long once on a loaded machine, though read so. A type
+// of the host's own with methods is asked about, as a value, a map's key and a map's type, and its
+// values and keys once for the type: asked of each, converting the host's messages, which no
+// condition reads, took four times what converting a list does, and a map of interfaces holding
+// CEL's timestamps as keys, which none keys one by, three times what one holding strings does.
+func TestConvertingCELsOwnValuesReadsNoMethodsOfTheirTypes(t *testing.T) {
+	cels := []any{
+		types.String("a"), types.Bytes("b"), types.Bytes(nil), types.Double(1.5), types.Int(-1), types.Uint(2), types.True, types.NullValue,
+		types.Timestamp{Time: time.Unix(1, 0)},
+		types.Duration{Duration: time.Second},
+	}
+	for name, attributes := range map[string]map[string]any{
+		"CEL's own values": {"l": cels, "s": []types.String{"a"}, "m": map[string]types.Int{"a": 1}},
+		"maps keyed by CEL's own values": {
+			"s": map[types.String]int{"a": 1}, "i": map[types.Int]types.String{1: "a"}, "b": map[types.Bool]int{true: 1},
+			"u": map[types.Uint]int{2: 1}, "a": map[any]any{types.String("k"): types.Int(1), types.Int(2): 1},
+		},
+		"Go's own values": {
+			"s": "a", "i": 1, "l": []any{1.5, true, uint8(2), []byte("b"), [1]byte{}, json.RawMessage(`{"a": [1]}`)},
+			"m": map[string]any{"a": time.Second, "t": time.Unix(1, 0)}, "k": map[int]bool{1: true}, "p": new(int),
+		},
+	} {
+		read := rbac.CountMethodsRead(t)
+		if _, ok := rbac.ConvertingCharge(attributes); !ok || *read != 0 {
+			t.Errorf("%s: read %t, the methods of their types read %d times", name, ok, *read)
+		}
+	}
+	for name, attributes := range map[string]map[string]any{
+		"a value": {"v": stringer("a")}, "a map's key": {"m": map[any]int{stringer("a"): 1}}, "a map's type": {"m": map[stringer]int{}},
+	} {
+		read := rbac.CountMethodsRead(t)
+		if _, ok := rbac.ConvertingCharge(attributes); !ok || *read == 0 {
+			t.Errorf("%s of a type with methods: read %t, the methods of its type read %d times", name, ok, *read)
+		}
+	}
+	strs, messages := make([]stringer, 1000), make([]*wideMessage, 1000)
+	keys := map[any]int{}
+	for i := range messages {
+		messages[i] = &wideMessage{}
+		keys[stringer(strconv.Itoa(i))], keys[types.Double(i)], keys[types.Timestamp{Time: time.Unix(int64(i), 0)}] = i, i, i
+	}
+	read := rbac.CountMethodsRead(t)
+	if rbac.ConvertingCharge(map[string]any{"s": strs, "m": messages, "k": keys}); *read > 10 {
+		t.Errorf("1,000 strings of the host's type, 1,000 messages of the host's, and a map keyed by 1,000 strings of the host's type, "+
+			"CEL's doubles and CEL's timestamps: the methods of their types read %d times", *read)
+	}
+}
+
+// stringer is a host's own string type with a method, which conditions read as a string.
+type stringer string
+
+func (s stringer) String() string { return string(s) }
+
 // Converting a value, or copying it for a hook, allocates no more for each unit it charges than a
 // few times what converting a string does, whatever types the host passes: nothing is made, read or
 // moved whole before what it holds in place is charged, nor made once either is past what it may
 // spend. Values of types drawn by reflection, arrays narrow and wide, structs, pointers, slices and
 // maps of them, interfaces holding them, and the host's own types and messages, nested in one
 // another, many of one type, empty, nil or full, and some of a mebibyte or more, each allocate
-// within that. JSON text and slices of bytes, each charged as one value and a tenth of its length,
-// aren't drawn: parsing a short text, and keeping a short slice a copy makes, each allocate several
-// hundred bytes.
+// within that, slices of bytes and JSON text among them: charged as one value and a tenth of its
+// length, parsing a short text made a decoder, 950 bytes, and a copy kept each short slice apart,
+// 290 bytes.
 func TestConvertingOrCopyingAValueOfAnyTypeAllocatesWhatItCharges(t *testing.T) {
 	l := make([]any, 2000)
 	for i := range l {
@@ -3019,25 +3210,35 @@ func TestConvertingOrCopyingAValueOfAnyTypeAllocatesWhatItCharges(t *testing.T) 
 	}
 	strs := least(rbac.ConvertingWork, map[string]any{"l": l})
 	bytes := float64(strs.Bytes) / float64(strs.Charged)
+	within := func(drawn string, attributes map[string]any, of string) {
+		t.Helper()
+		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
+			// A few kibibytes a kind, made whatever it holds.
+			if w := least(work, attributes); float64(w.Bytes) > 5*bytes*float64(w.Charged)+(16<<10) {
+				t.Errorf("%s: %s %s allocated %d bytes, charged %d, %.0f for each unit, where converting strings allocates %.0f",
+					drawn, doing, of, w.Bytes, w.Charged, float64(w.Bytes)/float64(w.Charged), bytes)
+			}
+		}
+	}
 	for seed := range uint64(160) {
 		d := &typeDraw{rng: rand.New(rand.NewPCG(seed, 127)), empty: int(seed % 4), most: 64 << 10, all: 4 << 20}
 		if seed%8 == 7 {
 			d.most, d.all = 48<<20, 48<<20
 		}
 		attributes, of := d.attributes()
-		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
-			// A few kibibytes a kind, made whatever it holds.
-			if w := least(work, attributes); float64(w.Bytes) > 5*bytes*float64(w.Charged)+(16<<10) {
-				t.Errorf("seed %d: %s %s allocated %d bytes, charged %d, %.0f for each unit, where converting strings allocates %.0f",
-					seed, doing, of, w.Bytes, w.Charged, float64(w.Bytes)/float64(w.Charged), bytes)
-			}
-		}
+		within(fmt.Sprint("seed ", seed), attributes, of)
+	}
+	// And 2,000 of each type drawn alone, which a type holding few among others may not show.
+	for i, typ := range drawnTypes {
+		d := &typeDraw{rng: rand.New(rand.NewPCG(uint64(i), 127)), most: 64 << 10, all: 4 << 20}
+		attributes, of := d.many(typ, 2000)
+		within(fmt.Sprint("type ", i), attributes, of)
 	}
 }
 
 // typeDraw draws types a host may pass, by reflection, and values of them: Go's and the host's own
-// scalars, times, interfaces, the host's own messages and the well-known ones, and arrays, structs,
-// pointers, slices and maps of them, nested.
+// scalars, times, bytes, JSON text, interfaces, the host's own messages and the well-known ones,
+// and arrays, structs, pointers, slices and maps of them, nested.
 type typeDraw struct {
 	rng *rand.Rand
 	// empty is how often, in sixths, a map, slice, pointer or interface drawn holds nothing.
@@ -3053,13 +3254,23 @@ var drawnTypes = []reflect.Type{
 	reflect.TypeFor[hostDouble](), reflect.TypeFor[wideDouble](), reflect.TypeFor[hostString](), reflect.TypeFor[intByte](),
 	reflect.TypeFor[types.String](), reflect.TypeFor[*structpb.Struct](),
 	reflect.TypeFor[*timestamppb.Timestamp](), reflect.TypeFor[*descriptorpb.FileOptions](), reflect.TypeFor[*wideMessage](),
+	reflect.TypeFor[[]byte](), reflect.TypeFor[json.RawMessage](),
 }
+
+// drawnTexts are the JSON texts typeDraw draws, short, as a value of each kind takes.
+var drawnTexts = []string{`1`, `-2.5e3`, `"s"`, `true`, `null`, `[]`, `{}`, ` [1, "a"] `, `{"a": {}}`, `"\u00e9"`}
 
 // attributes are many values of one type drawn, in a list, a slice or a map of their type, or a few
 // where it is wide, and what they are.
 func (d *typeDraw) attributes() (map[string]any, string) {
 	t := d.typ(3)
-	n := min(d.rng.IntN(2000)+1, int(d.all/max(t.Size(), 1)))
+	return d.many(t, d.rng.IntN(2000)+1)
+}
+
+// many are n values of t, or as many as d.all holds, in a list, a slice or a map of t, and what
+// they are.
+func (d *typeDraw) many(t reflect.Type, n int) (map[string]any, string) {
+	n = min(n, int(d.all/max(t.Size(), 1)))
 	switch d.rng.IntN(3) {
 	case 0:
 		l := make([]any, n)
@@ -3082,11 +3293,10 @@ func (d *typeDraw) attributes() (map[string]any, string) {
 	}
 }
 
-// typ is a type nesting no more than depth deep, holding no more than d.most in place, and no
-// slice of bytes.
+// typ is a type nesting no more than depth deep, holding no more than d.most in place.
 func (d *typeDraw) typ(depth int) reflect.Type {
 	for {
-		if t := d.draw(depth); t.Size() <= d.most && (t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8) {
+		if t := d.draw(depth); t.Size() <= d.most {
 			return t
 		}
 	}
@@ -3126,6 +3336,12 @@ func (d *typeDraw) value(t reflect.Type, depth int) reflect.Value {
 	v := reflect.New(t).Elem()
 	d.held += t.Size()
 	empty := d.rng.IntN(6) < d.empty || depth <= 0 || d.held > d.all
+	if t == reflect.TypeFor[json.RawMessage]() {
+		if !empty {
+			v.SetBytes([]byte(drawnTexts[d.rng.IntN(len(drawnTexts))]))
+		}
+		return v
+	}
 	switch t.Kind() {
 	case reflect.Bool:
 		v.SetBool(d.rng.IntN(2) == 0)
@@ -3512,11 +3728,12 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 	}
 }
 
-// CEL's cost tracking holds what a loop's steps evaluate until they are charged, and a loop's own
-// values until it ends, and reads all it holds in search of what a step didn't evaluate, as the
-// argument a failing call never reached: each step of a loop over a list the host passes would
-// take longer than the one before, past what it is charged, and one failing, charged little, the
-// most. It holds no more for a step than the step evaluates, whatever came before.
+// CEL's cost tracking held what a loop's steps evaluated until they were charged, and a loop's own
+// values until it ended, and read all it held in search of what a step didn't evaluate, as the
+// argument a failing call never reached: each step of a loop over a list the host passes took
+// longer than the one before, past what it was charged, and one failing, charged little, the most.
+// It holds no more for a step than the step evaluates, whatever came before, and none where each
+// call passes it the arguments it charges the call by.
 func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
 	l := make([]any, 3000)
 	for i := range l {
@@ -3624,11 +3841,12 @@ func TestALoopsStepCostsEachLogicalOperatorItEvaluates(t *testing.T) {
 	}
 }
 
-// CEL copies the keys of a map the host passes before a loop over it takes its first step, however
-// few it takes, so a loop over one, inside another loop, took time growing with the map's size and
-// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, however the
-// host passed the map, and one over a literal map no more than its bound, though the bound counts a
-// step of map() whose transform is a literal only 1 more than it costs.
+// A loop over a map reads each of its keys before it takes its first step, however few it takes, to
+// order them, as CEL copied the keys of a map the host passes, so a loop over one, inside another
+// loop, took time growing with the map's size and the outer loop's steps, charged only for the
+// steps. Such a loop costs 1 for each key, however the host passed the map, and one over a literal
+// map no more than its bound, though the bound counts a step of map() whose transform is a literal
+// only 1 more than it costs.
 func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
 	m, n := map[string]any{}, map[string]int{}
 	for i := range 3000 {
@@ -4119,6 +4337,38 @@ func TestALiteralCostsWhatItBuilds(t *testing.T) {
 			if b, got := rbac.ConditionCost(t, looped(n), nil); got != cost+more || b != bound+more {
 				t.Errorf("%s cost %d, bounded at %d, and with one element %d, bounded at %d", looped(n)[:60], got, b, cost, bound)
 			}
+		}
+	}
+}
+
+// CEL charges each call, attribute and literal it plans as it evaluates it, so what the package plans
+// in place of one, to charge what it reads before it runs, to order a map's keys or to charge a key,
+// is charged as CEL charged the one it replaced only where the package charges CEL so: planned
+// otherwise, comparisons cost 1 less, reading a time in a zone 100 less, and a loop's range and a
+// map literal's key read from an attribute 1 less, than they did. CEL charges a condition as a check
+// plans it what it charges it planned as CEL plans it, and 1 more for each key of a map a loop
+// starts over. CEL charges the qualifiers of a variable named from the root past a loop's variable
+// of its name where the check passes the variables as a map, as here, and not where it passes them
+// as the activation a check passes, which a check plans such a variable to charge them all the same.
+func TestAConditionIsChargedWhatCELChargesIt(t *testing.T) {
+	attributes := map[string]any{
+		"n": 4, "s": "ab", "k": "a", "zone": "Asia/Tokyo", "l": []any{"a", "b", "c"}, "m": map[string]any{"a": 1, "b": 2, "c": 3},
+	}
+	for expr, keys := range map[string]uint64{
+		`request.attributes.n > 3 && request.attributes.s != "x" && request.attributes.s in ["ab"]`:                               0,
+		`request.time.getHours("Europe/Paris") >= 0 && request.time.getMinutes(request.attributes.zone) >= 0`:                     0,
+		`request.attributes.l.all(x, x != "q") && request.attributes.l.map(x, x + x).size() == 3`:                                 0,
+		`(request.attributes.n > 3 ? request.attributes.l : []).exists_one(x, x == "a")`:                                          0,
+		`{request.attributes.s: 1}[request.attributes.s] == 1 && request.attributes.m[request.attributes.k] == 1`:                 0,
+		`request.attributes.m.all(k, request.attributes.m[k] > 0) && request.attributes.m.filter(k, k != "a") != []`:              6,
+		`[request.attributes.m, {"x": 1}].all(m, m.all(k, k != ""))`:                                                              4,
+		`dyn(request.attributes.m).all(k, true)`:                                                                                  3,
+		`[1].all(request, .request.attributes.n > 3 && has(.request.attributes.s) && (true ? .request : {}).attributes.s != "x")`: 0,
+		`[1].all(request, .request.attributes.m[.request.attributes.k] == 1 && .request.attributes["m"]["b"] == 2)`:               0,
+	} {
+		planned, alone := rbac.ConditionCharged(t, expr, attributes)
+		if planned != alone+keys {
+			t.Errorf("%s: CEL charged %d as a check plans it, and %d as CEL plans it", expr, planned, alone)
 		}
 	}
 }
@@ -4845,6 +5095,23 @@ func TestAZoneThatFailsToLoadForAWhileLoadsOnceItCan(t *testing.T) {
 	}
 }
 
+// A condition reading a time in a zone a literal names is one, though the platform's files fail to
+// give the zone for a while, so a change bounding what a check reads together counts it at all a
+// condition may cost: counted nothing, as one that isn't a condition, a change could add another
+// past that bound while they failed, which checks then read once the zone loads.
+func TestAConditionWhoseZoneFailsToLoadForAWhileIsBoundedAsAnyCondition(t *testing.T) {
+	const zone = "Pacific/Chatham"
+	h := setup(t)
+	expr := `request.time.getMinutes("` + zone + `") >= 0`
+	rbac.ForgetZones(zone)
+	restore := rbac.FailZoneLoads(t, syscall.EMFILE)
+	failing := rbac.ConditionLimit(h.authz, expr)
+	restore()
+	if limit := rbac.ConditionLimit(h.authz, expr); limit == 0 || failing < limit {
+		t.Errorf("a condition whose zone fails to load is bounded at %d, and at %d once it loads", failing, limit)
+	}
+}
+
 // The host's clock is read in UTC, as a time it passes as an attribute is, and as CEL reads one
 // with no zone: string() writes a time in its own zone, so a clock or a database returning times in
 // each replica's local zone decided by where the replica runs, a deny comparing the request's time
@@ -4945,8 +5212,8 @@ func (o otherwise) ID() int64 { return o.id }
 
 // A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
 // it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
-// dropped, so it would run unbounded. Nor is one whose range it plans under another id: its first
-// step wouldn't find the range, so a loop over a map would copy its keys uncharged. Nor is one
+// dropped, so it would run unbounded. Nor is one whose range it plans under another id, where
+// nothing would order a map's keys or charge them as the loop starts. Nor is one
 // whose range, which may be a map, it plans as something else, which nothing orders, so a loop
 // over it would give its keys as Go ranges over it, but where CEL checks the range as a list.
 func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
@@ -4977,6 +5244,89 @@ func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
 			if err := rbac.PlanLoopsOtherwise(t, expr, ranges, same); err != nil {
 				t.Errorf("%s planned as CEL plans it: %v", expr, err)
 			}
+		}
+	}
+}
+
+// CEL reads a variable a condition names from the root where a loop's variable of the same name
+// hides it, as `.request` in `l.all(request, ...)`, from what the check passed, outside the
+// evaluation, and qualifies it there, where nothing is charged: a key it computed, and whatever
+// computing it evaluated, ran uncharged, so a key searching a string of 99,990 bytes at each of
+// 3,000 steps of a loop cost 6,003, and so did each of its fields, so a loop reading one 24 deep
+// cost about half what reading another so does; and a key naming a loop's variable it read outside
+// the loop, where one of another name failed, and the one hiding the variable read the variable.
+// Such a variable is charged, and decides, as one read beside a loop's variable of another name,
+// and a type named so, as `.int`, is still the type.
+func TestAVariableNamedFromTheRootPastALoopsVariableIsReadAsAnyOther(t *testing.T) {
+	n := rbac.CountSearches(t)
+	l := make([]any, 3000)
+	for i := range l {
+		l[i] = fmt.Sprint(i)
+	}
+	var d any = 1
+	for range 22 {
+		d = map[string]any{"a": d}
+	}
+	attributes := map[string]any{
+		"l": l, "ten": l[:10], "s": strings.Repeat("x", 99_990), "m": map[string]any{"0": 1, "a": 2}, "k": "a", "d": d,
+	}
+	deep := `.attributes.d` + strings.Repeat(".a", 22)
+	reads := []string{
+		`%[1]s` + deep + ` == 1`, `has(%[1]s` + deep + `)`, `(true ? %[1]s : {})` + deep + ` == 1`,
+		`%[1]s.attributes.m.exists(k, %[1]s.attributes.m[k] == 2)`,
+	}
+	searching := `%[1]s.attributes.l.filter(x, %[1]s.attributes.s.contains(x)).size()`
+	for _, key := range []string{
+		`string(` + searching + `)`, `[string(` + searching + `)][0]`, `(` + searching + ` > 0 ? "a" : "0")`,
+		`%[1]s.attributes.k`, `string(size(%[1]s.attributes.s) - 99990)`, `y`,
+	} {
+		reads = append(reads, `%[1]s.attributes.m[`+key+`] == 2`, `(true ? %[1]s.attributes.m : {})[`+key+`] == 2`,
+			`%[1]s.attributes["m"][`+key+`] == 2`)
+	}
+	for _, read := range reads {
+		var decided [2][]rbac.Decided
+		for i, named := range [][2]string{{"request", ".request"}, {"other", "request"}} {
+			expr := `request.attributes.ten.all(z, ["a"].all(y, [1].all(` + named[0] + `, ` + fmt.Sprintf(read, named[1]) + `)))`
+			*n = 0
+			var err error
+			if decided[i], err = rbac.Evaluations(t, expr, attributes, 1); err != nil || *n > 1 {
+				t.Errorf("%s, searching %d times: %v", expr, *n, err)
+			}
+		}
+		if !slices.Equal(decided[0], decided[1]) {
+			t.Errorf("%s read past a loop's variable of its name: %+v, and beside one of another: %+v", read, decided[0], decided[1])
+		}
+	}
+	for _, expr := range []string{
+		`[1].all(request, .request.attributes.m["a"] == 2)`, `[1].all(request, (true ? .request.attributes : {}).m.a == 2)`,
+		`[resource.attributes].exists(subject, subject.k == "a" && .subject.id == "u")`,
+		`[1].all(request, .request.attributes.m == {"0": 1, "a": 2})`, `["a"].all(y, [1].all(request, .request.attributes.m[y] == 2))`,
+		`[{"attributes": {"k": "0"}}].all(request, .request.attributes.m[request.attributes.k] == 1)`, `[1].all(int, type(1) == .int)`,
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
+// A condition whose variable named from the root past a loop's variable of its name CEL plans as
+// something else than an attribute reading it, or under another id, as another version of CEL may,
+// isn't a condition: what qualifies it would run uncharged again.
+func TestAVariableNamedFromTheRootPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{
+		`[1].all(request, .request.attributes.k == "a")`, `["x"].all(action, .action == "cluster:login")`,
+		`[1].all(request, .request.attributes.m[.request.attributes.k] == 2)`,
+	} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+		} {
+			if err := rbac.PlanRootedOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its variable named from the root planned %s is a condition", expr, how)
+			}
+		}
+		if err := rbac.PlanRootedOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
 		}
 	}
 }
@@ -5203,6 +5553,62 @@ func TestAChangesConditionsCompileBriefly(t *testing.T) {
 	// u1's holds; u0's doesn't.
 	if allowed(t, h, h.as(t, "u0"), login, cluster) || !allowed(t, h, h.as(t, "u1"), login, cluster) || rbac.Compiled(h.authz) != before+2 {
 		t.Error("checks keep what they compile")
+	}
+}
+
+// A condition stored that no longer compiles, as one ordering numbers of different types once it
+// has checked a loop does after an upgrade of CEL, is compiled once, as one that compiles is, and
+// not again for each check reading it, each of which pays for compiling it once, cached or not:
+// charged 16,384 for 2 KiB, each took 45 ms. Compiling it takes about as long as compiling one of
+// its length that compiles, as CEL wrote out each of its errors twice, with the line holding it,
+// which a check reads none of. A change storing it again is refused, whatever checks keep, with
+// what CEL found, and a change bounding the conditions on a scope reads its limit, nothing, once.
+func TestAConditionThatNoLongerCompilesIsCompiledOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	fill := func(part func(i int) string) string {
+		s := part(0)
+		for i := 1; len(s)+len(" && ")+len(part(i)) <= rbac.MaxExpression; i++ {
+			s += " && " + part(i)
+		}
+		return s
+	}
+	expr := fill(func(i int) string { return fmt.Sprintf("[1].all(v, true) && %d < 2u", i) })
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: expr}
+	storeAround(t, h, g)
+	compiles := rbac.CountCompiles(t)
+	u := h.as(t, "u")
+	for range 3 {
+		if allowed(t, h, u, login, cluster) {
+			t.Fatal("a condition that doesn't compile held")
+		}
+	}
+	if *compiles != 1 {
+		t.Errorf("3 checks compiled a condition that doesn't compile %d times", *compiles)
+	}
+	b := rbac.Binding{Role: "cluster.login", Principal: identity("v"), Condition: rbac.Condition{Expression: expr}}
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrInvalid) ||
+		!strings.Contains(err.Error(), "found no matching overload for '_<_'") {
+		t.Errorf("storing a condition checks keep as failing: %v", err)
+	}
+	*compiles = 0
+	for range 2 {
+		if limit := rbac.ConditionLimit(h.authz, expr+" || true"); limit != 0 {
+			t.Errorf("a condition that doesn't compile is bounded at %d", limit)
+		}
+	}
+	if *compiles != 1 {
+		t.Errorf("reading the limit of a condition that doesn't compile twice compiled it %d times", *compiles)
+	}
+	compiled, err := rbac.CompileTook(t, fill(func(int) string { return "[1, 2, 3] == [1, 2, 3]" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, failing := range []string{expr, fill(func(i int) string { return fmt.Sprintf("request.attributes.f%d()", i) })} {
+		if took, err := rbac.CompileTook(t, failing); err == nil || took > 3*compiled {
+			t.Errorf("%d bytes that don't compile took %v to compile, as many that do %v: %v", len(failing), took, compiled, err)
+		}
 	}
 }
 

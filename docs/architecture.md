@@ -179,15 +179,20 @@ erDiagram
     rbac_history {
         bigint id PK
         xid8 txid
+        bigint cluster "the cluster that wrote it, system_identifier"
         timestamptz effective_at
         text tenant
         text entity
         text key
-        text op "create, update, delete, expire, baseline, prune"
+        text op "create, update, delete, expire, baseline, prune, commit"
         jsonb before
         jsonb after
         text actor
         text how
+    }
+    rbac_expired {
+        bigint id PK
+        timestamptz until "a time DeleteExpired deleted by"
     }
     rbac_roles ||--o{ rbac_grants : "a custom role's grants"
     rbac_roles ||--o{ rbac_eligibilities : "a custom role's eligibilities"
@@ -198,6 +203,7 @@ erDiagram
     rbac_groups ||--o{ rbac_grants : "granted to"
     rbac_grants ||--o{ rbac_history : "recorded"
     rbac_members ||--o{ rbac_history : "recorded"
+    rbac_expired ||--o{ rbac_history : "recorded, in no tenant"
 ```
 
 - **Built-in roles are not stored.** They are the host's `Config.Catalog`, so a deploy changes
@@ -210,7 +216,14 @@ erDiagram
   they and the grants they read name, each by its key (`book`), a change's read of its actor's
   authority with those the roles it grants list, through others too (`listingSQL`), as
   `holdsRole` walks them, but not those its actor's roles list, of which it reads only their ids
-  (`powerOf`); only a read needing every one reads the tenant's by the tenant
+  (`powerOf`). That walk carries ids alone, so its `UNION` passes over a role reached again before
+  reading it: each role reached costs a lookup by its key for its list and one for its row, which
+  alone reads its permissions, and each listing reaching it only its id. Carrying whole rows, the
+  walk read, detoasted and hashed a role's every permission once for each role listing it: beside
+  300 roles of 1,000 permissions for 50 types, each listing 64 others, it passed 19,200 rows
+  through its `UNION` and read 171,912 buffers, in 1.3 s, and a change granting one took 2.6 s,
+  half of it under its locks; walking ids, it reads 300 rows and 900 buffers, in 5 ms, and the
+  change takes 83 ms. Only a read needing every one reads the tenant's by the tenant
   (`everyCustomRole`): `CustomRoles` and `Roles`, which list them, `Grantable`, which offers any,
   `SetRole`, which reads those listing the role and counts them, `DeleteRole`, which refuses a role
   another lists, and the check of exclusive values, which finds those giving one by their
@@ -444,6 +457,12 @@ flowchart LR
 statement, the grants and denies on the tenant its label values are decided by too, apart from the
 conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
 something allows. So a label is decided by the values the subject held as it held its grants.
+`Permissions` decides each permission as a check of it would, by one such read, and the label only
+once the grants give something it decides, so it asks the constraints about values only where a
+check would; and it walks a role's permissions once for each carrier its grants have, and once for
+each carrier and condition its conditional ones have (`permissionsOf`), however many groups grant
+it: once for each grant, a subject in 1,000 groups each granted a role of 1,000 permissions on the
+4 scopes of a path had it read 4 million entries, in 180 ms, against 2,000 in 17.
 
 ```mermaid
 flowchart TB
@@ -514,10 +533,25 @@ sequenceDiagram
   ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second. A hook writing
   to its copy reads its write when the call asks it again, and nothing decided or asked of another
   hook does. A copy holds no more than a check converts (`maxConverted`), counted as converting
-  counts it, each value, map, list, pointer and message what converting it costs (`mapCost`),
+  counts it, each value, map, list, pointer, message and slice of bytes what converting it costs
+  (`mapCost`),
   whatever the copy shares or moves whole, so it counts what converting the same does, but for what
-  JSON text and packed messages decode to, which it holds as bytes, and for a message, or a longer
-  length of a slice, reached twice, which it copies once where converting counts it again: past it
+  JSON text and packed messages decode to, which it holds as bytes, and for a message, a slice of
+  bytes, or a longer length of a slice, reached twice, which it copies once where converting counts
+  it again. A slice is what a hook or a condition reads of it, its elements from where it starts,
+  as many as its length, so neither knows one by its capacity (`sliceKey`): converting knows one by
+  where it starts, its length and its type (`copiedKeyOf`), converting each length once, a list of
+  its own, and a copy by where it starts and its type, copying its elements once, as many as the
+  longest length it is reached with, each length a slice of that copy. So a copy costs no more than
+  converting the same, each slice holds in the copy what it holds in the host, and one holding
+  itself ends either, as a slice reached again while it is copied is a slice of the copy, and one
+  reached again while it is converted can't be read. Slices of one array that start apart are
+  copied apart, each as converting converts it. A copy knew a slice by its capacity too, so one
+  array's 2,000 strings reached at one length with 100 capacities were copied, and charged, 100
+  times, past what a copy holds, where converting counted them once, and so were lists and JSON
+  texts that are two slices of one array, one with room to grow, that a check converted; known so by
+  converting too, to count what that copy did, lists of the 100 a check read were past what it
+  converts. Past what a copy holds
   the hook can't be asked, and the call is refused (`uncopied`) as any other, a `DeniedError` of the
   permission on the resource asked about, or the tenant, whose `Reason` names the hook and whose
   message only the permission. Counting a list's elements twice, a string by the bytes of its
@@ -525,11 +559,9 @@ sequenceDiagram
   again for the message, attributes a check converts couldn't be copied, as a resource's nearly
   40,000 timestamps, which a check converts. A copy keeps each slice it copies apart from the maps,
   pointers and messages, changing it where it is kept as its elements are copied (`copied`), as five
-  lookups of it for each element cost about what copying the element did. A slice reached at several
-  lengths or capacities is copied once from where it starts, each length a slice of the copy, as
-  converting counts a length once whatever its capacity (`sliceKey`), and one reached while its
-  elements are copied, before a longer length outgrew that copy, a slice of its own, whose elements
-  are copied too, as set in the longer alone it held the host's. A value holding no map,
+  lookups of it for each element cost about what copying the element did. One reached while its
+  elements are copied, before a longer length outgrew that copy, is a slice of its own, whose
+  elements are copied too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
   the interface. A time is shared so too, in UTC or the local zone, which any code can reach, but
   in a zone of the host's own is moved to a copy of the zone, one for each copy (`zone`), wherever
@@ -570,9 +602,11 @@ sequenceDiagram
   during the call would leave its place to one made after, which would be given the first one's
   copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
-  `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
-  errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
-  CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
+  `Config.Attributes`. Each is compiled once, and one that doesn't compile is found so once, as
+  checks keep it as they keep a program (`conditions.compile`), bounded in cost, and fails closed:
+  a condition that errors gives nothing, and a deny's that errors denies. A check converts what the
+  host passes into CEL's own values once (`converter`), deeply, from a closed set of Go values
+  (`Attributes`): bools,
   strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
   slices, arrays, pointers, maps
   keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types,
@@ -589,7 +623,8 @@ sequenceDiagram
   read as a list of them rather than as bytes (`byteKind`), another message, a map keyed by a
   double or a lock or
   holding two keys read as the same value, and so JSON text naming a member twice
-  once unescaped, read through `json.Decoder`'s tokens (`parseJSON`), or a packed message setting a
+  once unescaped, read by the package's own parser as `encoding/json` reads it (`parseJSON`), or a
+  packed message setting a
   field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the
   last where a reader of the first reads another, JSON text that isn't UTF-8 or escapes half a
   surrogate pair, a `json.Number` JSON doesn't write, a value holding itself, or nesting past
@@ -603,6 +638,10 @@ sequenceDiagram
   are read as it is, by their fields' names alone (`variable`), as a kind declarations refuse in
   part is, so no list or map an operator meets holds it; hashed, a map literal keyed by two kinds
   past `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held.
+  Its type has none of a map's traits, so CEL has no `size()` or `in` for it, but CEL loops over a
+  value that is a map or a list in Go whatever type it says it is, so a loop's range is refused where
+  its type can't be looped over (`stepping.inOrder`): looped over, `subject.attributes.all(k, false)`
+  held for `unreadable`, which is empty.
   Built, a list holding it was decided by its size or by another value it held, as comparing reads
   the smaller value whole and no further, so `[subject.attributes] != []` held, and
   `[subject.attributes, 1] == [{}, 2]` failed for a kind that can't be read but was false for one
@@ -649,11 +688,18 @@ sequenceDiagram
   condition reads, but each map, `Struct` or JSON object 8, and each list, `ListValue` or JSON
   array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
   times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
-  as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
-  for a hook, whatever held it, but for times an interface holds each in a zone of the host's own,
-  as parsing text with an offset of part of an hour makes them, 290 ns, as a copy copies each such
-  zone, a copy charging a struct a tenth of the bytes it sets whole, and each of its fields at least
-  a tenth, as finding what it costs and whether it shares it walks each,
+  as many ints took 12 ms. Each slice of bytes and JSON text costs 3 (`bytesCost`), as a copy keeps
+  each slice it copies apart (`copied`) and converting keeps each text it parses (`once`): charged
+  one and a tenth of its length, 150,000 slices of a byte took 76 ms to copy, and 79,000 JSON texts
+  of a byte 80 ms to convert, each read through a `json.Decoder` of its own, which took most of a
+  microsecond for each text, so converting parses JSON itself (`jsonParser`). So weighed, a unit
+  took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
+  dynamic one of the host's up to 361, and times an interface holds each in a zone of the host's
+  own, as parsing text with an offset of part of an hour makes them, 290, as a copy copies each
+  such zone, but a microsecond for a message of the host's own type whose reflection panics, which
+  a copy asks of each (`itself`), whatever held it, a copy charging a struct a tenth of the bytes it
+  sets whole, and each of its fields at least a tenth, as finding what it costs and whether it
+  shares it walks each,
   found once for each type (`typeFact`), and none of the types an empty array would hold: walked for
   each value, and along each path through such arrays, a copy of 10,000 structs of 4,000 empty
   fields, charged 10,013, took 2.3 s, and of 100 values of a type nesting two empty arrays of the
@@ -699,8 +745,14 @@ sequenceDiagram
   every condition reading an attribute fails: converting isn't charged to a condition, and charging
   the check would let what one condition reads fail the others. A message the host passes is known
   by its type among those conditions read (`wellKnown`), as finding it one by reflection's
-  `Implements` took five times what converting a number does. The subject's and the request's
-  attributes are converted once for a call, by one converter (`askingOf`), as a change checks them
+  `Implements` took five times what converting a number does, and so is one of CEL's own scalars
+  (`celScalar`), which took three times what converting a string does; what reflection finds of
+  another type with methods is kept for the type (`methodsOf`), a map's key's too (`keyType`), as
+  asked of each value, converting the host's messages, which no condition reads, took four times
+  what converting a list does, and asked of each key, a map of interfaces holding CEL's timestamps
+  as keys, which no condition keys one by, 335 ns a unit.
+  The subject's and the request's attributes are converted once for a call, by one converter
+  (`askingOf`), as a change checks them
   on each scope it reaches, before its transaction and in it, and each check converts its resource's
   apart, on a converter spending what that one left (`rest`): so each check counts all three, in the
   order request, subject, resource, and a value the resource's share with them twice. Counting it
@@ -727,8 +779,9 @@ sequenceDiagram
   map, in an order that changes from one evaluation to the next, so what `map()` and `filter()`
   made, and how far `all()` or `exists()` went, and what they cost, turned on it: a grant reading
   the first key `map()` made allowed 55 of 100 identical checks, and a deny reading the first
-  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, so
-  the cost tracking observes it as it did, its value a map whose keys come sorted (`stepping.order`):
+  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, and
+  evaluated by what CEL planned, so CEL charges it as it would, its value a map whose keys come
+  sorted (`stepping.order`), which folds by its iterator, as it has no `Fold` of its own:
   bools, ints, uints, doubles, strings and bytes, each by value (`compareKeys`), by a merge sort that
   compares each key at most once at each of `⌈log2 n⌉` levels, reading no more of either than the
   key it places holds (`sortKeys`). The loop is charged that before it sorts, and bounded alike
@@ -759,10 +812,23 @@ sequenceDiagram
   of dyn may hold, but where a loop's variable named `request` hides it. Where reading the
   platform's files failed, as once the process
   ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
-  the next check plans it again: kept, a real zone failed until the process dropped it. A
+  the next check plans it again: kept, a real zone failed until the process dropped it. Meanwhile a
+  change bounding what a check reads together counts such a condition at all a condition may cost
+  (`conditions.limit`), as it is one: counted nothing, a change could add another past the bound. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
   as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
-  key or a loop's condition where the package can't charge or refuse it isn't a condition. What a
+  key, a loop's condition or a variable named from the root past a loop's variable of its name
+  where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
+  `.request` in `l.all(request, ...)`, from what the check passed, outside the evaluation, and
+  qualifies it there, where nothing is charged: a key searching a string costing 10,000 at each of
+  3,000 steps cost 6,003, its fields cost nothing, and a key naming a loop's variable failed, or,
+  naming the one that hides the variable, read the variable. So it
+  is planned as an attribute of the variable read from what the check passed (`rooting`), which CEL
+  qualifies, and evaluates a key or a choice of, on the evaluation's frame, charged as anywhere
+  else. CEL charges each call it plans as the call runs, so the call planned in place of one
+  (`charged`) charges CEL as that call once it has run, and a key or a loop's range read from an attribute is
+  evaluated by what CEL planned, so CEL charges each as it would: otherwise a comparison cost 1
+  less, and reading a time in a zone `zoneCost` less, than their bounds count. What a
   check reads together is bounded where it is stored, for each scope: an identity's conditional
   grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional
@@ -1301,16 +1367,18 @@ flowchart TB
   `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), through
   `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
   seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
-  decides at the later of the call's time and the latest time recorded that its snapshot sees, but
-  no later than the database's clock as it reads it (`decidedSQL`, `expiredUntil`), which takes
-  nothing from a time a run recorded, as none is past the clock as the run's statement began, before
-  the snapshot that sees it is taken; the clock as the read's own statement began can be before its
-  snapshot, as in a simple query, which plans a statement, and waits for its locks, first. Every
+  decides at the later of the call's time and the latest time recorded that its snapshot sees
+  (`decidedSQL`), and refuses where that is past the database's clock as it reads it once it has
+  its snapshot (`expiredAhead`, `callClock.passed`), which no time a run recorded is while the clock
+  doesn't go back, as none is past the clock as the run's statement began, before the snapshot that
+  sees it is taken; the clock as the read's own statement began can be before its snapshot, as in a
+  simple query, which plans a statement, and waits for its locks, first. Every
   expiry it compares is decided so too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
-  statement (`filterAt`), which runs later than `Filter` read the time. The call then decides at that
+  statement (`filterAt`), which runs later than `Filter` read the time, and keeps no row where the
+  time is past the clock (`filterHolding`). The call then decides at that
   time (`callClock.passed`): the conditions it evaluates, the label values the read decides and its
   statements after it read it as their time, `Explain` building what conditions read only once it
   has read the subject's keys. `Holders` reads the latest time first in its snapshot
@@ -1360,17 +1428,22 @@ flowchart TB
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
   records each write to the table, as the entity `expired`, and `AsOf` doesn't read it: as of a
-  time, a read decides at that time. Without the bound on what a read takes, one row of a time far
-  ahead, which the application's role could write around the package, had every later call of every
-  host decide then, for good, a deny binding through a place that ends before then lifted, and a
-  condition reading `request.time` met. A time past the clock now only the table's owner disabling
-  its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
-  a host behind the clock then decides at it as each statement reads it, and that host's changes are
-  tried again until the clock passes the time. The bound leaves a run's time whole only where a
-  read bounds it by the clock the run recorded it by, which hasn't gone back since: a clock gone
-  back, or a hot standby's own clock behind the primary's, cuts it to before what the run removed
-  ended, and a read then decides by the state the run left, which no moment held, until the clock
-  passes it.
+  time, a read decides at that time. Deciding at the latest time, unbounded, one row of a time far
+  ahead, which the application's role could once write around the package, had every later call of
+  every host decide then, for good, a deny binding through a place that ends before then lifted, and
+  a condition reading `request.time` met; and bounded by the clock as a read reads it, as code
+  before bounded it, a clock behind the one a run recorded the time by cut it to before what the run
+  removed ended, and a read decided by the state the run left, which no moment held. So a read that
+  finds the time past the clock refuses, as `ErrConflict`: a check, a list, `Holders`' snapshot
+  (`expiredBy`) and a change alike; and `Filter`'s condition keeps no row, in the one test that
+  keeps none past the holding's lapse too, which reads the clock once, while each use of the time
+  (`filterAt`), reading only the snapshot, reads the same. A time is past the clock only where the
+  table's owner disabled its trigger (`rbac_expired_until`), where the database's clock went back
+  since a run recorded it, or on a hot standby whose clock is behind its primary's: there every call
+  reading it is refused until the clock passes the time, and then decides at it. The comparison is
+  exact, with no margin for drift between the clocks: however little the clock is behind the time, a
+  row the run passed over could have ended between them, and deciding at the clock lets that through
+  as any cut does.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
@@ -1411,7 +1484,11 @@ flowchart TB
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
   the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
-  is named and keyed as a tenant's own is (above), by the schema it migrates.
+  is named and keyed as a tenant's own is (above), by the schema it migrates. Only the role owning
+  the tables migrates them, as a migration makes what it makes its maker's, and from
+  `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
+  role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
 
 ```mermaid
 flowchart TB
@@ -1422,6 +1499,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
+    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
@@ -1711,14 +1789,17 @@ transactions commit after the commit record. The README's
 
 ```mermaid
 flowchart LR
-    admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
+    admin["Administrator's role<br/>runs Migrate, a superuser's as it,<br/>owns the tables, rbac_expired_through<br/>and AsOf's views"]
     histrole["History's role<br/>owns rbac_history, rbac_record<br/>and rbac_history_commit"]
-    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
+    app["Application's role<br/>USAGE on the schema; SELECT, INSERT,<br/>UPDATE and DELETE on the tables but<br/>rbac_history, rbac_expired and rbac_migrations;<br/>EXECUTE on rbac_group_members, rbac_tenant_keys,<br/>rbac_text_array, rbac_changes_grants<br/>and rbac_expired_through; USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
     histrole -->|"inserts"| hist[("rbac_history")]
     app -.->|"SELECT only"| hist
+    app -.->|"SELECT only"| expired[("rbac_expired")]
+    app -->|"DeleteExpired, through<br/>rbac_expired_through, as its owner"| expired
+    expired -->|"rbac_record runs as"| histrole
     admin -->|"PruneHistory"| hist
 ```
 
@@ -1749,7 +1830,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Permissions`, a check deciding label values and a change's read of its actor's authority read each such deny's permissions once however many permissions they decide, each entry looked up among those the grants give, or for fewer than four compared with each (`listedDenies`); a change, which doesn't know what it will hand on, compares the first three it asks about, and one its actor holds none of (`askingDenies`). So each permission is decided by the denies listing it alone: compared with each permission's, `Permissions` of 300 beside 400 denies of 256 other permissions took 300 ms, and takes 12, and granting a role of 300 beside 368 such denies binding the actor took 350 ms, and takes 36. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
-| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. A read needing every role of a tenant reads at most these, and every other read those it names, with those they list. |
+| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. A read needing every role of a tenant reads at most these, and every other read those it names, with those they list, each once however many list it: a change's walk of those listed reads each role's list and row by its key once, so a tenant's 300 roles each listing 64 others cost it 600 lookups and 300 reads of their permissions, not a read of a role's permissions for each of the 19,200 listings. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |

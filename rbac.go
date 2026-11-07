@@ -278,10 +278,10 @@ func keysSQL(tenant, identity, now string) string {
 // and the grants and denies they reach, were as they had been.
 const lapseSQL = `(SELECT min(e) FROM ends)`
 
-// decidedSQL is SQL defining, in a WITH, decided(at, expired): the time a statement reading an
-// actor or a subject decides at, given now, SQL for the call's time, and the latest time
-// DeleteExpired deleted by that its snapshot sees, as rbac_expired records it, but no later than
-// the database's clock (expiredUntil), null for none. It decides at the later of the two
+// decidedSQL is SQL defining, in a WITH, decided(at, expired, ahead): the time a statement reading
+// an actor or a subject decides at, given now, SQL for the call's time, and the latest time
+// DeleteExpired deleted by that its snapshot sees, as rbac_expired records it, null for none, and
+// whether that is past the database's clock (expiredAhead). It decides at the later of the two
 // (decidedAt). DeleteExpired removes what has ended in transactions of its own, places in groups
 // before memberships, passing over what a change holds, so a read by an earlier time could find a
 // later-ending row removed and an earlier-ending one left, a state no moment held: as the place a
@@ -290,30 +290,36 @@ const lapseSQL = `(SELECT min(e) FROM ends)`
 // of the memberships alone where it removes their places with them, so a snapshot seeing any of its
 // removals sees a time each had ended by, or a place's membership had, after which the place gives
 // nothing (keysSQL), and a read deciding no earlier finds what it removed ended or giving nothing.
-// The caller has the call decide at it too (callClock.passed). As of a time, it is that time.
+// The caller has the call decide at it too, or refuses it where it is ahead (callClock.passed). As
+// of a time, it is that time. It is read once for the statement, as no plan inlines a CTE that
+// calls a volatile function.
 func (a *Authorizer) decidedSQL(now string) string {
 	if a.asOf {
-		return `decided(at, expired) AS (SELECT ` + now + `::timestamptz, NULL::timestamptz)`
+		return `decided(at, expired, ahead) AS (SELECT ` + now + `::timestamptz, NULL::timestamptz, false)`
 	}
-	return `decided(at, expired) AS (SELECT greatest(` + now + `::timestamptz, e.until), e.until
-		FROM (SELECT ` + expiredUntil + ` AS until FROM rbac_expired) e)`
+	return `decided(at, expired, ahead) AS (SELECT greatest(` + now + `::timestamptz, e.until), e.until, e.ahead
+		FROM (SELECT max(until) AS until, ` + expiredAhead + ` AS ahead FROM rbac_expired) e)`
 }
 
-// expiredUntil is SQL, of rbac_expired, for the latest time recorded there, but no later than the
-// database's clock as the statement reads it, null for none, which least alone would read as that
-// clock. No write records a time past the clock as its own statement began (rbac_expired_until),
+// expiredAhead is SQL, of rbac_expired, for whether the latest time recorded there, max(until), is
+// past the database's clock as the statement reads it, which it reads once: false where there is
+// none. No write records a time past the clock as its own statement began (rbac_expired_until),
 // which is before it commits, so before a snapshot that sees it is taken, and the clock read after:
-// so it takes nothing from a time DeleteExpired recorded, by the clock of the server it recorded it
-// on, while that clock doesn't go back; a hot standby reads by its own (README: Expiry). Not the
-// clock as the statement began: a statement of a simple query takes its snapshot after it is
-// planned, once it has waited for the locks it reads by, as do those after the first of several in
-// one, so it could see a time a run recorded after it began, and decide before the end of a row the
-// run removed, by a state no moment held. A time past the clock, which only a role that may disable
-// the table's triggers, or the database's clock going back, can leave there, would otherwise have
-// every call decide at it, for good: a deny binding a subject through a place ending before then
-// lifted, and a condition reading request.time met. In decidedSQL the clock is read once for the
-// statement, as no plan inlines a CTE that calls a volatile function.
-const expiredUntil = `CASE WHEN max(until) IS NOT NULL THEN least(max(until), clock_timestamp()) END`
+// so no time DeleteExpired recorded is ahead of the clock of the server it recorded it on, while
+// that clock doesn't go back. One is ahead where it has gone back, on a hot standby whose own clock
+// is behind the primary's, or where a role that may disable the table's triggers wrote it. A read
+// finding one refuses (callClock.passed), and Filter's condition keeps no row (filterHolding),
+// rather than decide at it or at the clock: at it, a deny binding a subject through a place ending
+// before then lifted, and a condition reading request.time met, for every call until the clock
+// passes it; at the clock, a read could find the place a deny binds a subject by, which the run
+// removed, gone, and the membership or place its power comes through, which ended sooner, still
+// there, a state no moment held. Exactly, with no margin for the clocks' drift: however little the
+// clock is behind the time, a row the run passed over could have ended between them, so deciding
+// at the clock within a margin lets that state through as any cut does. Not the clock as the
+// statement began: a statement of a simple query takes its snapshot after it is planned, once it
+// has waited for the locks it reads by, as do those after the first of several in one, so it could
+// see a time a run recorded after it began, and refuse though no clock is behind.
+const expiredAhead = `coalesce(max(until) > clock_timestamp(), false)`
 
 // decidedAt is SQL for the time decidedSQL defines.
 const decidedAt = "(SELECT at FROM decided)"
@@ -329,22 +335,24 @@ func (a *Authorizer) readingNow() (time.Time, bool) {
 }
 
 // expiredBy has the call decide no earlier than the latest time DeleteExpired deleted by that q's
-// snapshot sees, no later than the database's clock (expiredUntil), as decidedSQL has a read of an
-// actor or a subject (callClock.passed): for a read of many principals in one snapshot, as
-// Holders', whose first statement it is, so every statement of it decides at one time; and as the
-// last statement of a change's transaction that read its actor, where a run committing after that
-// read removed a row that ended after the change's time, which the statements after it could find
-// removed, as whether what the change gives breaks an exclusive dimension, has it tried again,
-// rather than decide them at the earlier time by what the run left. As of a time, it is that time.
+// snapshot sees, or refuses it where that is past the database's clock (expiredAhead), as
+// decidedSQL has a read of an actor or a subject (callClock.passed): for a read of many principals
+// in one snapshot, as Holders', whose first statement it is, so every statement of it decides at
+// one time; and as the last statement of a change's transaction that read its actor, where a run
+// committing after that read removed a row that ended after the change's time, which the statements
+// after it could find removed, as whether what the change gives breaks an exclusive dimension, has
+// it tried again, rather than decide them at the earlier time by what the run left. As of a time,
+// it is that time.
 func (a *Authorizer) expiredBy(ctx context.Context, q DB) error {
 	if a.asOf || a.clock == nil {
 		return nil
 	}
 	var expired *time.Time
-	if err := a.queryRowIndexed(ctx, q, `SELECT `+expiredUntil+` FROM rbac_expired`).Scan(&expired); err != nil || expired == nil {
+	var ahead bool
+	if err := a.queryRowIndexed(ctx, q, `SELECT max(until), `+expiredAhead+` FROM rbac_expired`).Scan(&expired, &ahead); err != nil || expired == nil {
 		return err
 	}
-	return a.clock.passed(*expired, false)
+	return a.clock.passed(*expired, ahead, false)
 }
 
 // exempting is the keys a deny exempts s by: its keys, and its identity even where it isn't a
@@ -378,14 +386,14 @@ func (a *Authorizer) keysOf(ctx context.Context, q DB, tenant string, s Subject)
 // keysAt is keysOf at a time, first as readingNow says of the call's time.
 func (a *Authorizer) keysAt(ctx context.Context, q DB, tenant string, s Subject, at time.Time, first bool) (keys, binding []string, err error) {
 	rows, err := a.queryIndexed(ctx, q, `WITH RECURSIVE `+a.decidedSQL("$3")+`, `+keysSQL("$1::text", "$2::text", decidedAt)+`
-		SELECT k, k IN (SELECT k FROM keys), (SELECT expired FROM decided) FROM bound ORDER BY k`, tenant, s.identityKey(), at)
+		SELECT k, k IN (SELECT k FROM keys), (SELECT expired FROM decided), (SELECT ahead FROM decided) FROM bound ORDER BY k`, tenant, s.identityKey(), at)
 	if err != nil {
 		return nil, nil, err
 	}
 	var k string
-	var in bool
+	var in, ahead bool
 	var expired *time.Time
-	_, err = pgx.ForEachRow(rows, []any{&k, &in, &expired}, func() error {
+	_, err = pgx.ForEachRow(rows, []any{&k, &in, &expired, &ahead}, func() error {
 		if in {
 			keys = append(keys, k)
 		}
@@ -395,7 +403,7 @@ func (a *Authorizer) keysAt(ctx context.Context, q DB, tenant string, s Subject,
 	if err != nil || expired == nil {
 		return keys, binding, err
 	}
-	return keys, binding, a.clock.passed(*expired, first)
+	return keys, binding, a.clock.passed(*expired, ahead, first)
 }
 
 // countedOf keeps the keys whose grants a read counts.
@@ -768,11 +776,14 @@ var (
 	// in a statement a hook ran, or the signer Export and Checkpoint.Sign are given, where the error
 	// it returns wraps PostgreSQL's, alone or beside others, as errors.Join holds them, or holds it
 	// as errors.As reads it. Try it again: under WithTx, the host's whole transaction, as WithTx
-	// says. A hook's error is read in the order errors.Is and errors.As read it, however many errors
-	// it holds, to the first race or ErrConflict in it, and once ten thousand or so of them are read,
-	// each one once: one whose tree holds itself, as a host's type wrapping itself by mistake can,
-	// which they read forever, a call reads round until then and returns, though the host's own
-	// errors.Is of what it returns, or of what Config.OnRefused is told, can still read it forever.
+	// says. A call, a check too, that read a time DeleteExpired recorded past the database's clock,
+	// as a hot standby whose clock is behind its primary's reads one, matches it until that clock
+	// passes the time (README: Expiry). A hook's error is read in the order errors.Is and errors.As
+	// read it, however many errors it holds, to the first race or ErrConflict in it, and once ten
+	// thousand or so of them are read, each one once: one whose tree holds itself, as a host's type
+	// wrapping itself by mistake can, which they read forever, a call reads round until then and
+	// returns, though the host's own errors.Is of what it returns, or of what Config.OnRefused is
+	// told, can still read it forever.
 	ErrConflict = errors.New("rbac: conflict")
 	// ErrNotFound is what Config.ResourceOf returns, or wraps, for a scope the host no longer has,
 	// as a resource deleted without DeleteScopes: a change that only takes access away there, as
@@ -1442,8 +1453,14 @@ func (c *callClock) earlier() time.Time {
 // before its transaction, and from then on reads the host's clock as no earlier (reading), so it
 // decides at it in its transaction too, and is refused so again only where a run still commits
 // while it runs, removing a row that ended after that time. first is whether the read was the first
-// of its phase to read the time.
-func (c *callClock) passed(expired time.Time, first bool) error {
+// of its phase to read the time. Where the read found expired past the database's clock, ahead
+// (expiredAhead), it refuses the call, a check too, and tried again once the clock passes the time,
+// it decides there.
+func (c *callClock) passed(expired time.Time, ahead, first bool) error {
+	if ahead {
+		return fmt.Errorf("%w: DeleteExpired deleted by %s, past the database's clock, which is skewed behind the clock it ran by, as a hot standby's behind its primary's, or went back; try again once the clock passes it",
+			ErrConflict, expired.UTC().Format(time.RFC3339Nano))
+	}
 	if c == nil || !expired.After(c.expired) {
 		return nil
 	}

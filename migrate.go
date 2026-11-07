@@ -17,21 +17,21 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Migrations are the SQL files that create and upgrade the package's tables, for a host that
-// runs its migrations with a tool of its own: apply each once, in order of their names, in a
-// transaction of its own or at READ COMMITTED, in a database whose encoding is UTF8: one that
-// waits for the writes in flight to the tables reads them once they end, which a stricter
-// transaction's snapshot, taken by an earlier statement, doesn't, and before any change to the
-// package's tables in that transaction, as Migrate requires. They hold no backslash, so they mean
-// the same whatever the session's standard_conforming_strings. Apply each with a short
-// lock_timeout, and where it is refused as SQLSTATE 55P03 or 40P01, roll it back and apply it
-// again, as Migrate does: a migration that waits for a lock holds those it took meanwhile, and so
-// can deadlock with a change, or stall every other. A wait shorter than deadlock_timeout never ends
-// an autovacuum worker holding the table, as PostgreSQL cancels one only once a wait for its lock
-// passes that: where one holds a table of the package's as a migration gives way, apply it again
-// having first locked that table IN SHARE UPDATE EXCLUSIVE MODE with a lock_timeout past
-// deadlock_timeout, and then with the short one again, as Migrate does. Migrate applies them
-// itself.
+// Migrations are the SQL files that create and upgrade the package's tables, for a host that runs
+// its migrations with a tool of its own: apply each once, in order of their names, as the role
+// owning the package's tables, as Migrate does, in a transaction of its own or at READ COMMITTED,
+// in a database whose encoding is UTF8: one that waits for the writes in flight to the tables reads
+// them once they end, which a stricter transaction's snapshot, taken by an earlier statement,
+// doesn't, and before any change to the package's tables in that transaction, as Migrate requires.
+// They hold no backslash, so they mean the same whatever the session's standard_conforming_strings.
+// Apply each with a short lock_timeout, and where it is refused as SQLSTATE 55P03 or 40P01, roll it
+// back and apply it again, as Migrate does: a migration that waits for a lock holds those it took
+// meanwhile, and so can deadlock with a change, or stall every other. A wait shorter than
+// deadlock_timeout never ends an autovacuum worker holding the table, as PostgreSQL cancels one
+// only once a wait for its lock passes that: where one holds a table of the package's as a
+// migration gives way, apply it again having first locked that table IN SHARE UPDATE EXCLUSIVE MODE
+// with a lock_timeout past deadlock_timeout, and then with the short one again, as Migrate does.
+// Migrate applies them itself.
 func Migrations() fs.FS {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
@@ -56,6 +56,14 @@ func Migrations() fs.FS {
 // events are pending, as migrations up to 0032_expired_writes alter history.
 // So where one of those is pending, it refuses, as ErrInvalid, a transaction holding such events,
 // before it waits for another replica's migration or applies any.
+//
+// Only the role owning the package's tables migrates them: a migration makes what it makes its
+// maker's, and from 0028_as_of_views on checks the schema of AsOf's views against it, which AsOf
+// finds among that role's views. As another role, Migrate refuses, as ErrInvalid naming that one,
+// before it applies anything or takes any lock, but as a superuser, which it runs each migration as
+// that role for, by SET LOCAL ROLE, and as itself again after: so a superuser's migration makes
+// and checks what that role's own would, and fails where that one's would, saying what to grant.
+// Where the tables aren't made yet, the role migrating makes them, and owns them.
 //
 // A migration waits at most 100 ms for any lock it takes on the package's tables, as it holds those
 // it took before meanwhile, which every statement reading them waits for: a change that reads them
@@ -218,6 +226,51 @@ func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
 	})
 }
 
+// asOwner has tx, which migrates the package's tables in schema, run as the role owning them, where
+// they are made, and returns what puts its role back as it was, or nil where it runs as it is. A
+// migration makes what it makes its maker's, and some check what they find against their maker, as
+// 0028_as_of_views does the schema of AsOf's views, which AsOf finds among the views of the tables'
+// owner: another role's migration would leave them another's, or fail partway, having made some
+// that are. So it refuses another role, as ErrInvalid naming the owner, before Migrate takes any
+// lock, but a superuser, which it sets, by SET LOCAL ROLE, to the owner, whose privileges its
+// statements are then checked against, so it makes and checks what the owner's own migration would:
+// no bound on what runs, as code of the owner's a migration calls can RESET ROLE, as it ran as the
+// superuser outright before. The current schema is the first on the search_path the role has USAGE
+// on, which "$user" names by the role, so it refuses an owner it is another for.
+func asOwner(ctx context.Context, tx pgx.Tx, schema string) (restore func() error, err error) {
+	var owner *string
+	var mine, super bool
+	var role string
+	if err := tx.QueryRow(ctx, `SELECT o.rolname::pg_catalog.text, coalesce(o.oid = r.oid, false), r.rolsuper, pg_catalog.current_setting('role')
+		FROM pg_catalog.pg_roles r
+		LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(pg_catalog.quote_ident($1) || '.rbac_grants')
+		LEFT JOIN pg_catalog.pg_roles o ON o.oid = c.relowner
+		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &mine, &super, &role); err != nil {
+		return nil, err
+	}
+	switch {
+	case owner == nil || mine:
+		return nil, nil
+	case !super:
+		return nil, fmt.Errorf("%w: the package's tables in schema %s are %s's, and a migration makes what it makes its maker's: migrate as %[3]s, or as a superuser, which migrates as that role",
+			ErrInvalid, schema, *owner)
+	}
+	var current *string
+	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('role', $1, true)`, *owner); err != nil {
+		return nil, err
+	}
+	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_schema()`).Scan(&current); err != nil {
+		return nil, err
+	}
+	if current == nil || *current != schema {
+		return nil, fmt.Errorf("%w: as %s, which owns the package's tables, schema %s isn't the first on the search_path: that role has no USAGE on it, or the search_path names another for it first", ErrInvalid, *owner, schema)
+	}
+	return func() error {
+		_, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('role', $1, true)`, role)
+		return err
+	}, nil
+}
+
 // milliseconds is d as a setting such as lock_timeout reads it.
 func milliseconds(d time.Duration) string {
 	return strconv.FormatInt(d.Milliseconds(), 10) + "ms"
@@ -261,6 +314,10 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		}
 		if encoding != "UTF8" {
 			return fmt.Errorf("rbac: the database's encoding is %s, not UTF8", encoding)
+		}
+		restore, err := asOwner(ctx, tx, *schema)
+		if err != nil {
+			return err
 		}
 		if !own {
 			if err := historyUnwritten(ctx, tx, *schema); err != nil {
@@ -328,10 +385,15 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 			}
 			done = true
 		}
+		// As they were, for what a host's transaction runs after.
+		if restore != nil {
+			if err := restore(); err != nil {
+				return err
+			}
+		}
 		if standard {
 			return nil
 		}
-		// As it was, for what a host's transaction runs after.
 		_, err = tx.Exec(ctx, `SELECT set_config('standard_conforming_strings', $1, true)`, conforming)
 		return err
 	})

@@ -889,9 +889,10 @@ func (a *Authorizer) checkCondition(checked map[string]error, b Binding) []error
 }
 
 // conditionFaults returns why a condition, of a grant or a deny, can't be stored. Each expression
-// is compiled once in checked, nil for one condition alone: one that doesn't compile isn't cached,
-// so a change of many bindings carrying it would otherwise compile it for each, past what
-// MaxConditionBytes, which counts it once, lets it spend.
+// is compiled once in checked, nil for one condition alone: a change caches nothing it compiles,
+// and checks cache only what they read stored, so a change of many bindings carrying one that
+// doesn't compile would otherwise compile it for each, past what MaxConditionBytes, which counts it
+// once, lets it spend.
 func (a *Authorizer) conditionFaults(checked map[string]error, c Condition) []string {
 	var faults []string
 	bad := func(reason string) { faults = append(faults, reason) }
@@ -3400,9 +3401,11 @@ func removing[T any](a *Authorizer, table, columns string, collect func(pgx.Rows
 // reads a state its batches left that no moment held; as each ended by Config.Now and the
 // database's clock both, a host whose clock runs ahead, or one setting Config.Now wrong, can't have
 // a later call decide past the database's clock, and a call decides later than its own clock only
-// where a run removed a row that ended after it. It records the time through rbac_expired_through,
-// which the application's database role executes in place of writing rbac_expired, and history
-// records it. A race PostgreSQL refuses matches ErrConflict.
+// where a run removed a row that ended after it. A server whose clock is behind the time, as a hot
+// standby's behind its primary's, refuses every call reading it (ErrConflict) until its clock
+// passes it. It records the time through rbac_expired_through, which the application's database
+// role executes in place of writing rbac_expired, and history records it. A race PostgreSQL refuses
+// matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	defer conflicting(&err)
