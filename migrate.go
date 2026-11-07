@@ -251,7 +251,7 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string) (restore func() erro
 	case owner == nil || mine:
 		return nil, nil
 	case !super:
-		return nil, fmt.Errorf("%w: the package's tables in schema %s are %s's, and a migration makes what it makes its maker's: migrate as %[2]s, or as a superuser, which migrates as that role",
+		return nil, fmt.Errorf("%w: the package's tables in schema %s are %s's, and a migration makes what it makes its maker's: migrate as %[3]s, or as a superuser, which migrates as that role",
 			ErrInvalid, schema, *owner)
 	}
 	var current *string

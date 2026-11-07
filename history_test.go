@@ -892,11 +892,12 @@ func TestASuperuserMakesAsOfsViewsAsTheTablesOwner(t *testing.T) {
 	r.readsAsOf(t)
 }
 
-// Migrate as a role that doesn't own the package's tables and is no superuser is refused, naming
-// the role that does, before it applies anything or takes a lock, so it doesn't wait for another
-// replica's migration first: as the application's role, and as a member of the administrator's,
-// whose migration would make what it makes its own. Each waited for the other replica, and the
-// member's then made its own what it migrated.
+// Migrate as a role that doesn't own the package's tables and is no superuser is refused, saying to
+// migrate as the role that does, before it applies anything or takes a lock, so it doesn't wait for
+// another replica's migration first: as the application's role, and as a member of the
+// administrator's, whose migration would make what it makes its own. Each waited for the other
+// replica, and the member's then made its own what it migrated; and the refusal said to migrate as
+// the schema.
 func TestMigrateAsARoleNotOwningTheTablesIsRefused(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
@@ -942,7 +943,7 @@ func TestMigrateAsARoleNotOwningTheTablesIsRefused(t *testing.T) {
 			}
 			bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			if err := rbac.Migrate(bounded, conn); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), r.admin) {
+			if err := rbac.Migrate(bounded, conn); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "migrate as "+r.admin+",") {
 				t.Errorf("Migrate as %s, beside another replica's migration: %v", role, err)
 			}
 		}()
