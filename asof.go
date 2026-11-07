@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -242,7 +243,7 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 	}
 	switch {
 	case len(views) == 0:
-		return standIns{}, "", fmt.Errorf("%w: no views of history of the role owning its tables stand beside schema %s: migrate it to 0028_as_of_views as that role", ErrInvalid, schema)
+		return standIns{}, "", noViews(ctx, q, schema)
 	case len(views) > 1:
 		return standIns{}, "", fmt.Errorf("%w: views of %s.rbac_history stand in schemas %s", ErrInvalid, schema, strings.Join(views, ", "))
 	case len(bare) > 0:
@@ -252,6 +253,55 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 	}
 	s.views = views[0]
 	return s, path, nil
+}
+
+// noViews is the error of AsOf finding no views of history of the role owning schema's tables
+// (asOfViews), read on q, which says what makes them: migrating to 0028_as_of_views as that role,
+// which makes rbac_as_of_views and runs it, or where that is applied, running rbac_as_of_views as
+// that role. That takes the function being that role's, and the views' schema being that role's
+// and holding nothing else, which a migration as a superuser, before Migrate migrated as the
+// tables' owner, left another's: a superuser then gives that role the function, and makes the
+// schema again for it, empty, as one makes the schema where it is gone.
+func noViews(ctx context.Context, q DB, schema string) error {
+	var owner, made, in, by string
+	var standing bool
+	if err := q.QueryRow(ctx, `WITH here AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2),
+		  owner AS (SELECT t.relowner FROM pg_catalog.pg_class t
+		    WHERE t.relnamespace = (SELECT here.oid FROM here) AND t.relname = 'rbac_grants' AND t.relkind IN ('r', 'p')),
+		  v AS (
+		  SELECT DISTINCT n.nspname::pg_catalog.text AS nspname, r.rolname::pg_catalog.text AS rolname FROM pg_catalog.pg_depend d
+		  JOIN pg_catalog.pg_rewrite w ON w.oid = d.objid
+		  JOIN pg_catalog.pg_class c ON c.oid = w.ev_class
+		  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		  JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+		  WHERE d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+		    AND d.refobjid = $1::pg_catalog.text::pg_catalog.regclass AND c.relkind = 'v' AND c.relname = 'rbac_grants'
+		    AND NOT pg_catalog.pg_is_other_temp_schema(c.relnamespace) AND c.relnamespace <> pg_catalog.pg_my_temp_schema())
+		SELECT coalesce((SELECT r.rolname::pg_catalog.text FROM pg_catalog.pg_roles r WHERE r.oid = (SELECT owner.relowner FROM owner)), ''),
+		  coalesce((SELECT r.rolname::pg_catalog.text FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+		    WHERE p.pronamespace = (SELECT here.oid FROM here) AND p.proname = 'rbac_as_of_views' AND p.pronargs = 0), ''),
+		  coalesce((SELECT v.nspname FROM v ORDER BY v.nspname, v.rolname LIMIT 1), ''), coalesce((SELECT v.rolname FROM v ORDER BY v.nspname, v.rolname LIMIT 1), ''),
+		  pg_catalog.to_regnamespace(pg_catalog.quote_ident($2 || '_as_of')) IS NOT NULL`,
+		historyTable(schema), schema).Scan(&owner, &made, &in, &by, &standing); err != nil {
+		return err
+	}
+	if made == "" {
+		return fmt.Errorf("%w: no views of history stand beside schema %s: migrate it to 0028_as_of_views as %s, the role owning its tables", ErrInvalid, schema, owner)
+	}
+	why := fmt.Sprintf("no views of history of %s, the role owning its tables, stand beside schema %s", owner, schema)
+	if in != "" {
+		why = fmt.Sprintf("AsOf's views of history beside schema %s are %s's, and it reads only those of %s, the role owning its tables", schema, by, owner)
+	}
+	views, role := pgx.Identifier{cmp.Or(in, schema+"_as_of")}.Sanitize(), pgx.Identifier{owner}.Sanitize()
+	run := fmt.Sprintf("as that role, with %s first on its search_path, SELECT rbac_as_of_views()", schema)
+	switch {
+	case made != owner || in != "":
+		run = fmt.Sprintf("as a superuser, run DROP SCHEMA IF EXISTS %s CASCADE, CREATE SCHEMA %[1]s AUTHORIZATION %s and ALTER FUNCTION %[3]s.rbac_as_of_views() OWNER TO %[2]s, and then, %[4]s",
+			views, role, pgx.Identifier{schema}.Sanitize(), run)
+	case !standing:
+		run = fmt.Sprintf("as a superuser, run CREATE SCHEMA %s AUTHORIZATION %s, and then, %s", views, role, run)
+	}
+	return fmt.Errorf("%w: %s: %s", ErrInvalid, why, run)
 }
 
 // stand refuses, on q, the schema of the views s found, where planted is true of it by the catalog

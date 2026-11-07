@@ -12565,6 +12565,94 @@ func TestPermissionsReadEachDenysListOnce(t *testing.T) {
 	}
 }
 
+// Permissions walks a role's permissions once for each carrier its unconditional grants have, and
+// once for each carrier and condition its conditional ones have, however many grants hold it: for a
+// subject in a thousand groups each granted a role of a thousand permissions on each scope of a
+// cluster's path, it walked the role once for each grant, 4 million entries in 180 ms, where
+// Authorize took 15. What it lists is still what Authorize allows, under the condition or not, of
+// a role granted to the tenant's members too, and of a privileged one granted to them, which gives
+// them nothing.
+func TestPermissionsWalkARoleOnceHoweverManyGrantsHoldIt(t *testing.T) {
+	var given, conditioned []rbac.Permission
+	for i := range 500 {
+		given = append(given, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+		conditioned = append(conditioned, rbac.Permission(fmt.Sprintf("cluster:q%03d", i)))
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "given", Permissions: given, ResourceTypes: []string{"cluster"}},
+			rbac.RoleDefinition{ID: "conditioned", Permissions: conditioned, ResourceTypes: []string{"cluster"}, Privileged: true},
+		)
+	})
+	ctx := t.Context()
+	u := h.as(t, "u")
+	mfa := `request.attributes.mfa == true`
+	// Written around the package, as one made before the role was privileged stays.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		VALUES ('t1', 'cluster', 'c1', 'members', 't1', 'given', ''), ('t1', 'cluster', 'c1', 'members', 't1', 'conditioned', $1)`, mfa); err != nil {
+		t.Fatal(err)
+	}
+	// u in groups from to to, each granted the one role on every scope of the cluster's path, and the
+	// other on the cluster under the condition.
+	inGroups := func(from, to int) {
+		t.Helper()
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', s.type, s.id, 'group', 'g' || i, 'given' FROM generate_series($1::int, $2) AS i,
+				  (VALUES ('cluster', 'c1'), ('workspace', 'w1'), ('org', 'o1'), ('tenant', 't1')) AS s(type, id)`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+				SELECT 't1', 'cluster', 'c1', 'group', 'g' || i, 'conditioned', $3 FROM generate_series($1::int, $2) AS i`, []any{mfa}},
+		} {
+			if _, err := h.pool.Exec(ctx, q.sql, append([]any{from, to}, q.args...)...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(k int) { read += k })
+	// lists lists u's permissions on the cluster with mfa or without, checking a few against
+	// Authorize, and returns how many entries the listing read.
+	lists := func(withMFA bool) int {
+		t.Helper()
+		c := rbac.WithRequest(ctx, map[string]any{"mfa": withMFA})
+		read = 0
+		perms, err := h.authz.Permissions(c, u, cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := read
+		want := len(given)
+		if withMFA {
+			want += len(conditioned)
+		}
+		if len(perms) != want {
+			t.Errorf("with mfa %t, Permissions lists %d permissions, not %d", withMFA, len(perms), want)
+		}
+		for _, p := range []rbac.Permission{given[0], given[len(given)-1], conditioned[0], conditioned[len(conditioned)-1], view, root} {
+			err := h.authz.Authorize(c, u, p, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			if listed := slices.Contains(perms, p); listed != (err == nil) {
+				t.Errorf("with mfa %t, Permissions lists %s: %t, Authorize: %v", withMFA, p, listed, err)
+			}
+		}
+		return entries
+	}
+	inGroups(1, 1)
+	one := lists(true)
+	inGroups(2, 100)
+	if each := (lists(true) - one) / 99; each >= len(given) {
+		t.Errorf("Permissions read %d entries more for each group granted a role of %d permissions on 4 scopes, and another under a condition", each, len(given))
+	}
+	lists(false)
+}
+
 // A change's read of its actor's authority decides each permission the actor hands on by the
 // denies listing it alone, as Permissions does: compared with every deny's list for each, an actor
 // granting a role of 300 permissions beside 368 denies of 256 others read 85 million entries of

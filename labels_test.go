@@ -2034,6 +2034,45 @@ func TestALabeledDecisionAsksTheConstraintsOnlyAboutTheValuesItsLabelAsksFor(t *
 	}
 }
 
+// Permissions of a labeled resource decides the subject's label values only once its grants give
+// it something the label decides, as a check decides them only once a grant allows: so where none
+// gives it anything there, it asks the constraints about no value and lists nothing, as every check
+// refuses plainly, where it asked about each value the label asks for and failed with a failing
+// hook's error. Once a grant gives it something there, it asks, and fails as a check of that does.
+func TestPermissionsOfALabeledResourceAsksAboutValuesOnlyOnceAGrantGivesSomething(t *testing.T) {
+	errDown := errors.New("the policy service is down")
+	asked := 0
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "down", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			if in.Permission == "comp:bravo" {
+				asked++
+				return false, errDown
+			}
+			return false, nil
+		}}}
+	})
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.hold(t, "u", "comp:bravo")
+	secret := cluster
+	secret.Labels = rbac.Label{"comp": {"bravo"}}
+	for _, p := range []rbac.Permission{view, login, root, grantC} {
+		if err := h.authz.Authorize(ctx, u, p, secret); !errors.Is(err, rbac.ErrDenied) {
+			t.Fatalf("Authorize %s: %v", p, err)
+		}
+	}
+	if listed, err := h.authz.Permissions(ctx, u, secret); err != nil || len(listed) > 0 || asked > 0 {
+		t.Errorf("Permissions of a resource no grant gives anything on lists %v: %v, asking the hook %d times", listed, err, asked)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	if err := h.authz.Authorize(ctx, u, login, secret); !errors.Is(err, errDown) {
+		t.Fatalf("Authorize %s: %v", login, err)
+	}
+	if listed, err := h.authz.Permissions(ctx, u, secret); !errors.Is(err, errDown) {
+		t.Errorf("Permissions of a resource a grant gives something on lists %v: %v", listed, err)
+	}
+}
+
 // A change that checks the labels of many scopes by one read of the actor's values, as one to the
 // members of many groups, decides each label by every value it asks for, asking the constraints
 // once about each value the labels ask for, however many ask for it, and nothing about the rest.
