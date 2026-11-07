@@ -634,13 +634,15 @@ type Constraint struct {
 // message does, is copied as any other pointer of the host's type, by the struct it points to, so a
 // constraint reads the type the host passed, in a list, a field or a map of that type too: its
 // message is a copy of its own where the field embedding it is exported, as embedding it by its
-// type's name makes it, and shared, as below, where it isn't. Past 20,000 deep, twice as deep as any condition reads, a copy holds zero
-// values, but for what it copied less deep, as copying deeper would overflow the stack. A host's
-// struct among the attributes is copied by its exported fields and those an unexported struct it
-// embeds promotes: the rest, a pointer it embeds unexported and the fields that promotes among
-// them, reflection can't set, so they are shared. A map's keys are shared, and what a pointer among
-// them reaches, as a copied key would be another key: key a map among the attributes by values, not
-// pointers, or write through none.
+// type's name makes it, and can't be copied, as below, where it isn't. Past 20,000 deep, twice as
+// deep as any condition reads, a copy holds zero values, but for what it copied less deep, as
+// copying deeper would overflow the stack. A host's struct among the attributes is copied by its
+// exported fields and those an unexported struct it embeds promotes, and the rest, which reflection
+// can't set, whole, so one holding there a pointer, a slice, a map or an interface, which the copy
+// would share, can't be copied. Nor can a channel, a func, a lock or an unsafe pointer, wherever it
+// lies, nor a map keyed by a pointer, or by a value holding one, in place or in an interface: a
+// copy sets a map's keys as they are, as a copied key would be another key. Where the attributes
+// hold one, the constraint can't be asked, and the call is refused as above.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string

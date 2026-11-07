@@ -1503,16 +1503,16 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // struct it embeds promotes are its own too, and its other unexported fields are copied whole, as
 // setting it copies them, so it copies none holding more than that copies, as a pointer, a slice or
 // another package's state, which reflection can't set, nor a value holding an unsafe pointer in
-// place, nor a lock, a channel or a func wherever it lies, a map's key an interface holds too, as it
-// would copy a lock and share the others (copyable), and a message's reflection only as that of a
-// copy of the message (pointer). A map's keys are set as they are, of a type it can copy in place,
-// and what a pointer among them reaches is shared: a copied key would be another key, so the copy
-// would find nothing under the one the host passed. It copies at most what a check converts
-// (maxConverted), counted as converting counts it, whatever it shares or copies whole (mapCost),
-// and no value nesting past maxCopied deep, nor one holding itself that reaches as many values
-// holding others (copier.around), past which, or where v holds what it can't copy, it reports
-// false, and the copy is v's zero value: copying recurses as far as v reaches, as a check's
-// converting does, which stops there.
+// place, nor a lock, a channel or a func wherever it lies, as it would copy a lock and share the
+// others (copyable), and a message's reflection only as that of a copy of the message (pointer). A
+// map's keys are set as they are, as a copied key would be another key, under which the copy would
+// find nothing the host passed, so it copies no map keyed by what it wouldn't share, as a pointer,
+// a struct holding one, or an interface holding one, however deep in the key (sharedKey). It copies
+// at most what a check converts (maxConverted), counted as converting counts it, whatever it shares
+// or copies whole (mapCost), and no value nesting past maxCopied deep, nor one holding itself that
+// reaches as many values holding others (copier.around), past which, or where v holds what it can't
+// copy, it reports false, and the copy is v's zero value: copying recurses as far as v reaches, as a
+// check's converting does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
@@ -1738,9 +1738,10 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 		c.reachedAgain(done, at)
 		return done.out
 	}
-	// Its keys are set as they are, so one of a type no copy can hold in place (copyable) refuses
-	// it, as its values do once copy reaches them, and so does one an interface holds, below.
-	if !copyable(v.Type().Key()) {
+	// Its keys are set as they are, so one of a type a copy wouldn't share (sharedKey) refuses it,
+	// and so does one an interface in a key holds (payHashed): set so, a pointer, or a channel an
+	// interface in a struct held, was the host's.
+	if !sharedKey(v.Type().Key()) {
 		c.overflow()
 		return reflect.Value{}
 	}
@@ -1767,12 +1768,6 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 		// What the entries before it held can leave less than its value holds in place, as one of two
 		// arrays of 100,000 interfaces did, which was read, 1.6 MB, only to be found past it.
 		if !c.pay(textLength(textOf(key))) || hashed && !c.payHashed(key) || !c.building(0, least) {
-			break
-		}
-		// One an interface holds is set as it is too, so one no copy can hold in place refuses the map,
-		// as the map's key type does: set so, a channel an interface held as a key was the host's.
-		if kt.Kind() == reflect.Interface && !key.IsNil() && !copyable(key.Elem().Type()) {
-			c.overflow()
 			break
 		}
 		if held := c.copy(it.Value(), depth); !c.over {
@@ -2445,7 +2440,8 @@ func keyTenths(t reflect.Type) uint64 {
 // of, a tenth of its bytes in place (keyTenths), and the strings an array or a struct key holds, and
 // what the interfaces it holds hold, a tenth of their bytes (payHashing), as Go hashes a key whole.
 // Charged an array's or a struct's bytes in place alone, a copy of 50 entries keyed by structs each
-// holding a string of 1 MiB took 1.4 ms, charged 167.
+// holding a string of 1 MiB took 1.4 ms, charged 167. As hashing reads each interface the key
+// holds, it refuses one holding what a copy can't set as it is (heldKey).
 func (c *copier) payHashed(key reflect.Value) bool {
 	if key.Kind() != reflect.Interface {
 		return c.payHashing(key)
@@ -2454,7 +2450,8 @@ func (c *copier) payHashed(key reflect.Value) bool {
 		return true
 	}
 	key = key.Elem()
-	return c.pay(keyTenths(key.Type())/10) && (key.Kind() == reflect.String || !hashesHeld(key.Type()) || c.payHashing(key))
+	return c.heldKey(key) && c.pay(keyTenths(key.Type())/10) &&
+		(key.Kind() == reflect.String || !hashesHeld(key.Type()) || c.payHashing(key))
 }
 
 // payHashing pays a tenth of the bytes of each string v holds in place, and of what each interface it
@@ -2468,7 +2465,7 @@ func (c *copier) payHashing(v reflect.Value) bool {
 			return true
 		}
 		e := v.Elem()
-		return c.pay(tenths(e.Type())/10) && (!hashesHeld(e.Type()) || c.payHashing(e))
+		return c.heldKey(e) && c.pay(tenths(e.Type())/10) && (!hashesHeld(e.Type()) || c.payHashing(e))
 	case reflect.Array:
 		for i := range v.Len() {
 			if !c.payHashing(v.Index(i)) {
@@ -2511,6 +2508,48 @@ func hashesWithin(t reflect.Type) bool {
 		}
 	}
 	return false
+}
+
+// heldKey reports whether a copy can set as it is e, what an interface in a map's key holds
+// (sharedKey), and is over where it can't.
+func (c *copier) heldKey(e reflect.Value) bool {
+	if !sharedKey(e.Type()) {
+		c.overflow()
+		return false
+	}
+	return true
+}
+
+// sharedKey reports whether a copy can set a map's key of type t as it is, as it sets each: a copied
+// key would be another key, under which the copy would find nothing the host passed. So t holds in
+// place only what a copy shares (shared), but for interfaces, each told by what it holds as the key
+// is hashed (payHashed): a key holding a pointer gave a hook what it reaches of the host's, and one
+// whose interface held a pointer or a channel, in a struct or an array, did too. No condition reads
+// a map keyed by any of them (keyType). An array's or a struct's is found once for each type
+// (typeFact).
+func sharedKey(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Interface:
+		return true
+	case reflect.Array, reflect.Struct:
+		return shared(t) || copyable(t) && typeFact(&keyTypes, t, sharedKeyWithin)
+	default:
+		return shared(t)
+	}
+}
+
+// sharedKeyWithin is sharedKey of t, an array or a struct a copy doesn't share whole, by what it
+// holds in place.
+func sharedKeyWithin(t reflect.Type) bool {
+	if t.Kind() == reflect.Array {
+		return sharedKey(t.Elem())
+	}
+	for i := range t.NumField() {
+		if !sharedKey(t.Field(i).Type) {
+			return false
+		}
+	}
+	return true
 }
 
 // shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
@@ -2625,8 +2664,9 @@ func flatWithin(t reflect.Type) bool {
 	return true
 }
 
-// What flat, tenths and hashesHeld found of each array and struct type they were asked about.
-var flatTypes, tenthsTypes, hashingTypes sync.Map
+// What flat, tenths, hashesHeld and sharedKey found of each array and struct type they were asked
+// about.
+var flatTypes, tenthsTypes, hashingTypes, keyTypes sync.Map
 
 // typeFact is what find finds of t, kept in known, so it is found once for each type: finding it
 // walks each type t holds in place, and copying asks it of each value it copies. Walked for each, a

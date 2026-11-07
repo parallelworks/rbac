@@ -475,11 +475,14 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   field held with the host, and ones holding a channel or a func, which a hook was given shared
   with the host, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
   which a hook was given alone, in an array, or in a slice or a map of arrays, and not in an array
-  of arrays; and ones holding structs whose fields hold nothing in place, as empty structs or empty
-  arrays, which a copy charged nothing for them and now charges a tenth for each, can be past what a
-  hook's copy holds, as 1,000 structs of 4,000 empty fields are, while a struct holding an empty
-  array of funcs, which marks it only never to be compared, or of a struct holding a lock that
-  isn't itself one, was refused and is now copied; and a condition building a list or a map
+  of arrays, and ones holding a map keyed by a pointer, or by a value holding one, in place or in an
+  interface, or by a struct or an array whose interface held a channel or a lock, which a hook was
+  given holding the host's pointer or channel, or the lock; and ones holding structs whose fields
+  hold nothing in place, as empty structs or empty arrays, which a copy charged nothing for them and
+  now charges a tenth for each, can be past what a hook's copy holds, as 1,000 structs of 4,000
+  empty fields are, while a struct holding an empty array of funcs, which marks it only never to be
+  compared, or of a struct holding a lock that isn't itself one, was refused and is now copied; and
+  a condition building a list or a map
   holding attributes no condition can read, or reading the `subject`, the `resource` or the
   `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
@@ -553,9 +556,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
   keep their state in; nor what it would share with the host, a channel or a func, wherever it
   lies, as a constraint sending on its copy's channel sent on the host's, and calling its copy's
-  func ran the host's closure, but where a map's key that is a pointer reaches it: a key is given as
-  it is, as the copy finds an entry only by the host's own key, so what a pointer key reaches is the
-  host's; a host's type that is its own reflection by a generated message's
+  func ran the host's closure; nor a map keyed by a pointer, or by a value holding one, in place or
+  in an interface, however deep in the key, which no condition reads either: a key is given as it
+  is, as the copy finds an entry only by the host's own key, so a constraint writing through a
+  pointer key wrote to the host's, and an interface in a struct or an array key gave it the host's
+  channel, or a lock; a host's type that is its own reflection by a generated message's
   it embeds is given holding the reflection of a copy of the message. Where the attributes hold
   more, nest
   deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be

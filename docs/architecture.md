@@ -538,9 +538,14 @@ sequenceDiagram
   host's type that is its own reflection by one held, read past it; or it holds the host's, which
   the copy shared. Nor does it copy a channel or a func, which it can only share, wherever it lies,
   a map's key an interface holds too: set as they were, a constraint sending on its copy's channel
-  sent on the host's, and calling its copy's func ran the host's closure. But a map's key that is a
-  pointer is set as it is, as the copy finds an entry only by the host's own key, so what it reaches
-  is the host's, a channel or a lock among it. A lock is refused
+  sent on the host's, and calling its copy's func ran the host's closure. Nor does it copy a map
+  keyed by what it wouldn't share whole (`sharedKey`): a pointer, or a value holding one, in place
+  or in an interface, however deep in the key. It sets each key as it is, as a copied key would be
+  another key, under which the copy would find nothing the host passed: so what a pointer key
+  reached was the host's, and a constraint writing through it wrote to the host's, and an interface
+  in a struct or an array key gave a hook the host's channel, or a lock. Each interface a key holds
+  is told as hashing it is charged (`payHashed`), as it is read then anyway. No condition reads a
+  map keyed by any of them, as CEL keys are bools, ints, uints and strings. A lock is refused
   wherever it lies too, a lock of the host's own that isn't a struct, as an integer a pointer to
   which locks and unlocks, among them, which a converter refuses too (`hostLock`), as conditions
   read it by its kind: asked only where a value was held in place, a copy copied one alone and in an

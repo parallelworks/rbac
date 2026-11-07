@@ -3390,6 +3390,8 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		"an atomic int": &atomic.Int64{}, "a struct marked never to be copied": marked{A: 1},
 		"one marked by an empty array of unsafe pointers": unsafeMarked{A: 1}, "one marked by one of locks it embeds": embeddingMarked{A: 1},
 		"a map keyed by a struct holding a mutex": map[keyed]int{{K: "a"}: 1}, "a message held by value": []structpb.Value{{}},
+		"a map keyed by a struct marked never to be copied": map[marked]int{{A: 1}: 1}, "one an interface key holds": map[any]int{marked{A: 1}: 1},
+		"a map keyed by a struct whose interface it can't set holds a string": map[struct{ a any }]int{{"a"}: 1},
 		"a reflect.Value": reflect.ValueOf(1), "an unsafe pointer": unsafe.Pointer(&x),
 		"a map keyed by a struct holding an unsafe pointer": map[struct{ P unsafe.Pointer }]int{{unsafe.Pointer(&x)}: 1},
 		"a struct holding a slice it can't set":             struct{ tags []string }{[]string{"a"}},
@@ -3559,6 +3561,45 @@ func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing
 	}
 }
 
+// A hook's copy sets a map's keys as they are, as a copied key would be another key, under which the
+// hook would find nothing the host passed: so a key that is a pointer, or holds one, gave the hook
+// the host's value, and a constraint writing through it wrote to the host's, and a key whose
+// interface held a pointer or a channel, in a struct or an array, gave it the host's too. No
+// condition reads a map keyed by any of them, as CEL keys are bools, ints, uints and strings, and
+// no hook is given one, empty too where its key's type holds a pointer in place. A key holding a
+// string, a time, or an interface holding one, reaches nothing a hook could write to, and is copied.
+func TestAHookIsGivenNoMapKeyedByWhatReachesTheHost(t *testing.T) {
+	x, ch := 1, make(chan int)
+	type pointing struct{ P *int }
+	type holding struct{ A any }
+	type embedding struct{ holding }
+	for name, m := range map[string]any{
+		"a pointer": map[*int]int{&x: 1}, "pointers, holding none": map[*int]int{}, "a message": map[*structpb.Struct]int{{}: 1},
+		"a struct holding a pointer": map[pointing]int{{&x}: 1}, "an array of pointers": map[[1]*int]int{{&x}: 1},
+		"an interface holding a pointer": map[any]int{"a": 1, &x: 2}, "a struct's interface holding a pointer": map[holding]int{{&x}: 1},
+		"an interface holding such a struct": map[any]int{holding{&x}: 1}, "a struct's interface holding a lock": map[holding]int{{spinLock(1)}: 1},
+		"an array's interface holding a channel": map[[1]any]int{{ch}: 1}, "a struct's interface holding a channel": map[holding]int{{ch}: 1},
+		"an interface holding an array's interface holding a pointer": map[any]int{[1]any{&x}: 1}, "a struct embedding such a struct": map[embedding]int{{holding{&x}}: 1},
+	} {
+		attributes := map[string]any{"m": m, "ok": true}
+		if _, evaluated := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); evaluated {
+			t.Errorf("a map keyed by %s: a condition read its kind", name)
+		}
+		if rbac.Copies(attributes) {
+			t.Errorf("a map keyed by %s: a hook was given a copy", name)
+		}
+	}
+	for name, m := range map[string]any{
+		"a struct whose interface holds a string": map[holding]int{{"a"}: 1, {}: 2}, "an interface holding a time": map[any]int{time.Unix(1, 0): 1},
+		"a struct holding a time": map[struct{ T time.Time }]int{{time.Unix(1, 0)}: 1}, "an array of strings": map[[1]string]int{{"a"}: 1},
+	} {
+		attributes := map[string]any{"m": m}
+		if copied := rbac.DeepCopy(attributes); !reflect.DeepEqual(copied, attributes) {
+			t.Errorf("a map keyed by %s: a hook was given %#v", name, copied)
+		}
+	}
+}
+
 // Types of the host's own a draw holds: a lock that is a map, structs marked never to be copied, by
 // an empty array of a mutex, or never to be compared, by one of funcs, one holding an empty array
 // of what holds a lock, one embedding a mutex, and one that is a message by the Struct it embeds.
@@ -3590,8 +3631,9 @@ func (*spinLockMap) Lock()   {}
 func (*spinLockMap) Unlock() {}
 
 // shapeDraw draws a type a host may pass, and values of it, from drawnLeaves, held alone, in arrays
-// of none, one or two, arrays of arrays, slices, pointers, maps keyed by each of drawnKeys, structs,
-// and interfaces holding any of them.
+// of none, one or two, arrays of arrays, slices, pointers, maps keyed by each of drawnKeys, pointers
+// and structs or arrays holding a pointer or an interface among them, structs, and interfaces
+// holding any of them.
 type shapeDraw struct{ rng *mathrand.Rand }
 
 var drawnLeaves = []reflect.Type{
@@ -3611,7 +3653,9 @@ var drawnLeaves = []reflect.Type{
 var drawnKeys = []reflect.Type{
 	reflect.TypeFor[string](), reflect.TypeFor[int](), reflect.TypeFor[bool](), reflect.TypeFor[float64](), reflect.TypeFor[any](),
 	reflect.TypeFor[spinLock](), reflect.TypeFor[[1]int](), reflect.TypeFor[[1]spinLock](), reflect.TypeFor[struct{ A int }](),
-	reflect.TypeFor[chan int](), reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[byteLock](),
+	reflect.TypeFor[chan int](), reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[byteLock](), reflect.TypeFor[*int](),
+	reflect.TypeFor[struct{ P *int }](), reflect.TypeFor[[1]*int](), reflect.TypeFor[struct{ A any }](), reflect.TypeFor[[1]any](),
+	reflect.TypeFor[struct{ T time.Time }](),
 }
 
 func (d *shapeDraw) typ(depth int) reflect.Type {
@@ -3680,7 +3724,7 @@ func (d *shapeDraw) value(t reflect.Type, depth int) reflect.Value {
 	case reflect.Map:
 		v.Set(reflect.MakeMap(t))
 		for range d.rng.IntN(3) {
-			if k := d.value(t.Key(), depth-1); k.Kind() != reflect.Interface || k.IsNil() || k.Elem().Type().Comparable() {
+			if k := d.value(t.Key(), depth-1); k.Comparable() {
 				v.SetMapIndex(k, d.value(t.Elem(), depth-1))
 			}
 		}
@@ -3788,11 +3832,11 @@ func holdsAny(v reflect.Value) bool {
 	return false
 }
 
-// unshared is the channel, func, unsafe pointer or lock v, a hook's copy, holds, or empty for none:
-// a map's key is given as it is, so what a pointer key reaches is the host's, and a message's own
-// state is protobuf's.
+// unshared is the channel, func, unsafe pointer or lock v, a hook's copy, holds, or a pointer a
+// map's key holds, which is the host's, as a key is given as it is, or empty for none: a message's
+// own state is protobuf's, and a time's zone none writes to.
 func unshared(v reflect.Value, key bool, seen map[uintptr]bool) string {
-	if !v.IsValid() {
+	if !v.IsValid() || v.Type() == reflect.TypeFor[time.Time]() {
 		return ""
 	}
 	t, locker := v.Type(), reflect.TypeFor[sync.Locker]()
@@ -3801,7 +3845,9 @@ func unshared(v reflect.Value, key bool, seen map[uintptr]bool) string {
 		return t.String()
 	case reflect.PointerTo(t).Implements(locker) && !t.Implements(locker):
 		return "a lock, " + t.String()
-	case t.Kind() == reflect.Pointer && (key || v.IsNil() || seen[v.Pointer()] || generated(t)):
+	case t.Kind() == reflect.Pointer && key && !v.IsNil():
+		return "a pointer in a map's key, " + t.String()
+	case t.Kind() == reflect.Pointer && (v.IsNil() || seen[v.Pointer()] || generated(t)):
 		return ""
 	}
 	switch v.Kind() {
@@ -3842,8 +3888,10 @@ func unshared(v reflect.Value, key bool, seen map[uintptr]bool) string {
 // value of any other, but where it is or holds in place a nil message CEL reads as another value;
 // a hook is given a copy of every value a condition reads, charged as converting it is, or less
 // where it holds an Any, whose packed bytes it holds; and no copy holds a channel, a func, an
-// unsafe pointer or a lock, but where a pointer key reaches it. An interface holding a nil lock of
-// the host's own that is a slice gave a hook the lock, where one held directly was refused.
+// unsafe pointer or a lock, nor a map whose key holds a pointer, in place or in an interface. An
+// interface holding a nil lock of the host's own that is a slice gave a hook the lock, where one
+// held directly was refused, and a map keyed by a pointer, or by a struct or an array whose
+// interface held a pointer or a channel, gave a hook the host's.
 func TestConvertingAndCopyingAgreeOnEveryShape(t *testing.T) {
 	for seed := range uint64(4000) {
 		d := &shapeDraw{rng: mathrand.New(mathrand.NewPCG(seed, 138))}
