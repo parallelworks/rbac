@@ -2546,8 +2546,9 @@ func TestCopyingPrefixesOfOneSliceCopiesItOnce(t *testing.T) {
 // A slice reached at one length with several capacities, as three-index slices of one array are, is
 // copied once, and charged as converting it is, once: copied for each capacity, 100 such slices of
 // an array of 2,000 strings were charged 100 times what converting them was, past what a hook's copy
-// holds, so every constrained call was refused for attributes a check reads. Each is the hook's own,
-// as long as its capacity.
+// holds, so every constrained call was refused for attributes a check reads; and converted for each
+// capacity, to count as that copy did, they were past what a check converts. Each is the hook's
+// own, as long as its capacity.
 func TestCopyingASliceAtSeveralCapacitiesCostsWhatConvertingItDoes(t *testing.T) {
 	base := make([]string, 2000, 2100)
 	for i := range base {
@@ -2903,7 +2904,7 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 // what converting them costs, and no more where they hold JSON text or packed messages, which
 // converting decodes and a copy holds as bytes, a value reached twice, which a copy copies once
 // where converting may count it again, or slices of one array, which a copy copies once for where
-// each starts and its capacity, and converting once for each length too.
+// each starts, whatever its capacity, and converting once for each length, and bytes each time.
 func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 	for _, mode := range []struct {
 		name                      string
@@ -4310,8 +4311,8 @@ func holdsAny(v reflect.Value) bool {
 }
 
 // startsShared reports whether v holds two slices of one type starting at one place at two lengths,
-// which a copy copies once, at the longer, and converting at each, as slices of values of no size
-// all start at one place.
+// or two of bytes at any, which a copy copies once, at the longer, and converting at each length,
+// and bytes each time, as slices of values of no size, and empty ones, all start at one place.
 func startsShared(v reflect.Value, lengths map[[2]any]int) bool {
 	if !v.IsValid() {
 		return false
@@ -4321,7 +4322,7 @@ func startsShared(v reflect.Value, lengths map[[2]any]int) bool {
 		return !v.IsNil() && startsShared(v.Elem(), lengths)
 	case reflect.Slice:
 		at := [2]any{v.Type(), v.Pointer()}
-		if n, ok := lengths[at]; v.IsNil() || ok && n != v.Len() {
+		if n, ok := lengths[at]; v.IsNil() || ok && (n != v.Len() || v.Type().Elem().Kind() == reflect.Uint8) {
 			return !v.IsNil()
 		}
 		lengths[at] = v.Len()
@@ -4686,8 +4687,8 @@ func writtenMessage(m protoreflect.Message) {
 // value of a type a check refuses by its type, empty or nil too, and a condition reads the zero
 // value of any other, but where it is or holds in place a nil message CEL reads as another value;
 // a hook is given a copy of every value a condition reads, charged as converting it is, or less
-// where it holds an Any, whose packed bytes it holds, or a slice at two lengths, which it copies
-// once; no copy holds a channel, a func, an unsafe pointer or a lock, nor a map whose key holds a
+// where it holds an Any, whose packed bytes it holds, or a slice at two lengths, or two slices of
+// bytes starting at one place, which it copies once; no copy holds a channel, a func, an unsafe pointer or a lock, nor a map whose key holds a
 // pointer, in place or in an interface; and a hook writing all its copy reaches, as reflection and
 // the methods of the host's types can, writes nothing of the host's, nor of another hook's copy. An
 // interface holding a nil lock of the host's own that is a slice gave a hook the lock, where one
