@@ -1229,13 +1229,20 @@ func TestActivationsUnderAGenericPlanReadOnlyTheirHoldersPaths(t *testing.T) {
 // plan too: found by the group they were made through, or beside the tenant, a plan costing them by
 // averages would read every activation in the tenant.
 func TestLeavingUnderAGenericPlanReadsOnlyTheLeaversActivations(t *testing.T) {
-	// On one connection, where a call made once beforehand has planned its statements: planning one
-	// reads its indexes' metapages, as again once the tables are analyzed, and that of an index
-	// holding no row each time, as the custom roles' and the conditional grants' are here, which
-	// counts as pages read.
+	// On one connection, which keeps the plan of each statement it has run: planning one reads its
+	// indexes' metapages, as again once the tables are analyzed, and that of an index holding no row
+	// each time, as the custom roles' and the conditional grants' are here, which counts as pages
+	// read. So a change counts the least of a few runs (least): the first plans its statements, as
+	// does a run after another session makes or drops a schema in the database, which has the
+	// connection plan every statement it keeps again. On a database other tests shared, one run in
+	// seven was planned again, reading some 30 pages more, past the limit at a later size. And
+	// autovacuum leaves the copy's tables alone: at its next visit to the database it would analyze
+	// and vacuum them, planning the statements again too, by statistics the earlier sizes weren't
+	// planned by.
 	h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_generic_plan&pool_max_conns=1"), withLabels, func(c *rbac.Config) {
 		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
 	})
+	unvacuumed(t, h, crowdedTables...)
 	ctx := t.Context()
 	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
 	h.groups(t, "oncall")
@@ -1256,7 +1263,7 @@ func TestLeavingUnderAGenericPlanReadsOnlyTheLeaversActivations(t *testing.T) {
 		}
 	}
 	tables := []string{"rbac_grants", "rbac_members"}
-	// The pages of each, and their indexes, each reads, in a transaction it rolls back.
+	// The least pages of each, and their indexes, each reads in a run, in a transaction it rolls back.
 	read := func() map[string]int64 {
 		t.Helper()
 		pages := map[string]int64{}
@@ -1271,26 +1278,29 @@ func TestLeavingUnderAGenericPlanReadsOnlyTheLeaversActivations(t *testing.T) {
 				return a.ChangeMembers(ctx, admin, "t1", nil, []rbac.Member{{Group: "oncall", Principal: groupOf("inner")}})
 			},
 		} {
-			for _, measured := range []bool{false, true} {
-				func() {
-					tx, err := h.pool.Begin(ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer func() { _ = tx.Rollback(ctx) }()
-					before := map[string]int64{}
-					for _, table := range tables {
-						before[table] = pagesRead(ctx, t, tx, table)
-					}
-					if err := f(h.authz.WithTx(tx)); err != nil {
-						t.Fatalf("%s: %v", what, err)
-					}
-					for _, table := range tables {
-						if measured {
-							pages[what+" of "+table] = pagesRead(ctx, t, tx, table) - before[table]
-						}
-					}
-				}()
+			fewest, err := least(func() (map[string]int64, error) {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					return nil, err
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				run := map[string]int64{}
+				for _, table := range tables {
+					run[table] = -pagesRead(ctx, t, tx, table)
+				}
+				if err := f(h.authz.WithTx(tx)); err != nil {
+					return nil, fmt.Errorf("%s: %w", what, err)
+				}
+				for _, table := range tables {
+					run[table] += pagesRead(ctx, t, tx, table)
+				}
+				return run, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for table, n := range fewest {
+				pages[what+" of "+table] = n
 			}
 		}
 		return pages
@@ -6246,13 +6256,25 @@ func TestMembersGainingAGrantAreDecidedAsOne(t *testing.T) {
 		}
 		return denials(err), allocated
 	}
-	oneRefused, oneAllocated := refuse(1)
-	manyRefused, manyAllocated := refuse(40)
+	// The least each allocates in a few runs (least): deciding a refusal formats its reason, and the
+	// first formatting since a garbage collection emptied fmt's pool of printers allocates the pool a
+	// slot for each P anew, 4 KB on 30 of them, which, counted in forty members' decision and not in
+	// one's, passed twice one's in about one run of a hundred.
+	var oneRefused, manyRefused int
+	allocations, err := least(func() (map[string]uint64, error) {
+		var one, many uint64
+		oneRefused, one = refuse(1)
+		manyRefused, many = refuse(40)
+		return map[string]uint64{"one": one, "many": many}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if manyRefused != oneRefused {
 		t.Errorf("adding one member was refused %d times, and forty %d", oneRefused, manyRefused)
 	}
-	if manyAllocated > 2*oneAllocated {
-		t.Errorf("deciding what one member gains allocated %d bytes, and forty %d", oneAllocated, manyAllocated)
+	if one, many := allocations["one"], allocations["many"]; many > 2*one {
+		t.Errorf("deciding what one member gains allocated %d bytes, and forty %d", one, many)
 	}
 }
 

@@ -39,7 +39,7 @@ with `go test -run`. So a test whose own body reads what its subtests did runs a
   with `pgtest.Skip`, which fails it in CI, where every test can run, and so the `go` job fails on
   a top-level test that skipped. The test that migrates beside an autovacuum worker waits two of
   `autovacuum_naptime` and 30 seconds for one, which in CI has come within a minute; a shorter
-  naptime there has autovacuum analyze a crowded copy before its test reads that nothing had.
+  naptime there has autovacuum analyze a crowded copy while a test reads it as copying left it.
 - The coverage each shard prints counts only the statements its own tests reach, so it reads low.
   The `go` job merges every shard's profile into the whole suite's, as `make test` prints it.
 - `crowded` copies its tenants from a schema each test process fills once, as writing their 46,000
