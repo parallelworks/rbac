@@ -232,10 +232,11 @@ func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
 // 0028_as_of_views does the schema of AsOf's views, which AsOf finds among the views of the tables'
 // owner: another role's migration would leave them another's, or fail partway, having made some
 // that are. So it refuses another role, as ErrInvalid naming the owner, before Migrate takes any
-// lock, but a superuser, which it sets, by SET LOCAL ROLE, to the owner, whose rights are then all
-// it has, so it makes and checks what the owner's own migration would. The current schema is the
-// first on the search_path the role has USAGE on, which "$user" names by the role, so it refuses
-// an owner it is another for.
+// lock, but a superuser, which it sets, by SET LOCAL ROLE, to the owner, whose privileges its
+// statements are then checked against, so it makes and checks what the owner's own migration would:
+// no bound on what runs, as code of the owner's a migration calls can RESET ROLE, as it ran as the
+// superuser outright before. The current schema is the first on the search_path the role has USAGE
+// on, which "$user" names by the role, so it refuses an owner it is another for.
 func asOwner(ctx context.Context, tx pgx.Tx, schema string) (restore func() error, err error) {
 	var owner *string
 	var mine, super bool
