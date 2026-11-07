@@ -1,7 +1,6 @@
 package rbac
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -261,7 +260,10 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 // that role. That takes the function being that role's, and the views' schema being that role's
 // and holding nothing else, which a migration as a superuser, before Migrate migrated as the
 // tables' owner, left another's: a superuser then gives that role the function, and makes the
-// schema again for it, empty, as one makes the schema where it is gone.
+// schema again for it, empty, as one makes the schema where it is gone. And it takes no other
+// views of history named as the package's tables standing anywhere, which rbac_as_of_views would
+// take for the views and refuse: in a schema other than the views', one that can hold anything
+// else, only those views are dropped.
 func noViews(ctx context.Context, q DB, schema string) error {
 	var owner, made, in, by string
 	var standing bool
@@ -288,16 +290,25 @@ func noViews(ctx context.Context, q DB, schema string) error {
 	if made == "" {
 		return fmt.Errorf("%w: no views of history stand beside schema %s: migrate it to 0028_as_of_views as %s, the role owning its tables", ErrInvalid, schema, owner)
 	}
+	mine := schema + "_as_of"
 	why := fmt.Sprintf("no views of history of %s, the role owning its tables, stand beside schema %s", owner, schema)
-	if in != "" {
+	switch in {
+	case "":
+	case mine:
 		why = fmt.Sprintf("AsOf's views of history beside schema %s are %s's, and it reads only those of %s, the role owning its tables", schema, by, owner)
+	default:
+		why = fmt.Sprintf("views of history beside schema %s stand in schema %s, and are %s's, and AsOf reads only those of %s, the role owning its tables", schema, in, by, owner)
 	}
-	views, role := pgx.Identifier{cmp.Or(in, schema+"_as_of")}.Sanitize(), pgx.Identifier{owner}.Sanitize()
+	views, role := pgx.Identifier{mine}.Sanitize(), pgx.Identifier{owner}.Sanitize()
 	run := fmt.Sprintf("as that role, with %s first on its search_path, SELECT rbac_as_of_views()", schema)
 	switch {
 	case made != owner || in != "":
-		run = fmt.Sprintf("as a superuser, run DROP SCHEMA IF EXISTS %s CASCADE, CREATE SCHEMA %[1]s AUTHORIZATION %s and ALTER FUNCTION %[3]s.rbac_as_of_views() OWNER TO %[2]s, and then, %[4]s",
+		run = fmt.Sprintf("run DROP SCHEMA IF EXISTS %s CASCADE, CREATE SCHEMA %[1]s AUTHORIZATION %s and ALTER FUNCTION %[3]s.rbac_as_of_views() OWNER TO %[2]s, and then, %[4]s",
 			views, role, pgx.Identifier{schema}.Sanitize(), run)
+		if in != "" && in != mine {
+			run = fmt.Sprintf("drop the views of history named as the package's tables in schema %s, %s", pgx.Identifier{in}.Sanitize(), run)
+		}
+		run = "as a superuser, " + run
 	case !standing:
 		run = fmt.Sprintf("as a superuser, run CREATE SCHEMA %s AUTHORIZATION %s, and then, %s", views, role, run)
 	}

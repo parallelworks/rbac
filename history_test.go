@@ -1085,6 +1085,58 @@ func TestASuperusersMigrationAsItselfIsGivenBackAsTheReadmeSays(t *testing.T) {
 	}
 }
 
+// Where views of history named as the package's tables stand in a schema of another role's other
+// than AsOf's, and none of the role owning the tables stand anywhere, AsOf's error says to drop
+// those views, and not that schema, which holds what else its owner keeps there: once a superuser
+// has done what it says, and the administrator's role made the views, AsOf reads, and the other
+// schema and what else it holds stand. It said to drop that schema, CASCADE, and make it again
+// for the administrator's role, after which rbac_as_of_views, finding no views' schema, failed to
+// make one.
+func TestAsOfSaysToDropOnlyTheViewsOfHistoryStandingInAnotherSchema(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	r.harden(t)
+	quoted := func(name string) string { return pgx.Identifier{name}.Sanitize() }
+	views := r.schema + "_as_of"
+	// Named to come before the views' schema, as AsOf's error names the first.
+	other := "a_" + r.schema
+	if _, err := r.super.Exec(ctx, `CREATE SCHEMA `+other+`; CREATE TABLE `+other+`.kept (id int);
+		CREATE VIEW `+other+`.rbac_grants AS SELECT h.id FROM `+r.schema+`.rbac_history h`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := r.super.Exec(context.WithoutCancel(ctx), `DROP SCHEMA IF EXISTS `+other+` CASCADE`); err != nil {
+			t.Errorf("DROP SCHEMA %s: %v", other, err)
+		}
+	})
+	if _, err := r.super.Exec(ctx, `DROP SCHEMA `+views+` CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	err := r.asOf(ctx, t)
+	want := `drop the views of history named as the package's tables in schema ` + quoted(other) + `, run DROP SCHEMA IF EXISTS ` +
+		quoted(views) + ` CASCADE, CREATE SCHEMA ` + quoted(views) + ` AUTHORIZATION ` + quoted(r.admin)
+	if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), `DROP SCHEMA IF EXISTS `+quoted(other)) {
+		t.Fatalf("AsOf where views of history stand only in another schema: %v", err)
+	}
+	for _, sql := range []string{`DROP VIEW ` + other + `.rbac_grants`, `DROP SCHEMA IF EXISTS ` + views + ` CASCADE`,
+		`CREATE SCHEMA ` + views + ` AUTHORIZATION ` + r.admin, `ALTER FUNCTION ` + r.schema + `.rbac_as_of_views() OWNER TO ` + r.admin} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if _, err := r.adminPool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+		t.Fatal(err)
+	}
+	r.readsAsOf(t)
+	var kept bool
+	if err := r.super.QueryRow(ctx, `SELECT to_regclass($1 || '.kept') IS NOT NULL`, other).Scan(&kept); err != nil || !kept {
+		t.Errorf("schema %s keeps its table: %t, %v", other, kept, err)
+	}
+}
+
 // The README's database roles, set up as its steps say and given nothing more, run the package: as
 // the administrator's role, Migrate, on a new schema or one history's role took history over in
 // before the last migration, and on a host's transaction that changed the tables, and PruneHistory;
