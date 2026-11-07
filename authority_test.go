@@ -4375,8 +4375,25 @@ func custom(t *testing.T, mutate ...func(*rbac.Config)) *harness {
 func crowded(t *testing.T, pool *pgxpool.Pool, mutate ...func(*rbac.Config)) *harness {
 	t.Helper()
 	h := harnessOn(t, pool, mutate...)
-	pgtest.Copy(t, pool, pgtest.Template(t, "crowded", crowd), crowdedTables...)
+	h.copyCrowd(t)
 	return h
+}
+
+// copyCrowd copies crowded's tenants into h's tables, as migrating left them.
+func (h *harness) copyCrowd(t *testing.T) {
+	t.Helper()
+	pgtest.Copy(t, h.pool, pgtest.Template(t, "crowded", crowd), crowdedTables...)
+}
+
+// unvacuumed has autovacuum leave tables of h's schema alone, so only the test analyzes or vacuums
+// them.
+func unvacuumed(t *testing.T, h *harness, tables ...string) {
+	t.Helper()
+	for _, table := range tables {
+		if _, err := h.pool.Exec(t.Context(), `ALTER TABLE `+table+` SET (autovacuum_enabled = off)`); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // crowdedTables are the tables crowd writes, history last, as it records the others.
@@ -4422,9 +4439,14 @@ var crowding = []string{
 // migrating left them, and what is written next is recorded after what it copied.
 func TestACrowdedCopyIsWhatWritingItAfreshMakes(t *testing.T) {
 	ctx := t.Context()
-	copied := crowded(t, pgtest.Open(t, ""))
+	// Autovacuum analyzes and vacuums the copy's tables at its next visit to the database once they
+	// are written, and once analyzed four of them before the test read that nothing had. Off for
+	// them from before they are written, it leaves them as copying them did, which is what is checked:
+	// an ANALYZE or VACUUM that copying ran would still show.
+	copied := harnessOn(t, pgtest.Open(t, ""))
+	unvacuumed(t, copied, crowdedTables...)
+	copied.copyCrowd(t)
 	copySchema := currentSchema(t, copied)
-	// Checked first, as autovacuum may analyze and vacuum the tables once they are written.
 	empty := currentSchema(t, setup(t))
 	if got, want := relationStats(t, copied, copySchema), relationStats(t, copied, empty); !maps.Equal(got, want) {
 		t.Errorf("a copy's statistics are %v, not as migrating left them: %v", got, want)
