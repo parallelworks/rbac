@@ -60,8 +60,10 @@ import (
 // Condition is none, and one with a title or description has an expression. A pattern it matches
 // is a string literal,
 // of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
-// and a comparison, or a search of a list, that would read more than a condition may spend, or
-// reading a time in a zone whose name is longer than 64 bytes, holds a byte no zone's name does, as
+// it indexes a variable it names from the root where a loop's variable of the same name hides it,
+// as `.request` in `l.all(request, ...)`, by literals alone; and a comparison, or a search of a
+// list, that would read more than a condition may spend, or reading a time in a zone whose name is
+// longer than 64 bytes, holds a byte no zone's name does, as
 // tzdata.zi's dot, or has a part that is Local, the zone the process runs in, or localtime, in any
 // case, as posix/localtime, fails before it runs. request.time is the host's clock (Config.Now) in
 // UTC, and a time the host passes is read in UTC too (Attributes), so string() of one writes the
@@ -462,6 +464,9 @@ func (c *conditions) build(expr string) (program, error) {
 // plan plans checked to run within limit, as costs charges its calls, once the options before
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
+	if indexedPastLoop(checked.NativeRep()) {
+		return nil, errors.New("a variable named from the root past a loop's variable of its name is indexed by a key it computes, which CEL evaluates where nothing charges it")
+	}
 	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
 	l, str, g := newLiterals(checked.NativeRep(), limit), &stringing{env: env}, newGuards(checked.NativeRep(), limit)
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
@@ -491,6 +496,46 @@ func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint
 		return nil, errors.New("a comparison, a search or a match is planned where this package can't bound it")
 	}
 	return prg, nil
+}
+
+// indexedPastLoop reports whether checked indexes a variable it names from the root where a loop's
+// variable of the same name hides it, as `.request` in `l.all(request, ...)`, by anything but a
+// literal, at once or past selects, indexes and either side of a choice. CEL reads such a variable
+// from what the check passed, outside the evaluation, and indexes it there, where nothing is charged,
+// so the key and whatever computing it evaluated ran uncharged: a key searching a string costing
+// 10,000 at each of 3,000 steps of a loop cost 6,003, and one concatenating strings at each took
+// 200 ms where 10,000 covers 1.5 at most. Read there by its fields or literal keys, it reads a value
+// for each, uncharged too, but no more than the condition names.
+func indexedPastLoop(checked *ast.AST) bool {
+	refs := checked.ReferenceMap()
+	var rooted func(e ast.Expr) bool
+	rooted = func(e ast.Expr) bool {
+		switch e.Kind() {
+		case ast.IdentKind, ast.SelectKind:
+			if ref, ok := refs[e.ID()]; ok {
+				return strings.HasPrefix(ref.Name, ".")
+			}
+			return e.Kind() == ast.SelectKind && !e.AsSelect().IsTestOnly() && rooted(e.AsSelect().Operand())
+		case ast.CallKind:
+			args := e.AsCall().Args()
+			switch fn := e.AsCall().FunctionName(); {
+			case fn == operators.Index && len(args) == 2:
+				return rooted(args[0])
+			case fn == operators.Conditional && len(args) == 3:
+				return rooted(args[1]) || rooted(args[2])
+			}
+		default:
+			// A literal, a list, a map or a loop is a value of its own.
+		}
+		return false
+	}
+	return len(ast.MatchDescendants(ast.NavigateAST(checked), func(e ast.NavigableExpr) bool {
+		if e.Kind() != ast.CallKind || e.AsCall().FunctionName() != operators.Index {
+			return false
+		}
+		args := e.AsCall().Args()
+		return len(args) == 2 && args[1].Kind() != ast.LiteralKind && rooted(args[0])
+	})) > 0
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they

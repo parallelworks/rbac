@@ -4904,6 +4904,49 @@ func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
 	}
 }
 
+// CEL reads a variable a condition names from the root where a loop's variable of the same name
+// hides it, as `.request` in `l.all(request, ...)`, from what the check passed, outside the
+// evaluation, and indexes it there, where nothing is charged: a key it computed, and whatever
+// computing it evaluated, ran uncharged, so a key searching a string of 100,000 bytes at each of
+// 3,000 steps of a loop cost 6,003. A condition indexing one by anything but a literal isn't one;
+// reading it by its fields or a literal key, or one past a loop's variable of another name, is.
+func TestAVariableNamedFromTheRootPastALoopsVariableIsIndexedOnlyByALiteral(t *testing.T) {
+	n := rbac.CountSearches(t)
+	l := make([]any, 3000)
+	for i := range l {
+		l[i] = fmt.Sprint(i)
+	}
+	attributes := map[string]any{"l": l, "s": strings.Repeat("x", 99_990), "m": map[string]any{"0": 1, "a": 2}, "k": "a"}
+	searching := `%[1]s.attributes.l.filter(x, %[1]s.attributes.s.contains(x)).size()`
+	for _, key := range []string{
+		`string(` + searching + `)`, `[string(` + searching + `)][0]`, `(` + searching + ` > 0 ? "a" : "0")`,
+		`%[1]s.attributes.k`, `string(size(%[1]s.attributes.s) - 99990)`,
+	} {
+		for _, read := range []string{
+			`%[1]s.attributes.m[` + key + `] == 1`, `(true ? %[1]s.attributes.m : {})[` + key + `] == 1`, `%[1]s.attributes["m"][` + key + `] == 1`,
+		} {
+			*n = 0
+			past := `[1].all(request, ` + fmt.Sprintf(read, ".request") + `)`
+			if _, _, _, err := rbac.EvaluateCondition(t, past, attributes); err == nil || *n > 0 {
+				t.Errorf("%s, searching %d times, is a condition: %v", past, *n, err)
+			}
+			beside := `[1].all(other, ` + fmt.Sprintf(read, "request") + `)`
+			if _, _, _, err := rbac.EvaluateCondition(t, beside, attributes); err != nil {
+				t.Errorf("%s: %v", beside, err)
+			}
+		}
+	}
+	for _, expr := range []string{
+		`[1].all(request, .request.attributes.m["a"] == 2)`, `[1].all(request, (true ? .request.attributes : {}).m.a == 2)`,
+		`[resource.attributes].exists(subject, subject.k == "a" && .subject.id == "u")`,
+		`[1].all(request, .request.attributes.m == {"0": 1, "a": 2})`,
+	} {
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
+			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
 // A check passes ids, a kind, a type and a tenant of at most MaxID bytes, and a permission as the
 // action, so a condition comparing an attribute with one, as an owner's does, or finding one in a
 // map, costs little, and no more than its bound however long they are. A comprehension's variable
