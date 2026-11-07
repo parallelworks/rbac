@@ -223,8 +223,8 @@ const maxConverted = 2 * maxCheckCost
 // 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where as many ints took
 // 12 ms and 6 ms; so weighed, a unit takes 20 to 115 ns to convert and 25 to 200 ns to copy,
 // whatever holds it, a copied message the most, but for times an interface holds each in a zone of
-// the host's own, as parsing text with an offset makes them, about 290 ns, as a copy copies each
-// such zone (copier.zone).
+// the host's own, as parsing text with an offset of part of an hour makes them, about 290 ns, as a
+// copy copies each such zone (copier.zone).
 const (
 	mapCost     = 8
 	listCost    = 4

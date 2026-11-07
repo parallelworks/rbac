@@ -630,10 +630,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
     the host's own key, so a constraint writing through a pointer key wrote to the host's, and an
     interface in a struct or an array key gave it the host's channel, or a lock. No condition reads
     such a map either, as CEL keys are bools, ints, uints and strings.
-  - **Reflections that fail:** a message, or a message's reflection, whose copying panics, as the
-    methods of the host's own reflection can, a struct embedding a nil one, or a dynamic message
-    made without its type, or makes a message of another type than the host passed: each panicked
-    every call asking a hook about it.
+  - **Reflections that fail:** a message, or a message's reflection, whose copying panics, as that
+    of a struct of the host's embedding a nil reflection, or of a dynamic message made without its
+    type, does, which panicked every call asking a hook about it, or makes a message of another
+    type than the host passed, which a hook was given as that type.
 
 ## Principals
 

@@ -647,7 +647,8 @@ type Constraint struct {
 // call is refused as above. A time in a zone of the host's own, as time.FixedZone and
 // time.LoadLocation make, is copied in a copy of the zone, one for each copy, a map's key too: a
 // zone's methods write none of it, but assigning through Location writes it whole, so a constraint
-// doing so wrote the host's. So a copy's time is == to none of the host's, though Equal to it.
+// doing so wrote the host's. So such a time in a copy is == to none of the host's, though Equal to
+// it.
 type ConstraintInput struct {
 	Tenant       string
 	ResourceType string
