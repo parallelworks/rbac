@@ -549,8 +549,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   member or guest of it (`SetMemberships`), and nothing while its membership is suspended. A guest,
   such as one from another tenant, holds what it is granted there and nothing granted to the
   tenant's members. Leaving a tenant (`DeletePrincipal`) removes what the identity held there,
-  its exemptions from denies and its place among approvers too; `DeletePrincipalEverywhere` removes
-  a deleted identity from every tenant.
+  its exemptions from denies and its place among approvers too, but for a deny or an eligibility
+  naming it that commits once it has found those, which it leaves as if set after it: `SetDeny` and
+  `SetEligibility` take no lock of the identities they name, and taking it out of one meanwhile
+  could deadlock with another removal. Removing it again takes it out. `DeletePrincipalEverywhere`
+  removes a deleted identity from every tenant.
 - **Groups:** a group is its tenant's (`SetGroup`, `ImportGroups`), and `group:<id>` names it only
   there. Its members are identities that are members or guests of the tenant, and other groups of
   the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
