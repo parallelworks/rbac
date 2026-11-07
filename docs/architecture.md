@@ -566,6 +566,10 @@ sequenceDiagram
   are read as it is, by their fields' names alone (`variable`), as a kind declarations refuse in
   part is, so no list or map an operator meets holds it; hashed, a map literal keyed by two kinds
   past `maxConverted` held one entry, and `request.attributes in {subject.attributes: true}` held.
+  Its type has none of a map's traits, so CEL has no `size()` or `in` for it, but CEL loops over a
+  value that is a map or a list in Go whatever type it says it is, so a loop's range is refused where
+  its type can't be looped over (`stepping.inOrder`): looped over, `subject.attributes.all(k, false)`
+  held for `unreadable`, which is empty.
   Built, a list holding it was decided by its size or by another value it held, as comparing reads
   the smaller value whole and no further, so `[subject.attributes] != []` held, and
   `[subject.attributes, 1] == [{}, 2]` failed for a kind that can't be read but was false for one
@@ -683,8 +687,9 @@ sequenceDiagram
   map, in an order that changes from one evaluation to the next, so what `map()` and `filter()`
   made, and how far `all()` or `exists()` went, and what they cost, turned on it: a grant reading
   the first key `map()` made allowed 55 of 100 identical checks, and a deny reading the first
-  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, so
-  the cost tracking observes it as it did, its value a map whose keys come sorted (`stepping.order`):
+  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, and
+  evaluated by what CEL planned, so CEL charges it as it would, its value a map whose keys come
+  sorted (`stepping.order`), which folds by its iterator, as it has no `Fold` of its own:
   bools, ints, uints, doubles, strings and bytes, each by value (`compareKeys`), by a merge sort that
   compares each key at most once at each of `⌈log2 n⌉` levels, reading no more of either than the
   key it places holds (`sortKeys`). The loop is charged that before it sorts, and bounded alike
@@ -718,7 +723,11 @@ sequenceDiagram
   the next check plans it again: kept, a real zone failed until the process dropped it. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
   as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
-  key or a loop's condition where the package can't charge or refuse it isn't a condition. What a
+  key or a loop's condition where the package can't charge or refuse it isn't a condition. CEL
+  charges each call it plans as the call runs, so the call planned in place of one (`charged`)
+  charges CEL as that call once it has run, and a key or a loop's range read from an attribute is
+  evaluated by what CEL planned, so CEL charges each as it would: otherwise a comparison cost 1
+  less, and reading a time in a zone `zoneCost` less, than their bounds count. What a
   check reads together is bounded where it is stored, for each scope: an identity's conditional
   grants, the conditional grants to groups, the tenant's members
   and the public, each the tenant's and those from each source the host owns apart, the conditional

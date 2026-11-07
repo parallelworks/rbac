@@ -3410,11 +3410,12 @@ func TestAConditionCostsNoMoreThanItsBoundWhereCELExpandsMacrosOtherwise(t *test
 	}
 }
 
-// CEL's cost tracking holds what a loop's steps evaluate until they are charged, and a loop's own
-// values until it ends, and reads all it holds in search of what a step didn't evaluate, as the
-// argument a failing call never reached: each step of a loop over a list the host passes would
-// take longer than the one before, past what it is charged, and one failing, charged little, the
-// most. It holds no more for a step than the step evaluates, whatever came before.
+// CEL's cost tracking held what a loop's steps evaluated until they were charged, and a loop's own
+// values until it ended, and read all it held in search of what a step didn't evaluate, as the
+// argument a failing call never reached: each step of a loop over a list the host passes took
+// longer than the one before, past what it was charged, and one failing, charged little, the most.
+// It holds no more for a step than the step evaluates, whatever came before, and none where each
+// call passes it the arguments it charges the call by.
 func TestALoopsStepsTakeNoLongerForTheStepsBefore(t *testing.T) {
 	l := make([]any, 3000)
 	for i := range l {
@@ -3522,11 +3523,12 @@ func TestALoopsStepCostsEachLogicalOperatorItEvaluates(t *testing.T) {
 	}
 }
 
-// CEL copies the keys of a map the host passes before a loop over it takes its first step, however
-// few it takes, so a loop over one, inside another loop, took time growing with the map's size and
-// the outer loop's steps, charged only for the steps. Such a loop costs 1 for each key, however the
-// host passed the map, and one over a literal map no more than its bound, though the bound counts a
-// step of map() whose transform is a literal only 1 more than it costs.
+// A loop over a map reads each of its keys before it takes its first step, however few it takes, to
+// order them, as CEL copied the keys of a map the host passes, so a loop over one, inside another
+// loop, took time growing with the map's size and the outer loop's steps, charged only for the
+// steps. Such a loop costs 1 for each key, however the host passed the map, and one over a literal
+// map no more than its bound, though the bound counts a step of map() whose transform is a literal
+// only 1 more than it costs.
 func TestALoopOverAMapCostsEachOfItsKeys(t *testing.T) {
 	m, n := map[string]any{}, map[string]int{}
 	for i := range 3000 {
@@ -4017,6 +4019,34 @@ func TestALiteralCostsWhatItBuilds(t *testing.T) {
 			if b, got := rbac.ConditionCost(t, looped(n), nil); got != cost+more || b != bound+more {
 				t.Errorf("%s cost %d, bounded at %d, and with one element %d, bounded at %d", looped(n)[:60], got, b, cost, bound)
 			}
+		}
+	}
+}
+
+// CEL charges each call, attribute and literal it plans as it evaluates it, so what the package plans
+// in place of one, to charge what it reads before it runs, to order a map's keys or to charge a key,
+// is charged as CEL charged the one it replaced only where the package charges CEL so: planned
+// otherwise, comparisons cost 1 less, reading a time in a zone 100 less, and a loop's range and a
+// map literal's key read from an attribute 1 less, than they did. CEL charges a condition as a check
+// plans it what it charges it planned as CEL plans it, and 1 more for each key of a map a loop
+// starts over.
+func TestAConditionIsChargedWhatCELChargesIt(t *testing.T) {
+	attributes := map[string]any{
+		"n": 4, "s": "ab", "k": "a", "zone": "Asia/Tokyo", "l": []any{"a", "b", "c"}, "m": map[string]any{"a": 1, "b": 2, "c": 3},
+	}
+	for expr, keys := range map[string]uint64{
+		`request.attributes.n > 3 && request.attributes.s != "x" && request.attributes.s in ["ab"]`:                  0,
+		`request.time.getHours("Europe/Paris") >= 0 && request.time.getMinutes(request.attributes.zone) >= 0`:        0,
+		`request.attributes.l.all(x, x != "q") && request.attributes.l.map(x, x + x).size() == 3`:                    0,
+		`(request.attributes.n > 3 ? request.attributes.l : []).exists_one(x, x == "a")`:                             0,
+		`{request.attributes.s: 1}[request.attributes.s] == 1 && request.attributes.m[request.attributes.k] == 1`:    0,
+		`request.attributes.m.all(k, request.attributes.m[k] > 0) && request.attributes.m.filter(k, k != "a") != []`: 6,
+		`[request.attributes.m, {"x": 1}].all(m, m.all(k, k != ""))`:                                                 4,
+		`dyn(request.attributes.m).all(k, true)`:                                                                     3,
+	} {
+		planned, alone := rbac.ConditionCharged(t, expr, attributes)
+		if planned != alone+keys {
+			t.Errorf("%s: CEL charged %d as a check plans it, and %d as CEL plans it", expr, planned, alone)
 		}
 	}
 }
