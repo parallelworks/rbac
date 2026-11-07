@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -2900,7 +2901,9 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 // JSON text is read as encoding/json reads it into an any, where a condition can read it at all:
 // converting parses it itself, as a json.Decoder made for each text, and read a token at a time,
 // took a microsecond for a text of one byte. Texts drawn at random are read so, each naming a
-// member of an object once, and a text a byte or three from one is read so too or refused.
+// member of an object once, and a text a byte or three from one is read so too or refused, a
+// number to its bits: compared by reflect.DeepEqual, -0 read as 0 passed, which a condition tells
+// apart, as string() does.
 func TestJSONTextIsReadAsEncodingJSONReadsIt(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	bytes := []byte(" \t\n\r[]{},:\"\\/-+.0123456789eEtrufalsnbu\x00\x01\x7f\xc3\xa9\xff")
@@ -2921,10 +2924,49 @@ func TestJSONTextIsReadAsEncodingJSONReadsIt(t *testing.T) {
 		read, ok := rbac.ParseJSON(text)
 		var want any
 		err := json.Unmarshal(text, &want)
-		if ok && (err != nil || !reflect.DeepEqual(read, want)) || !ok && whole {
+		if ok && (err != nil || !sameJSON(read, want)) || !ok && whole {
 			t.Fatalf("%q read %t as %#v, where encoding/json reads %#v, %v", text, ok, read, want, err)
 		}
 	}
+}
+
+// Text a fuzzer writes, where a condition can read it, is read as encoding/json reads it: any it
+// reads otherwise, or that encoding/json refuses, a condition would read as a value the host
+// doesn't.
+func FuzzJSONTextIsReadAsEncodingJSONReadsIt(f *testing.F) {
+	for _, text := range []string{
+		``, ` `, `0`, `-0`, `01`, `1.`, `.1`, `+1`, `0x10`, `1e`, `1E+2`, `1e400`, `1e-400`, `123456789012345678901234567890`,
+		`4.9e-324`, `NaN`, `-`, `true`, `tru`, `truex`, `null`, `""`, `"\"\\\/\b\f\n\r\t"`, `"\u00e9\uD83D\ude00"`, `"\ud83d"`,
+		`"\ude00\ud83d"`, `"\ud83d\u0041"`, `"\u0000"`, `"\x41"`, "\"\x00\"", "\"\x7f\"", "\"\xff\"", "\"\xed\xa0\x80\"",
+		"\xef\xbb\xbf1", "\f1", `[]`, `{}`, `[1,]`, `[1 2]`, `{"a":1,}`, `{"a":1,"\u0061":2}`, `[1] [2]`, `[[]`, "[1]\x00",
+		` {"a": [true, false, null, -1.5e3, "b"], "": {}} `,
+	} {
+		f.Add([]byte(text))
+	}
+	f.Fuzz(func(t *testing.T, text []byte) {
+		read, ok := rbac.ParseJSON(text)
+		var want any
+		if err := json.Unmarshal(text, &want); ok && (err != nil || !sameJSON(read, want)) {
+			t.Fatalf("%q read as %#v, where encoding/json reads %#v, %v", text, read, want, err)
+		}
+	})
+}
+
+// sameJSON reports whether a and b, read from JSON text into an any, are the same value, a number
+// to its bits, as reflect.DeepEqual finds -0 and 0 equal.
+func sameJSON(a, b any) bool {
+	switch a := a.(type) {
+	case float64:
+		b, ok := b.(float64)
+		return ok && math.Float64bits(a) == math.Float64bits(b)
+	case []any:
+		b, ok := b.([]any)
+		return ok && (a == nil) == (b == nil) && slices.EqualFunc(a, b, sameJSON)
+	case map[string]any:
+		b, ok := b.(map[string]any)
+		return ok && (a == nil) == (b == nil) && maps.EqualFunc(a, b, sameJSON)
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // jsonNumbers and jsonCharacters are what jsonDraw writes numbers and strings of.
