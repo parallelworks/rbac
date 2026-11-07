@@ -556,7 +556,8 @@ func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint
 // whatever computing it evaluated, ran on a frame of its own, uncharged, so a key searching a string
 // costing 10,000 at each of 3,000 steps of a loop cost 6,003; read only by its fields, 28 deep at
 // each step, each unit charged took two to three times what reading another variable so took; and
-// a key naming a loop's variable was read outside the loop, where it failed.
+// a key naming a loop's variable was read outside the loop, where one of another name failed and
+// the one hiding the variable read the variable.
 type rooting struct {
 	// names are such variables, by the ids of the identifiers naming them, and planned those planned
 	// so.

@@ -738,7 +738,8 @@ sequenceDiagram
   where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
   `.request` in `l.all(request, ...)`, from what the check passed, outside the evaluation, and
   qualifies it there, where nothing is charged: a key searching a string costing 10,000 at each of
-  3,000 steps cost 6,003, its fields cost nothing, and a key naming a loop's variable failed. So it
+  3,000 steps cost 6,003, its fields cost nothing, and a key naming a loop's variable failed, or,
+  naming the one that hides the variable, read the variable. So it
   is planned as an attribute of the variable read from what the check passed (`rooting`), which CEL
   qualifies, and evaluates a key or a choice of, on the evaluation's frame, charged as anywhere
   else. CEL charges each call it plans as the call runs, so the call planned in place of one

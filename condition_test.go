@@ -4931,8 +4931,9 @@ func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
 // computing it evaluated, ran uncharged, so a key searching a string of 99,990 bytes at each of
 // 3,000 steps of a loop cost 6,003, and so did each of its fields, so a loop reading one 24 deep
 // cost about half what reading another so does; and a key naming a loop's variable it read outside
-// the loop, where it failed. Such a variable is charged, and decides, as one read beside a loop's
-// variable of another name, and a type named so, as `.int`, is still the type.
+// the loop, where one of another name failed, and the one hiding the variable read the variable.
+// Such a variable is charged, and decides, as one read beside a loop's variable of another name,
+// and a type named so, as `.int`, is still the type.
 func TestAVariableNamedFromTheRootPastALoopsVariableIsReadAsAnyOther(t *testing.T) {
 	n := rbac.CountSearches(t)
 	l := make([]any, 3000)
