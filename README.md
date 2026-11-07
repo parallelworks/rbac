@@ -195,7 +195,7 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
-  a labeled resource, once a grant allows, and `Permissions` of one, once the grants give anything
+  a labeled resource, once a grant allows, and `Permissions` of one, once it would list anything
   the label decides, asks it once about each value the label asks for that the subject's grants
   give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
   change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
