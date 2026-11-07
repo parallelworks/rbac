@@ -1157,8 +1157,8 @@ the package's uses foreign data, so none of the roles needs any.
   saying what to run, as it reads only the views of the role owning the tables; from `0028` on, it
   failed at `0033_view_seeks_and_hints`, as the views' schema was that role's; and it made
   `rbac_expired`, `rbac_expired_until` and `rbac_expired_through` its own where it made them, as it
-  made its own whatever else a migration it applied made, as `rbac_changes_grants` where it began
-  before `0021_grant_denies`, which a later migration, as that role, can't alter. To give them
+  made its own whatever else a migration it applied made, as `rbac_changes_grants` where it applied
+  `0021_grant_denies`, which a later migration, as that role, can't alter. To give them
   back, a superuser, with the package's schema first on its search_path, runs
   `ALTER TABLE rbac_expired OWNER TO <administrator>`,
   `ALTER FUNCTION rbac_expired_until() OWNER TO <administrator>` and
