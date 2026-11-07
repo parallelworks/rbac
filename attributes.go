@@ -2297,7 +2297,11 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 		}
 		c.slices[k] = s
 	case n > s.out.Cap():
-		grown := reflect.MakeSlice(v.Type(), n, min(max(n, 2*s.out.Cap()), v.Cap()))
+		// At least twice as long, whatever room past its length v has: grown no further than v's,
+		// 40,000 slices of one array of strings, each one longer than the one before it and with no
+		// room past it, as three-index slices can be, were each copied anew, with all the copies
+		// they outgrew, taking 3.7 s and 12 GB, charged 80,016.
+		grown := reflect.MakeSlice(v.Type(), n, max(n, 2*s.out.Cap()))
 		reflect.Copy(grown, s.out)
 		if c.outgrown == nil {
 			c.outgrown = map[copiedKey][]reflect.Value{}

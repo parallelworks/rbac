@@ -2823,6 +2823,18 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 			}
 		}
 	}
+	// A copy grows its copy of a slice's elements at least twice over for a longer length, whatever
+	// room the slice has past it: grown no further than that, slices of one array, each one longer
+	// than the one before it and with no room past it, were each copied anew, so 2,000 of strings
+	// allocated 8,514 bytes for each unit charged, and 40,000 took 3.7 s and 12 GB, charged 80,016.
+	// Converting reads each as a list of its own, at the cost of each, so it isn't asked here.
+	texts := make([]string, n)
+	if w := least(rbac.CopyingWork, listed(func(i int) any { return texts[: i+1 : i+1] })); !w.Done ||
+		float64(w.Allocations)/float64(w.Charged) > 2.5*allocations || float64(w.Bytes)/float64(w.Charged) > 5*bytes {
+		t.Errorf("copying %d slices of one array of strings, each one longer, done %t, allocated %.2f times and %.0f bytes for "+
+			"each unit charged, where converting strings allocates %.2f times and %.0f bytes", n, w.Done,
+			float64(w.Allocations)/float64(w.Charged), float64(w.Bytes)/float64(w.Charged), allocations, bytes)
+	}
 	// A struct no condition reads is refused whatever it holds, but converting a map of them read
 	// each entry into one value, moving it whole, charged two, and a hook's copy set a struct holding
 	// a map whole, its unexported fields too, charged one, and moved each of a slice's elements whole

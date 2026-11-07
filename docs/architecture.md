@@ -559,9 +559,13 @@ sequenceDiagram
   again for the message, attributes a check converts couldn't be copied, as a resource's nearly
   40,000 timestamps, which a check converts. A copy keeps each slice it copies apart from the maps,
   pointers and messages, changing it where it is kept as its elements are copied (`copied`), as five
-  lookups of it for each element cost about what copying the element did. One reached while its
-  elements are copied, before a longer length outgrew that copy, is a slice of its own, whose
-  elements are copied too, as set in the longer alone it held the host's. A value holding no map,
+  lookups of it for each element cost about what copying the element did. A longer length of a
+  slice than its copy holds grows the copy at least twice over, whatever room past its length the
+  slice has (`lengthen`): grown no further than that room, 40,000 slices of one array of strings,
+  each one longer than the one before it and with no room past it, as three-index slices can be,
+  were each copied anew, taking 3.7 s and 12 GB, charged 80,016. One reached while its elements are
+  copied, before a longer length outgrew that copy, is a slice of its own, whose elements are copied
+  too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
   the interface. A time is shared so too, in UTC or the local zone, which any code can reach, but
   in a zone of the host's own is moved to a copy of the zone, one for each copy (`zone`), wherever
