@@ -1410,22 +1410,23 @@ type Predicate struct {
 // custom role first granted to them since gives, or one granted to the members gives a subject
 // that has since become one. The query decides no earlier than the latest time DeleteExpired
 // deleted by that it sees, as a check does, and keeps no row where that is past the database's
-// clock, where a check is refused (ErrConflict); with the label column, where that is as late as a
-// time the subject's membership, or a place in a group of its own or of a group it is in, ended
-// after the holding was read, it keeps no row, so a query run once DeleteExpired has deleted by
-// such a time since Filter comes back empty. Build one for each query. The host's query must reach
-// this package's tables and call its function rbac_tenant_keys (they are in the pool's schema), and
-// column names are trusted host code; every value is an argument. It counts only unconditional
-// grants, and leaves out every resource a deny covers, conditional ones included, so it never keeps
-// one Authorize refuses: Reachable's Conditional and ConditionalExcept name the scopes where that
-// may be too strict. It keeps only the rows whose own key, their path's first, is of the type, so
-// the host's table can hold resources of several types, as one store of every resource does, where
-// a grant on a container reaches every row under it. The planner can't tell how many of a table's
-// rows are of a type, and counts the condition as keeping as many as of a table of one type: a host
-// listing a type from a table of several tests its own column of the type too, whose statistics
-// count them, and indexes it after the tenant and before what a page sorts by, as
-// (tenant, type, id): with an index of the tenant alone, a sorted page of a type of few rows reads
-// the rows of every type until it is full.
+// clock, where a check is refused (ErrConflict); with the label column it keeps none once that is
+// as late as the first time after the holding was read that the subject's membership, or its last
+// path to one of its groups, ended, so a query run once DeleteExpired has deleted by such a time
+// since Filter comes back empty, but not by a place that ended while another, from another source
+// or through another group, kept the subject in the group. Build one for each query. The host's
+// query must reach this package's tables and call its function rbac_tenant_keys (they are in the
+// pool's schema), and column names are trusted host code; every value is an argument. It counts
+// only unconditional grants, and leaves out every resource a deny covers, conditional ones
+// included, so it never keeps one Authorize refuses: Reachable's Conditional and ConditionalExcept
+// name the scopes where that may be too strict. It keeps only the rows whose own key, their path's
+// first, is of the type, so the host's table can hold resources of several types, as one store of
+// every resource does, where a grant on a container reaches every row under it. The planner can't
+// tell how many of a table's rows are of a type, and counts the condition as keeping as many as of
+// a table of one type: a host listing a type from a table of several tests its own column of the
+// type too, whose statistics count them, and indexes it after the tenant and before what a page
+// sorts by, as (tenant, type, id): with an index of the tenant alone, a sorted page of a type of
+// few rows reads the rows of every type until it is full.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (_ Predicate, err error) {
 	defer conflicting(&err)
 	a = a.still()
