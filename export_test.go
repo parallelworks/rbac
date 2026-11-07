@@ -536,6 +536,10 @@ func (b *beforeStatement) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.B
 // what binds it, holds.
 const HeldMarker = "SELECT 0, id, principal, scope, role, expires_at, conditional"
 
+// EveryCustomRole is text only the statements reading every custom role of a tenant by the tenant
+// hold, as a list of them does.
+const EveryCustomRole = everyCustomRole
+
 // ExcludesMarker is text only the statement reading who holds two values of an exclusive dimension
 // (conflictsIn) holds, which a change runs once it has read its actor.
 const ExcludesMarker = "HAVING count(DISTINCT value) > 1"
@@ -555,6 +559,15 @@ func SetReadingEntries(t *testing.T, f func(n int)) {
 	old := readingEntries
 	readingEntries = f
 	t.Cleanup(func() { readingEntries = old })
+}
+
+// SetDerivingRoles runs f each time a read derives n custom roles as the catalog has them now,
+// until t ends.
+func SetDerivingRoles(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := derivingRoles
+	derivingRoles = f
+	t.Cleanup(func() { derivingRoles = old })
 }
 
 // SetReadingDenies runs f each time a decision reads n entries of a deny's permissions, comparing
