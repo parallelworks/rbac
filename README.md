@@ -102,10 +102,10 @@ a column of the type too, whose statistics count them, and index it after the te
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
 the subject's label holding and what the constraints answered, so build one for each query; the
-query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, taken no
-later than the database's clock, and with the label column keeps no row once that is as late as the
-first time after `Filter` read the holding that the subject's membership, or its last path to one of
-its groups, ended. It compares the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, keeps no row
+where that is past the database's clock, where a check is refused (Expiry), and with the label
+column keeps no row once that is as late as the first time after `Filter` read the holding that the
+subject's membership, or its last path to one of its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
@@ -123,8 +123,11 @@ scopes conditional ones reach, to check one by one. The condition reads the pack
 host's statement, which the host plans, so the package can't pin its plan as it pins its own reads
 (Planner settings): a plan the host's session made while those tables were small, and keeps, reads
 each of them whole, once for each type and key the condition looks up, as a page read whole costs
-less than descending any index. Run the query with sequential scans off for it alone, as in
-`SET LOCAL enable_seqscan = off` before it and `RESET enable_seqscan` after, in its transaction, or
+less than descending any index. Run the query with sequential scans off for it alone, as
+`SET LOCAL enable_seqscan = off` before it does in a transaction of its own, whose end puts the
+setting back as the session had it, or in a savepoint rolled back to after it, which puts it back
+as the transaction had it; not `RESET enable_seqscan` after it, which sets the session's own to what
+it started with, dropping a value the session set, as a pool can for each connection it opens. Or
 plan it again once the tables have grown, as an analysis of them does: under a plan cached while
 they held a few rows, a list read 43,736 pages of grants and 4,502 of denies beside 20,000 of each.
 
@@ -172,7 +175,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access. A check, `Activate`
   and a change read only the custom roles they and the grants they read name, a change with those
-  the roles it grants list, through others too, so the tenant's other roles cost them nothing;
+  the roles it grants list, through others too, each once however many roles list it, at two
+  lookups by its key and one read of its permissions, so the tenant's other roles cost them nothing;
   `CustomRoles`, `Roles`, `Grantable`, `SetRole` and `DeleteRole` read every one, which
   `rbac.MaxCustomRoles` bounds.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
@@ -192,7 +196,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `resource.attributes`, a test of an attribute's presence, `in`, `size()`, a macro or a comparison
   included, fails, so a grant's gives nothing and a deny's applies; and a constraint is asked about
   that bare tenant, so one deciding them by the tenant's state reads it through its `q`. A check of
-  a labeled resource asks it once about each value the label asks for that the subject's grants
+  a labeled resource, once a grant allows, and `Permissions` of one, once it would list anything
+  the label decides, asks it once about each value the label asks for that the subject's grants
   give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
   change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
   test any label, ask about every one, as do `SetRole` and `DeleteRole`, and `ChangeMembers` taking
@@ -1043,8 +1048,10 @@ have the server load a library or run a program of its choosing; and:
 
 1. `Migrate` runs as an administrator's role the application's isn't a member of, with only the
    package's schema in its search_path, so that role owns the package's tables: their owner can
-   disable the triggers that record them. A later migration can change history too, so the
-   administrator's role keeps both owners' rights. It owns the schema of `AsOf`'s views too, named
+   disable the triggers that record them. Once they are made, `Migrate` as another role is refused,
+   but as a superuser, which migrates as that role ([Running it](#running-it), Tables). A later
+   migration can change history too, so the administrator's role keeps both owners' rights. It
+   owns the schema of `AsOf`'s views too, named
    as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
    database, which a role that doesn't own it hasn't by default, so a superuser makes it first,
    empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
@@ -1143,6 +1150,34 @@ the package's uses foreign data, so none of the roles needs any.
   failure leaves the database at the last migration recorded, from which migrating again goes on.
   The package's calls don't check what the database was migrated to: make them from a replica only
   once its own migrations are applied, as `Migrate` returning nil says.
+  Only the role owning the package's tables migrates them, the administrator's of
+  [History](#history): a migration makes what it makes its maker's, and from `0028_as_of_views` on
+  checks the schema of `AsOf`'s views against it, which `AsOf` finds among that role's views. So
+  once the tables are made, `Migrate` as another role is refused, as `rbac.ErrInvalid` naming the
+  role owning them, before it applies anything or takes any lock, but as a superuser, which runs
+  each migration as that role, by `SET LOCAL ROLE`, and is itself again after: a superuser's
+  migration makes and checks what that role's own would, and fails where that one's would, as
+  where it may not make the views' schema or give `rbac_history_commit` to history's role, saying
+  what to do. A tool of the host's own applies them as that role too. Before this release, a
+  superuser's migration of tables another role owned ran as itself: from before `0028_as_of_views`,
+  it made the views' schema, the views and `rbac_as_of_views` its own, so `AsOf` refuses every read,
+  saying what to run, as it reads only the views of the role owning the tables; from `0028` on, it
+  failed at `0033_view_seeks_and_hints`, as the views' schema was that role's; and it made
+  `rbac_expired`, `rbac_expired_until` and `rbac_expired_through` its own where it made them, as it
+  made its own whatever else a migration it applied made, as `rbac_changes_grants` where it applied
+  `0021_grant_denies`, which a later migration, as that role, can't alter. To give them
+  back, a superuser, with the package's schema first on its search_path, runs
+  `ALTER TABLE rbac_expired OWNER TO <administrator>`,
+  `ALTER FUNCTION rbac_expired_until() OWNER TO <administrator>` and
+  `ALTER FUNCTION rbac_expired_through(timestamptz) OWNER TO <administrator>`, and the same,
+  `ALTER TABLE`, `ALTER FUNCTION` or `ALTER STATISTICS`, for each other table, function or
+  statistics object in that schema that is still the superuser's, but history's table and
+  functions, which go to history's role, as [History](#history) says; where `AsOf` refuses
+  every read, as its error says, `ALTER FUNCTION rbac_as_of_views() OWNER TO <administrator>`,
+  `DROP SCHEMA IF EXISTS <schema>_as_of CASCADE` and
+  `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>`, and then the administrator's role
+  runs `SELECT rbac_as_of_views()`, which makes the views again and gives them to each role that
+  may read history; and where `0033` failed, migrate again.
   On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
   them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
   would miss the writes it waits for. Call it there before any change to the package's tables: from
@@ -1350,12 +1385,14 @@ the package's uses foreign data, so none of the roles needs any.
   of history, as `AsOf` and an export, waits for it, and a transaction under way as it starts that
   made a change can make it give way. The role migrating makes the function, which writes history as
   its owner, and gives it to `rbac_record`'s owner, history's role where the roles are set up as
-  [History](#history) says: as a superuser, or as a role that may `SET ROLE` to history's role,
-  where that role has `CREATE` on the schema or the role migrating may grant it that, as the
-  schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
-  42501, having changed nothing, rather than leave the function to another role: grant history's
-  role `CREATE` on the schema, or history's role to the role migrating with the `SET` option, as its
-  hint says, or migrate as a superuser, and migrate again. No role but its owner may execute it, nor
+  [History](#history) says: as a role that may `SET ROLE` to history's role, as the administrator's
+  may, where that role has `CREATE` on the schema or the role migrating may grant it that, as the
+  schema's owner can, which it does for the migration alone, or as a superuser owning the tables.
+  Otherwise migrating fails with SQLSTATE 42501, having changed nothing, rather than leave the
+  function to another role: grant history's role `CREATE` on the schema, or history's role to the
+  role migrating with the `SET` option, as its hint says, and migrate again. A superuser's migration
+  of tables another role owns runs as that role, as above, so it fails alike, and the hint no
+  longer offers one. No role but its owner may execute it, nor
   `rbac_record`, which writes history as its owner too, as only their triggers call them: migrating
   revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the schema's default
   privileges can grant it as each is made, where `0003_history` revoked it on `rbac_record` from
@@ -1558,26 +1595,35 @@ the package's uses foreign data, so none of the roles needs any.
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
   a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
   deletes the times no later than its own and adds its own, refusing one past the database's clock,
-  and history records each write, as one of the package's tables (History). A read takes the latest
-  time no later than the database's clock as it reads it, which takes nothing from a time a run
-  recorded: no write records one past the clock as its own statement began, which is before it
-  commits, and so before a read that sees it takes its snapshot. Bounded by the clock as the read's
-  statement began, a statement sent in a simple query, as by a pool that prepares none, which takes
-  its snapshot once it is planned, after any lock it waited for, could find a run's removals and
-  decide before what they removed ended. So a role that may execute the function, as the
-  application's may, can move what a
-  call decides no earlier than up to that clock and no further, as a run could, and never back, and
-  history records each time it wrote; a time past the clock, which only a role that may disable the
-  table's triggers can leave there, or the database's clock going back, has a call of a host behind
-  that clock decide at it as each of its statements reads it, and such a host's changes tried again
-  (`rbac.ErrConflict`) until the clock passes the time. The bound takes nothing from a time a run
-  recorded only where a read bounds it by the clock the run recorded it by, which hasn't gone back
-  since: where that clock has gone back, or on a hot standby, whose own clock can be behind the
-  primary's, a read can cut a run's time to before what the run removed ended, and until the clock
-  passes that time decide by the state the run left, which no moment held. Keep the database's
-  clock from stepping back, and make checks, and run `Filter`'s conditions, on the primary, or on a
-  standby whose clock is kept with it; `AsOf`, which doesn't read the table, reads on a standby as
-  before.
+  and history records each write, as one of the package's tables (History). So a role that may
+  execute the function, as the application's may, can move what a call decides no earlier than up to
+  that clock and no further, as a run could, and never back, and history records each time it wrote.
+  A read that finds the latest time past the database's clock, as it reads the clock once it has its
+  snapshot, decides neither at that time nor at the clock, but is refused (`rbac.ErrConflict`), a
+  check and a list too, and `Filter`'s condition keeps no row: decided at that time, it would lift a
+  deny binding through a place that ends before then, and meet a condition reading `request.time`,
+  and decided at the clock, find the place a deny binds by, which a run removed, gone, and the
+  membership or place a power comes through, which ended sooner and the run passed over, still
+  there, a state no moment held. On a primary whose clock doesn't go back, no read is refused so: no
+  write records a time past the clock as its own statement began, which is before it commits, and so
+  before a read that sees it takes its snapshot. Compared with the clock as the read's statement
+  began, a statement sent in a simple query, as by a pool that prepares none, which takes its
+  snapshot once it is planned, after any lock it waited for, could find a time a run recorded after
+  that, and be refused. A time is past the clock on a hot standby whose clock is behind its
+  primary's, which replays what a run on the primary recorded, where the database's clock has gone
+  back since a run recorded it, or where a role that may disable the table's triggers wrote it:
+  there every check, list and change that reads it is refused until the clock passes the time, and
+  from then on decides at it, as before. The comparison has no margin for the clocks' drift: however
+  little the clock is behind the time, a row the run passed over could have ended between them. Keep
+  the database's clock from stepping back, and a standby's synchronized with its primary's, or make
+  checks, and run `Filter`'s conditions, on the primary. A time a run recorded while the database's
+  clock was set far ahead, which then went back, refuses every call reading it until the clock
+  passes it again. The table's owner can bring it back to the clock, as migrating to
+  `0032_expired_writes` did, which history records, but reads then decide by the state the run left
+  until the clock passes the time: what the run removed that hadn't ended by the clock, as the place
+  a deny binds a subject by, gone, and what it passed over still there, a state no moment held. So
+  first restore what the run removed that hadn't ended by the clock, which history records with each
+  row, or wait for the clock. `AsOf`, which doesn't read the table, reads on a standby as before.
   A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the

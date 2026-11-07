@@ -179,15 +179,20 @@ erDiagram
     rbac_history {
         bigint id PK
         xid8 txid
+        bigint cluster "the cluster that wrote it, system_identifier"
         timestamptz effective_at
         text tenant
         text entity
         text key
-        text op "create, update, delete, expire, baseline, prune"
+        text op "create, update, delete, expire, baseline, prune, commit"
         jsonb before
         jsonb after
         text actor
         text how
+    }
+    rbac_expired {
+        bigint id PK
+        timestamptz until "a time DeleteExpired deleted by"
     }
     rbac_roles ||--o{ rbac_grants : "a custom role's grants"
     rbac_roles ||--o{ rbac_eligibilities : "a custom role's eligibilities"
@@ -198,6 +203,7 @@ erDiagram
     rbac_groups ||--o{ rbac_grants : "granted to"
     rbac_grants ||--o{ rbac_history : "recorded"
     rbac_members ||--o{ rbac_history : "recorded"
+    rbac_expired ||--o{ rbac_history : "recorded, in no tenant"
 ```
 
 - **Built-in roles are not stored.** They are the host's `Config.Catalog`, so a deploy changes
@@ -210,7 +216,14 @@ erDiagram
   they and the grants they read name, each by its key (`book`), a change's read of its actor's
   authority with those the roles it grants list, through others too (`listingSQL`), as
   `holdsRole` walks them, but not those its actor's roles list, of which it reads only their ids
-  (`powerOf`); only a read needing every one reads the tenant's by the tenant
+  (`powerOf`). That walk carries ids alone, so its `UNION` passes over a role reached again before
+  reading it: each role reached costs a lookup by its key for its list and one for its row, which
+  alone reads its permissions, and each listing reaching it only its id. Carrying whole rows, the
+  walk read, detoasted and hashed a role's every permission once for each role listing it: beside
+  300 roles of 1,000 permissions for 50 types, each listing 64 others, it passed 19,200 rows
+  through its `UNION` and read 171,912 buffers, in 1.3 s, and a change granting one took 2.6 s,
+  half of it under its locks; walking ids, it reads 300 rows and 900 buffers, in 5 ms, and the
+  change takes 83 ms. Only a read needing every one reads the tenant's by the tenant
   (`everyCustomRole`): `CustomRoles` and `Roles`, which list them, `Grantable`, which offers any,
   `SetRole`, which reads those listing the role and counts them, `DeleteRole`, which refuses a role
   another lists, and the check of exclusive values, which finds those giving one by their
@@ -444,6 +457,12 @@ flowchart LR
 statement, the grants and denies on the tenant its label values are decided by too, apart from the
 conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
 something allows. So a label is decided by the values the subject held as it held its grants.
+`Permissions` decides each permission as a check of it would, by one such read, and the label only
+once the grants give something it decides, so it asks the constraints about values only where a
+check would; and it walks a role's permissions once for each carrier its grants have, and once for
+each carrier and condition its conditional ones have (`permissionsOf`), however many groups grant
+it: once for each grant, a subject in 1,000 groups each granted a role of 1,000 permissions on the
+4 scopes of a path had it read 4 million entries, in 180 ms, against 2,000 in 17.
 
 ```mermaid
 flowchart TB
@@ -1277,16 +1296,18 @@ flowchart TB
   `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), through
   `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
   seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
-  decides at the later of the call's time and the latest time recorded that its snapshot sees, but
-  no later than the database's clock as it reads it (`decidedSQL`, `expiredUntil`), which takes
-  nothing from a time a run recorded, as none is past the clock as the run's statement began, before
-  the snapshot that sees it is taken; the clock as the read's own statement began can be before its
-  snapshot, as in a simple query, which plans a statement, and waits for its locks, first. Every
+  decides at the later of the call's time and the latest time recorded that its snapshot sees
+  (`decidedSQL`), and refuses where that is past the database's clock as it reads it once it has
+  its snapshot (`expiredAhead`, `callClock.passed`), which no time a run recorded is while the clock
+  doesn't go back, as none is past the clock as the run's statement began, before the snapshot that
+  sees it is taken; the clock as the read's own statement began can be before its snapshot, as in a
+  simple query, which plans a statement, and waits for its locks, first. Every
   expiry it compares is decided so too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
-  statement (`filterAt`), which runs later than `Filter` read the time. The call then decides at that
+  statement (`filterAt`), which runs later than `Filter` read the time, and keeps no row where the
+  time is past the clock (`filterHolding`). The call then decides at that
   time (`callClock.passed`): the conditions it evaluates, the label values the read decides and its
   statements after it read it as their time, `Explain` building what conditions read only once it
   has read the subject's keys. `Holders` reads the latest time first in its snapshot
@@ -1336,17 +1357,22 @@ flowchart TB
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
   records each write to the table, as the entity `expired`, and `AsOf` doesn't read it: as of a
-  time, a read decides at that time. Without the bound on what a read takes, one row of a time far
-  ahead, which the application's role could write around the package, had every later call of every
-  host decide then, for good, a deny binding through a place that ends before then lifted, and a
-  condition reading `request.time` met. A time past the clock now only the table's owner disabling
-  its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
-  a host behind the clock then decides at it as each statement reads it, and that host's changes are
-  tried again until the clock passes the time. The bound leaves a run's time whole only where a
-  read bounds it by the clock the run recorded it by, which hasn't gone back since: a clock gone
-  back, or a hot standby's own clock behind the primary's, cuts it to before what the run removed
-  ended, and a read then decides by the state the run left, which no moment held, until the clock
-  passes it.
+  time, a read decides at that time. Deciding at the latest time, unbounded, one row of a time far
+  ahead, which the application's role could once write around the package, had every later call of
+  every host decide then, for good, a deny binding through a place that ends before then lifted, and
+  a condition reading `request.time` met; and bounded by the clock as a read reads it, as code
+  before bounded it, a clock behind the one a run recorded the time by cut it to before what the run
+  removed ended, and a read decided by the state the run left, which no moment held. So a read that
+  finds the time past the clock refuses, as `ErrConflict`: a check, a list, `Holders`' snapshot
+  (`expiredBy`) and a change alike; and `Filter`'s condition keeps no row, in the one test that
+  keeps none past the holding's lapse too, which reads the clock once, while each use of the time
+  (`filterAt`), reading only the snapshot, reads the same. A time is past the clock only where the
+  table's owner disabled its trigger (`rbac_expired_until`), where the database's clock went back
+  since a run recorded it, or on a hot standby whose clock is behind its primary's: there every call
+  reading it is refused until the clock passes the time, and then decides at it. The comparison is
+  exact, with no margin for drift between the clocks: however little the clock is behind the time, a
+  row the run passed over could have ended between them, and deciding at the clock lets that through
+  as any cut does.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
@@ -1387,7 +1413,11 @@ flowchart TB
   another replica's migration is bounded by the session's `lock_timeout` alone, and not tried again.
   On a host's transaction `Migrate` applies them all in one savepoint, with neither the bound nor
   the tries, as rolling back to the savepoint frees nothing the host took before. The schema's lock
-  is named and keyed as a tenant's own is (above), by the schema it migrates.
+  is named and keyed as a tenant's own is (above), by the schema it migrates. Only the role owning
+  the tables migrates them, as a migration makes what it makes its maker's, and from
+  `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
+  role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
 
 ```mermaid
 flowchart TB
@@ -1398,6 +1428,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
+    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
@@ -1687,14 +1718,17 @@ transactions commit after the commit record. The README's
 
 ```mermaid
 flowchart LR
-    admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
+    admin["Administrator's role<br/>runs Migrate, a superuser's as it,<br/>owns the tables, rbac_expired_through<br/>and AsOf's views"]
     histrole["History's role<br/>owns rbac_history, rbac_record<br/>and rbac_history_commit"]
-    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
+    app["Application's role<br/>USAGE on the schema; SELECT, INSERT,<br/>UPDATE and DELETE on the tables but<br/>rbac_history, rbac_expired and rbac_migrations;<br/>EXECUTE on rbac_group_members, rbac_tenant_keys,<br/>rbac_text_array, rbac_changes_grants<br/>and rbac_expired_through; USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
     histrole -->|"inserts"| hist[("rbac_history")]
     app -.->|"SELECT only"| hist
+    app -.->|"SELECT only"| expired[("rbac_expired")]
+    app -->|"DeleteExpired, through<br/>rbac_expired_through, as its owner"| expired
+    expired -->|"rbac_record runs as"| histrole
     admin -->|"PruneHistory"| hist
 ```
 
@@ -1725,7 +1759,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
 | `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Permissions`, a check deciding label values and a change's read of its actor's authority read each such deny's permissions once however many permissions they decide, each entry looked up among those the grants give, or for fewer than four compared with each (`listedDenies`); a change, which doesn't know what it will hand on, compares the first three it asks about, and one its actor holds none of (`askingDenies`). So each permission is decided by the denies listing it alone: compared with each permission's, `Permissions` of 300 beside 400 denies of 256 other permissions took 300 ms, and takes 12, and granting a role of 300 beside 368 such denies binding the actor took 350 ms, and takes 36. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
-| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. A read needing every role of a tenant reads at most these, and every other read those it names, with those they list. |
+| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. A read needing every role of a tenant reads at most these, and every other read those it names, with those they list, each once however many list it: a change's walk of those listed reads each role's list and row by its key once, so a tenant's 300 roles each listing 64 others cost it 600 lookups and 300 reads of their permissions, not a read of a role's permissions for each of the 19,200 listings. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |
