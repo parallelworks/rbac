@@ -709,8 +709,9 @@ func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 
 // The README's database roles, set up as its steps say and given nothing more, run the package: as
 // the administrator's role, Migrate, on a new schema or one history's role took history over in
-// before the last migration, and PruneHistory; and as the application's, changes to every table,
-// checks, lists, DeleteExpired, a read as of a time, History and Export.
+// before the last migration, and on a host's transaction that changed the tables, and PruneHistory;
+// and as the application's, changes to every table, checks, lists, DeleteExpired, a read as of a
+// time, History and Export.
 func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 	names, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {
@@ -819,6 +820,16 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 				}
 				return nil
 			}))
+			// Migrate on a host's transaction reads what it checks of one that changed the tables, its
+			// locks, history's triggers, what was applied and history, as the administrator's role.
+			if err := pgx.BeginFunc(ctx, r.adminPool, func(tx pgx.Tx) error {
+				if _, err := tx.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'migrating')`); err != nil {
+					return err
+				}
+				return rbac.Migrate(ctx, tx)
+			}); err != nil {
+				t.Errorf("Migrate on a host's transaction that changed the tables, as the administrator's role: %v", err)
+			}
 			var n int
 			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
 				t.Fatal(err)

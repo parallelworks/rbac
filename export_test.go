@@ -405,6 +405,16 @@ func SetMigrateAttempts(t *testing.T, n int, backoff time.Duration) {
 	t.Cleanup(func() { migrateAttempts, migrateBackoff = oldAttempts, oldBackoff })
 }
 
+// HistoryAltered is the version of the last migration that alters history's table, before which
+// Migrate refuses a host's transaction that has written history.
+const HistoryAltered = historyAltered
+
+// MigrateLock is the statement taking the lock Migrate takes on schema, which another replica's
+// migration holds until it ends, and its arguments.
+func MigrateLock(schema string) (string, []any) {
+	return advisory{kind: "migrate"}.taking(schema)
+}
+
 // SetMaxPrune bounds what one PruneHistory deletes to n until t ends.
 func SetMaxPrune(t *testing.T, n int) {
 	t.Helper()
@@ -1881,9 +1891,11 @@ func SetHoldingPlaces(t *testing.T, f func() func()) {
 }
 
 // AsOfView is the query of AsOf's view of table, one of the package's in schema with columns, as
-// byTime has AsOf and PruneHistory read history: what 0028_as_of_views makes it, for a test to hold
-// the view to. A grant, an eligibility, a deny, a membership, a group or a place in one reads the
-// columns history copies beside each version, as columns, by the table's column each copies.
+// byTime has AsOf and PruneHistory read history: what 0033_view_seeks_and_hints makes it, for a
+// test to hold the view to. A grant, an eligibility, a deny, a membership, a group or a place in one
+// reads the columns history copies beside each version, as columns, by the table's column each
+// copies, and tests a version for a later one naming the entity as the version's own, as a prune
+// does.
 func AsOfView(schema, table string, columns []string) string {
 	entities := map[string]struct {
 		entity string
@@ -1931,6 +1943,6 @@ func AsOfView(schema, table string, columns []string) string {
 		WHERE h.tenant = ` + tenant + ` AND h.entity = ` + entity + `
 		  AND h.op NOT IN ('delete', 'expire') AND h.effective_at <= ` + at + `
 		  AND ` + b.byAnother("h") + `
-		  AND CASE WHEN ` + b.later("h", entity) + ` IS NOT NULL THEN false
-		    ELSE ` + b.byCommit("h", "NOT "+b.writtenLater("h", entity), "c.at <= "+at) + ` END`
+		  AND CASE WHEN ` + b.later("h", "h.entity") + ` IS NOT NULL THEN false
+		    ELSE ` + b.byCommit("h", "NOT "+b.writtenLater("h", "h.entity"), "c.at <= "+at) + ` END`
 }
