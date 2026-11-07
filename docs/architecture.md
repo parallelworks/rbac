@@ -1113,7 +1113,8 @@ flowchart TB
   them ended at, which commits with them: a snapshot seeing any row a batch removed sees it. A read
   of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and the
   latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
-  row it finds removed had ended by then, and the rows still there it decides by their ends, so it
+  row it finds removed had ended by then, or is a place of an identity whose membership had, which
+  gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
   statement (`filterAt`), which runs later than `Filter` read the time. The call then decides at that
   time (`callClock.passed`): the conditions it evaluates, the label values the read decides and its

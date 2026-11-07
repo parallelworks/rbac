@@ -290,9 +290,11 @@ func lapseSQL(tenant, identity string) string {
 // earlier time could find a later-ending row removed and an earlier-ending one left, a state no
 // moment held: as the place a deny binds the subject by gone, and the membership or place its power
 // comes through still there. It records with each batch, in its transaction, the latest time a row
-// the batch removes ended at, so a snapshot seeing any of its removals sees a time each had ended
-// by, and a read deciding no earlier finds what it removed ended. The caller has the call decide at
-// it too (callClock.passed). As of a time, it is that time.
+// the batch removes ended at, of the memberships alone where it removes their places with them, so
+// a snapshot seeing any of its removals sees a time each had ended by, or a place's membership had,
+// after which the place gives nothing (keysSQL), and a read deciding no earlier finds what it
+// removed ended or giving nothing. The caller has the call decide at it too (callClock.passed). As
+// of a time, it is that time.
 func (a *Authorizer) decidedSQL(now string) string {
 	if a.asOf {
 		return `decided(at, expired) AS (SELECT ` + now + `::timestamptz, NULL::timestamptz)`
@@ -1063,11 +1065,11 @@ type Config struct {
 	// it once more in its transaction, under its locks, where it decides again, the ends of what it
 	// writes included. A call a hook makes, as a constraint's of GroupsOf, is a call of its own and
 	// reads it apart, so what the hook decides by is of its own moment, not the asking call's. A call
-	// decides no earlier than the latest time a row DeleteExpired removed ended at, which ended by
-	// that run's Config.Now and the database's clock both: keep every host's clock synchronized with
-	// the database's, as one running behind has calls after another's DeleteExpired, where it removed
-	// a row that ended after the host's clock, decide later than it reads, and some changes tried
-	// again.
+	// decides no earlier than the latest time a row DeleteExpired removed ended at, a membership's for
+	// the places it removed with one, which ended by that run's Config.Now and the database's clock
+	// both: keep every host's clock synchronized with the database's, as one running behind has calls
+	// after another's DeleteExpired, where it removed a row that ended after the host's clock, decide
+	// later than it reads, and some changes tried again.
 	Now func() time.Time
 }
 

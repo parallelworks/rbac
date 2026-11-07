@@ -6,10 +6,11 @@
 -- state no moment held, by which the actor acted by the power and escaped the deny. Each batch of a
 -- run now records here, in its transaction, the latest time a row it removes ended at, and a read of
 -- an actor or a subject decides no earlier than the latest it sees: every row it finds removed had
--- ended by then. A batch adds its own row and deletes those no later, passing over one another run
--- is deleting, so runs never wait for each other and the latest stays. No tenant's:
--- a run removes what has ended in every tenant. History doesn't record it, and AsOf doesn't read
--- it: as of a time, a read decides at that time.
+-- ended by then, or is a place of an identity whose membership had, which gives nothing once it
+-- has. A batch adds its own row and deletes those no later, passing over one another run is
+-- deleting, so runs never wait for each other and the latest stays. No tenant's: a run removes what
+-- has ended in every tenant. History doesn't record it, and AsOf doesn't read it: as of a time, a
+-- read decides at that time.
 CREATE TABLE rbac_expired (
     until timestamptz NOT NULL CHECK (isfinite(until))
 );

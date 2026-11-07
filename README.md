@@ -1220,14 +1220,16 @@ can leave the application's role without it. The administrator's and history's r
   memberships, passing over what a change holds, by its own clock: a read by an earlier clock could
   find the place a deny binds the actor by, which ended later, removed, and the membership or place
   its power comes through, which ended sooner, still there, a state no moment held. So each batch
-  records in `rbac_expired`, in its own transaction, the latest time a row it removes ended at,
-  which ended by the run's `Config.Now` and the database's clock both: a host whose clock runs
+  records in `rbac_expired`, in its own transaction, the latest time a row it removes ended at, a
+  membership's for the places it removes with one, which ended by the run's `Config.Now` and the
+  database's clock both: a host whose clock runs
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
   a run that removes nothing records nothing. A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
   host, decides no earlier than the latest time recorded that its snapshot sees: every row it finds
-  removed had ended by then, as it commits with the time. The call decides at that time from then
+  removed had ended by then, as it commits with the time, or is a place of an identity whose
+  membership had, which gives nothing once it has. The call decides at that time from then
   on, its conditions' `request.time` and its statements after the read too. So a call decides later
   than its own clock only where a run removed a row that ended after it. A change is tried again
   instead (`rbac.ErrConflict`) where its transaction read the time before that read, as for whether
