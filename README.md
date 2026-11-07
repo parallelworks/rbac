@@ -1473,10 +1473,10 @@ the package's uses foreign data, so none of the roles needs any.
   History), or where constraints were set immediate, as the statement that did, or the first change
   after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
   where its `lock_timeout` is longer.
-- **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
-  conditions are cached. Read a resource's ancestors and attributes from where they are stored,
-  never from request input, no earlier than the content they protect, and from the primary. A
-  deny is only as complete as the ancestors passed.
+- **What the host passes:** a check reads grants, memberships and groups as they are; only
+  conditions, compiled or found not to compile, are cached. Read a resource's ancestors and
+  attributes from where they are stored, never from request input, no earlier than the content
+  they protect, and from the primary. A deny is only as complete as the ancestors passed.
 - **Ids:** an id names its identity, group or resource for good. Never reuse one, or a new
   resource or account inherits the grants of the one before it. Delete a resource's grants with
   `DeleteScopes` in the transaction that deletes it, in one call with every scope under it too,

@@ -542,9 +542,11 @@ sequenceDiagram
   during the call would leave its place to one made after, which would be given the first one's
   copy.
 - **Conditions** are CEL over `subject`, `resource`, `request` and `action`, typed by
-  `Config.Attributes`. Each is compiled once, bounded in cost, and fails closed: a condition that
-  errors gives nothing, and a deny's that errors denies. A check converts what the host passes into
-  CEL's own values once (`converter`), deeply, from a closed set of Go values (`Attributes`): bools,
+  `Config.Attributes`. Each is compiled once, and one that doesn't compile is found so once, as
+  checks keep it as they keep a program (`conditions.compile`), bounded in cost, and fails closed:
+  a condition that errors gives nothing, and a deny's that errors denies. A check converts what the
+  host passes into CEL's own values once (`converter`), deeply, from a closed set of Go values
+  (`Attributes`): bools,
   strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
   slices, arrays, pointers, maps
   keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.

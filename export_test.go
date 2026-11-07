@@ -1315,6 +1315,44 @@ func CountEvaluations(t *testing.T) *int {
 	return n
 }
 
+// CountCompiles counts the expressions compiled, whether or not each is a condition, until t ends.
+func CountCompiles(t *testing.T) *int {
+	t.Helper()
+	old, n := compiling, new(int)
+	compiling = func() { *n++ }
+	t.Cleanup(func() { compiling = old })
+	return n
+}
+
+// CompileTook is the least time compiling expr took of three tries, as a check compiles one, by
+// conditions that have compiled others before, and why it isn't a condition: a check reads none
+// of that.
+func CompileTook(t *testing.T, expr string) (took time.Duration, err error) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the environment makes once, on the first failure too, as the names its errors suggest.
+	if _, err := c.build("true"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.build("undeclared"); err == nil {
+		t.Fatal("an undeclared name compiles")
+	}
+	took = time.Duration(1<<63 - 1)
+	for range 3 {
+		start := time.Now()
+		_, err = c.build(expr)
+		took = min(took, time.Since(start))
+	}
+	return took, err
+}
+
+// ConditionLimit is the most evaluating expr can cost, as a change bounding the conditions on a
+// scope reads it from a.
+func ConditionLimit(a *Authorizer, expr string) uint64 { return a.conds.limit(expr) }
+
 // CountSearches counts the searches of a string conditions run, contains, startsWith and endsWith,
 // until t ends.
 func CountSearches(t *testing.T) *int {

@@ -164,8 +164,8 @@ const (
 	// compilePerByte is what compiling a condition costs for each byte of it. Compiling one takes
 	// about as long as evaluating forty units of cost for each, twice that where attributes are
 	// declared, as it is checked against them too, but once for each condition, which checks then
-	// read from the cache, so this counts it cheaper: a check of conditions none of which is cached
-	// can take a few times what its budget implies.
+	// read from the cache, whether or not it compiled, so this counts it cheaper: a check of
+	// conditions none of which is cached can take a few times what its budget implies.
 	compilePerByte = 8
 	// maxDepth bounds how deeply a condition nests: checking its types takes time that grows much
 	// faster than its length with depth, which compilePerByte doesn't count.
@@ -303,10 +303,11 @@ type conditions struct {
 // program is a condition compiled, and why it doesn't check against the attributes declared now,
 // if it doesn't: one stored under other declarations, as before an attribute was declared another
 // type or no longer, would otherwise run as if they hadn't changed, and a deny reading it as a
-// string lift for a list, so a check reads it as failing.
+// string lift for a list, so a check reads it as failing. Or it is why an expression isn't a
+// condition (failed), which checks keep in its place (conditions.compile).
 type program struct {
 	cel.Program
-	typed error
+	typed, failed error
 	// readsAction is whether it reads the action, or might, so it can decide apart for each.
 	readsAction bool
 	// limit is the most evaluating it can cost (worstCost), which it runs within, so a check never
@@ -346,6 +347,9 @@ func (c *conditions) check(expr string) error {
 		}
 		c.keepLimit(expr, prg.limit)
 	}
+	if prg.failed != nil {
+		return prg.failed
+	}
 	return prg.typed
 }
 
@@ -359,7 +363,9 @@ func (c *conditions) limit(expr string) uint64 {
 		return limit
 	}
 	prg, err := c.build(expr)
-	if err != nil {
+	// Nothing is kept for one that failed as the platform's files failed to give a time zone for a
+	// while (settled), which a check plans again.
+	if err != nil && !settled(err) {
 		return 0
 	}
 	c.keepLimit(expr, prg.limit)
@@ -398,19 +404,27 @@ func (c *conditions) cached(expr string) (program, bool) {
 	return prg, ok
 }
 
-// compile returns an expression's program, or why it isn't a condition, and keeps the program.
+// compile returns an expression's program, or why it isn't a condition, and keeps either, so one
+// that isn't is compiled as seldom as one that is: a condition stored that no longer compiles, as
+// after an upgrade of CEL, was compiled again by every check reading it, each charged 16,384 for 2
+// KiB of one that took 25 to 75 ms. Nothing is kept for one that failed as the platform's files
+// failed to give a time zone for a while (settled), which the next check plans again: kept, it would
+// fail for as long as checks kept it.
 func (c *conditions) compile(expr string) (program, error) {
 	if prg, ok := c.cached(expr); ok {
-		return prg, nil
+		return prg, prg.failed
 	}
 	prg, err := c.build(expr)
 	if err != nil {
-		return program{}, err
+		if !settled(err) {
+			return program{}, err
+		}
+		prg = program{failed: err}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.programs[expr]; ok {
-		return prg, nil
+		return prg, prg.failed
 	}
 	// Bounded: conditions are data, so a tenant could store many. Those evicted are picked at
 	// random, so a tenant cycling through new conditions can't evict every other tenant's at once.
@@ -424,17 +438,18 @@ func (c *conditions) compile(expr string) (program, error) {
 	c.programs[expr] = prg
 	c.size += len(expr)
 	c.keptLimit(expr, prg.limit)
-	return prg, nil
+	return prg, prg.failed
 }
 
 // build compiles an expression, or returns why it isn't a condition.
 func (c *conditions) build(expr string) (program, error) {
+	compiling()
 	if len(expr) > MaxExpression {
 		return program{}, fmt.Errorf("%w: longer than %d bytes", errCondition, MaxExpression)
 	}
-	checked, iss := c.env.Compile(expr)
-	if iss.Err() != nil {
-		return program{}, fmt.Errorf("%w: %w", errCondition, iss.Err())
+	checked, err := compileIn(c.env, expr)
+	if err != nil {
+		return program{}, err
 	}
 	if checked.OutputType() != cel.BoolType {
 		return program{}, fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
@@ -458,6 +473,38 @@ func (c *conditions) build(expr string) (program, error) {
 	}
 	return program{Program: prg, typed: c.typeCheck(expr), readsAction: reading(checked.NativeRep(), "action"), limit: limit}, nil
 }
+
+// compileIn compiles expr in env, or returns why it doesn't compile (issues).
+func compileIn(env *cel.Env, expr string) (*cel.Ast, error) {
+	parsed, iss := env.Parse(expr)
+	if len(iss.Errors()) == 0 {
+		var checked *cel.Ast
+		if checked, iss = env.Check(parsed); len(iss.Errors()) == 0 {
+			return checked, nil
+		}
+	}
+	return nil, &issues{found: iss}
+}
+
+// issues is why an expression doesn't compile, as CEL found it, written out only once read: CEL
+// writes each error out with the line holding it, under which it marks its place a character at a
+// time, and its Compile writes them all out to tell whether it found any, so a hundred errors on a
+// line of 2 KiB took 20 ms to write out, twice, though a check reads none of it: compiling 2 KiB
+// that doesn't compile took five to fourteen times what compiling 2 KiB that does took. Written out
+// once, for every change asking of a program that keeps it, as CEL sorts the errors in place to
+// write them.
+type issues struct {
+	once  sync.Once
+	found *cel.Issues
+	text  string
+}
+
+func (i *issues) Error() string {
+	i.once.Do(func() { i.text, i.found = errCondition.Error()+": "+i.found.String(), nil })
+	return i.text
+}
+
+func (*issues) Unwrap() error { return errCondition }
 
 // plan plans checked to run within limit, as costs charges its calls, once the options before
 // have, as a test plans a loop as another version of CEL may.
@@ -612,9 +659,9 @@ func (c *conditions) typeCheck(expr string) error {
 	if c.typed == nil {
 		return nil
 	}
-	checked, iss := c.typed.Compile(expr)
-	if iss.Err() != nil {
-		return fmt.Errorf("%w: %w", errCondition, iss.Err())
+	checked, err := compileIn(c.typed, expr)
+	if err != nil {
+		return err
 	}
 	if checked.OutputType() != cel.BoolType {
 		return fmt.Errorf("%w: is %s, not a bool", errCondition, checked.OutputType())
@@ -2676,8 +2723,9 @@ func (c *conditions) decide(b *budget, expr string, vars map[string]any) (held, 
 
 // evaluating runs as a condition is evaluated, converting as what conditions read is built,
 // convertingKind as a kind's attributes are converted for it, searching as a search of a string
-// runs, and loadingZone as a time zone is loaded, as a test's counters.
-var evaluating, converting, convertingKind, searching, loadingZone = func() {}, func() {}, func() {}, func() {}, func() {}
+// runs, loadingZone as a time zone is loaded, and compiling as an expression is compiled, as a
+// test's counters.
+var evaluating, converting, convertingKind, searching, loadingZone, compiling = func() {}, func() {}, func() {}, func() {}, func() {}, func() {}
 
 // evaluate runs a condition's program on a request.
 func evaluate(prg program, vars map[string]any) run {

@@ -5215,6 +5215,62 @@ func TestAChangesConditionsCompileBriefly(t *testing.T) {
 	}
 }
 
+// A condition stored that no longer compiles, as one ordering numbers of different types once it
+// has checked a loop does after an upgrade of CEL, is compiled once, as one that compiles is, and
+// not again for each check reading it, each of which pays for compiling it once, cached or not:
+// charged 16,384 for 2 KiB, each took 45 ms. Compiling it takes about as long as compiling one of
+// its length that compiles, as CEL wrote out each of its errors twice, with the line holding it,
+// which a check reads none of. A change storing it again is refused, whatever checks keep, with
+// what CEL found, and a change bounding the conditions on a scope reads its limit, nothing, once.
+func TestAConditionThatNoLongerCompilesIsCompiledOnce(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	fill := func(part func(i int) string) string {
+		s := part(0)
+		for i := 1; len(s)+len(" && ")+len(part(i)) <= rbac.MaxExpression; i++ {
+			s += " && " + part(i)
+		}
+		return s
+	}
+	expr := fill(func(i int) string { return fmt.Sprintf("[1].all(v, true) && %d < 2u", i) })
+	g := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	g.Condition = rbac.Condition{Expression: expr}
+	storeAround(t, h, g)
+	compiles := rbac.CountCompiles(t)
+	u := h.as(t, "u")
+	for range 3 {
+		if allowed(t, h, u, login, cluster) {
+			t.Fatal("a condition that doesn't compile held")
+		}
+	}
+	if *compiles != 1 {
+		t.Errorf("3 checks compiled a condition that doesn't compile %d times", *compiles)
+	}
+	b := rbac.Binding{Role: "cluster.login", Principal: identity("v"), Condition: rbac.Condition{Expression: expr}}
+	if err := h.authz.Apply(ctx, h.as(t, "owner"), cluster, rbac.Change{Grant: []rbac.Binding{b}}); !errors.Is(err, rbac.ErrInvalid) ||
+		!strings.Contains(err.Error(), "found no matching overload for '_<_'") {
+		t.Errorf("storing a condition checks keep as failing: %v", err)
+	}
+	*compiles = 0
+	for range 2 {
+		if limit := rbac.ConditionLimit(h.authz, expr+" || true"); limit != 0 {
+			t.Errorf("a condition that doesn't compile is bounded at %d", limit)
+		}
+	}
+	if *compiles != 1 {
+		t.Errorf("reading the limit of a condition that doesn't compile twice compiled it %d times", *compiles)
+	}
+	compiled, err := rbac.CompileTook(t, fill(func(int) string { return "[1, 2, 3] == [1, 2, 3]" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, failing := range []string{expr, fill(func(i int) string { return fmt.Sprintf("request.attributes.f%d()", i) })} {
+		if took, err := rbac.CompileTook(t, failing); err == nil || took > 3*compiled {
+			t.Errorf("%d bytes that don't compile took %v to compile, as many that do %v: %v", len(failing), took, compiled, err)
+		}
+	}
+}
+
 // An actor holding its power under a condition hands it on under that condition, which a change
 // parses for whether it reads the subject once, however many bindings and permissions carry it:
 // parsing one takes milliseconds, and the change decides again in its transaction.
