@@ -53,7 +53,7 @@ func Migrations() fs.FS {
 // waited for. Call it there before any change to the package's tables: from 0027_commit_dates on,
 // each record of history a change writes holds an event deferred to the commit, as from
 // 0020_recorded_prunes on each record a prune deletes does, and PostgreSQL alters no table whose
-// events are pending, as migrations up to 0029_commit_trigger alter history.
+// events are pending, as migrations up to 0032_expired_writes alter history.
 // So where one of those is pending, it refuses, as ErrInvalid, a transaction holding such events,
 // before it waits for another replica's migration or applies any.
 //
@@ -137,7 +137,7 @@ var errReplica = errors.New("rbac: waiting for another migration of the schema")
 // this names it, and checks that this one can't commit while such a transaction holds history;
 // another finds each migration altering history by its statements, failing until this names the
 // last.
-const historyAltered = 29
+const historyAltered = 32
 
 // historyUnwritten refuses, as ErrInvalid, a host's transaction tx that holds events of history's
 // deferred triggers in schema, where a migration pending alters history (historyAltered), which

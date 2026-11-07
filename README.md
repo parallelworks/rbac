@@ -1113,7 +1113,7 @@ the package's uses foreign data, so none of the roles needs any.
   would miss the writes it waits for. Call it there before any change to the package's tables: from
   `0027_commit_dates` on, each record of history a change writes holds an event deferred to the
   commit, as from `0020_recorded_prunes` on each record `PruneHistory` deletes does, and PostgreSQL
-  alters no table whose events are pending, as migrations up to `0029_commit_trigger` alter
+  alters no table whose events are pending, as migrations up to `0032_expired_writes` alter
   history, so where one of those is pending, `Migrate` refuses, as `rbac.ErrInvalid`, a
   transaction holding such events, before it waits for another replica's migration or applies any.
   A tool of the host's own applies them before any such change too.
