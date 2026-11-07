@@ -315,6 +315,71 @@ func TestMigrateOnAHostsTransactionLeavesItsLockTimeout(t *testing.T) {
 	}
 }
 
+// Migrate on a host's transaction comes before any change in it to the package's tables: from
+// 0027_commit_dates on, each record of history a change writes holds an event deferred to the
+// commit, and PostgreSQL alters no table whose events are pending, as migrations up to
+// rbac.HistoryAltered alter history. Where one of those is pending, Migrate refuses a transaction
+// holding such events, as ErrInvalid, before it applies any, and the transaction goes on to commit
+// its change with its commit record. It migrates one that took a transaction id writing no history;
+// one that wrote history before 0027, whose records hold no events, and whose change counts from its
+// own date, with no commit record; and one that wrote history once no migration pending alters it,
+// which a later migration that does fails until HistoryAltered names it.
+func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
+	const change = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`
+	altering, after := fmt.Sprintf("%04d", rbac.HistoryAltered), fmt.Sprintf("%04d", rbac.HistoryAltered+1)
+	for _, c := range []struct {
+		name, from, write string
+		refused           bool
+		commits           int
+	}{
+		{"a change, with a migration altering history pending", altering, change, true, 1},
+		{"a transaction id, with a migration altering history pending", altering, `SELECT pg_current_xact_id()`, false, 0},
+		{"a change before history recorded commits", commitDates(t), change, false, 0},
+		{"a change, with none pending altering history", after, change, false, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.from == after && latestMigration(t) <= rbac.HistoryAltered {
+				t.Skip("no migration after the last that alters history")
+			}
+			ctx := t.Context()
+			pool := pgtest.Open(t, "")
+			migrateFiles(t, pool, "", c.from)
+			recordMigrations(t, pool, c.from)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := tx.Exec(ctx, c.write); err != nil {
+				t.Fatal(err)
+			}
+			err = rbac.Migrate(ctx, tx)
+			if c.refused && !errors.Is(err, rbac.ErrInvalid) || !c.refused && err != nil {
+				t.Fatalf("Migrate on a host's transaction after %s: %v", c.name, err)
+			}
+			want := latestMigration(t)
+			if c.refused {
+				want = rbac.HistoryAltered - 1
+			}
+			if v := migratedTo(t, tx); v != want {
+				t.Errorf("migrated to %d, not %d", v, want)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var grants, commits int
+			if err := pool.QueryRow(ctx, `SELECT count(DISTINCT g.id), count(c.id) FROM rbac_history g
+				LEFT JOIN rbac_history c ON c.txid = g.txid AND c.entity = 'commit' WHERE g.entity = 'grant'`).Scan(&grants, &commits); err != nil {
+				t.Fatal(err)
+			}
+			if c.write == change && (grants != 1 || commits != c.commits) {
+				t.Errorf("the change committed %d grants with %d commit records, not %d", grants, commits, c.commits)
+			}
+		})
+	}
+}
+
 // Migrate waits for another replica's migration as long as the session's lock_timeout lets it,
 // and no longer: a try that wait ends isn't tried again, as each would wait as long again.
 func TestMigrateWaitsForAReplicaAsLongAsTheSessionsLockTimeout(t *testing.T) {

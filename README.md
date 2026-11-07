@@ -808,7 +808,19 @@ notification some listener in the cluster has yet to read, and any role may `LIS
 one fills while a listener lags, as one in a long transaction does, and every commit that notifies
 then fails until that listener catches up or ends: where the host's own transactions notify, size
 it for how far its listeners fall behind, and retry such a commit once the queue drains, or keep
-the default and watch `pg_notification_queue_usage()`. `pg_stat_activity` lists a session
+the default and watch `pg_notification_queue_usage()`. And the rest of a commit runs, after the
+deferred triggers, each loaded extension's pre-commit callbacks: postgres_fdw commits there every
+remote transaction the transaction opened, as any read or write of a foreign table opens one, and a
+remote `COMMIT` waits for what the remote server has it wait for, as a remote deferred foreign key's
+check waits for a row another session holds there, which `lock_timeout`, the local session's,
+doesn't bound: in a test, a commit 1.5 s past its record, for as long as the remote lock was held. A
+role with `USAGE` on a postgres_fdw server and a user mapping, or a privilege on a foreign table
+and a mapping another made, can do this, and one with `USAGE` on the wrapper can make a server of
+its own. The commit record doesn't refuse a transaction that used a foreign connection, which
+PostgreSQL 18's `postgres_fdw_get_connections()` could tell it: no check of postgres_fdw's sees
+another extension's callbacks, as another foreign-data wrapper's that commits its own remote
+transactions, nor a connection a deferred trigger of the host's opens after the commit record, so
+the roles below give the application's role none of these. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
@@ -822,7 +834,12 @@ written. In a procedure or a `DO` block, it refuses too a transaction that has a
 open that the block declared in an earlier transaction, whose commit ran it, as a cursor's creation
 time is the block's, and nothing tells it from one declared in this transaction: declare such a
 cursor before the block, in a transaction of its own, and fetch from it in the block by its name, or
-close it before a transaction that changes the package's tables commits. A `FOR` loop over a query,
+close it before a transaction that changes the package's tables commits. A query string of several
+statements, as the simple protocol sends one, as pgx's `Exec` in its simple mode or `psql -c` does,
+counts as one such block, as each of its statements, and each of its transactions, began when it
+did: a transaction of it that changes the package's tables is refused after one of it that declared
+a cursor `WITH HOLD` and committed, which ran it, so declare the cursor in a query string of its
+own. A `FOR` loop over a query,
 which PL/pgSQL runs to its end as each `COMMIT` in it begins, is not refused. The check of a
 temporary table's deferrable trigger reads the catalog as the commit record is written, so it is a
 best-effort defense that holds only where a hostile session can't make temporary objects: the roles
@@ -836,7 +853,9 @@ as long as writing them takes, which only `max_notify_queue_pages` bounds; and t
 settings of synchronous replication and prepared transactions, for as long as they let it. A role
 given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
 or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
-deferrable trigger, against which the check is best-effort.
+deferrable trigger, against which the check is best-effort; and a role given `USAGE` on a
+foreign-data wrapper or a foreign server, or a privilege on a foreign table, by a remote
+transaction's commit, for as long as the remote server has it wait.
 With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
 keeps it, shows when the transaction's commit was written, which an auditor can compare with its
 `CommittedAt`.
@@ -875,7 +894,13 @@ other way round, and one that names it first, which makes the session's temporar
 one. A function, operator or type in the views' schema is found before the package's, and runs as
 whoever reads, so `AsOf` refuses that schema where it holds more than its owner's views, another
 role may create in it, or it isn't the role's that owns the package's tables, as a grant, an
-extension installed there or a change of owner since migrating can make it. A statement looks each
+extension installed there or a change of owner since migrating can make it. It finds the views by
+the history they read, among those of the role that owns the package's tables and outside every
+session's temporary schema, as migrating finds them among the role's that migrates: a view of
+history named as one of the tables, that another session made in its temporary schema, as any role
+with `TEMPORARY` that may read history can, or another role's, stood beside them before
+`0033_view_seeks_and_hints`, and every read as of a time in the database failed while it stood, as
+did migrating, which makes the views again. A statement looks each
 name up by the catalog as it is then, whatever its transaction's snapshot, so what is made there as
 a read runs is called by the read's next statement: `AsOf` checks the schema again once its read
 returns, and fails where it has come to be so, on its own transaction once that has rolled back, as
@@ -900,7 +925,12 @@ planned over history, they cost past `jit_above_cost` for an ordinary subject: a
 compiling, and 110 ms without. It tests each version a statement reads for a later one by its
 row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
 history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
-much: a read of thousands of rows costs a few pages for each version. It looks each version's
+much: a read of thousands of rows costs a few pages for each version. The test names the version's
+entity as its own, so no index of history by scope serves it: through history's index of denies by
+scope, read by the tenant and the time alone, every scope skipped, each deny a statement read cost
+every later deny version of the tenant, and beside 6,000 denies on volumes binding its subject,
+`Reachable` read 18 million pages of history, 4.4 s, and `Denies` of one volume 6,875 to list its
+two, before `0033_view_seeks_and_hints`. It looks each version's
 commit record up by its transaction, a few pages more, as `History` does for `CommittedAt`, so
 what it answers turns on nothing an export leaves out. Joined to a group's members
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
@@ -1039,6 +1069,16 @@ defense, so a role that need not make temporary objects is better left unable to
 package's makes one, `AsOf` included, which reads views migrating made, so none of the roles needs
 `TEMPORARY`, and the check holds against each.
 
+Harden foreign data too: grant the application's role no `USAGE` on any foreign-data wrapper or
+foreign server, and no privilege on a foreign table, none of which PostgreSQL grants `PUBLIC` by
+default. A transaction that reads or writes a foreign table through postgres_fdw commits its remote
+transaction after its commit record is written, and waits for the remote server for as long as that
+has it wait, which nothing the package sets bounds (see above): `USAGE` on a server lets a role map
+itself to it, `USAGE` on a wrapper lets it make a server, and a privilege on a foreign table lets it
+read or write through a mapping for it, or for `PUBLIC`, without either. Nor let it reach any other
+extension that does work it can start, and wait on, in a pre-commit callback. No call of the
+package's uses foreign data, so none of the roles needs any.
+
 ## Running it
 
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
@@ -1051,7 +1091,12 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   once its own migrations are applied, as `Migrate` returning nil says.
   On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
   them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
-  would miss the writes it waits for.
+  would miss the writes it waits for. Call it there before any change to the package's tables: from
+  `0027_commit_dates` on, each record of history a change writes holds an event deferred to the
+  commit, and PostgreSQL alters no table whose events are pending, as migrations up to
+  `0029_commit_trigger` alter history, so where one of those is pending, `Migrate` refuses, as
+  `rbac.ErrInvalid`, a transaction holding such events, before it applies any. A tool of the host's
+  own applies them before any such change too.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a
@@ -1336,11 +1381,13 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
   each other by locks named for the schema holding the tables, so sessions reaching them through
   different search_paths still do. A host's transaction that changes the package's tables commits
-  having declared no cursor `WITH HOLD`, and with no enabled deferrable trigger on a temporary table
-  of its session: history refuses each as the transaction commits, with SQLSTATE 0A000, as it would
-  have its changes counted before they commit (see History), or where constraints were set
-  immediate, as the statement that did, or the first change after it. And the rest of its commit
-  waits for no lock past 100 ms, failing with SQLSTATE 55P03, where its `lock_timeout` is longer.
+  having declared no cursor `WITH HOLD`, nor with one open that an earlier transaction of its
+  procedure, `DO` block or query string of several statements declared, and with no enabled
+  deferrable trigger on a temporary table of its session: history refuses each as the transaction
+  commits, with SQLSTATE 0A000, as it would have its changes counted before they commit (see
+  History), or where constraints were set immediate, as the statement that did, or the first change
+  after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
+  where its `lock_timeout` is longer.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A

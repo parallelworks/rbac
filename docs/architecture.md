@@ -1337,8 +1337,12 @@ flowchart LR
   earlier transaction, whose commit ran it: its creation time is the block's too, and neither the
   cursors open at the transaction's first record nor a time that record took tells it from one
   declared in the transaction before its first change. Declared before the block, or closed first,
-  it isn't. The temporary-table check reads the catalog as the commit record is written, so it is a
-  best-effort defense that assumes the README's roles: it holds against a session with no
+  it isn't. A query string of several statements, as the simple protocol sends one, is such a block:
+  each of its statements, and each of its transactions, began when it did, so a cursor one
+  transaction of it declared and committed is refused in a later one of it that changes the tables,
+  and is declared in a query string of its own instead. The temporary-table check reads the
+  catalog as the commit record is written, so it is a best-effort defense that assumes the README's
+  roles: it holds against a session with no
   `TEMPORARY` privilege, which can make no temporary object, and is best-effort against one with it.
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
   package's makes a temporary object, `AsOf`'s included. What runs after the commit record is the
@@ -1349,8 +1353,15 @@ flowchart LR
   `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
   those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
   can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
-  queue, which only `max_notify_queue_pages` bounds), the wait for synchronous replication, and for
-  a prepared transaction, everything until `COMMIT PREPARED`. A transaction that committed before
+  queue, which only `max_notify_queue_pages` bounds), each loaded extension's pre-commit callbacks,
+  in which postgres_fdw commits the transaction's remote transactions, each waiting for what the
+  remote server has it wait for, as a remote deferred foreign key's check, which no local
+  `lock_timeout` bounds (1.5 s in a test), the wait for synchronous replication, and for a prepared
+  transaction, everything until `COMMIT PREPARED`. The commit record doesn't refuse a transaction
+  that used a foreign connection: no check of postgres_fdw's connections sees another extension's
+  callbacks, or a connection a deferred trigger opens after the commit record, so the README's roles
+  give the application's role no `USAGE` on a foreign-data wrapper or server, and no privilege on a
+  foreign table. A transaction that committed before
   `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
   commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
   covers as every other field; a prune deletes it with the last of its transaction's other records.
@@ -1438,7 +1449,11 @@ flowchart LR
   were made, and AsOf refuses alike one that holds more than its owner's views, another may create
   in, or isn't the role's that owns the package's tables, as a grant, an extension installed there
   or a change of owner can make it. AsOf finds the views by the history they read, whatever either
-  schema is named, as `rbac_as_of_views` does by any of them left, and refuses where one of the
+  schema is named, as `rbac_as_of_views` does by any of them left, among the views of the role
+  owning the package's tables, or for `rbac_as_of_views` the role migrating, outside every session's
+  temporary schema: a view of history another session made in its own, as any role with
+  `TEMPORARY` that reads history can, or another role's, stood beside them, and every AsOf in the
+  database and every remaking of the views failed while it stood. It refuses where one of the
   package's tables has none, which would be read as it is now, or where the role has no `USAGE` on
   their schema, which the search_path would leave out; it refuses a search_path that names pg_temp
   after the package's schema, as it reads the session's own tables after its views and before the
@@ -1511,8 +1526,16 @@ flowchart LR
   conditions, and history's index of scopes holds them only for one that names a scope, so a read of
   them by their principal, scope, role or group seeks them in the index leading to it: by statistics
   that counted the tenant's rows of them as a few, a plan read every one in the tenant through
-  either instead. `Holders` looks each identity's membership of the tenant up on its own, by its
-  key, which the view of memberships gives as the principal: joined to a group's members, or looked
+  either instead. The test for a later version names its entity as the version's own, a value no
+  partial index's predicate is proven from, as `PruneHistory`'s does, so history's indexes of
+  denies by scope and of grants' and eligibilities' scopes, whose predicates name entities, can't
+  serve it: by the tenant and the time alone, every scope skipped, a plan read every later deny
+  version in the tenant for each deny, 18 million pages of history for a `Reachable` beside 6,000
+  denies binding its subject. Naming the row's scope instead would have the scope index seek it, but
+  a grant or an eligibility moved in place to another scope keeps its key, and its version before
+  the move would read as its last at the scope it left. `Holders` looks each identity's membership
+  of the tenant up on its own, by its key, which the view of memberships gives as the principal:
+  joined to a group's members, or looked
   up by the principal history copies beside the entity, it read, by such statistics, every
   membership in the tenant again for each member. The view of custom roles takes each one's newest
   version, testing none for a later one, so `Grantable`, which can offer any, reads each version
@@ -1541,7 +1564,9 @@ it: not `pg_write_all_data` or `pg_create_subscription`, through which it could 
 `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, which run programs
 and write and read files as the server; before PostgreSQL 16 it has no `CREATEROLE`, which makes it
 a member of any role but a superuser; it has no `REPLICATION` attribute, which reads every data
-file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The README's
+file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set; and it has no `USAGE` on
+a foreign-data wrapper or server, nor a privilege on a foreign table, whose remote transactions
+commit after the commit record. The README's
 [History](../README.md#history) section has the exact grants.
 
 ```mermaid

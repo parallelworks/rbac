@@ -204,22 +204,28 @@ func errPlanted(views, schema string) error {
 }
 
 // asOfViews returns the views of history in schema, which it finds by what they read, whatever
-// either schema is named, and the search_path q reads by: refusing them where they are of no one
-// schema, where theirs holds no view of one of the package's tables, those of schema prefixed
+// either schema is named, among the views of the role owning schema's tables outside every
+// session's temporary schema, and the search_path q reads by: refusing them where they are of no
+// one schema, where theirs holds no view of one of the package's tables, those of schema prefixed
 // rbac_ but rbac_expired, which no read as of a time reads, as it would be read as it is now, or, as
-// migrating does, where planted is true of it.
+// migrating does, where planted is true of it. A view of history that another session made in its
+// temporary schema, as any role with TEMPORARY that reads history can, or another role's, would
+// otherwise stand beside them, and have every read as of a time refused while it stood.
 func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, error) {
 	s := standIns{schema: schema}
 	var views, bare []string
 	var path string
 	var refused bool
-	if err := q.QueryRow(ctx, `WITH v AS (
+	if err := q.QueryRow(ctx, `WITH here AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2),
+		  v AS (
 		  SELECT DISTINCT c.relnamespace AS oid FROM pg_catalog.pg_depend d
 		  JOIN pg_catalog.pg_rewrite w ON w.oid = d.objid
 		  JOIN pg_catalog.pg_class c ON c.oid = w.ev_class
 		  WHERE d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-		    AND d.refobjid = $1::pg_catalog.text::pg_catalog.regclass AND c.relkind = 'v' AND c.relname = 'rbac_grants'),
-		  here AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2),
+		    AND d.refobjid = $1::pg_catalog.text::pg_catalog.regclass AND c.relkind = 'v' AND c.relname = 'rbac_grants'
+		    AND c.relowner = (SELECT t.relowner FROM pg_catalog.pg_class t
+		      WHERE t.relnamespace = (SELECT here.oid FROM here) AND t.relname = 'rbac_grants' AND t.relkind IN ('r', 'p'))
+		    AND NOT pg_catalog.pg_is_other_temp_schema(c.relnamespace) AND c.relnamespace <> pg_catalog.pg_my_temp_schema()),
 		  tables AS (SELECT t.relname, c.oid AS view FROM pg_catalog.pg_class t
 		    LEFT JOIN (pg_catalog.pg_class c JOIN v ON c.relnamespace = v.oid) ON c.relname = t.relname AND c.relkind = 'v'
 		    WHERE t.relnamespace = (SELECT here.oid FROM here)
@@ -236,7 +242,7 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 	}
 	switch {
 	case len(views) == 0:
-		return standIns{}, "", fmt.Errorf("%w: no views of history stand beside schema %s: migrate it to 0028_as_of_views", ErrInvalid, schema)
+		return standIns{}, "", fmt.Errorf("%w: no views of history of the role owning its tables stand beside schema %s: migrate it to 0028_as_of_views as that role", ErrInvalid, schema)
 	case len(views) > 1:
 		return standIns{}, "", fmt.Errorf("%w: views of %s.rbac_history stand in schemas %s", ErrInvalid, schema, strings.Join(views, ", "))
 	case len(bare) > 0:

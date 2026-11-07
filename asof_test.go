@@ -954,6 +954,102 @@ func TestAsOfReadsAGroupsMembersAndAScopesDeniesAlone(t *testing.T) {
 	}
 }
 
+// As of a time, each deny a statement reads is tested for a later version by its key, beside
+// thousands of the tenant's denies on other scopes, in a history of many tenants, analyzed: a plan
+// read its later versions through history's index of denies by scope, by the tenant and the time
+// alone, so each deny read cost every later version of the tenant's denies. Beside 6,000 denies on
+// volumes binding its subject, Reachable read 18 million pages of history, a host's query of
+// Filter's condition 36 million, and Denies of one volume 6,875 to list its two. What the first two
+// read grows with the denies they read, not with their square, and what Denies reads not at all.
+func TestAsOfReadsADenysLaterVersionsByItsKey(t *testing.T) {
+	volumes := rbac.RoleDefinition{ID: "volume.admin", Permissions: []rbac.Permission{"volume:view"}, ResourceTypes: []string{"volume"}}
+	h := crowded(t, pgtest.Open(t, ""), func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), volumes) })
+	ctx := t.Context()
+	u := h.as(t, "u", "g")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	exec(`CREATE TABLE clusters (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL)`)
+	exec(`INSERT INTO clusters VALUES ('t1', 'c1', $1)`, h.path(t, cluster))
+	denied := 0
+	// Two denies on each volume, one naming u's group and one the public.
+	more := func(n int) {
+		t.Helper()
+		exec(`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions)
+			SELECT 't1', 'volume', 'v' || i, d.id, d.principals, '{volume:view}'
+			FROM generate_series($1::int + 1, $2::int) i, (VALUES ('d', '{group:g}'::text[]), ('e', '{public:}')) d(id, principals)`, denied, n)
+		denied = n
+		exec(`ANALYZE rbac_history`)
+	}
+	read := func(at time.Time) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			pred, err := a.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+			if err != nil {
+				return err
+			}
+			for what, f := range map[string]func() error{
+				"Reachable": func() error { return second(a.Reachable(ctx, u, login, "t1", "cluster")) },
+				"a query of Filter's condition": func() error {
+					rows, err := tx.Query(ctx, `SELECT id FROM clusters WHERE `+pred.SQL, pred.Args...)
+					if err != nil {
+						return err
+					}
+					ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+					if err == nil && !slices.Equal(ids, []string{"c1"}) {
+						err = fmt.Errorf("the clusters u may log in to: %v", ids)
+					}
+					return err
+				},
+				"Denies of one volume": func() error {
+					ds, err := a.Denies(ctx, "t1", []rbac.Scope{{Type: "volume", ID: "v1"}})
+					if err == nil && len(ds) != 2 {
+						err = fmt.Errorf("the denies on v1: %+v", ds)
+					}
+					return err
+				},
+			} {
+				n, err := leastPages(ctx, t, tx, f)
+				if err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				}
+				pages[what] = n
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	// Each size is read by statistics of its own, by any of which a plan could read the later
+	// versions so, as by one of these one did: some 80 pages of history for each deny beside 1,000,
+	// and 3,000 beside 6,000, against about 3, and 6 for Filter's, each sought by its key.
+	more(1)
+	few := read(dbNow(t, h))
+	for _, n := range []int{500, 3000} {
+		more(n)
+		for what, many := range read(dbNow(t, h)) {
+			most := few[what] + 10*int64(2*n)
+			if what == "Denies of one volume" {
+				most = few[what]*3/2 + deeper
+			}
+			if many > most {
+				t.Errorf("as of a time, %s read %d pages of history beside two denies on volumes, and %d beside %d", what, few[what], many, 2*n)
+			}
+		}
+	}
+}
+
 func TestAsOfReadsPastAStatementTheSessionPrepared(t *testing.T) {
 	h := setupOn(t, pgtest.Open(t, "pool_max_conns=1"))
 	ctx := t.Context()
@@ -2531,6 +2627,45 @@ func TestABatchHoldingACursorCommitsAsTheHintSays(t *testing.T) {
 	}
 }
 
+// A query string of several statements, as the simple protocol sends one, is a block too: each of
+// its statements began as it did, and each of its transactions with them, so a transaction of it
+// that changes the package's tables, after one of it that declared a cursor WITH HOLD and
+// committed, is refused as one with a cursor declared in it, which nothing tells it from. The
+// refusal names such a query string, and its hint says how one commits: with the cursor declared
+// in a query string of its own, as it then does.
+func TestAQueryStringHoldingACursorCommitsAsTheHintSays(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	conn, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	exec := func(sql string) error {
+		_, err := conn.Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol)
+		return err
+	}
+	const (
+		declare = `BEGIN; DECLARE batch CURSOR WITH HOLD FOR SELECT 1; COMMIT;`
+		change  = `BEGIN; INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'batched'); COMMIT;`
+	)
+	err = exec(declare + ` ` + change)
+	if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "0A000" ||
+		!strings.Contains(pgErr.Message, "query string") || !strings.Contains(pgErr.Hint, "query string of its own") {
+		t.Fatalf("a change after a transaction of its query string that declared a cursor WITH HOLD: %v", err)
+	}
+	for _, sql := range []string{`CLOSE batch`, declare, change, `CLOSE batch`} {
+		if err := exec(sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	var commits int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history m JOIN rbac_history c ON c.txid = m.txid AND c.entity = 'commit'
+		WHERE m.entity = 'membership' AND m.key = 'user:batched'`).Scan(&commits); err != nil || commits != 1 {
+		t.Errorf("the change has %d commit records, %v", commits, err)
+	}
+}
+
 // The commit record's trigger fires as a transaction commits once for each record it wrote, and the
 // event of each but the last only looks for a later one: first among the next 32 ids, where the
 // records a statement writes are, one after another, unless more than 32 sessions write history at
@@ -3822,5 +3957,76 @@ func TestAsOfReadsItsViewsWhateverEitherSchemaIsNamed(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Error(err)
+	}
+}
+
+// AsOf finds its views among those of the role owning the package's tables, as migrating finds
+// them among the role's that migrates, outside every session's temporary schema: a view of history
+// named as one of the tables, made in its temporary schema by another session, as any role with
+// TEMPORARY that may read history can, or by the session reading, or another role's in a schema of
+// its own, stood beside them, and every read as of a time in the database was refused while it
+// stood, as was making the views again.
+func TestAsOfFindsItsViewsWhateverViewsOfHistoryOthersMake(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	at := dbNow(t, h)
+	var schema string
+	if err := h.pool.QueryRow(ctx, `SELECT quote_ident(current_schema())`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	views := viewsOf(t, h)
+	over := `CREATE TEMPORARY VIEW rbac_grants AS SELECT id FROM ` + schema + `.rbac_history`
+	for _, c := range []struct {
+		what string
+		made func(t *testing.T, tx pgx.Tx) []string
+	}{
+		{"another session's temporary view", func(t *testing.T, _ pgx.Tx) []string {
+			t.Helper()
+			other, err := pgx.ConnectConfig(ctx, h.pool.Config().ConnConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = other.Close(context.WithoutCancel(ctx)) })
+			if _, err := other.Exec(ctx, over); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+		{"the reading session's temporary view", func(*testing.T, pgx.Tx) []string { return []string{over} }},
+		{"another role's view in a schema of its own", func(t *testing.T, tx pgx.Tx) []string {
+			t.Helper()
+			other, _ := role(t, tx)
+			planted := pgx.Identifier{"planted_" + strings.ToLower(rand.Text())}.Sanitize()
+			return []string{
+				`CREATE SCHEMA ` + planted + ` AUTHORIZATION ` + other,
+				`GRANT USAGE ON SCHEMA ` + schema + ` TO ` + other, `GRANT SELECT ON ` + schema + `.rbac_history TO ` + other,
+				`SET LOCAL ROLE ` + other, `CREATE VIEW ` + planted + `.rbac_grants AS SELECT id FROM ` + schema + `.rbac_history`, `RESET ROLE`,
+			}
+		}},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			for _, sql := range c.made(t, tx) {
+				if _, err := tx.Exec(ctx, sql); err != nil {
+					t.Fatalf("%s: %v", sql, err)
+				}
+			}
+			if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, u, login, cluster) }); err != nil {
+				t.Errorf("as of when u held its login, beside %s: %v", c.what, err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+				t.Errorf("making the views again beside %s: %v", c.what, err)
+			}
+			var stand bool
+			if err := tx.QueryRow(ctx, `SELECT to_regclass($1 || '.rbac_grants') IS NOT NULL`, views).Scan(&stand); err != nil || !stand {
+				t.Errorf("made again beside %s, the views stand in %s: %t, %v", c.what, views, stand, err)
+			}
+		})
 	}
 }
