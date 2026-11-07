@@ -611,11 +611,12 @@ func TestMigratingTheMembersIndexWaitsForAChangeInFlight(t *testing.T) {
 	}
 }
 
-// rolesAfterDenies is a pool whose transactions run fire, once, just before the first statement
-// naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities, alone or in a batch.
+// rolesAfterDenies is a pool whose transactions run fire, once, on the transaction, just before the
+// first statement naming rbac_roles that follows one naming rbac_denies or rbac_eligibilities, alone
+// or in a batch.
 type rolesAfterDenies struct {
 	*pgxpool.Pool
-	fire func()
+	fire func(pgx.Tx)
 }
 
 func (p *rolesAfterDenies) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
@@ -636,7 +637,7 @@ func (tx *rolesAfterDeniesTx) see(sql string) {
 	if roles := strings.Contains(sql, "rbac_roles"); roles && tx.denies && tx.p.fire != nil {
 		fire := tx.p.fire
 		tx.p.fire = nil
-		fire()
+		fire(tx.Tx)
 	} else if !roles && (strings.Contains(sql, "rbac_denies") || strings.Contains(sql, "rbac_eligibilities")) {
 		tx.denies = true
 	}
@@ -683,6 +684,17 @@ func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
 	if _, err := pool.Exec(ctx, function); err != nil {
 		t.Fatal(err)
 	}
+	// Its reads decide no earlier than the times DeleteExpired deleted by, in rbac_expired, which
+	// 0030 makes: the schema has it too, and once the migration starts, which makes it again, the
+	// change's own session has one of its own for the rest of its transaction, which hasn't read it
+	// there yet.
+	expired, err := fs.ReadFile(rbac.Migrations(), "0030_expired_through.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(expired)); err != nil {
+		t.Fatal(err)
+	}
 	db := &rolesAfterDenies{Pool: pool}
 	cfg := rbac.Config{
 		Catalog:        append(slices.Clone(catalog), groupMembers),
@@ -702,8 +714,16 @@ func TestMigrateGivesWayToAChangeReadingItsTablesInAnotherOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	migrated := make(chan error, 1)
-	db.fire = func() {
+	db.fire = func(tx pgx.Tx) {
 		if _, err := pool.Exec(ctx, `DROP FUNCTION rbac_changes_grants(text[])`); err != nil {
+			migrated <- err
+			return
+		}
+		if _, err := pool.Exec(ctx, `DROP TABLE rbac_expired`); err != nil {
+			migrated <- err
+			return
+		}
+		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE rbac_expired (until timestamptz NOT NULL) ON COMMIT DROP`); err != nil {
 			migrated <- err
 			return
 		}
@@ -7507,8 +7527,49 @@ func TestAChangeHoldsWhatDeleteExpiredDeletesBeforeItReadsItsTime(t *testing.T) 
 // which a write around the package holds, without the group's lock.
 func TestTheTestsSeeAChangeWaitForARowOnceItHasReadItsTime(t *testing.T) {
 	h := grouped(t)
+	h.groups(t, "crew")
+	if p, _ := waitForTheGroupsRow(t, h).(string); !strings.Contains(p, "waits for a row lock") || !strings.Contains(p, "INSERT INTO rbac_groups") {
+		t.Errorf("SetGroup waiting for the group's row, having read its time, panicked with %q", p)
+	}
+}
+
+// The watch that sees those waits outlives its connection: it connects again, failing the change
+// it was watching as the connection ended, which could have waited unseen, so a change after it is
+// seen to wait, or fails, and none passes unwatched.
+func TestTheTestsWatchForRowWaitsPastALostConnection(t *testing.T) {
+	h := grouped(t)
 	ctx := t.Context()
 	h.groups(t, "crew")
+	// A change that reads its time starts the watch, if none has yet.
+	if err := h.authz.SetGroup(ctx, h.as(t, "groups"), "t1", rbac.GroupDefinition{ID: "crew", Name: "Crew"}); err != nil {
+		t.Fatal(err)
+	}
+	wait, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	pid, err := rbac.RowWaitWatch(wait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ended bool
+	if err := h.pool.QueryRow(ctx, `SELECT pg_terminate_backend($1, 10000)`, int32(pid)).Scan(&ended); err != nil || !ended {
+		t.Fatalf("ending the watch's session %d: %t, %v", pid, ended, err)
+	}
+	if p, _ := waitForTheGroupsRow(t, h).(string); !strings.Contains(p, "waits for a row lock") && !strings.Contains(p, "lost its connection") {
+		t.Errorf("SetGroup waiting for the group's row once the watch's session ended panicked with %q", p)
+	}
+	if p, _ := waitForTheGroupsRow(t, h).(string); !strings.Contains(p, "waits for a row lock") {
+		t.Errorf("SetGroup waiting for the group's row once the watch connected again panicked with %q", p)
+	}
+	if again, err := rbac.RowWaitWatch(wait); err != nil || again == pid {
+		t.Errorf("the watch is on session %d, ended as %d was: %v", again, pid, err)
+	}
+}
+
+// waitForTheGroupsRow has SetGroup of the group crew wait for its row, which a transaction of the
+// test's holds until SetGroup has waited, and returns what SetGroup panicked with.
+func waitForTheGroupsRow(t *testing.T, h *harness) any {
+	t.Helper()
+	ctx := t.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -7540,7 +7601,11 @@ func TestTheTestsSeeAChangeWaitForARowOnceItHasReadItsTime(t *testing.T) {
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if p, _ := (<-panicked).(string); !strings.Contains(p, "waits for a row lock") || !strings.Contains(p, "INSERT INTO rbac_groups") {
-		t.Errorf("SetGroup waiting for the group's row, having read its time, panicked with %q", p)
+	select {
+	case p := <-panicked:
+		return p
+	case <-time.After(10 * time.Second):
+		t.Fatal("SetGroup never ended")
+		return nil
 	}
 }

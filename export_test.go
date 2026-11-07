@@ -35,8 +35,12 @@ func init() {
 		}
 		rowWaits.push(w)
 		return w, func(err error) error {
-			if waited := rowWaits.pop(w); waited != "" {
+			waited, lost := rowWaits.pop(w)
+			if waited != "" {
 				panic("rbac: a change waits for a row lock once it has read the time it decides at: " + strings.Join(strings.Fields(waited), " "))
+			}
+			if lost != nil {
+				panic("rbac: the watch for row waits lost its connection while a change that had read its time ran, so it could have waited unseen: " + lost.Error())
 			}
 			return err
 		}
@@ -52,11 +56,12 @@ func init() {
 type clockWatched struct {
 	pgx.Tx
 	clock *callClock
-	// pid is the change's session; read, once the change has read its time, and waited, the
-	// statement it waited for a row in, are rowWaits'.
+	// pid is the change's session; read, once the change has read its time, waited, the
+	// statement it waited for a row in, and lost, why rowWaits stopped watching it, are rowWaits'.
 	pid    uint32
 	read   bool
 	waited string
+	lost   error
 }
 
 var (
@@ -88,8 +93,13 @@ func (w *clockWatched) check(ctx context.Context, sql string) {
 // time, for a wait on a row: for another transaction to end, as one holding the row does, or to
 // finish inserting a key. A wait on a relation, as for a migration, or for its extension, is none
 // a change could take first. It polls each millisecond while any change is so, and sees a wait that
-// lasts longer.
+// lasts longer. Where its connection fails, it connects again, and each change it was watching
+// fails, as it could have waited unseen meanwhile; where it can't connect, every change from then
+// on fails, rather than passing unwatched.
 var rowWaits = &waitWatch{by: map[uint32][]*clockWatched{}, woken: make(chan struct{}, 1)}
+
+// rowWaitsTimeout bounds each of the watch's connections and queries.
+const rowWaitsTimeout = 10 * time.Second
 
 type waitWatch struct {
 	mu sync.Mutex
@@ -98,6 +108,9 @@ type waitWatch struct {
 	by    map[uint32][]*clockWatched
 	once  sync.Once
 	woken chan struct{}
+	// pid is the watch's own session, 0 while it connects; gone is why it stopped for good.
+	pid  uint32
+	gone error
 }
 
 func (ww *waitWatch) push(w *clockWatched) {
@@ -109,8 +122,9 @@ func (ww *waitWatch) push(w *clockWatched) {
 	ww.by[w.pid] = append(ww.by[w.pid], w)
 }
 
-// pop ends watching w, and returns the statement it waited for a row in, if any.
-func (ww *waitWatch) pop(w *clockWatched) string {
+// pop ends watching w, and returns the statement it waited for a row in, if any, and why the watch
+// lost sight of it, if it did.
+func (ww *waitWatch) pop(w *clockWatched) (waited string, lost error) {
 	ww.mu.Lock()
 	defer ww.mu.Unlock()
 	ws := ww.by[w.pid]
@@ -122,11 +136,27 @@ func (ww *waitWatch) pop(w *clockWatched) string {
 	} else {
 		ww.by[w.pid] = ws
 	}
-	return w.waited
+	return w.waited, w.lost
 }
 
-// read marks w as having read its time, from when its waits count. The watch outlives the change
-// that starts it, so it keeps none of its context's cancellation.
+// lose marks every change that has read its time as unwatched since err.
+func (ww *waitWatch) lose(err error) {
+	ww.mu.Lock()
+	defer ww.mu.Unlock()
+	ww.pid = 0
+	for _, ws := range ww.by {
+		for _, w := range ws {
+			if w.read && w.lost == nil {
+				w.lost = err
+			}
+		}
+	}
+}
+
+// read marks w as having read its time, from when its waits count, once the watch is connected to
+// see them: a change that reads its time while the watch connects, as after its connection failed,
+// waits for it, as a wait on a row meanwhile would go unseen, and fails where it doesn't connect. The
+// watch outlives the change that starts it, so it keeps none of its context's cancellation.
 func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 	if w.pid == 0 {
 		return
@@ -143,13 +173,61 @@ func (ww *waitWatch) read(ctx context.Context, w *clockWatched) {
 	case ww.woken <- struct{}{}:
 	default:
 	}
+	// Past every wait the watch's own bounds allow it, to close a failed connection and open another.
+	connecting, cancel := context.WithTimeout(ctx, 3*rowWaitsTimeout)
+	defer cancel()
+	// Where the change's own context ends first, it sends nothing more that could wait.
+	if _, err := ww.connected(connecting); err != nil && ctx.Err() == nil {
+		ww.mu.Lock()
+		if w.lost == nil {
+			w.lost = err
+		}
+		ww.mu.Unlock()
+	}
 }
 
 func (ww *waitWatch) watch(ctx context.Context, database string) {
-	conn, err := pgx.Connect(ctx, database)
-	if err != nil {
-		return
+	for {
+		conn, err := connectWatch(ctx, database)
+		if err != nil {
+			gone := fmt.Errorf("connecting: %w", err)
+			ww.mu.Lock()
+			ww.gone = gone
+			ww.mu.Unlock()
+			ww.lose(gone)
+			return
+		}
+		ww.mu.Lock()
+		ww.pid = conn.PgConn().PID()
+		ww.mu.Unlock()
+		err = ww.poll(ctx, conn)
+		ww.lose(err)
+		closing, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+		_ = conn.Close(closing)
+		cancel()
 	}
+}
+
+// connectWatch connects to database, trying again until rowWaitsTimeout passes: a server refusing a
+// connection for a moment, as one at max_connections does, would otherwise end the watch for good.
+func connectWatch(ctx context.Context, database string) (*pgx.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+	defer cancel()
+	for {
+		conn, err := pgx.Connect(ctx, database)
+		if err == nil {
+			return conn, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// poll watches on conn until a query on it fails, and returns why.
+func (ww *waitWatch) poll(ctx context.Context, conn *pgx.Conn) error {
 	for {
 		ww.mu.Lock()
 		var pids []int32
@@ -164,19 +242,9 @@ func (ww *waitWatch) watch(ctx context.Context, database string) {
 			<-ww.woken
 			continue
 		}
-		rows, err := conn.Query(ctx, `SELECT pid, query FROM pg_stat_activity WHERE pid = ANY($1)
-			AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple', 'speculative token')`, pids)
+		waiting, err := ww.waiting(ctx, conn, pids)
 		if err != nil {
-			return
-		}
-		waiting := map[int32]string{}
-		var pid int32
-		var query string
-		if _, err := pgx.ForEachRow(rows, []any{&pid, &query}, func() error {
-			waiting[pid] = query
-			return nil
-		}); err != nil {
-			return
+			return err
 		}
 		// Only a change still innermost on its session since before the read waited there.
 		ww.mu.Lock()
@@ -187,6 +255,89 @@ func (ww *waitWatch) watch(ctx context.Context, database string) {
 		}
 		ww.mu.Unlock()
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// waiting is the statement each of pids waits for a row in, read on conn.
+func (ww *waitWatch) waiting(ctx context.Context, conn *pgx.Conn, pids []int32) (map[int32]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, rowWaitsTimeout)
+	defer cancel()
+	rows, err := conn.Query(ctx, `SELECT pid, query FROM pg_stat_activity WHERE pid = ANY($1)
+		AND wait_event_type = 'Lock' AND wait_event IN ('transactionid', 'tuple', 'speculative token')`, pids)
+	if err != nil {
+		return nil, err
+	}
+	waiting := map[int32]string{}
+	var pid int32
+	var query string
+	_, err = pgx.ForEachRow(rows, []any{&pid, &query}, func() error {
+		waiting[pid] = query
+		return nil
+	})
+	return waiting, err
+}
+
+// RowWaitWatch returns the session the tests watch changes' row waits on, once the watch, which the
+// first change to read its time starts, has connected.
+func RowWaitWatch(ctx context.Context) (uint32, error) { return rowWaits.connected(ctx) }
+
+// connected waits until the watch is connected, and returns its session, or why it stopped for good.
+func (ww *waitWatch) connected(ctx context.Context) (uint32, error) {
+	for {
+		ww.mu.Lock()
+		pid, gone := ww.pid, ww.gone
+		ww.mu.Unlock()
+		switch {
+		case gone != nil:
+			return 0, gone
+		case pid != 0:
+			return pid, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// A change that reads its time while the watch connects, as after its connection failed, goes on
+// once the watch is connected, and not before, as a wait on a row meanwhile would go unseen; and
+// where the watch can't connect, it fails as it ends.
+func TestTheWatchHoldsAChangeThatReadsItsTimeUntilItIsConnected(t *testing.T) {
+	for _, connects := range []bool{true, false} {
+		t.Run(fmt.Sprintf("connects=%t", connects), func(t *testing.T) {
+			// Started, as watch is, but not yet connected.
+			ww := &waitWatch{by: map[uint32][]*clockWatched{}, woken: make(chan struct{}, 1)}
+			ww.once.Do(func() {})
+			w := &clockWatched{pid: 1}
+			ww.push(w)
+			read := make(chan struct{})
+			go func() {
+				defer close(read)
+				ww.read(t.Context(), w)
+			}()
+			select {
+			case <-read:
+				t.Fatal("the change went on while the watch connected")
+			case <-time.After(50 * time.Millisecond):
+			}
+			ww.mu.Lock()
+			if connects {
+				ww.pid = 2
+			} else {
+				ww.gone = fmt.Errorf("connecting: refused")
+			}
+			ww.mu.Unlock()
+			select {
+			case <-read:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the change never went on")
+			}
+			if _, lost := ww.pop(w); (lost == nil) != connects {
+				t.Errorf("the change, as the watch connected (%t), was lost: %v", connects, lost)
+			}
+		})
 	}
 }
 
@@ -329,6 +480,65 @@ func SetReadingKeys(t *testing.T, f func()) {
 	readingKeys = f
 	t.Cleanup(func() { readingKeys = old })
 }
+
+// BeforeStatement runs f once, the first time a change's transaction sends a statement whose text
+// holds marker once the change has read the time it decides at, or with anyTime, at any time, until
+// t ends.
+func BeforeStatement(t *testing.T, marker string, anyTime bool, f func()) {
+	t.Helper()
+	old := watched
+	var once sync.Once
+	watched = func(tx pgx.Tx, c *callClock) (pgx.Tx, func(error) error) {
+		w, end := old(tx, c)
+		return &beforeStatement{Tx: w, clock: c, marker: marker, anyTime: anyTime, f: func() { once.Do(f) }}, end
+	}
+	t.Cleanup(func() { watched = old })
+}
+
+// beforeStatement is a change's transaction BeforeStatement watches.
+type beforeStatement struct {
+	pgx.Tx
+	clock   *callClock
+	marker  string
+	anyTime bool
+	f       func()
+}
+
+func (b *beforeStatement) at(sql string) {
+	if (b.anyTime || b.clock != nil && b.clock.read) && strings.Contains(sql, b.marker) {
+		b.f()
+	}
+}
+
+func (b *beforeStatement) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	b.at(sql)
+	return b.Tx.Exec(ctx, sql, args...)
+}
+
+func (b *beforeStatement) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	b.at(sql)
+	return b.Tx.Query(ctx, sql, args...)
+}
+
+func (b *beforeStatement) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	b.at(sql)
+	return b.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (b *beforeStatement) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
+	for _, q := range batch.QueuedQueries {
+		b.at(q.SQL)
+	}
+	return b.Tx.SendBatch(ctx, batch)
+}
+
+// HeldMarker is text only readHeld's statement, which reads an actor's or a subject's grants and
+// what binds it, holds.
+const HeldMarker = "SELECT 0, id, principal, scope, role, expires_at, conditional"
+
+// ExcludesMarker is text only the statement reading who holds two values of an exclusive dimension
+// (conflictsIn) holds, which a change runs once it has read its actor.
+const ExcludesMarker = "HAVING count(DISTINCT value) > 1"
 
 // SetCheckingRole runs f each time a decision begins checking a role for a grant, until t ends.
 func SetCheckingRole(t *testing.T, f func()) {
@@ -1192,6 +1402,36 @@ func EvaluateConditionOf(t *testing.T, expr string, subject, resource, request m
 		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: resource})
 	r := evaluate(prg, vars)
 	return r.held, r.evaluated
+}
+
+// Decided is what an evaluation of a condition decided, and what it cost.
+type Decided struct {
+	Held, Evaluated bool
+	Cost            uint64
+}
+
+// Evaluations is what each of n evaluations of expr decides as a check does, the attributes
+// converted again for each, on a request with attributes, which the resource carries too, or why
+// expr isn't a condition.
+func Evaluations(t *testing.T, expr string, attributes map[string]any, n int) ([]Decided, error) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		return nil, err
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	decided := make([]Decided, n)
+	for i := range decided {
+		vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+			Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+		r := evaluate(prg, vars)
+		decided[i] = Decided{r.held, r.evaluated, r.cost}
+	}
+	return decided, nil
 }
 
 // EvaluateDeclared is EvaluateConditionOf under declares, the subject's attributes alone passed,

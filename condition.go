@@ -1,12 +1,14 @@
 package rbac
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"math"
+	"math/bits"
 	"reflect"
 	"regexp"
 	"regexp/syntax"
@@ -74,7 +76,13 @@ import (
 // decides, as a list or a long string, looking one up in a map, or looping over one, each element
 // of which costs at least 1 however little its step evaluates, and 1 more for each logical operator
 // or choice it may, and each key of a map 1 more each time a loop over it starts, however few steps
-// it takes. A list or map literal costs 1 more for each element, or 2 for each entry, each time it
+// it takes. A loop over a map gives its keys in one order, whatever order the map's entries come
+// in: bools, ints, uints, doubles, strings and then bytes, each by its value, strings and bytes by
+// their bytes, so `{"b": 1, "a": 2}.map(k, k)` is `["a", "b"]`. Sorting them costs 1 for each two
+// keys each time their number halves to one, and each key what reading it does past 1, once, before
+// the loop starts, and a loop over a map holding more than one key of another type, as a literal
+// keyed by lists can, fails.
+// A list or map literal costs 1 more for each element, or 2 for each entry, each time it
 // is built, and contains, startsWith and endsWith cost reading what they search, at least 1 however
 // short either string is, and fail before they run where they would cost more than a condition may.
 // A comparison costs reading the smaller value, charged as it is read, once, before it runs.
@@ -459,15 +467,19 @@ func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns, g)),
 		cel.CustomDecorator(g.bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
-		cel.CustomDecoratorV2(k.decorate), cel.CustomDecoratorV2(l.decorate),
+		cel.CustomDecoratorV2(k.decorate), cel.CustomDecoratorV2(l.decorate), cel.CustomDecoratorV2(s.order),
 	})...)
 	if err != nil {
 		return nil, err
 	}
 	// Another version of CEL may plan a loop's condition, a key, a literal, or a call refused before
-	// it runs where no decorator sees it, which would run unbounded too.
+	// it runs where no decorator sees it, which would run unbounded too, and a loop's range where
+	// none orders it, which would loop over a map as Go happens to range over it.
 	if len(s.stepped) != len(s.ranges) {
 		return nil, errors.New("a loop's condition is planned where this package can't bound it")
+	}
+	if len(s.ordered) != len(s.planned) {
+		return nil, errors.New("a loop's range is planned where this package can't order a map's keys")
 	}
 	if len(k.planned) != len(k.keys) {
 		return nil, errors.New("a key is planned where this package can't charge it")
@@ -792,8 +804,12 @@ func (w worst) comprehension(e ast.Expr) (uint64, extent) {
 			w.vars[v] = xs[:len(xs)-1]
 		}
 	}
-	// Each element evaluates the condition, and the step while it holds.
+	// Each element evaluates the condition, and the step while it holds; a map's keys are sorted
+	// first (stepping.inOrder), each key, as each element bounds it, read once.
 	loops := cost.SafeMultiply(over.length, cost.SafeAdd(cond, step))
+	if over.form != notMap {
+		n = cost.SafeAdd(n, sortCost(over.length, each.text))
+	}
 	return cost.SafeAdd(cost.SafeAdd(n, init), cost.SafeAdd(loops, result)), x
 }
 
@@ -1342,23 +1358,29 @@ const looping = "@looping"
 // whose first argument is the loop's range: charging it drops what the steps before kept, and
 // costs what charging the condition did, and at a loop's first step 1 more for each key of a map
 // it ranges over (costs). It counts the steps too, each costing at least 1, and charges each 1 more
-// for each logical operator and choice it may evaluate (free), which limit bounds (counting).
+// for each logical operator and choice it may evaluate (free), which limit bounds (counting). A
+// loop's range it plans to give a map's keys in one order (order).
 type stepping struct {
 	// ranges are the ids of the ranges of checked's loops, by those of their conditions, planned
 	// whether each range has been planned, by its id, and stepped those of the conditions planned
 	// as steps. operators are what each of a loop's steps may evaluate (free), by its condition's id.
-	ranges           map[int64]int64
-	planned, stepped map[int64]bool
-	operators        map[int64]uint64
-	limit            uint64
+	// lists are the ranges CEL checks as lists, by their ids, and ordered those order planned.
+	ranges                           map[int64]int64
+	planned, stepped, lists, ordered map[int64]bool
+	operators                        map[int64]uint64
+	limit                            uint64
 }
 
 func newStepping(checked *ast.AST, limit uint64) *stepping {
-	s := &stepping{ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, operators: map[int64]uint64{}, limit: limit}
+	s := &stepping{
+		ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, lists: map[int64]bool{},
+		ordered: map[int64]bool{}, operators: map[int64]uint64{}, limit: limit,
+	}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
 		comp := e.AsComprehension()
 		s.ranges[comp.LoopCondition().ID()] = comp.IterRange().ID()
 		s.planned[comp.IterRange().ID()] = false
+		s.lists[comp.IterRange().ID()] = checked.GetType(comp.IterRange().ID()).Kind() == types.ListKind
 		s.operators[comp.LoopCondition().ID()] = free(comp.LoopCondition()) + free(comp.LoopStep())
 	}
 	return s
@@ -1473,6 +1495,237 @@ func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's loops take more steps than it may cost"})
 	}
 	return s.cond.Exec(frame)
+}
+
+// order plans each of checked's loops' ranges to give a map's keys in one order (inOrder), not as
+// Go ranges over the map, which changes from one evaluation to the next: a loop reads its keys in
+// turn, so what map() and filter() made of them, and how far a loop went before it stopped, and so
+// what it cost, turned on that order. Over a map of three keys,
+// `request.attributes.scopes.map(k, k)[0] == "read"` held in 55 of 100 identical checks, Explain
+// disagreeing with the check before it in 51, and a deny's
+// `request.attributes.scopes.filter(k, true)[0] == "admin"` lifted in 84, so a requester could ask
+// until it lifted. A range is planned as CEL planned it, of the same kind, so the tracking observes
+// and charges it as it did: an attribute is resolved here, as keyedAttribute resolves one, since
+// CEL plans a select already watched. One CEL plans as something else, as a loop, it leaves where
+// CEL checks it as a list, and plan refuses otherwise. A loop's condition, which decorate plans
+// under its range's id, is no range.
+func (s *stepping) order(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	if _, ok := s.planned[i.ID()]; !ok {
+		return i, nil
+	}
+	switch r := i.(type) {
+	case *step:
+		return i, nil
+	case interpreter.InterpretableAttribute:
+		i = &orderedAttribute{InterpretableAttribute: r, s: s}
+	case interpreter.InterpretableConstructor:
+		i = &orderedConstructor{InterpretableConstructor: r, s: s}
+	case interpreter.InterpretableCall:
+		i = &orderedCall{InterpretableCall: r, s: s}
+	default:
+		if !s.lists[i.ID()] {
+			return i, nil
+		}
+	}
+	s.ordered[i.ID()] = true
+	return i, nil
+}
+
+// inOrder is v, the value of the loop's range id, giving its keys in one order where it is a map of
+// more than one: sorted (sortKeys), once the condition evaluating on vars is charged what sorting
+// them costs, before any is sorted, as worst bounds it (sortCost). That is 1 for each two keys at
+// each of sortLevels, as comparing and moving a key took 13 to 15 ns, where a unit charged covers
+// 20 to 145 ns of what the package does elsewhere, and what reading each key costs past 1
+// (textSize), once: a comparison reads no more of a key than it holds, at about 50 bytes a
+// nanosecond, so the eleven levels a condition can pay for read its bytes in a tenth of the time
+// charging them once covers. Charged 1 for each key and what reading it costs at each level,
+// sorting 500 keys of 36 bytes, as ids, cost 18,000, past what a condition may, for 64 µs of work,
+// and 500 short keys, which a loop costing about half what a condition may reads, 4,500, for 57 µs.
+// A map keyed by another type than keyRank orders, as a map literal keyed by lists can be, has no
+// order, and a loop over it fails.
+func (s *stepping) inOrder(vars interpreter.Activation, id int64, v ref.Val) ref.Val {
+	m, ok := v.(traits.Mapper)
+	if !ok || !m.Type().HasTrait(traits.IterableType) {
+		return v
+	}
+	n := count(m)
+	if n < 2 {
+		return v
+	}
+	// Charged before any key is read.
+	chargePast(vars, sortSteps(n), s.limit)
+	keys := make([]ref.Val, 0, n)
+	if native := entries(m); native != nil {
+		for k := range native {
+			keys = append(keys, k)
+		}
+	} else {
+		for it := m.Iterator(); it.HasNext() == types.True; {
+			keys = append(keys, it.Next())
+		}
+	}
+	var text uint64
+	for _, k := range keys {
+		if keyRank(k) < 0 {
+			return types.LabelErrNode(id, types.NewErr("rbac: a map keyed by %s has no order to loop over it in", k.Type().TypeName()))
+		}
+		text += textSize(k) - 1
+	}
+	chargePast(vars, text, s.limit)
+	return orderedMap{Mapper: m, keys: types.NewRefValList(types.DefaultTypeAdapter, sortKeys(keys))}
+}
+
+// orderedMap is a map whose keys a loop gives in the order keys holds them.
+type orderedMap struct {
+	traits.Mapper
+	keys traits.Lister
+}
+
+func (m orderedMap) Iterator() traits.Iterator { return m.keys.Iterator() }
+
+// orderedAttribute is a loop's range CEL plans as an attribute, as a select or an index, resolved
+// as CEL resolves one and ordered.
+type orderedAttribute struct {
+	interpreter.InterpretableAttribute
+	s *stepping
+}
+
+func (a *orderedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	v, err := a.Attr().Resolve(frame)
+	if err != nil {
+		return types.LabelErrNode(a.ID(), types.WrapErr(err))
+	}
+	return a.s.inOrder(frame, a.ID(), a.Adapter().NativeToValue(v))
+}
+
+func (a *orderedAttribute) Eval(vars interpreter.Activation) ref.Val {
+	return a.Exec(interpreter.AsFrame(vars))
+}
+
+// orderedConstructor is a loop's range CEL plans as a literal, ordered once built.
+type orderedConstructor struct {
+	interpreter.InterpretableConstructor
+	s *stepping
+}
+
+func (c *orderedConstructor) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	return c.s.inOrder(frame, c.ID(), c.InterpretableConstructor.Exec(frame))
+}
+
+func (c *orderedConstructor) Eval(vars interpreter.Activation) ref.Val {
+	return c.Exec(interpreter.AsFrame(vars))
+}
+
+// orderedCall is a loop's range CEL plans as a call, as dyn(), ordered once it has run.
+type orderedCall struct {
+	interpreter.InterpretableCall
+	s *stepping
+}
+
+func (c *orderedCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	return c.s.inOrder(frame, c.ID(), c.InterpretableCall.Exec(frame))
+}
+
+func (c *orderedCall) Eval(vars interpreter.Activation) ref.Val {
+	return c.Exec(interpreter.AsFrame(vars))
+}
+
+// keyRank is where keys of v's type come in a loop over a map: bools, ints, uints, doubles, strings
+// and then bytes, each type in its own order (compareKeys), or -1 for another type, which has none.
+func keyRank(v ref.Val) int {
+	switch v.(type) {
+	case types.Bool:
+		return 0
+	case types.Int:
+		return 1
+	case types.Uint:
+		return 2
+	case types.Double:
+		return 3
+	case types.String:
+		return 4
+	case types.Bytes:
+		return 5
+	}
+	return -1
+}
+
+// compareKeys orders x and y, of types keyRank orders: false before true, numbers by their values,
+// and strings and bytes by their bytes. No two keys of a map compare equal: a map holds no NaN, and
+// 0.0 and -0.0 are one key (comparableKey, misheld).
+func compareKeys(x, y ref.Val) int {
+	if c := cmp.Compare(keyRank(x), keyRank(y)); c != 0 {
+		return c
+	}
+	switch x := x.(type) {
+	case types.Bool:
+		y, _ := y.(types.Bool)
+		switch {
+		case x == y:
+			return 0
+		case !bool(x):
+			return -1
+		}
+		return 1
+	case types.Int:
+		y, _ := y.(types.Int)
+		return cmp.Compare(x, y)
+	case types.Uint:
+		y, _ := y.(types.Uint)
+		return cmp.Compare(x, y)
+	case types.Double:
+		y, _ := y.(types.Double)
+		return cmp.Compare(x, y)
+	case types.String:
+		y, _ := y.(types.String)
+		return strings.Compare(string(x), string(y))
+	case types.Bytes:
+		y, _ := y.(types.Bytes)
+		return bytes.Compare(x, y)
+	}
+	return 0
+}
+
+// sortKeys sorts keys by compareKeys, merging runs that double in length, so it compares each key
+// at most once at each of sortLevels(len(keys)) levels, as the run it is merged into: a comparison
+// reads no more of either key than the shorter holds, so no more than of the key it places.
+func sortKeys(keys []ref.Val) []ref.Val {
+	buf := make([]ref.Val, len(keys))
+	for width := 1; width < len(keys); width *= 2 {
+		for lo := 0; lo < len(keys); lo += 2 * width {
+			mid, hi := min(lo+width, len(keys)), min(lo+2*width, len(keys))
+			i, j, k := lo, mid, lo
+			for ; i < mid && j < hi; k++ {
+				if compareKeys(keys[j], keys[i]) < 0 {
+					buf[k], j = keys[j], j+1
+				} else {
+					buf[k], i = keys[i], i+1
+				}
+			}
+			k += copy(buf[k:], keys[i:mid])
+			copy(buf[k:], keys[j:hi])
+		}
+		keys, buf = buf, keys
+	}
+	return keys
+}
+
+// sortLevels is how many levels sortKeys merges n keys in: how many times n halves to 1.
+func sortLevels(n uint64) uint64 {
+	if n < 2 {
+		return 0
+	}
+	return length(bits.Len64(n - 1))
+}
+
+// sortSteps is what comparing and moving n keys costs as sortKeys sorts them: 1 for each two at
+// each level (stepping.inOrder).
+func sortSteps(n uint64) uint64 { return cost.SafeMultiply(n/2+n%2, sortLevels(n)) }
+
+// sortCost is the most ordering a map's keys costs (stepping.inOrder), where it holds at most n of
+// them, each costing to read no more than text: sortSteps, and the rest of reading each once.
+func sortCost(n, text uint64) uint64 {
+	return cost.SafeAdd(sortSteps(n), cost.SafeMultiply(n, text-min(text, 1)))
 }
 
 // counting is what a condition reads, and how many steps its loops have taken, which it costs at

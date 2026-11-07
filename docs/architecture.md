@@ -378,7 +378,7 @@ flowchart BT
   of one whose id other tenants use too was counted as a thousand or more, and joined in one
   statement its memberships were hashed with every tenant's; looked up each by its key, a group of
   20,000 read 80,000 pages of memberships that fill 900. It reads with sequential scans off, by its
-  SET clause, whatever its caller's (`0029_member_reads`): the places a group at a time in the
+  SET clause, whatever its caller's (`0031_member_reads`): the places a group at a time in the
   primary key's order, and the memberships by their keys, as `= ANY` of them, which a plan for many
   reads through a bitmap, each page once; counted, as the members were, by the tenant's selectivity
   and the keys' apart, they are read each on its own in a tenant holding a small share of the table,
@@ -548,9 +548,14 @@ sequenceDiagram
   turn on map order or on which kind reached a shared value first, and each kind is converted, and
   charged, whole, whatever it holds, but where it nests past `maxNested`: converting stops there, so
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
-  failing closed. Nothing else does, nor on the order of the kinds: JSON text whose values may cost
-  more than `maxConverted`, by its brackets, braces, commas and colons, each bracket and brace what
-  building a list or an object costs (`jsonValues`), fails them all unparsed, where compared with
+  failing closed. A map of structs, which no condition reads, is refused unread at 2 for each entry
+  (`refusedWhole`), as reading an entry copies it whole: a map of 2,000 structs of 64 KiB took 7 ms,
+  charged as much. Nothing else turns on map order, nor on the order of the kinds, whether a hook
+  can be given a copy included (below), and a loop gives a map's keys in an order of its own
+  (`stepping.order`, below): JSON text
+  whose values may cost more than `maxConverted`, by its brackets, braces, commas and colons, each
+  bracket and brace what building a list or an object costs (`jsonValues`), fails them all
+  unparsed, where compared with
   what was left, it failed them where what came before it left less than it may hold, though what it
   holds fit, as `[]` holds less than its brackets count. A value reached twice
   is converted once, but for a resource's sharing it with the subject's or the request's (below),
@@ -559,7 +564,31 @@ sequenceDiagram
   array, pointer, but to a message, and other message 4 (`mapCost`), as building each takes several
   times what converting a number does: charged one, 160,000 empty maps took 93 ms to convert, where
   as many ints took 12 ms. So weighed, a unit took 20 to 115 ns to convert and 25 to 200 ns to copy
-  for a hook, whatever held it, where reading one in a condition takes 70 to 145 ns, and a check
+  for a hook, whatever held it, a copy charging a struct a tenth of the bytes it sets whole, and a
+  slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
+  before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a
+  struct, which reading an entry moves and setting it hashes (`keyTenths`), each before it moves
+  them, and of the strings such a key holds and what its interfaces hold, which hashing reads too
+  (`payHashed`): charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms,
+  and of 2,000 entries keyed by arrays of 4 KiB 8 ms, and charged their bytes in place alone, of 50
+  keyed by structs each holding a string of 1 MiB 1.4 ms, for 167. Nor does it move a slice's
+  elements or a map's values where what they hold in place, at least one for each 24 bytes, costs
+  more than is left (`leastCopied`): a map holding an array of 4 MiB allocated 12 MB, and 2,000
+  arrays of 4,096 interfaces 133 MB, before being found past what a copy holds. A copy holds
+  nothing nesting past `maxCopied`: it is
+  refused there (`overflow`), where it held the zero value, or the copy of a value reached less
+  deep before, as map order decided, so a constraint was given a value on one call and its zero
+  value on the next. Each map, pointer and message it keeps how much deeper it reaches, copied
+  whole, and each slice each prefix of its elements (`copied.reached`), so reaching one again
+  deeper is refused where copying it there would be, and whether a value nests that deep is of what
+  it holds. Around a cycle it isn't: the path a copy takes around one nests as deep as where it
+  entered it, which map order picks, so two links each holding the other, beside a chain of 9,998
+  links to one, were copied on one call and refused on the next, and an order-free depth would be
+  a longest simple path. So a copy that reaches a value it is still copying (`around`) is refused
+  once it has reached 20,000 maps, lists, pointers, structs, arrays and messages, counting each
+  time it reaches one, and a message a pointer reaches apart from the pointer (`hold`), however
+  shallow the value: a path nests no deeper, in any order, than the values it reaches hold. Reading one
+  in a condition takes 70 to 145 ns, and a check
   converts in about 20 ms at most what it may spend on a scope's grants' conditions, past which
   every condition reading an attribute fails: converting isn't charged to a condition, and charging
   the check would let what one condition reads fail the others. A message the host passes is known
@@ -588,8 +617,24 @@ sequenceDiagram
   each element or entry it builds, and a loop's step for each logical operator and choice it may
   evaluate, on top of what CEL charges, a key a condition computes by its
   length, and `contains`, `startsWith` and `endsWith` by the strings they read, at least 1 however
-  empty either is. A comparison is charged as it measures the values (`measured`), once, reading
-  both in step until the smaller is read whole, before it runs: measured again at each doubling of
+  empty either is. A loop over a map reads its keys in turn, which CEL gives as Go ranges over the
+  map, in an order that changes from one evaluation to the next, so what `map()` and `filter()`
+  made, and how far `all()` or `exists()` went, and what they cost, turned on it: a grant reading
+  the first key `map()` made allowed 55 of 100 identical checks, and a deny reading the first
+  `filter()` kept lifted in 84. Each loop's range is planned as CEL planned it, of the same kind, so
+  the cost tracking observes it as it did, its value a map whose keys come sorted (`stepping.order`):
+  bools, ints, uints, doubles, strings and bytes, each by value (`compareKeys`), by a merge sort that
+  compares each key at most once at each of `⌈log2 n⌉` levels, reading no more of either than the
+  key it places holds (`sortKeys`). The loop is charged that before it sorts, and bounded alike
+  (`sortCost`): 1 for each two keys at each level, as comparing and moving a key took 13 to 15 ns
+  where a unit covers 20 to 145 ns elsewhere, and each key what reading it costs past 1, once, as
+  comparing reads about 50 bytes a nanosecond, so the eleven levels a condition can pay for read a
+  key's bytes in a tenth of what charging them once covers. Charged 1 for each key and its bytes at
+  each level, sorting 500 keys of 36 bytes cost 18,000, past what a condition may, for 64 µs of
+  work. A map holding more than one key of
+  another type, as a literal keyed by lists, has no order, and a loop over it fails; a range CEL
+  plans as something else, as a loop, is left where CEL checks it as a list, and refused otherwise.
+  A comparison is charged as it measures the values (`measured`), once, reading both in step until the smaller is read whole, before it runs: measured again at each doubling of
   how far it read, again in search of a double that isn't finite and again for CEL's charge,
   comparing JSON nested 3,300 deep took twenty times what it was charged. Reading a time in a zone
   loads the zone once for the process (`zones`), bounded at `maxZones`, and finds a name names none
@@ -760,7 +805,12 @@ sequenceDiagram
   question, whatever end it asks about, so each later end is one comparison.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
-  while the change waited for its locks.
+  while the change waited for its locks. Only memberships in force at the call's time count,
+  suspended and guests' too, and a group's identities only while theirs is, as `Members` lists
+  them: counted as stored, an identity whose membership had ended, in none of its groups, changed
+  the fingerprint as `DeleteExpired` removed it and its places, so every run clearing a group's
+  departed members had the changes asking the host about that group tried again, though nothing the
+  host could read of it had changed.
 - **Sources.** Grants, groups and members from a source in `Config.Sources` are the host's: only
   `Import`, `ImportGroups`, `ImportMembers` and the host's deletes change them.
 - **Custom roles.** `SetRole` redefines a role in place for every grant of it, so it asks
@@ -1121,6 +1171,71 @@ flowchart TB
   taking an advisory lock once a change has read its time panics, and so does a change whose session
   waited for a row then, whatever the statement, as another session's watch of each one's wait
   events sees (`watched`). As of a time, it is that time.
+- **No earlier than `DeleteExpired` deleted by.** `DeleteExpired` removes what has ended in
+  transactions of its own, by its own clock: places in groups, then memberships with every place of
+  theirs, each a batch at a time, passing over what a change holds (`SKIP LOCKED`). A change reads
+  its time and then its actor in one statement (`readHeld`); a run by a later clock committing in
+  between could leave that statement the place in a group a deny binds the actor by, which ended
+  later, removed, and the membership or place its power comes through, which ended sooner, still
+  there, as it hadn't reached it or passed over it: by its own time, the actor held the power and
+  escaped the deny, a state no moment held. With no skew, `Apply` granting, `SetEligibility`,
+  `Activate`'s check of its approver and a change to members read the time before the actor; with
+  `DeleteExpired`'s clock ahead, every change and check could. So each batch records in
+  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), the latest time one of
+  them ended at, which commits with them: a snapshot seeing any row a batch removed sees it. A read
+  of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and the
+  latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
+  row it finds removed had ended by then, or is a place of an identity whose membership had, which
+  gives nothing once it has, and the rows still there it decides by their ends, so it
+  reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
+  statement (`filterAt`), which runs later than `Filter` read the time. The call then decides at that
+  time (`callClock.passed`): the conditions it evaluates, the label values the read decides and its
+  statements after it read it as their time, `Explain` building what conditions read only once it
+  has read the subject's keys. `Holders` reads the latest time first in its snapshot
+  (`expiredBy`), so all its statements decide at it: by an earlier time, it would list an identity
+  in a group whose place a run passed over, and named by a deny through a place the run removed,
+  which at no moment held the permission and escaped the deny. A change's transaction in which a
+  statement read the time before the read, as `stillStanding`, or a change to members reading its
+  time before what the change reaches, decided that by the earlier time, so the change is tried
+  again (`ErrConflict`); so is one whose last statement (`expiredBy`), in a transaction that read
+  its actor, finds a later time, which a run committed after that read, as a statement after it
+  could have read some of its removals by the earlier time: the check of an exclusive dimension
+  would find a value an identity held until then removed, and pass a value the actor gave it by a
+  power that had ended by then. The call reads the host's clock as no earlier than the latest time
+  it found (`callClock.reading`), so the change's next try, which finds it before its transaction,
+  decides there at it, and is refused again only where another run, while it runs, removes a row
+  that ended after its time. What a change reads before its transaction only decides whether it
+  goes on, which its transaction decides again, so there the call decides later where it finds a
+  later time. The condition `Filter` gives with the label column holds the subject's label holding,
+  which the query doesn't read, decided at `Filter`'s time. `Filter` reads with it when the
+  subject's keys first change by time alone, the earliest end after then of its membership, or of a
+  place in a group of its own or of a group it is in (`lapseSQL`), and the condition keeps no row
+  where the query decides at that time or later (`filterHolding`): by then a run can have removed
+  the place a deny binds it by and passed over the one its value came through. Before then its
+  keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
+  grants in force at the query's time are no more than at `Filter`'s, so each row kept the subject
+  could read at `Filter`'s time by the holding, with what runs removed since, which had all ended by
+  then. Keeping no row at any later time, a run between `Filter` and the query would have emptied
+  the result for any subject, though it removed nothing the subject held anything through.
+  `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
+  each lists what only grows with the rows in force, so an element listed was in force then, and
+  one left out had ended by then or by a run's time. A batch adds its own time and deletes those no
+  later that no other run is deleting (`SKIP LOCKED`), which only `DeleteExpired` writes, so runs
+  never wait for each other, a run in a host's transaction left open too, the latest time stays,
+  and a batch removing what ended sooner leaves it as it is. One time for every tenant: a run
+  removes what has ended in every tenant, and recording a time for each would read them all first.
+  The time is what the batch removed, not the run's clock: its rows ended by the run's `Config.Now`
+  and by the database's clock both, so a host's clock set a year ahead can't have every later call
+  of every host decide a year on, for good, as the latest time only moves on; and a call decides
+  later than its own clock only where a run removed a row that ended after it. Recorded as the
+  run's clock, every run, removing nothing or only what ended long before, had every call of a host
+  whose clock is behind the run's decide later than it reads, and every change in flight as it
+  committed tried again: with a run every 50 ms beside four sessions granting roles that end 200 ms
+  on, 3.5% of changes, and none so. A place removed with its membership may end later, or never, but
+  gives nothing once the membership has ended, which it records. `Activate`
+  ends an activation its duration after the time it read once it held the places it rests on,
+  which those places last until: deciding later shortens it, never extends it past them. History
+  doesn't record the time, and `AsOf` doesn't read it: as of a time, a read decides at that time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
@@ -1206,16 +1321,23 @@ flowchart LR
   that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in
   no tenant, keyed by nothing), and AsOf counts each change from it, or from the change's own date
   where that is later. The constraint trigger `rbac_history_committed`, deferred to the commit, runs
-  `rbac_record` as history's role for each record the transaction wrote, and the event of its last,
-  by id, writes the commit record, dated by the clock then. A session can fire deferred triggers
-  early with `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit record's own
-  event fires inside the trigger that wrote it, a level deeper than at the commit, so there it
-  defers the trigger again, by name, and writes a record dated -infinity, which no read counts from,
-  whose event records the commit anew as it commits; AsOf counts from the latest. A cursor `WITH
-  HOLD` the transaction declared, also in a procedure's or a `DO` block's later transaction, whose
-  creation time is the block's, and an enabled deferrable trigger on a temporary table, would run
-  the session's own code after the commit record as it commits, so a transaction with either is
-  refused. The temporary-table check reads the catalog as the commit record is written, so it is a
+  `rbac_history_commit` as history's role for each record the transaction wrote, which looks for a
+  later record of the transaction among the next 32 ids and then among all of its records, and the
+  event of its last, by id, writes the commit record, dated by the clock then. Each event costs the
+  commit about 8 µs where the transaction's records take ids one after another, or nearly, and 15.5
+  where more than 32 sessions write history at once, record by record. A session can fire deferred
+  triggers early with `SET CONSTRAINTS ... IMMEDIATE` and hold the transaction open: the commit
+  record's own event fires inside the trigger that wrote it, a level deeper than at the commit, so
+  there it defers the trigger again, by name, and writes a record dated -infinity, which no read
+  counts from, whose event records the commit anew as it commits; AsOf counts from the latest. A
+  cursor `WITH HOLD` the transaction declared, also in a procedure's or a `DO` block's later
+  transaction, whose creation time is the block's, and an enabled deferrable trigger on a temporary
+  table, would run the session's own code after the commit record as it commits, so a transaction
+  with either is refused. So is one with a cursor `WITH HOLD` open that its block declared in an
+  earlier transaction, whose commit ran it: its creation time is the block's too, and neither the
+  cursors open at the transaction's first record nor a time that record took tells it from one
+  declared in the transaction before its first change. Declared before the block, or closed first,
+  it isn't. The temporary-table check reads the catalog as the commit record is written, so it is a
   best-effort defense that assumes the README's roles: it holds against a session with no
   `TEMPORARY` privilege, which can make no temporary object, and is best-effort against one with it.
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
@@ -1225,12 +1347,15 @@ flowchart LR
   default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
   the temporary buffers; 2,000 held a commit about 5.4 s at `temp_buffers = 4GB`, which
   `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
-  those tables, the wait for synchronous replication, and for a prepared transaction, everything
-  until `COMMIT PREPARED`. A transaction that committed before `0027_commit_dates` has none, and its
-  changes count from their own dates. `History` returns no commit record, but each record with its
-  transaction's (`Record.CommittedAt`), which the chain covers as every other field; a prune deletes
-  it with the last of its transaction's other records. What AsOf reads of a time is final once every
-  transaction whose commit record is dated by then is seen by others.
+  those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
+  can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
+  queue, which only `max_notify_queue_pages` bounds), the wait for synchronous replication, and for
+  a prepared transaction, everything until `COMMIT PREPARED`. A transaction that committed before
+  `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
+  commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
+  covers as every other field; a prune deletes it with the last of its transaction's other records.
+  What AsOf reads of a time is final once every transaction whose commit record is dated by then is
+  seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
   takes at its first write, and only those of transactions older than every transaction still
   running, which have all ended. So a cursor never passes a record that commits later. That is
@@ -1245,7 +1370,12 @@ flowchart LR
   search_path, would: that role can do neither.
 - **Generations.** A cursor names its generation: the database cluster, by its system and
   timeline, and the database and schema. Failing over or recovering to a point in time starts a
-  new generation, which an export starts again from `Genesis`. A restore that starts none, as
+  new generation, which an export starts again from `Genesis`, and so does a `pg_upgrade`, which
+  gives the cluster a new identifier and starts its timeline at 1: the whole of history is exported
+  again under a new chain. Keying a generation on an identifier the installation stores would keep
+  it across a `pg_upgrade`, but a logical dump copies that row to a cluster whose transactions
+  number anew, which must start one, and nothing SQL reads that a `pg_upgrade` keeps, as a table's
+  OID, is sure to differ in such a copy. A restore that starts none, as
   from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
   refuses that cursor, and history is exported again from the start. Where it kept that record
   and lost what came after, nothing in the database tells it from recovering from a crash, so a
@@ -1417,7 +1547,7 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 ```mermaid
 flowchart LR
     admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
-    histrole["History's role<br/>owns rbac_history and rbac_record"]
+    histrole["History's role<br/>owns rbac_history, rbac_record<br/>and rbac_history_commit"]
     app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]

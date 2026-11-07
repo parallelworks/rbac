@@ -152,7 +152,7 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 		return "", err
 	}
 	if after != (Cursor{}) && after.Generation != generation {
-		return "", fmt.Errorf("%w: the cursor is another generation's, as before a failover: export this one from the start", ErrInvalid)
+		return "", fmt.Errorf("%w: the cursor is another generation's, as before a failover or a pg_upgrade: export this one from the start", ErrInvalid)
 	}
 	if after.following() && !held {
 		return "", fmt.Errorf("%w: the database no longer holds the cursor's last record, as after a restore or a prune past it: export it again from the start", ErrInvalid)
@@ -634,9 +634,10 @@ var maxUnsized = 100
 // as a record.
 //
 // It reads the primary, and fails on a replica, which can't tell which timeline it follows until
-// long after a failover. A failover or a recovery to a point in time starts a new generation, and
-// a restore that starts none, as from a disk snapshot, loses what came after it: either can use
-// again ids and transactions the last one used past what it kept. History refuses a cursor from
+// long after a failover. A failover or a recovery to a point in time starts a new generation, and a
+// restore that starts none, as from a disk snapshot, loses what came after it: either can use again
+// ids and transactions the last one used past what it kept. A pg_upgrade, which gives the cluster a
+// new identifier and starts its timeline at 1, starts one too. History refuses a cursor from
 // another generation, whose last record the database no longer holds, or after which a prune since
 // its export began deleted records, as one through the cursor of an export further on does, and
 // history is exported again from the start, kept apart from the last export: an export from it

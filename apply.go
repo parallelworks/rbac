@@ -244,7 +244,11 @@ type standing struct {
 // to the memberships the array finds, which the planner counts as ten, a nested loop would compare
 // each member with every one of them. With no group named, the groups' members are planned out:
 // the planner would cost them by the tenant's largest groups, past JIT's thresholds in a large
-// tenant.
+// tenant. Only memberships in force at now count, suspended and guests' too, and a group's
+// identities only while theirs is, as Members lists them: one whose membership has ended has left
+// the tenant and every group, whether or not DeleteExpired has removed it and its places yet, so
+// its removal meanwhile, which changes nothing the host could read, doesn't have the change tried
+// again. An identity named itself stands as having no membership then.
 var standSQL = `
 	WITH RECURSIVE ` + insideSQL("$3", "$4", "NULL", false) + `, of(root, principal) AS (
 	  SELECT 'group:' || root, principal FROM inside WHERE $3::text[] IS NOT NULL
@@ -253,9 +257,10 @@ var standSQL = `
 	  SELECT jsonb_object_agg(principal, guest::text || ' ' || suspended::text || ' ' ||
 	    coalesce(extract(epoch FROM expires_at)::text, ''))
 	  FROM rbac_memberships WHERE tenant = $1 AND principal = ANY(ARRAY(SELECT principal FROM of))
+	    AND (expires_at IS NULL OR expires_at > $4)
 	)
 	SELECT o.root, array_agg(o.principal || '=' || coalesce((SELECT m FROM held) ->> o.principal, '') ORDER BY o.principal)
-	FROM of o
+	FROM of o WHERE o.root = o.principal OR (SELECT m FROM held) ->> o.principal IS NOT NULL
 	GROUP BY o.root`
 
 // stand reads the standing of principals in a tenant on q.
@@ -1055,11 +1060,11 @@ func (c *constrained) holdingAndKeys(ctx context.Context, q DB) (Holding, []stri
 		phase = 1
 	}
 	if c.held[phase] == nil {
-		h, _, keys, err := c.a.holdingRead(ctx, q, c.actor, c, true)
+		h, _, got, err := c.a.holdingRead(ctx, q, c.actor, c, alsoRead{keys: true})
 		if err != nil {
 			return Holding{}, nil, err
 		}
-		c.held[phase], c.keys[phase] = &h, keys
+		c.held[phase], c.keys[phase] = &h, got.keys
 	}
 	return *c.held[phase], c.keys[phase], nil
 }
@@ -2153,9 +2158,16 @@ func (a *Authorizer) begin(ctx context.Context, fn func(pgx.Tx) error) error {
 	// One that fails before needing the time reads it there too, so its refusal is dated where it
 	// decided: a reading from before the locks can predate a change it waited for.
 	a.clock.before, a.clock.began, a.clock.read, a.clock.picked = a.clock.at, a.clock.read, false, false
+	a.clock.changing, a.clock.decided = true, false
+	defer func() { a.clock.changing = false }()
 	return begin(ctx, a.db, func(tx pgx.Tx) error {
 		w, end := watched(tx, a.clock)
 		err := fn(w)
+		// Last, so a run that committed once the change read its actor, removing a row that ended after
+		// the change's time, which a statement after that read could find removed, has it tried again.
+		if err == nil && a.clock.decided {
+			err = a.expiredBy(ctx, w)
+		}
 		if end != nil {
 			err = end(err)
 		}
@@ -3324,7 +3336,12 @@ func removing[T any](a *Authorizer, table, columns string, collect func(pgx.Rows
 // those a change is holding, and a membership one of whose places in groups a change holds, rather
 // than wait on it, so the next run removes them. It removes a batch at a time, on a pool each in a
 // transaction of its own, so none holds many locks, and on an error those it removed before stay
-// removed. A race PostgreSQL refuses matches ErrConflict.
+// removed. With each batch it records the latest time a row it removes ended at, a membership's for
+// the places it removes with one, which every check and change decides no earlier than, so none
+// reads a state its batches left that no moment held; as each ended by Config.Now and the
+// database's clock both, a host whose clock runs ahead, or one setting Config.Now wrong, can't have
+// a later call decide past the database's clock, and a call decides later than its own clock only
+// where a run removed a row that ended after it. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	defer conflicting(&err)
@@ -3380,7 +3397,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 	expiring := func(table, key string) func(pgx.Tx) (int64, int64, error) {
 		return statement(`WITH d AS (DELETE FROM ` + table + ` WHERE ` + key + ` = ANY(ARRAY(
 			SELECT ` + key + ` FROM ` + table + ` WHERE expires_at <= least($1, statement_timestamp())
-			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)) RETURNING 1)
+			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)) RETURNING expires_at), ` + expiredThroughSQL("d") + `
 		SELECT count(*), count(*) FROM d`)
 	}
 	var total int64
@@ -3442,16 +3459,40 @@ func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all 
 	if tenants, principals, err = tenantPrincipals(rows); err != nil || len(tenants) == 0 {
 		return picked, 0, err
 	}
+	// Of the memberships alone: a place of an identity that is no member gives nothing, ended or not.
 	err = byIndexes(ctx, tx, stmt(into(&all), `
 		WITH ended AS (
 		  DELETE FROM rbac_memberships ms USING unnest($1::text[], $2::text[]) AS p(tenant, principal)
 		  WHERE ms.tenant = p.tenant AND ms.principal = p.principal
-		  RETURNING ms.tenant, ms.principal
+		  RETURNING ms.tenant, ms.principal, ms.expires_at
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
-		)
+		), `+expiredThroughSQL("ended")+`
 		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, tenants, principals))
 	return picked, all, err
+}
+
+// expiredThroughSQL is SQL defining, in a WITH of a batch of DeleteExpired, after removed, the rows
+// it removes with their expires_at, the statements recording in rbac_expired the latest of those,
+// where it removes any, and deleting the times recorded no later, passing over those another run
+// is deleting: every check and change decides no earlier than the latest time recorded that it
+// sees (decidedSQL), and one seeing a row the batch removed sees the time too, as they commit
+// together, so it reads no state the batch left that no moment held, as a later-ending place a deny
+// binds a subject by removed and an earlier-ending one its power comes through passed over or not
+// reached yet. The time is of what it removes, which ended by Config.Now and the database's clock
+// both, so a call decides later than its own clock only where a row that ended after it is gone:
+// recorded as the run's clock, every run, whatever it removed, had every call of a host whose clock
+// is behind the run's decide later than it reads, and a change in flight tried again. Only
+// DeleteExpired writes the table, so neither of two runs waits for the other, and the latest stays.
+func expiredThroughSQL(removed string) string {
+	return `expired_through(until) AS (
+		  SELECT max(expires_at) FROM ` + removed + `
+		), passed AS (
+		  DELETE FROM rbac_expired WHERE ctid = ANY(ARRAY(SELECT ctid FROM rbac_expired
+		    WHERE until <= (SELECT until FROM expired_through) FOR UPDATE SKIP LOCKED))
+		), recorded AS (
+		  INSERT INTO rbac_expired (until) SELECT until FROM expired_through WHERE until IS NOT NULL
+		)`
 }
 
 // tenantPrincipals collects rows of a tenant and a principal's key.

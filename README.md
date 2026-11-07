@@ -101,8 +101,11 @@ condition as keeping as many as of a table of one type: listing a type from a ta
 a column of the type too, whose statistics count them, and index it after the tenant and before what
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
-the subject's label holding and what the constraints answered, so build one for each query. It
-compares the tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
+the subject's label holding and what the constraints answered, so build one for each query; the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, and with the
+label column keeps no row once that is as late as a time the subject's membership, or a place in a
+group of its own or of a group it is in, ended after `Filter` read the holding. It compares the
+tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
 past 128 on containers and the tenant, as one holding a grant on everything it created does, each of
@@ -306,23 +309,27 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
   but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
-  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message.
-  That is about a map of 50,000 short strings, nearly 16,000 maps of one entry each, or nearly
-  40,000 timestamps, and a unit costs about what reading one does, so a check spends no more
-  converting than its conditions may reading, about 20 ms: each map charged one, as a number is, a
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
+  a map of structs, which none reads and reading copies whole, is refused unread at 2 for each
+  entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms. That is about a map of
+  50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
+  unit costs about what reading one does, so a check spends no more converting than its conditions
+  may reading, about 20 ms: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
   empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
-  nor on the order of the kinds. The subject's, the
-  resource's and the request's attributes share that, so attributes a tenant's users write, as a
-  resource's tags, can take every check of the resource past it, where a grant's condition reading
-  an attribute gives nothing and a deny's applies, whoever asks: bound what users may store, or pass
-  conditions only what they read. A call reads the subject's and the request's as its first check
-  converted them: change none of them while it runs, as from a hook, as a check after the change can
-  read them as they were, though never another value as one of them. Comparing a double that isn't
-  finite fails, and no list or map a condition reads holds one: building a list or a map holding one
+  nor on the order of the kinds, whether a hook can be given a copy included, below: a loop gives a
+  map's keys in an order of their own. The subject's, the
+  resource's and the request's attributes share what a check converts, so attributes a tenant's
+  users write, as a resource's tags, can take every check of the resource past it, where a grant's
+  condition reading an attribute gives nothing and a deny's applies, whoever asks: bound what users
+  may store, or pass conditions only what they read. A call reads the subject's and the request's as
+  its first check converted them: change none of them while it runs, as from a hook, as a check
+  after the change can read them as they were, though never another value as one of them.
+  Comparing a double that isn't finite fails, and no list or map a condition reads holds one:
+  building a list or a map holding one
   fails, and an attribute holding one, however deep, is refused, as a declared double that isn't
   finite is, failing whatever reads it, and whatever reads its kind whole; and where no
   declarations cover the kind, none of its attributes can be read, as where they hold anything
@@ -341,9 +348,19 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `{"dev": 1, "prod": 2}[resource.attributes.env]` does. A list literal costs 1 more for each
   element and a map literal 2 for each entry, each time it is built, and a step of a loop 1 more
   for each `&&`, `||` and `?:` it may evaluate, its macro's own among them, which CEL charges a
-  constant or nothing. `contains` costs what reading both strings does, multiplied, and
-  `startsWith` and `endsWith` what reading
-  the shorter does, at least 1 however short or empty either is, and one costing more than a
+  constant or nothing. A loop over a map gives its keys in one order, whatever order the map's
+  entries come in: bools, ints, uints, doubles, strings and then bytes, each by its value, strings
+  and bytes by their bytes, so `{"b": 1, "a": 2}.map(k, k)` is `["a", "b"]`. It gave them in the
+  order Go happened to range over the map, which changes from one evaluation to the next, so over
+  a request's three scopes `request.attributes.scopes.map(k, k)[0] == "read"` held in 55 of 100
+  identical checks, `Explain` disagreeing with the check before it in 51, and a deny's
+  `request.attributes.scopes.filter(k, true)[0] == "admin"` lifted in 84, so a requester could ask
+  until it lifted; and how far `all()` or `exists()` went before it stopped, and so what it cost,
+  turned on it too. Sorting the keys costs, when the loop starts, 1 for each two keys each time
+  their number halves to one, and each key what reading it does past 1, once, and a loop over a
+  map holding more than one key of another type, as a literal keyed by lists can, fails.
+  `contains` costs what reading both strings does, multiplied, and `startsWith` and `endsWith` what
+  reading the shorter does, at least 1 however short or empty either is, and one costing more than a
   condition may fails before it runs: `contains` of one long string the request passes in another
   tries each place in it, which can take a third of a second. A comparison costs reading the
   smaller value, read once, in step with the other, and charged before it runs: measured again
@@ -392,7 +409,13 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   a zone an attribute names is bounded 500 higher than before loading it was charged, so a scope's
   conditions that read many may be past a bound as an upgrade leaves them, and costs those 500 at
   each read, so one reading more than about sixteen in a loop, which held once the process had
-  loaded them, fails. Adding to `request.time`, or converting it, was bounded at all a condition
+  loaded them, fails. A loop over a map costs sorting its keys, so one over 500 short keys, which
+  cost about half what a condition may, now costs about two thirds, and one over more than about
+  700 fails the same way, or over more than about 580 keys of 36 bytes, as ids, each costing its
+  bytes once more, as does one over a map literal holding more than one key of another
+  type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
+  so they may be past a bound as an upgrade leaves them. Adding
+  to `request.time`, or converting it, was bounded at all a condition
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
@@ -400,7 +423,14 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
-  whatever grants it; and a condition building a list or a map holding attributes no condition can
+  whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
+  interface, which a hook's copy sets whole and is now charged their bytes, as it charged a struct
+  holding none, or maps keyed by arrays or structs, or by interfaces holding them, whose keys it is
+  now charged the bytes of, and of the strings they hold and what their interfaces hold, as hashing
+  them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as
+  its zero value, and ones holding themselves that reach 20,000 maps, lists, pointers, structs,
+  arrays and messages, counting each time one is reached, however shallow, which were copied
+  whole; and a condition building a list or a map holding attributes no condition can
   read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
@@ -459,8 +489,15 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
   `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
-  more than a check converts, counted alike: where the attributes hold more, the hook can't be
-  asked, and the call is refused as any other, a `DeniedError` of the permission on the resource
+  more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
+  condition reads, along any path, wherever a value reached twice is reached first, nor a value
+  holding itself, as a graph of objects with links back can, that reaches 20,000 maps, lists,
+  pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
+  deep a path around the cycle nests turns on where the copy enters it, which the order a map's
+  entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
+  of them, were copied on one call and refused on the next. Where the attributes hold more, nest
+  deeper or hold themselves so, the hook can't be asked, rather than be given part of them,
+  and the call is refused as any other, a `DeniedError` of the permission on the resource
   asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
   users can write what takes attributes past it, as a resource's tags, and the message named the
   constraint. What one removes from an actor the actor can't hand on, but for a
@@ -527,9 +564,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   from one takes nothing away, so no freeze, label or deny refuses that, though making its place
   there end sooner adds an identity that isn't a member, which is refused, as `ImportMembers`
   refuses importing its place again, once it has asked `ValidateGrant` about what the place gives,
-  as for any identity that isn't a member, and `DeleteGroup` counts none as a member from a source
-  the host owns. Read as stored, each such place was one a removal took away, and a member the
-  host keeps, until `DeleteExpired` ran. When the host takes a group over (`ImportGroups` from one
+  as for any identity that isn't a member, `DeleteGroup` counts none as a member from a source the
+  host owns, and a change counts none in what the host was asked about, which it reads again under
+  its locks. Read as stored, each such place was one a removal took away, and a member the host
+  keeps, until `DeleteExpired` ran; and a change asking the host about its group meanwhile was tried
+  again once `DeleteExpired` removed it. When the host takes a group over (`ImportGroups` from one
   of `Config.Sources`), the members a tenant put in it, from no source of the host's, leave it.
 - **Changing members is granting:** a group's members hold what it and the groups it is in hold,
   so `ChangeMembers`, with `rbac.GroupMembers` on the group and its label, checks a change to its members as the
@@ -674,7 +713,11 @@ as `Record` says, so `History` reads on past it. `History` reads the primary, an
 replica. A generation (`Cursor.Generation`) names the cluster, and the database and schema history
 is in, so no two installations in a cluster share one. A failover or a recovery to a point in time
 starts a new one, and a restore that starts none, as from a disk snapshot, loses what came after it:
-either can number again what the last one numbered past what it kept. `History` refuses a cursor
+either can number again what the last one numbered past what it kept. A `pg_upgrade` starts a new
+one too, as it gives the cluster a new identifier and starts its timeline at 1, though it loses
+nothing: export to the end before it, and keep the last checkpoint, as every cursor from before it
+is then refused, and the whole of history is exported again from `Genesis` under a new chain, which
+an audit compares with the last export up to that checkpoint. `History` refuses a cursor
 from another generation, whose last record the database no longer holds, or after which a prune
 since its export began deleted records, as below, and history is exported again from the start, kept
 apart from the last export: an export from it would read on past what is gone. A restore that keeps
@@ -753,7 +796,19 @@ COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large `
 costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s past its commit
 record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that sets a large
 `temp_buffers` and makes many such tables holds its own commit back accordingly; set `temp_buffers`
-no larger than the session's temporary data needs. `pg_stat_activity` lists a session
+no larger than the session's temporary data needs. The rest of a commit also writes the
+notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQL's notification
+queue, which no SQL can see beforehand: about 1.6 ms a MB on a test server, 260 ms for 160 MB, and
+some 13 s at the default queue of 8 GB, which `lock_timeout` doesn't bound either. Any role may
+`NOTIFY`, which takes no privilege, so revoking `EXECUTE` on `pg_notify` from `PUBLIC` bounds
+nothing. From PostgreSQL 17 on, `max_notify_queue_pages`, set as the server starts, bounds it: a
+commit whose notifications overflow the queue fails with SQLSTATE 54000, its changes with it, rather
+than being held, so 1,024 pages, 8 MB, hold one about 13 ms at most. But the queue holds every
+notification some listener in the cluster has yet to read, and any role may `LISTEN`, so a small
+one fills while a listener lags, as one in a long transaction does, and every commit that notifies
+then fails until that listener catches up or ends: where the host's own transactions notify, size
+it for how far its listeners fall behind, and retry such a commit once the queue drains, or keep
+the default and watch `pg_notification_queue_usage()`. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
@@ -763,14 +818,22 @@ which `AsOf` counts it from, as its latest. It refuses a transaction that declar
 HOLD`, which committing runs to its end, also one a procedure or a `DO` block declares in a
 transaction after it committed, and a session that has an enabled deferrable trigger on a temporary
 table, which fires as it commits: either would run a session's own code after the commit record was
-written. The check of a temporary table's deferrable trigger reads the catalog as the commit record
-is written, so it is a best-effort defense that holds only where a hostile session can't make
-temporary objects: the roles below revoke `TEMPORARY` on the database from `PUBLIC` and grant it to
-none of them, as no call of the package's makes a temporary object, `AsOf`'s included, so none of
-them makes any, and against them the defense holds. So the application's role can hold a change's
-commit past its commit record only through the host's code that runs as the transaction commits, as
-a deferred trigger of the host's or a deferred constraint checking a row the role can lock, or for as
-long as the operator's settings of synchronous replication and prepared transactions let it; a role
+written. In a procedure or a `DO` block, it refuses too a transaction that has a cursor `WITH HOLD`
+open that the block declared in an earlier transaction, whose commit ran it, as a cursor's creation
+time is the block's, and nothing tells it from one declared in this transaction: declare such a
+cursor before the block, in a transaction of its own, and fetch from it in the block by its name, or
+close it before a transaction that changes the package's tables commits. A `FOR` loop over a query,
+which PL/pgSQL runs to its end as each `COMMIT` in it begins, is not refused. The check of a
+temporary table's deferrable trigger reads the catalog as the commit record is written, so it is a
+best-effort defense that holds only where a hostile session can't make temporary objects: the roles
+below revoke `TEMPORARY` on the database from `PUBLIC` and grant it to none of them, as no call of
+the package's makes a temporary object, `AsOf`'s included, so none of them makes any, and against
+them the defense holds. So the application's role can hold a change's commit past its commit record
+by what runs after it as the transaction commits, which includes the host's code that runs then, as
+a deferred trigger of the host's that reads a table by a name a temporary table can take, or a
+deferred constraint checking a row the role can lock; the notifications the transaction queued, for
+as long as writing them takes, which only `max_notify_queue_pages` bounds; and the operator's
+settings of synchronous replication and prepared transactions, for as long as they let it. A role
 given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
 or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
 deferrable trigger, against which the check is best-effort.
@@ -917,12 +980,16 @@ have the server load a library or run a program of its choosing; and:
    there, as an extension installed there makes, would run in place of the package's, as whoever
    reads as of a time.
 2. A role of history's own, which the administrator's role is a member of and the application's
-   isn't, owns `rbac_history` and the function `rbac_record`: transfer them to it after migrating.
+   isn't, owns `rbac_history` and the functions `rbac_record` and `rbac_history_commit`: transfer
+   them to it after migrating. A migration that makes such a function later, as
+   `0029_commit_trigger` makes `rbac_history_commit`, gives it to `rbac_record`'s owner itself, or
+   fails.
    It needs `USAGE` on the schema, since every write to the package's tables runs `rbac_record`
    as it, which refuses the write without it; `EXECUTE` on the functions `rbac_tenant_keys` and
    `rbac_text_array`, which history's index of the keys denies name calls for each record, and
    which every role has unless it is revoked; and `CREATE` there to be given them, unless a
-   superuser gives them.
+   superuser gives them, or, for one a migration gives it, the schema's owner migrates, which grants
+   it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
    tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
    `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
@@ -1170,7 +1237,45 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   than the views, or another role being able to create there, when the read begins or as it ends, or
   one of the views dropped as it ran. Drop the views' schema with the package's: dropping the
   package's drops the views, which read its history, but not their schema.
-  `0029_member_reads` replaces `rbac_group_members` again, which keeps its owner and who may execute
+  `0029_commit_trigger` has `rbac_history_committed` run a function of its own,
+  `rbac_history_commit`, in place of `rbac_record`. The trigger fires as a transaction commits once
+  for each record the transaction wrote, which ran with `rbac_record`'s settings and start and read
+  to the end of an index page for a later record of the transaction: about 12.5 µs a record on a
+  test server, 250 ms of `COMMIT` for 20,000 records, a fifth of what writing them took, and some
+  12 s for a million, which a `statement_timeout` can end. It now looks among the next 32 ids first,
+  as a statement's records take ids one after another, or nearly: about 8 µs a record, 160 ms for
+  20,000. Where none of those is the transaction's, as where more than 32 sessions write history at
+  once, record by record, it reads both, about 15.5 µs. It replaces the trigger, which locks history
+  against reads and writes until it commits, so every change, as each writes history, and every read
+  of history, as `AsOf` and an export, waits for it, and a transaction under way as it starts that
+  made a change can make it give way. The role migrating makes the function, which writes history as
+  its owner, and gives it to `rbac_record`'s owner, history's role where the roles are set up as
+  [History](#history) says: as a superuser, or as a role that may `SET ROLE` to history's role,
+  where that role has `CREATE` on the schema or the role migrating may grant it that, as the
+  schema's owner can, which it does for the migration alone. Otherwise migrating fails with SQLSTATE
+  42501, having changed nothing, rather than leave the function to another role: grant history's
+  role `CREATE` on the schema, or history's role to the role migrating with the `SET` option, as its
+  hint says, or migrate as a superuser, and migrate again. No role but its owner may execute it, nor
+  `rbac_record`, which writes history as its owner too, as only their triggers call them: migrating
+  revokes `EXECUTE` on both from every other role, `PUBLIC` included, as the schema's default
+  privileges can grant it as each is made, where `0003_history` revoked it on `rbac_record` from
+  `PUBLIC` alone; a role holding it could attach either to a table of its own in `pg_temp`, whose
+  triggers would then run as history's role. It replaces `rbac_record` too, which keeps its owner
+  and its settings, without its path for a commit record, which no trigger reaches any more. A
+  procedure or a `DO` block that changes the package's tables with a cursor `WITH HOLD` open that it
+  declared in an earlier transaction is refused as before, as nothing tells that cursor from one
+  declared in the transaction committing: its refusal now says so, and how such a batch commits.
+  `0030_expired_through` adds `rbac_expired`, the times `DeleteExpired` deleted by, which every
+  check, search and change of code after it reads and every `DeleteExpired` writes, and gives each
+  role holding `SELECT`, `INSERT`, `UPDATE` or `DELETE` on `rbac_grants` the same on it, as the
+  application's role of step 3 holds them, so a deployment that gave its roles their privileges
+  before migrating runs code after it with no step of its own; give a role you give its privileges
+  only after migrating those on it too. Code after it, run before it is applied, fails every check,
+  search and change, as the table doesn't exist. It takes no lock on the other tables. History
+  doesn't record it, and `AsOf` doesn't read it. Code before it never reads it. Run `DeleteExpired`
+  only from code after it once any runs: an earlier one records nothing, so the reads of later
+  code can find what it removed by a clock ahead of theirs.
+  `0031_member_reads` replaces `rbac_group_members` again, which keeps its owner and who may execute
   it and takes no lock on the tables, to plan its statements with sequential scans off, by its SET
   clause, whatever its caller's: it reads the groups' places a group at a time, in the order of the
   primary key, and the members' memberships by their keys, through a bitmap where a plan counts
@@ -1305,12 +1410,47 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   time the wait left behind, as by an actor's power that ended while it waited. So a change holds
   first what it writes that `DeleteExpired`, which waits for nothing, may be deleting, and holds
   until its own transaction ends; and reads what its actor acts by in one statement with the denies
-  binding it and its label values, as `SetRole` and `DeleteRole` do under the tenant's lock, so a
-  place ended by `DeleteExpired`'s clock but not yet by the change's, removed in between, can't have
-  it act by a power and escape a deny at no one moment. `SetMemberships` doesn't wait for the places
-  in groups of a membership that ended while it took its locks, which another transaction holds, as
-  a group's deletion: it is tried again (`rbac.ErrConflict`), as is a change whose host's clock goes
-  back between the two readings.
+  binding it and its label values, as `SetRole` and `DeleteRole` do under the tenant's lock.
+  `DeleteExpired` removes what has ended in transactions of its own, places in groups before
+  memberships, passing over what a change holds, by its own clock: a read by an earlier clock could
+  find the place a deny binds the actor by, which ended later, removed, and the membership or place
+  its power comes through, which ended sooner, still there, a state no moment held. So each batch
+  records in `rbac_expired`, in its own transaction, the latest time a row it removes ended at, a
+  membership's for the places it removes with one, which ended by the run's `Config.Now` and the
+  database's clock both: a host whose clock runs
+  ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
+  a run that removes nothing records nothing. A read of an actor's or a subject's grants, groups and
+  the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
+  `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
+  host, decides no earlier than the latest time recorded that its snapshot sees: every row it finds
+  removed had ended by then, as it commits with the time, or is a place of an identity whose
+  membership had, which gives nothing once it has. The call decides at that time from then
+  on, its conditions' `request.time` and its statements after the read too. So a call decides later
+  than its own clock only where a run removed a row that ended after it. A change is tried again
+  instead (`rbac.ErrConflict`) where its transaction read the time before that read, as for whether
+  what it grants to stands, or where, as its last statement finds, a run that committed after that
+  read removed a row that ended after the change's time, which a statement after it, as the check
+  of an exclusive dimension, could have found removed. Tried again, it finds the time before its
+  transaction, and decides there no earlier, so it is refused again only where yet another run
+  removes so while it runs: with `DeleteExpired` every 50 ms beside four sessions granting, without
+  pause, roles that end 200 ms on, none of about 1,650 changes was tried again. `Filter`'s condition
+  with the label column, whose holding the query doesn't read, keeps no row where the query sees a
+  time as late as the earliest that the subject's membership, or a place in a group of its own or of
+  a group it is in, ended after `Filter` read the holding: build it again. Before then, the subject's
+  keys and the denies binding it are those of `Filter`'s time, and the grants in force no more, so
+  each row the query keeps the subject could read at `Filter`'s time; a run by an earlier time, as
+  every one is for a subject whose membership and places don't end, leaves them as they were.
+  `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
+  what each lists only grows with the rows in force, so each element it lists was in force at that
+  time, and each it leaves out had ended by it or by a run's time. Runs never wait for each other,
+  and a run removing what ended sooner leaves the latest time as it is. Keep the hosts' clocks
+  synchronized with the database's: a host whose clock runs behind has a call after another's run
+  that removed a row ending after its clock decide later than it reads. An activation still ends
+  its duration after the time `Activate` read once it held the places it rests on, never later. As
+  of a time, a read decides at that time.
+  `SetMemberships` doesn't wait for the places in groups of a membership that ended while it took
+  its locks, which another transaction holds, as a group's deletion: it is tried again
+  (`rbac.ErrConflict`), as is a change whose host's clock goes back between the two readings.
 
 ## Development
 
