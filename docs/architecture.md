@@ -202,7 +202,22 @@ erDiagram
 
 - **Built-in roles are not stored.** They are the host's `Config.Catalog`, so a deploy changes
   them for every tenant at once. Custom roles are a tenant's own, prefixed `custom.`, and give
-  only permissions and types the catalog has.
+  only permissions and types the catalog has. A read derives each as the catalog has it now
+  (`current`), privileged by whether its types are those each of its permissions is unprivileged
+  on, sets of the catalog's types built once (`unprivilegedOn`), so a role of 1,000 permissions for
+  50 types costs 1,000 lookups: each permission looked up with each type, twice, deriving a
+  tenant's 300 such roles took 640 ms. A check, `Activate` and a change read only the custom roles
+  they and the grants they read name, each by its key (`book`), a change's read of its actor's
+  authority with those the roles it grants list, through others too (`listingSQL`), as
+  `holdsRole` walks them, but not those its actor's roles list, of which it reads only their ids
+  (`powerOf`); only a read needing every one reads the tenant's by the tenant
+  (`everyCustomRole`): `CustomRoles` and `Roles`, which list them, `Grantable`, which offers any,
+  `SetRole`, which reads those listing the role and counts them, `DeleteRole`, which refuses a role
+  another lists, and the check of exclusive values, which finds those giving one by their
+  permissions in its statement (`customGivenSQL`), so a role giving none is never read into it.
+  Before, `Activate` read every one, twice, and a change granting a custom role every one for its
+  actor's authority, before its transaction and under its locks: beside 299 roles of 1,000
+  permissions for 50 types, `Activate` of a role of one took 1.2 s, against 7 ms.
 - **A grant is one role to one principal on one scope**, from one source, until one time, under
   one condition. The key index `rbac_grants_key` holds what a check reads, so a check's read of
   grants is an index-only scan. The indexes by scope and by principal lead to both too and hold the
@@ -226,10 +241,26 @@ erDiagram
   the database so, and its removal of the places it ends (`leave`), which deletes each by where it
   is stored, as `restingIn` holds it: matched beside `tenant = $1`, a plan made while the table was
   small read every place in the tenant and for each one every place in the table, 2.6 million pages
-  to remove one member. A plan made while a table fit in a page reads it whole whatever the
-  statement's shape, so only the setting pins it; and the shapes pin what a plan reads with it off,
-  as statistics from a near-empty table count every value as distinct: a key's rows are read in the
-  order of the index leading to it where another leads to the tenant alone (`seekBy`), rows to lock
+  to remove one member. The custom roles a check, `Activate` and a change name are read so a key at
+  a time (`book`, `listingSQL`), and those a read of them all reads by the tenant
+  (`everyCustomRole`): read with them on, beside 40,000 roles of other tenants, `Explain` read 817
+  pages of them, and `Activate` 1,634. `DeletePrincipalEverywhere` finds the tenants an identity is
+  in by the indexes leading to it, its places in groups in the order only the one leading to the
+  principal gives, by `= ANY`, which a plan doesn't take as fixing the principal: by equality, a plan
+  by statistics from a near-empty table skipped through the index leading to the tenant, a descent
+  for each tenant. Whom denies exempt and eligibilities name as approvers, which no index finds
+  across tenants, it reads in the same statement, by a range of every row's `ctid`, which reads each
+  table a page at a time, in its order, as a sequential scan does, and which the setting doesn't
+  plan away: with it off and no such range, each table was read through a whole index, in its order,
+  as it was with TID scans off too, which a host's session can have, so `indexed` turns them on, as
+  every statement finding rows by where they are stored needs: a removal of places in groups, which
+  have no id, read every place with both off. Read in a statement of their own, the tenants were of
+  two moments, and a change between them naming the identity where it stopped approving had that
+  tenant found by neither. A plan made while a table fit
+  in a page reads it whole whatever the statement's shape, so only the setting pins it; and the
+  shapes pin what a plan reads with it off, as statistics from a near-empty table count every value
+  as distinct: a key's rows are read in the order of the index leading to it where another leads to
+  the tenant alone (`seekBy`), rows to lock
   are sorted from what their keys found and locked each by its key (`lockedInOrder`,
   `lockedDenies`), a count of a principal's groups reads its places in no
   order (`groupsBounded`), a typed count reads the scopes' index in its order, up to the count, and names the type too, so the primary key is sought by it, and the denies naming a subject's keys are kept to the types outside their read, so the index of keys finds them (`bindingDenies`), and an upsert
@@ -1061,7 +1092,11 @@ flowchart TB
   lists anyone left able to, as a catalog change can leave them. Which values an actor holds none
   of, and so can't hand on, a change reaching many scopes decides from each path's grants
   (`authorities`), reading each of its roles' permissions once for all of them. Where no dimension
-  is exclusive, nothing is read.
+  is exclusive, nothing is read. Of the tenant's custom roles, the check reads only which values
+  those giving one give, found by their permissions in the statement (`customExclusive`): read
+  whole and derived under the tenant's lock on exclusive values, 299 roles of 1,000 permissions,
+  giving none, had a `SetMemberships` of one member take 600 ms, against 6, while every change in
+  the tenant waited.
 
 ## Transactions and locks
 
@@ -1140,10 +1175,17 @@ flowchart TB
   group's key. `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its principal's, so
   neither waits for the other, and both delete the principal's grants and eligibilities on those
   scopes: each locks them in the order of their scopes first, eligibilities before grants, so they
-  don't deadlock. A revoke locks the grants it deletes in that order too, as a change ending places
-  in groups ends activations among them without their scope's lock. `DeleteRole` removes a role's
-  grants before its eligibilities, which it holds already, and holds the tenant's lock exclusive, so
-  no change runs beside it but `DeleteExpired`, which waits on no row. A host transaction making
+  don't deadlock. `DeletePrincipal` takes its principal out of the approvers and exemptions it
+  locked alone, by their ids and the versions it locked, in its next round trip: `SetEligibility`
+  and `SetDeny` take no lock of the identities they name, so one naming it can commit in between,
+  which, matched again by its key, would be locked out of order, and two removals of identities it
+  names both would deadlock. It is left naming it, as one set after the removal is, for a later
+  removal. `DeleteGroups` needs no such care, as setting either takes the lock of each group it
+  names, which the removal holds. A revoke locks the grants it deletes in that order too, as a
+  change ending places in groups ends activations among them without their scope's lock.
+  `DeleteRole` removes a role's grants before its eligibilities, which it holds already, and holds
+  the tenant's lock exclusive, so no change runs beside it but `DeleteExpired`, which waits on no
+  row. A host transaction making
   several changes takes each one's rows in this order, but not all of them together: two that make
   the same changes in opposite orders can deadlock (above). The order a statement locks its sorted
   rows in is how PostgreSQL plans it, not a promise of SQL: a subquery holding `FOR UPDATE`,
@@ -1212,10 +1254,15 @@ flowchart TB
   escaped the deny, a state no moment held. With no skew, `Apply` granting, `SetEligibility`,
   `Activate`'s check of its approver and a change to members read the time before the actor; with
   `DeleteExpired`'s clock ahead, every change and check could. So each batch records in
-  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), the latest time one of
-  them ended at, which commits with them: a snapshot seeing any row a batch removed sees it. A read
-  of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and the
-  latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
+  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), through
+  `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
+  seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
+  decides at the later of the call's time and the latest time recorded that its snapshot sees, but
+  no later than the database's clock as it reads it (`decidedSQL`, `expiredUntil`), which takes
+  nothing from a time a run recorded, as none is past the clock as the run's statement began, before
+  the snapshot that sees it is taken; the clock as the read's own statement began can be before its
+  snapshot, as in a simple query, which plans a statement, and waits for its locks, first. Every
+  expiry it compares is decided so too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
@@ -1239,11 +1286,12 @@ flowchart TB
   goes on, which its transaction decides again, so there the call decides later where it finds a
   later time. The condition `Filter` gives with the label column holds the subject's label holding,
   which the query doesn't read, decided at `Filter`'s time. `Filter` reads with it when the
-  subject's keys first change by time alone, the earliest end after then of its membership, or of a
-  place in a group of its own or of a group it is in (`lapseSQL`), and the condition keeps no row
-  where the query decides at that time or later (`filterHolding`): by then a run can have removed
-  the place a deny binds it by and passed over the one its value came through. Before then its
-  keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
+  subject's keys first change by time alone, the earliest end after then of its membership, or of
+  its last path to one of its groups, as `endsSQL` walks them (`lapseSQL`): a place another path
+  outlasts, from another source or through another group, changes none of them. The condition keeps
+  no row where the query decides at that time or later (`filterHolding`): by then a run can have
+  removed the place a deny binds it by and passed over the one its value came through. Before then
+  its keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
   grants in force at the query's time are no more than at `Filter`'s, so each row kept the subject
   could read at `Filter`'s time by the holding, with what runs removed since, which had all ended by
   then. Keeping no row at any later time, a run between `Filter` and the query would have emptied
@@ -1251,8 +1299,9 @@ flowchart TB
   `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
   each lists what only grows with the rows in force, so an element listed was in force then, and
   one left out had ended by then or by a run's time. A batch adds its own time and deletes those no
-  later that no other run is deleting (`SKIP LOCKED`), which only `DeleteExpired` writes, so runs
-  never wait for each other, a run in a host's transaction left open too, the latest time stays,
+  later that no other run is deleting (`SKIP LOCKED`), through `rbac_expired_through`, which alone
+  writes the table, as its owner, refusing a time past the database's clock, so runs never wait for
+  each other, a run in a host's transaction left open too, the latest time stays,
   and a batch removing what ended sooner leaves it as it is. One time for every tenant: a run
   removes what has ended in every tenant, and recording a time for each would read them all first.
   The time is what the batch removed, not the run's clock: its rows ended by the run's `Config.Now`
@@ -1266,7 +1315,18 @@ flowchart TB
   gives nothing once the membership has ended, which it records. `Activate`
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
-  doesn't record the time, and `AsOf` doesn't read it: as of a time, a read decides at that time.
+  records each write to the table, as the entity `expired`, and `AsOf` doesn't read it: as of a
+  time, a read decides at that time. Without the bound on what a read takes, one row of a time far
+  ahead, which the application's role could write around the package, had every later call of every
+  host decide then, for good, a deny binding through a place that ends before then lifted, and a
+  condition reading `request.time` met. A time past the clock now only the table's owner disabling
+  its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
+  a host behind the clock then decides at it as each statement reads it, and that host's changes are
+  tried again until the clock passes the time. The bound leaves a run's time whole only where a
+  read bounds it by the clock the run recorded it by, which hasn't gone back since: a clock gone
+  back, or a hot standby's own clock behind the primary's, cuts it to before what the run removed
+  ended, and a read then decides by the state the run left, which no moment held, until the clock
+  passes it.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
@@ -1340,13 +1400,15 @@ flowchart LR
   database role that wrote it, and the actor and call it was made through, with what the host
   attached. A change takes effect when its statement began, or its transaction where that began
   later, as in a procedure that commits as it goes, and an expiry when it expired, but never before
-  the row's last record. A write that bypassed the package is recorded too, with no actor. The
-  tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
-  eligibility's lists of principals, which they count in characters rather than bytes. A row of more
-  than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
-  `History` can't return. A row written before history was installed has one record from migrating,
-  its baseline, dated when it was created, or at the epoch where that was before year 1 or at its
-  first instant.
+  the row's last record. A write that bypassed the package is recorded too, with no actor. So is
+  each time `DeleteExpired` records in `rbac_expired`, as the entity `expired`, in no tenant, keyed
+  by its row's id, as two rows can hold one time; its row holds the time, so the chain covers it.
+  The tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
+  eligibility's lists of principals, which they count in characters rather than bytes. A row of
+  more than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
+  `History` can't return. A
+  row written before history was installed has one record from migrating, its baseline, dated when
+  it was created, or at the epoch where that was before year 1 or at its first instant.
 - **Commit records.** No other session sees a change before its transaction commits, which a host's
   transaction, or the package's own while `Config.OnChange` runs, can put off. So each transaction
   that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in
@@ -1368,8 +1430,12 @@ flowchart LR
   earlier transaction, whose commit ran it: its creation time is the block's too, and neither the
   cursors open at the transaction's first record nor a time that record took tells it from one
   declared in the transaction before its first change. Declared before the block, or closed first,
-  it isn't. The temporary-table check reads the catalog as the commit record is written, so it is a
-  best-effort defense that assumes the README's roles: it holds against a session with no
+  it isn't. A query string of several statements, as the simple protocol sends one, is such a block:
+  each of its statements, and each of its transactions, began when it did, so a cursor one
+  transaction of it declared and committed is refused in a later one of it that changes the tables,
+  and is declared in a query string of its own instead. The temporary-table check reads the
+  catalog as the commit record is written, so it is a best-effort defense that assumes the README's
+  roles: it holds against a session with no
   `TEMPORARY` privilege, which can make no temporary object, and is best-effort against one with it.
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
   package's makes a temporary object, `AsOf`'s included. What runs after the commit record is the
@@ -1380,11 +1446,20 @@ flowchart LR
   `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
   those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
   can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
-  queue, which only `max_notify_queue_pages` bounds), the wait for synchronous replication, and for
-  a prepared transaction, everything until `COMMIT PREPARED`. A transaction that committed before
-  `0027_commit_dates` has none, and its changes count from their own dates. `History` returns no
-  commit record, but each record with its transaction's (`Record.CommittedAt`), which the chain
-  covers as every other field; a prune deletes it with the last of its transaction's other records.
+  queue, which only `max_notify_queue_pages` bounds), each loaded extension's pre-commit callbacks,
+  in which postgres_fdw commits the transaction's remote transactions, each waiting for what the
+  remote server has it wait for, as a remote deferred foreign key's check, which no local
+  `lock_timeout` bounds (1.5 s in a test), the wait for synchronous replication, and for a prepared
+  transaction, everything until `COMMIT PREPARED`. The commit record doesn't refuse a transaction
+  that used a foreign connection: no check of postgres_fdw's connections sees another extension's
+  callbacks, or a connection a deferred trigger opens after the commit record, so the README's roles
+  give the application's role no `USAGE` on a foreign-data wrapper or server, no privilege on a
+  foreign table, nor `pg_read_all_data`, which reads every one, and no privilege on a view or a
+  function that reaches one as its owner, through the owner's mapping. A transaction that
+  committed before `0027_commit_dates` has none, and its changes count from their own dates.
+  `History` returns no commit record, but each record with its transaction's (`Record.CommittedAt`),
+  which the chain covers as every other field; a prune deletes it with the last of its
+  transaction's other records.
   What AsOf reads of a time is final once every transaction whose commit record is dated by then is
   seen by others.
 - **History's order.** `History` reads records in transaction order, by the id each transaction
@@ -1469,7 +1544,11 @@ flowchart LR
   were made, and AsOf refuses alike one that holds more than its owner's views, another may create
   in, or isn't the role's that owns the package's tables, as a grant, an extension installed there
   or a change of owner can make it. AsOf finds the views by the history they read, whatever either
-  schema is named, as `rbac_as_of_views` does by any of them left, and refuses where one of the
+  schema is named, as `rbac_as_of_views` does by any of them left, among the views of the role
+  owning the package's tables, or for `rbac_as_of_views` the role migrating, outside every session's
+  temporary schema: a view of history another session made in its own, as any role with
+  `TEMPORARY` that reads history can, or another role's, stood beside them, and every AsOf in the
+  database and every remaking of the views failed while it stood. It refuses where one of the
   package's tables has none, which would be read as it is now, or where the role has no `USAGE` on
   their schema, which the search_path would leave out; it refuses a search_path that names pg_temp
   after the package's schema, as it reads the session's own tables after its views and before the
@@ -1542,8 +1621,16 @@ flowchart LR
   conditions, and history's index of scopes holds them only for one that names a scope, so a read of
   them by their principal, scope, role or group seeks them in the index leading to it: by statistics
   that counted the tenant's rows of them as a few, a plan read every one in the tenant through
-  either instead. `Holders` looks each identity's membership of the tenant up on its own, by its
-  key, which the view of memberships gives as the principal: joined to a group's members, or looked
+  either instead. The test for a later version names its entity as the version's own, a value no
+  partial index's predicate is proven from, as `PruneHistory`'s does, so history's indexes of
+  denies by scope and of grants' and eligibilities' scopes, whose predicates name entities, can't
+  serve it: by the tenant and the time alone, every scope skipped, a plan read every later deny
+  version in the tenant for each deny, 18 million pages of history for a `Reachable` beside 6,000
+  denies binding its subject. Naming the row's scope instead would have the scope index seek it, but
+  a grant or an eligibility moved in place to another scope keeps its key, and its version before
+  the move would read as its last at the scope it left. `Holders` looks each identity's membership
+  of the tenant up on its own, by its key, which the view of memberships gives as the principal:
+  joined to a group's members, or looked
   up by the principal history copies beside the entity, it read, by such statistics, every
   membership in the tenant again for each member. The view of custom roles takes each one's newest
   version, testing none for a later one, so `Grantable`, which can offer any, reads each version
@@ -1572,7 +1659,10 @@ it: not `pg_write_all_data` or `pg_create_subscription`, through which it could 
 `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, which run programs
 and write and read files as the server; before PostgreSQL 16 it has no `CREATEROLE`, which makes it
 a member of any role but a superuser; it has no `REPLICATION` attribute, which reads every data
-file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The README's
+file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set; and it has no `USAGE` on
+a foreign-data wrapper or server, nor a privilege on a foreign table, or on a view or function that
+reaches one as its owner, nor `pg_read_all_data`, which reads every one, as their remote
+transactions commit after the commit record. The README's
 [History](../README.md#history) section has the exact grants.
 
 ```mermaid
@@ -1614,8 +1704,8 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
-| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
-| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
+| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Permissions`, a check deciding label values and a change's read of its actor's authority read each such deny's permissions once however many permissions they decide, each entry looked up among those the grants give, or for fewer than four compared with each (`listedDenies`); a change, which doesn't know what it will hand on, compares the first three it asks about, and one its actor holds none of (`askingDenies`). So each permission is decided by the denies listing it alone: compared with each permission's, `Permissions` of 300 beside 400 denies of 256 other permissions took 300 ms, and takes 12, and granting a role of 300 beside 368 such denies binding the actor took 350 ms, and takes 36. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
+| `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. A read needing every role of a tenant reads at most these, and every other read those it names, with those they list. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
 | `MaxPlacesInGroup` | 20 | Places in force of one principal in one group, each from another source. Those from each source the host owns count apart. |

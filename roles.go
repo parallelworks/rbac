@@ -99,8 +99,8 @@ var readingEntries = func(n int) {}
 
 func isCustom(id Role) bool { return strings.HasPrefix(string(id), CustomPrefix) }
 
-// book reads, on q, the definitions of the custom roles among ids in a tenant. Without one
-// among them it reads nothing.
+// book reads, on q, the definitions of the custom roles among ids in a tenant, each by its key,
+// with sequential scans off (queryIndexed). Without one among them it reads nothing.
 func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
 	b := a.builtinBook()
 	var want []string
@@ -112,7 +112,7 @@ func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) 
 	if len(want) == 0 {
 		return b, nil
 	}
-	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM rbac_roles WHERE tenant = $1 AND id = ANY($2::text[])`, tenant, want)
+	rows, err := a.queryIndexed(ctx, q, byKey("$2", "rbac_roles", "id", roleColumns, "tenant = $1"), tenant, want)
 	if err != nil {
 		return book{}, err
 	}
@@ -121,19 +121,6 @@ func (a *Authorizer) book(ctx context.Context, q DB, tenant string, ids []Role) 
 		return book{}, err
 	}
 	return a.bookOf(a.current(roles)), nil
-}
-
-// tenantBook resolves ids with every custom role of the tenant when one is among them, as a
-// role's GrantableRoles can name any.
-func (a *Authorizer) tenantBook(ctx context.Context, q DB, tenant string, ids []Role) (book, error) {
-	if !slices.ContainsFunc(ids, isCustom) {
-		return a.builtinBook(), nil
-	}
-	custom, err := a.customRoles(ctx, q, tenant)
-	if err != nil {
-		return book{}, err
-	}
-	return a.bookOf(custom), nil
 }
 
 // builtinBook resolves the built-in roles.
@@ -685,7 +672,8 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 				return ChangeEvent{}, err
 			}
 		}
-		rows, err := tx.Query(ctx, `SELECT id FROM rbac_roles WHERE tenant = $1 AND id <> $2 AND $2 = ANY(grantable_roles) ORDER BY id`, tenant, id)
+		// Every custom role of the tenant, by it, as no index finds those listing the role.
+		rows, err := a.queryIndexed(ctx, tx, `SELECT id FROM `+everyCustomRole+` AND id <> $2 AND $2 = ANY(grantable_roles) ORDER BY id`, tenant, id)
 		if err != nil {
 			return ChangeEvent{}, err
 		}
@@ -715,18 +703,17 @@ func (a *Authorizer) DeleteRole(ctx context.Context, actor Subject, tenant strin
 		// by principal.
 		var revoked []Grant
 		var ended []Eligibility
+		var deleted []Role
 		if err := byIndexes(ctx, tx,
 			removing(a, "rbac_grants", grantColumns, collectGrants, &revoked, anyOf("id", "SELECT id FROM rbac_grants WHERE tenant = $1 AND "+ofRole), tenant, id),
 			removing(a, "rbac_eligibilities", eligibilityColumns, collectEligibilities, &ended,
 				anyOf("id", "SELECT id FROM rbac_eligibilities WHERE tenant = $1 AND "+ofRole), tenant, id),
+			stmt(collecting(&deleted, func(rows pgx.Rows) ([]Role, error) { return pgx.CollectRows(rows, pgx.RowTo[Role]) }),
+				`DELETE FROM rbac_roles WHERE tenant = $1 AND id = $2 RETURNING id`, tenant, id),
 		); err != nil {
 			return ChangeEvent{}, err
 		}
-		tag, err := tx.Exec(ctx, `DELETE FROM rbac_roles WHERE tenant = $1 AND id = $2`, tenant, id)
-		if err != nil || tag.RowsAffected() == 0 {
-			return ChangeEvent{Revoked: revoked, Ineligible: ended}, err
-		}
-		return ChangeEvent{Revoked: revoked, Ineligible: ended, DeletedRoles: []Role{id}}, nil
+		return ChangeEvent{Revoked: revoked, Ineligible: ended, DeletedRoles: deleted}, nil
 	})
 }
 
@@ -1728,6 +1715,31 @@ func (a *Authorizer) stillLabeled(ctx context.Context, tx pgx.Tx, checked labeli
 	return a.labelsHeld(ctx, tx, checked, values)
 }
 
+// everyCustomRole is SQL for the rows of rbac_roles of every custom role of the tenant $1, read by
+// the tenant, for a read that needs them all, as a list of them, SetRole's of those listing a role
+// and a change's of those giving exclusive values do: MaxCustomRoles bounds them. Every other read
+// of them looks each up by its key.
+const everyCustomRole = "rbac_roles WHERE tenant = $1"
+
+// listingSQL is SQL for the WITH entries listing, of roleColumns, of the custom roles in the tenant
+// $1 in the text array named and those their GrantableRoles name, through others too, and listed,
+// those with the custom roles the WITH entry held's grants hold, each read by its key (byKey): every
+// role a decision of whether an actor may grant those named reads, as holdsRole walks the roles each
+// lists, while of the roles a held one lists it reads only their ids (powerOf). A tenant's other
+// roles, however many or large, cost it nothing: those the actor's roles list too, as an admin's
+// role listing every role.
+func listingSQL(named string) string {
+	return `listing AS (
+		  ` + byKey(named, "rbac_roles", "id", roleColumns, "tenant = $1") + `
+		  UNION
+		  SELECT r.* FROM listing l CROSS JOIN LATERAL (` + byKey("l.grantable_roles", "rbac_roles", "id", roleColumns, "tenant = $1") + `) r
+		), listed AS (
+		  SELECT * FROM listing
+		  UNION ALL
+		  ` + byKey(namedCustom("SELECT role FROM held EXCEPT SELECT id FROM listing"), "rbac_roles", "id", roleColumns, "tenant = $1") + `
+		)`
+}
+
 // customRoleRows is SQL selecting cols of the rows of table, rbac_grants or rbac_eligibilities, in
 // the tenant $1 of the custom roles in the array ids for which where holds, a role at a time
 // (byKey), each through the partial index on custom roles' rows, which the LIKE matches. A generic
@@ -1870,7 +1882,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	if r != nil {
 		ids = append([]Role{r.ID}, r.GrantableRoles...)
 	}
-	aus, got, err := a.authoritiesIn(ctx, q, actor, root.Tenant, append([]Resource{root}, on...), ids, alsoRead{below: below})
+	aus, got, err := a.authoritiesIn(ctx, q, actor, root.Tenant, append([]Resource{root}, on...), ids, alsoRead{below: below, everyRole: r != nil})
 	if err != nil {
 		return authority{}, roleRead{}, err
 	}
@@ -1954,16 +1966,21 @@ func (a *Authorizer) lets(r, listed RoleDefinition) bool {
 }
 
 // privileged reports whether a custom role gives a permission on a type that only privileged
-// built-in roles give it on.
+// built-in roles give it on: whether its types are those each permission is unprivileged on, read
+// a permission at a time, as a role can give a thousand on as many types, and a read derive hundreds.
 func (a *Authorizer) privileged(r RoleDefinition) bool {
-	for _, p := range r.Permissions {
-		for _, t := range r.ResourceTypes {
-			if !a.unprivileged[permissionOn{p, t}] {
-				return true
-			}
-		}
+	if len(r.Permissions) == 0 {
+		return false
 	}
-	return false
+	var types typeSet
+	for _, t := range r.ResourceTypes {
+		bit, ok := a.typeBits[t]
+		if !ok {
+			return true
+		}
+		types = types.with(bit)
+	}
+	return slices.ContainsFunc(r.Permissions, func(p Permission) bool { return !types.within(a.unprivilegedOn[p]) })
 }
 
 // CustomRoles lists a tenant's custom roles, by id.
@@ -1975,8 +1992,10 @@ func (a *Authorizer) CustomRoles(ctx context.Context, tenant string) (_ []RoleDe
 	return a.customRoles(ctx, a.db, tenant)
 }
 
+// customRoles reads, on q, every custom role of a tenant, by the tenant, with sequential scans off
+// (queryIndexed), for a call that lists or manages them all: MaxCustomRoles bounds them.
 func (a *Authorizer) customRoles(ctx context.Context, q DB, tenant string) ([]RoleDefinition, error) {
-	rows, err := q.Query(ctx, `SELECT `+roleColumns+` FROM rbac_roles WHERE tenant = $1 ORDER BY id`, tenant)
+	rows, err := a.queryIndexed(ctx, q, `SELECT `+roleColumns+` FROM `+everyCustomRole+` ORDER BY id`, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -1994,12 +2013,13 @@ func (a *Authorizer) customRoles(ctx context.Context, q DB, tenant string) ([]Ro
 // declared can be: given below the tenant, a value would be decided by grants a check of it doesn't
 // read, so Authorize and Permissions could disagree. It is privileged and public as it is whole.
 func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
+	derivingRoles(len(roles))
 	for i, r := range roles {
 		alone := forTenantAlone(r.ResourceTypes)
 		r.Permissions = slices.DeleteFunc(r.Permissions, func(p Permission) bool { return !a.permissions[p] })
 		r.ResourceTypes = slices.DeleteFunc(r.ResourceTypes, func(t string) bool { return !a.types[t] })
-		r.Public = r.Public && !a.privileged(r) && !r.managesAccess()
 		r.Privileged = a.privileged(r) || r.managesAccess()
+		r.Public = r.Public && !r.Privileged
 		if !alone {
 			r.Permissions = slices.DeleteFunc(r.Permissions, a.labelPermission)
 		}
@@ -2007,6 +2027,9 @@ func (a *Authorizer) current(roles []RoleDefinition) []RoleDefinition {
 	}
 	return roles
 }
+
+// derivingRoles runs as current derives n custom roles, as a test counts how many a call reads.
+var derivingRoles = func(n int) {}
 
 // forTenantAlone reports whether a custom role's stored types are the tenant's alone, as
 // tenantAloneSQL tests them.

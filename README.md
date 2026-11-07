@@ -102,9 +102,10 @@ a column of the type too, whose statistics count them, and index it after the te
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
 the subject's label holding and what the constraints answered, so build one for each query; the
-query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, and with the
-label column keeps no row once that is as late as a time the subject's membership, or a place in a
-group of its own or of a group it is in, ended after `Filter` read the holding. It compares the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, taken no
+later than the database's clock, and with the label column keeps no row once that is as late as the
+first time after `Filter` read the holding that the subject's membership, or its last path to one of
+its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
@@ -169,7 +170,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   anything on or not, keeps the role listed from being deleted.
   `DeleteRole` removes one with its grants; `Roles` lists the built-in and custom roles a scope type
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
-  privileged when it gives what only privileged roles do, or changes access.
+  privileged when it gives what only privileged roles do, or changes access. A check, `Activate`
+  and a change read only the custom roles they and the grants they read name, a change with those
+  the roles it grants list, through others too, so the tenant's other roles cost them nothing;
+  `CustomRoles`, `Roles`, `Grantable`, `SetRole` and `DeleteRole` read every one, which
+  `rbac.MaxCustomRoles` bounds.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
   (`Config.Labels`), each `Ordered` (a level), `AllOf` (compartments) or `AnyOf` (releasable to
   these partners), and a resource carries its label (`Resource.Labels`), stored with it as its path
@@ -241,7 +246,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   redefining a custom role so that its grants give no value they couldn't, as renaming or narrowing
   it, is never refused. Where a dimension is exclusive, a tenant's changes run in turn, so two can't
   each give one value. The check reads every identity a change reaches, so a grant to the tenant's
-  members or the public reads every member. A subject whose grants could give it two anyway, as
+  members or the public reads every member, and of the tenant's custom roles only which values those
+  giving one give: a role giving none, however large, costs it nothing. A subject whose grants could give it two anyway, as
   after a catalog change, holds none of them, whatever the request, a constraint or a deny removes:
   checks and searches of its labels and of the values themselves refuse it, and it can't hand them
   on, but for those a role it holds lists in `GrantableRoles`, which it grants without holding, as
@@ -572,8 +578,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   member or guest of it (`SetMemberships`), and nothing while its membership is suspended. A guest,
   such as one from another tenant, holds what it is granted there and nothing granted to the
   tenant's members. Leaving a tenant (`DeletePrincipal`) removes what the identity held there,
-  its exemptions from denies and its place among approvers too; `DeletePrincipalEverywhere` removes
-  a deleted identity from every tenant.
+  its exemptions from denies and its place among approvers too, but for a deny or an eligibility
+  naming it that commits once it has found those, which it leaves as if set after it: `SetDeny` and
+  `SetEligibility` take no lock of the identities they name, and taking it out of one meanwhile
+  could deadlock with another removal. Removing it again takes it out. `DeletePrincipalEverywhere`
+  removes a deleted identity from every tenant.
 - **Groups:** a group is its tenant's (`SetGroup`, `ImportGroups`), and `group:<id>` names it only
   there. Its members are identities that are members or guests of the tenant, and other groups of
   the tenant, at most `rbac.MaxGroupDepth` deep (`ImportMembers`), each from a source, perhaps
@@ -693,8 +702,10 @@ than as a record of its own, and each record holds the cluster that wrote it (`R
 `system_identifier`), within which a commit record dates it. A change through the package records
 its actor and the call that made it (`Record.How`), and what the host attaches with
 `rbac.WithAudit`: on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
-one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
-one's. That context is what the session that wrote it says; the database role is what the database
+one, made by no one, and so is each time it records in `rbac_expired` that every check and change
+decides no earlier than, as the entity `expired`, in no tenant, keyed by its row's id, as two rows
+can hold one time (see Expiry). Triggers write it, so a write that bypasses the package is recorded
+too, as no one's. That context is what the session that wrote it says; the database role is what the database
 knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
 a deny's principals and exemptions and an eligibility's approvers, which they count to
 `rbac.MaxID` characters rather than bytes, so a write around the package can store those at up
@@ -832,7 +843,22 @@ notification some listener in the cluster has yet to read, and any role may `LIS
 one fills while a listener lags, as one in a long transaction does, and every commit that notifies
 then fails until that listener catches up or ends: where the host's own transactions notify, size
 it for how far its listeners fall behind, and retry such a commit once the queue drains, or keep
-the default and watch `pg_notification_queue_usage()`. `pg_stat_activity` lists a session
+the default and watch `pg_notification_queue_usage()`. And the rest of a commit runs, after the
+deferred triggers, each loaded extension's pre-commit callbacks: postgres_fdw commits there every
+remote transaction the transaction opened, as any read or write of a foreign table opens one, and a
+remote `COMMIT` waits for what the remote server has it wait for, as a remote deferred foreign key's
+check waits for a row another session holds there, which `lock_timeout`, the local session's,
+doesn't bound: in a test, a commit 1.5 s past its record, for as long as the remote lock was held. A
+role with `USAGE` on a postgres_fdw server and a user mapping, or a privilege on a foreign table
+and a mapping another made, can do this, and one with `USAGE` on the wrapper can make a server of
+its own. So can one with none of these that may read or write a view, or call a function that runs
+as its owner, that reaches a foreign table, through the owner's mapping; and `pg_read_all_data` is
+a privilege on every foreign table. The commit record doesn't refuse a
+transaction that used a foreign connection, which PostgreSQL 18's `postgres_fdw_get_connections()`
+could tell it: no check of postgres_fdw's sees another extension's callbacks, as another
+foreign-data wrapper's that commits its own remote transactions, nor a connection a deferred
+trigger of the host's opens after the commit record, so the roles below give the application's role
+none of these. `pg_stat_activity` lists a session
 in its commit, with `COMMIT` as its query, or waiting on `SyncRep`, and `pg_prepared_xacts` a
 prepared transaction until it is committed or rolled back; keep `max_prepared_transactions` at 0,
 the default, so none is. Any session can fire a transaction's deferred triggers before it commits,
@@ -846,7 +872,12 @@ written. In a procedure or a `DO` block, it refuses too a transaction that has a
 open that the block declared in an earlier transaction, whose commit ran it, as a cursor's creation
 time is the block's, and nothing tells it from one declared in this transaction: declare such a
 cursor before the block, in a transaction of its own, and fetch from it in the block by its name, or
-close it before a transaction that changes the package's tables commits. A `FOR` loop over a query,
+close it before a transaction that changes the package's tables commits. A query string of several
+statements, as the simple protocol sends one, as pgx's `Exec` in its simple mode or `psql -c` does,
+counts as one such block, as each of its statements, and each of its transactions, began when it
+did: a transaction of it that changes the package's tables is refused after one of it that declared
+a cursor `WITH HOLD` and committed, which ran it, so declare the cursor in a query string of its
+own. A `FOR` loop over a query,
 which PL/pgSQL runs to its end as each `COMMIT` in it begins, is not refused. The check of a
 temporary table's deferrable trigger reads the catalog as the commit record is written, so it is a
 best-effort defense that holds only where a hostile session can't make temporary objects: the roles
@@ -860,7 +891,10 @@ as long as writing them takes, which only `max_notify_queue_pages` bounds; and t
 settings of synchronous replication and prepared transactions, for as long as they let it. A role
 given `TEMPORARY` can hold it too by the temporary tables its session makes, for as long as dropping
 or emptying them takes, which a large `temp_buffers` lengthens, and by a temporary object's own
-deferrable trigger, against which the check is best-effort.
+deferrable trigger, against which the check is best-effort; and a role given `USAGE` on a
+foreign-data wrapper or a foreign server, or a privilege on a foreign table, or on a view or a
+function that reaches one as its owner, by a remote transaction's commit, for as long as the remote
+server has it wait.
 With `track_commit_timestamp` on, `pg_xact_commit_timestamp` of a record's `TxID`, while the server
 keeps it, shows when the transaction's commit was written, which an auditor can compare with its
 `CommittedAt`.
@@ -899,7 +933,13 @@ other way round, and one that names it first, which makes the session's temporar
 one. A function, operator or type in the views' schema is found before the package's, and runs as
 whoever reads, so `AsOf` refuses that schema where it holds more than its owner's views, another
 role may create in it, or it isn't the role's that owns the package's tables, as a grant, an
-extension installed there or a change of owner since migrating can make it. A statement looks each
+extension installed there or a change of owner since migrating can make it. It finds the views by
+the history they read, among those of the role that owns the package's tables and outside every
+session's temporary schema, as migrating finds them among the role's that migrates: a view of
+history named as one of the tables, that another session made in its temporary schema, as any role
+with `TEMPORARY` that may read history can, or another role's, stood beside them before
+`0033_view_seeks_and_hints`, and every read as of a time in the database failed while it stood, as
+did migrating, which makes the views again. A statement looks each
 name up by the catalog as it is then, whatever its transaction's snapshot, so what is made there as
 a read runs is called by the read's next statement: `AsOf` checks the schema again once its read
 returns, and fails where it has come to be so, on its own transaction once that has rolled back, as
@@ -924,7 +964,12 @@ planned over history, they cost past `jit_above_cost` for an ordinary subject: a
 compiling, and 110 ms without. It tests each version a statement reads for a later one by its
 row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
 history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
-much: a read of thousands of rows costs a few pages for each version. It looks each version's
+much: a read of thousands of rows costs a few pages for each version. The test names the version's
+entity as its own, so no index of history by scope serves it: through history's index of denies by
+scope, read by the tenant and the time alone, every scope skipped, each deny a statement read cost
+every later deny version of the tenant, and beside 6,000 denies on volumes binding its subject,
+`Reachable` read 18 million pages of history, 4.4 s, and `Denies` of one volume 6,875 to list its
+two, before `0033_view_seeks_and_hints`. It looks each version's
 commit record up by its transaction, a few pages more, as `History` does for `CommittedAt`, so
 what it answers turns on nothing an export leaves out. Joined to a group's members
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
@@ -1015,10 +1060,15 @@ have the server load a library or run a program of its choosing; and:
    superuser gives them, or, for one a migration gives it, the schema's owner migrates, which grants
    it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
-   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
-   `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
-   `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`, which
-   every role has unless it is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
+   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history`,
+   `rbac_expired` and `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the
+   functions `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`,
+   which every role has unless it is revoked, and on `rbac_expired_through`, through which
+   `DeleteExpired` records the times it deleted by, and which no role has unless it is granted;
+   only `SELECT` on `rbac_expired`, which every check and change reads, so that role can neither
+   record a time past the database's clock nor move back the latest, as only that function writes
+   it, and nothing on its id's sequence, with which `setval` could fail every run of
+   `DeleteExpired`; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
    id sequence, which a grant on all the schema's sequences can give: `setval` could number a change
    below the one before it, and `AsOf` would read the row as it was before the change. Never
    `TRIGGER`, which `ALL` includes: a trigger runs its function as whoever writes the table, and one
@@ -1063,6 +1113,20 @@ defense, so a role that need not make temporary objects is better left unable to
 package's makes one, `AsOf` included, which reads views migrating made, so none of the roles needs
 `TEMPORARY`, and the check holds against each.
 
+Harden foreign data too: grant the application's role no `USAGE` on any foreign-data wrapper or
+foreign server, and no privilege on a foreign table, none of which PostgreSQL grants `PUBLIC` by
+default. A transaction that reads or writes a foreign table through postgres_fdw commits its remote
+transaction after its commit record is written, and waits for the remote server for as long as that
+has it wait, which nothing the package sets bounds (see above): `USAGE` on a server lets a role map
+itself to it, `USAGE` on a wrapper lets it make a server, and a privilege on a foreign table lets it
+read or write through a mapping for it, or for `PUBLIC`, without either. Nor grant it
+`pg_read_all_data`, which reads every foreign table as one it may read, nor a privilege on a view,
+or `EXECUTE` on a function that runs as its owner (`SECURITY DEFINER`), that reads or writes a
+foreign table: through either, the owner's mapping, or one for `PUBLIC`, opens the remote
+transaction, with no privilege of the role's own on the table, server or wrapper. Nor let it reach
+any other extension that does work it can start, and wait on, in a pre-commit callback. No call of
+the package's uses foreign data, so none of the roles needs any.
+
 ## Running it
 
 - **Tables:** `rbac.Migrate` creates them, prefixed `rbac_`, in the connection's current schema,
@@ -1075,7 +1139,13 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   once its own migrations are applied, as `Migrate` returning nil says.
   On a host's transaction, a `pgx.Tx` or a `DB` whose `Begin` gives a savepoint of one, it applies
   them all in one savepoint, and refuses any isolation but READ COMMITTED: a stricter one's snapshot
-  would miss the writes it waits for.
+  would miss the writes it waits for. Call it there before any change to the package's tables: from
+  `0027_commit_dates` on, each record of history a change writes holds an event deferred to the
+  commit, as from `0020_recorded_prunes` on each record `PruneHistory` deletes does, and PostgreSQL
+  alters no table whose events are pending, as migrations up to `0032_expired_writes` alter
+  history, so where one of those is pending, `Migrate` refuses, as `rbac.ErrInvalid`, a
+  transaction holding such events, before it waits for another replica's migration or applies any.
+  A tool of the host's own applies them before any such change too.
   A migration locks what it changes until it commits, and while it waits for a lock, every check,
   list and change of that table queues behind it, and of those it locked already. So `Migrate` has
   it wait at most 100 ms for any lock: a change that reads the tables in another order than a
@@ -1309,6 +1379,33 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   20,000 to their memberships, as before, looked each up on its own, 20,179 pages that fill 856, and
   code from before it reads the places by statistics alone, every place in the table by those from
   when it was nearly empty. Code from before it and after it run beside each other, applied or not.
+  `0032_expired_writes` has history record every write to `rbac_expired`, as the entity `expired` in
+  no tenant, keyed by an id it gives each row, as two can hold one time, replacing `rbac_record`,
+  which keeps its owner and who may execute it, and widening history's check of entities, which
+  reads no record but locks history against reads and writes until migrating commits, so every
+  change, as each writes history, and every read of history, as `AsOf` and an export, waits for it.
+  Adding the id locks `rbac_expired` against reads and writes until migrating commits too, so every
+  check waits for it as well, for as long as `Migrate` waits for a lock and then runs. It records
+  each row the table holds as its baseline, brings a time past the database's clock back to it,
+  recorded as an `update`, and from then on refuses one past the clock, whoever writes it, by a
+  trigger, `rbac_expired_until`, which no role but its owner may execute. It takes from every role
+  but the table's owner every privilege on it but `SELECT`, on the table and on its column,
+  `TRIGGER` too, which would run a role's function as whoever writes the table, and every privilege
+  on the id's sequence, which the schema's default privileges can grant as it is made. It gives
+  `EXECUTE` on `rbac_expired_through`, which it makes, to each role that held `INSERT` on the table
+  or its column, as `0030_expired_through` gave the application's role of step 3, and to no other,
+  so a deployment that gave its roles their privileges before migrating runs `DeleteExpired` with no
+  step of its own; grant it to a role you give its privileges only after migrating. The function
+  runs as the table's owner, which it is given where another role migrates, and is SQL bound to the
+  table as it is made, so nothing a session names changes what it writes. A trigger already on
+  `rbac_expired` that runs a function a role other than the table's owner or a superuser owns, as a
+  role that held `TRIGGER` on it, which step 3 never gives, could have made, would run that role's
+  code as the table's owner whenever the function writes the table: migrating refuses it with
+  SQLSTATE 42501, having changed nothing; drop it, and migrate again. Code before it runs
+  `DeleteExpired` by writing the table, which the application's role of step 3 may no longer, and
+  fails with SQLSTATE 42501, and code after it, before it is applied, by the function, which doesn't
+  exist yet, and fails as `rbac.ErrInvalid`, saying so: run `DeleteExpired` only from code after it
+  once it is applied. Their checks, searches and changes run beside each other, applied or not.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1360,11 +1457,13 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   what `Config.OnRefused` is told, can still read it forever. Changes to the same rows wait for
   each other by locks named for the schema holding the tables, so sessions reaching them through
   different search_paths still do. A host's transaction that changes the package's tables commits
-  having declared no cursor `WITH HOLD`, and with no enabled deferrable trigger on a temporary table
-  of its session: history refuses each as the transaction commits, with SQLSTATE 0A000, as it would
-  have its changes counted before they commit (see History), or where constraints were set
-  immediate, as the statement that did, or the first change after it. And the rest of its commit
-  waits for no lock past 100 ms, failing with SQLSTATE 55P03, where its `lock_timeout` is longer.
+  having declared no cursor `WITH HOLD`, nor with one open that an earlier transaction of its
+  procedure, `DO` block or query string of several statements declared, and with no enabled
+  deferrable trigger on a temporary table of its session: history refuses each as the transaction
+  commits, with SQLSTATE 0A000, as it would have its changes counted before they commit (see
+  History), or where constraints were set immediate, as the statement that did, or the first change
+  after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
+  where its `lock_timeout` is longer.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only compiled
   conditions are cached. Read a resource's ancestors and attributes from where they are stored,
   never from request input, no earlier than the content they protect, and from the primary. A
@@ -1407,24 +1506,32 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   spent 500 of its 650 ms compiling. As of a time, every statement costs so for any subject, as
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
-- **Planner settings:** every statement a check, list or change sends on the package's tables, but
-  as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
-  `Conflicts` turn JIT off for theirs. Each sets them in the round trip that sends the statement,
-  several of a change's together, and puts the session's back after it, keeping each meanwhile in a
-  variable of the package's own named for it, as `rbac.enable_seqscan` and `rbac.jit`: a connection
-  plans a statement once for all its runs, and one planned while a table fit in a page read every
-  row of it, whatever the statement's shape, until an analysis had it planned again, as reading a
-  page costs less than descending any index. The statements are written so that, with them off, a
-  plan reaches its rows by key, by the group, the principal, the scope or the id the indexes lead
-  to, whatever the statistics: statistics from a near-empty table count every value as distinct, so
-  an index leading to the tenant looks as few rows to read by the tenant alone as by a key, and a
-  plan for rows sorted in a table's order reads a whole index in that order. A plan made while the
-  tables were small read 3,680 pages of grants, 7,546 of places and 5,772 of eligibilities to delete
-  one group beside 20,000 of each, and `Reachable` 18,744 of grants. The statement deleting a group
-  is planned so too, and with it the foreign key's cascade to its places, which PostgreSQL plans as
-  the first deletion in a session runs it and keeps: a host's own deletion of a group, planned with
-  sequential scans on while the places were few, leaves a plan that reads every one. `Filter`'s
-  condition runs in the host's statement, which the host plans (Lists).
+- **Planner settings:** every statement a check, list or change sends to read the package's tables,
+  but as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
+  `Conflicts` turn JIT off for theirs; and each that finds rows by where they are stored, as places
+  in groups, which have no id, turns TID scans on, should the host's session have them off, as with
+  them off too a plan read every place to remove one. Each sets them in the round trip that sends
+  the statement, several of a change's together, and puts the session's back after it, keeping each
+  meanwhile in a variable of the package's own named for it, as `rbac.enable_seqscan` and
+  `rbac.jit`: a connection plans a statement once for all its runs, and one planned while a table
+  fit in a page read every row of it, whatever the statement's shape, until an analysis had it
+  planned again, as reading a page costs less than descending any index. The statements are written
+  so that, with them off, a plan reaches its rows by key, by the group, the principal, the scope or
+  the id the indexes lead to, whatever the statistics: statistics from a near-empty table count
+  every value as distinct, so an index leading to the tenant looks as few rows to read by the tenant
+  alone as by a key, and a plan for rows sorted in a table's order reads a whole index in that
+  order. A plan made while the tables were small read 3,680 pages of grants, 7,546 of places and
+  5,772 of eligibilities to delete one group beside 20,000 of each, and `Reachable` 18,744 of
+  grants; beside 40,000 custom roles of other tenants, `Explain` and `CustomRoles` read 817 pages of
+  them, and `Activate` 1,634. No index finds whom denies exempt and eligibilities name as approvers
+  across tenants, so `DeletePrincipalEverywhere` reads every row of both, by a range of every row's
+  `ctid`, a page at a time in the table's order, which sequential scans being off doesn't plan away:
+  with them off and no such range, or TID scans off too, a plan read each through a whole index, in
+  its order, ten times the pages the table holds. The statement deleting a group is planned so too,
+  and with it the foreign key's cascade to its places, which PostgreSQL plans as the first deletion
+  in a session runs it and keeps: a host's own deletion of a group, planned with sequential scans on
+  while the places were few, leaves a plan that reads every one. `Filter`'s condition runs in the
+  host's statement, which the host plans (Lists).
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
@@ -1443,7 +1550,29 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   membership's for the places it removes with one, which ended by the run's `Config.Now` and the
   database's clock both: a host whose clock runs
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
-  a run that removes nothing records nothing. A read of an actor's or a subject's grants, groups and
+  a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
+  deletes the times no later than its own and adds its own, refusing one past the database's clock,
+  and history records each write, as one of the package's tables (History). A read takes the latest
+  time no later than the database's clock as it reads it, which takes nothing from a time a run
+  recorded: no write records one past the clock as its own statement began, which is before it
+  commits, and so before a read that sees it takes its snapshot. Bounded by the clock as the read's
+  statement began, a statement sent in a simple query, as by a pool that prepares none, which takes
+  its snapshot once it is planned, after any lock it waited for, could find a run's removals and
+  decide before what they removed ended. So a role that may execute the function, as the
+  application's may, can move what a
+  call decides no earlier than up to that clock and no further, as a run could, and never back, and
+  history records each time it wrote; a time past the clock, which only a role that may disable the
+  table's triggers can leave there, or the database's clock going back, has a call of a host behind
+  that clock decide at it as each of its statements reads it, and such a host's changes tried again
+  (`rbac.ErrConflict`) until the clock passes the time. The bound takes nothing from a time a run
+  recorded only where a read bounds it by the clock the run recorded it by, which hasn't gone back
+  since: where that clock has gone back, or on a hot standby, whose own clock can be behind the
+  primary's, a read can cut a run's time to before what the run removed ended, and until the clock
+  passes that time decide by the state the run left, which no moment held. Keep the database's
+  clock from stepping back, and make checks, and run `Filter`'s conditions, on the primary, or on a
+  standby whose clock is kept with it; `AsOf`, which doesn't read the table, reads on a standby as
+  before.
+  A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
   host, decides no earlier than the latest time recorded that its snapshot sees: every row it finds
@@ -1459,8 +1588,10 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   removes so while it runs: with `DeleteExpired` every 50 ms beside four sessions granting, without
   pause, roles that end 200 ms on, none of about 1,650 changes was tried again. `Filter`'s condition
   with the label column, whose holding the query doesn't read, keeps no row where the query sees a
-  time as late as the earliest that the subject's membership, or a place in a group of its own or of
-  a group it is in, ended after `Filter` read the holding: build it again. Before then, the subject's
+  time as late as the first after `Filter` read the holding that the subject's keys change by time
+  alone, as its membership, or its last path to one of its groups, ends: build it again. A place
+  that ends while another, from another source or through another group, keeps it in the group
+  changes none of them. Before then, the subject's
   keys and the denies binding it are those of `Filter`'s time, and the grants in force no more, so
   each row the query keeps the subject could read at `Filter`'s time; a run by an earlier time, as
   every one is for a subject whose membership and places don't end, leaves them as they were.

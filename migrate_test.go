@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
+	"regexp"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,6 +259,8 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := []string{
+				"rbac_expired_through search_path=pg_catalog, pg_temp",
+				"rbac_expired_until search_path=pg_catalog, pg_temp",
 				"rbac_group_members enable_seqscan=off",
 				"rbac_history_append_only search_path=pg_catalog, pg_temp",
 				"rbac_history_commit search_path=pg_catalog, pg_temp, plan_cache_mode=force_generic_plan, enable_seqscan=off",
@@ -264,6 +269,283 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 			}
 			if !slices.Equal(settings, want) {
 				t.Errorf("the package's functions are set as %q, want %q", settings, want)
+			}
+		})
+	}
+}
+
+// Migrating to 0032 records what rbac_expired holds, as its baseline, each row by the id it gives
+// it, brings a time there past the database's clock back to it, recorded as an update, and leaves
+// each role that could write the table only SELECT on it, and rbac_expired_through in its place,
+// and no role any privilege on the id's sequence, which the schema's default privileges grant the
+// application's role as it is made: the application's role, hardened as the README said before,
+// runs DeleteExpired as before with no step of its own, and the latest time it wrote stands no
+// later than the database's clock.
+func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	var before time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	past, future := before.Add(-time.Hour).Truncate(time.Second), before.AddDate(1, 0, 0).Truncate(time.Second)
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1), ($2)`, past, future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.adminPool.Exec(ctx, `ALTER DEFAULT PRIVILEGES IN SCHEMA `+r.schema+` GRANT ALL ON SEQUENCES TO `+r.app); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	var times []time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT array_agg(until ORDER BY until) FROM rbac_expired`).Scan(&times); err != nil {
+		t.Fatal(err)
+	}
+	var after time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if len(times) != 2 || !times[0].Equal(past) || times[1].Before(before) || times[1].After(after) {
+		t.Fatalf("rbac_expired holds %v once migrated, not %v and the time it migrated at", times, past)
+	}
+	kept, brought := expiredID(t, r.appPool, past), expiredID(t, r.appPool, times[1])
+	want := []expiredRecord{
+		{kept, expiredTime(past), "baseline", "Migrate", r.admin},
+		{brought, expiredTime(future), "baseline", "Migrate", r.admin},
+		{brought, expiredTime(times[1]), "update", "Migrate", r.admin},
+	}
+	if got := expiredRecords(t, r.appPool); !slices.Equal(got, want) {
+		t.Errorf("history records rbac_expired as %q, want %q", got, want)
+	}
+	var writes, reads, executes, public, numbers bool
+	if err := r.super.QueryRow(ctx, `SELECT has_table_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER'),
+		has_table_privilege($1, $2 || '.rbac_expired', 'SELECT'),
+		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
+		has_function_privilege('public', $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
+		has_sequence_privilege($1, pg_get_serial_sequence($2 || '.rbac_expired', 'id'), 'USAGE, SELECT, UPDATE')`,
+		r.app, r.schema).Scan(&writes, &reads, &executes, &public, &numbers); err != nil {
+		t.Fatal(err)
+	}
+	if writes || !reads || !executes || public || numbers {
+		t.Errorf("once migrated, the application's role writes rbac_expired %t, reads it %t and executes rbac_expired_through %t, every role executes it %t, and the application's role uses the id's sequence %t",
+			writes, reads, executes, public, numbers)
+	}
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(r.appPool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); err != nil || n != 1 {
+		t.Errorf("DeleteExpired on the application's role once migrated removed %d rows: %v", n, err)
+	}
+}
+
+// A role holding INSERT and UPDATE on rbac_expired's column alone, not on the table, which a revoke
+// of the table's privileges from the roles holding them never reaches, holds neither once migrated
+// to 0032, and executes rbac_expired_through in place of its INSERT, as a role holding the table's
+// does.
+func TestMigratingTakesTheWritesOfExpiredsColumnToo(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	for _, sql := range []string{
+		`REVOKE INSERT, UPDATE, DELETE ON rbac_expired FROM ` + r.app,
+		`GRANT INSERT (until), UPDATE (until) ON rbac_expired TO ` + r.app,
+	} {
+		if _, err := r.adminPool.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	const write = `INSERT INTO rbac_expired (until) VALUES (clock_timestamp() - interval '1 hour')`
+	if _, err := r.appPool.Exec(ctx, write); err != nil {
+		t.Fatalf("by its column's INSERT, before migrating: %v", err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	var writes, executes bool
+	if err := r.super.QueryRow(ctx, `SELECT has_any_column_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE'),
+		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE')`, r.app, r.schema).Scan(&writes, &executes); err != nil {
+		t.Fatal(err)
+	}
+	if writes || !executes {
+		t.Errorf("once migrated, the application's role writes rbac_expired's column %t and executes rbac_expired_through %t", writes, executes)
+	}
+	if _, err := r.appPool.Exec(ctx, write); sqlState(err) != "42501" {
+		t.Errorf("once migrated, the application's role wrote rbac_expired by its column's INSERT: %v", err)
+	}
+}
+
+// A trigger on rbac_expired that runs a function a role other than the table's owner or a
+// superuser owns, as a role holding TRIGGER on it could have made, which the README's roles never
+// do, would run that role's code as the table's owner once rbac_expired_through writes the table,
+// whoever calls it: migrating to 0032 refuses it, having changed nothing, and goes on once it is
+// dropped, beside triggers whose functions the table's owner and a superuser own, which run only
+// what they wrote.
+func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	// As a superuser: the application's role, which may make no function, can't here.
+	for _, sql := range []string{
+		`CREATE FUNCTION ` + r.schema + `.planted() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`ALTER FUNCTION ` + r.schema + `.planted() OWNER TO ` + r.app,
+		`CREATE TRIGGER planted BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.planted()`,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42501" ||
+		!strings.Contains(err.Error(), "trigger planted runs planted(), which "+r.app+" owns") {
+		t.Fatalf("migrating with a trigger on rbac_expired running the application's role's function: %v", err)
+	}
+	var applied int
+	var through bool
+	if err := r.adminPool.QueryRow(ctx, `SELECT max(version), to_regprocedure('rbac_expired_through(timestamptz)') IS NOT NULL
+		FROM rbac_migrations`).Scan(&applied, &through); err != nil || applied != 31 || through {
+		t.Fatalf("migrating, refused, applied up to %d and made rbac_expired_through %t: %v", applied, through, err)
+	}
+	for _, sql := range []string{
+		`DROP TRIGGER planted ON ` + r.schema + `.rbac_expired`,
+		`CREATE FUNCTION ` + r.schema + `.owners() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`ALTER FUNCTION ` + r.schema + `.owners() OWNER TO ` + r.admin,
+		`CREATE TRIGGER owners BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.owners()`,
+		`CREATE FUNCTION ` + r.schema + `.superusers() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`CREATE TRIGGER superusers BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.superusers()`,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("migrating once the trigger is dropped: %v", err)
+	}
+}
+
+// Code from 0032_expired_writes on, run before it is applied, fails DeleteExpired as ErrInvalid,
+// saying to migrate, as each of its batches calls rbac_expired_through, rather than as a call to a
+// function that doesn't exist, with PostgreSQL's hint to cast its arguments; and removes nothing.
+func TestDeleteExpiredBeforeItsMigrationSaysToMigrate(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(pool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "0032_expired_writes") || n != 0 {
+		t.Errorf("DeleteExpired before 0032_expired_writes is applied removed %d rows: %v", n, err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rbac_grants`).Scan(&left); err != nil || left != 1 {
+		t.Errorf("%d grants left: %v", left, err)
+	}
+}
+
+// A batch of DeleteExpired of the code before 0032 locks rbac_expired as its statement begins, and
+// writes history only as it ends, as the triggers recording what it removes fire, and a change
+// reads rbac_expired before it writes, and history as it does: migrating, which locked history first
+// and then waited for the table, deadlocked with such a batch in flight, which waited for history,
+// until one of them gave way, and adding the table's id, which locks it against reads too, would have
+// with a change. Here a transaction stands in for each: it writes rbac_expired, or reads it, and
+// once migrating, on a host's transaction that waits for locks as long as it takes, waits for it,
+// removes a grant, which history records, and commits. Both go on.
+func TestMigratingToExpiredWritesWaitsForABatchOfTheCodeBefore(t *testing.T) {
+	for name, first := range map[string]string{
+		"a batch":  `INSERT INTO rbac_expired (until) VALUES (clock_timestamp() - interval '1 hour')`,
+		"a change": `SELECT max(until) FROM rbac_expired`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			pool := pgtest.Open(t, "")
+			if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", "0032"); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, pool, "0032")
+			if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login')`); err != nil {
+				t.Fatal(err)
+			}
+			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			batch, err := pool.Begin(bounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = batch.Rollback(context.WithoutCancel(ctx)) }()
+			var pid int32
+			if err := batch.QueryRow(bounded, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := batch.Exec(bounded, first); err != nil {
+				t.Fatal(err)
+			}
+			host, err := pool.Begin(bounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+			if _, err := host.Exec(bounded, `SET LOCAL lock_timeout = 0`); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- rbac.Migrate(bounded, host) }()
+			for waiting := false; !waiting; {
+				select {
+				case err := <-done:
+					t.Fatalf("migrating didn't wait for %s: %v", name, err)
+				default:
+					if err := pool.QueryRow(bounded, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`,
+						pid).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if _, err := batch.Exec(bounded, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:y'`); err != nil {
+				t.Errorf("%s, as migrating waited for it: %v", name, err)
+			}
+			if err := batch.Commit(bounded); err != nil {
+				t.Errorf("%s's commit: %v", name, err)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("migrating beside %s: %v", name, err)
+			}
+			if err := host.Commit(bounded); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -312,6 +594,648 @@ func TestMigrateOnAHostsTransactionLeavesItsLockTimeout(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Migrate on a host's transaction comes before any change in it to the package's tables: from
+// 0027_commit_dates on, each record of history a change writes holds an event deferred to the
+// commit, as from 0020_recorded_prunes on each record a prune deletes does, and PostgreSQL alters no
+// table whose events are pending, as migrations up to rbac.HistoryAltered alter history. Where one
+// of those is pending, Migrate refuses a transaction holding such events, as ErrInvalid, before it
+// applies any, or waits for another replica's migration, whose migration altering history can't
+// commit while the transaction holds history, and the transaction goes on to commit its change with
+// its commit record: one that changed the tables; pruned history, with the commit record's trigger
+// on or off, or before 0027, as a release then pruned; or wrote a record of history as its owner,
+// naming no cluster. It migrates one that took a transaction id writing no history, also where a
+// commit record or a prune's record restored from another cluster holds that id; one that changed
+// the tables before 0027, whose records hold no events, and whose change counts from its own date,
+// with no commit record; and one that changed them once no migration pending alters history, which
+// a later migration that does fails until HistoryAltered names it.
+func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
+	const (
+		change = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`
+		took = `SELECT pg_current_xact_id()`
+		// As a host's tool restoring history writes it.
+		owned = `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+		VALUES (now(), 't1', 'grant', 'restored', 'create', '{}', 'restore')`
+		// As PruneHistory of a release before 0027 pruned a grant's version.
+		pruned = `SET LOCAL rbac.prune = 'on';
+		WITH gone AS (DELETE FROM rbac_history WHERE entity = 'grant' RETURNING txid, id)
+		INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+		SELECT now(), '', 'history', 'pruned', 'prune', jsonb_build_object('last', jsonb_build_object('txid', txid::text, 'id', id)), 'PruneHistory'
+		FROM gone`
+	)
+	altering, after := fmt.Sprintf("%04d", rbac.HistoryAltered), fmt.Sprintf("%04d", rbac.HistoryAltered+1)
+	for _, c := range []struct {
+		name, from, seed, write, restored string
+		refused, replica, prune, off      bool
+		commits                           int
+	}{
+		{name: "a change, with a migration altering history pending", from: altering, write: change, refused: true, commits: 1},
+		{name: "a change, with a migration altering history pending, as another replica migrates", from: altering, write: change, refused: true, replica: true, commits: 1},
+		{name: "a prune, with a migration altering history pending", from: altering, refused: true, prune: true},
+		{name: "a prune, with the commit record's trigger off and a migration altering history pending", from: altering, refused: true, prune: true, off: true},
+		{name: "a prune before history recorded commits", from: commitDates(t), seed: change, write: pruned, refused: true},
+		{name: "a record history's owner writes naming no cluster, with a migration altering history pending", from: altering, write: owned, refused: true},
+		{name: "a transaction id, with a migration altering history pending", from: altering, write: took},
+		{name: "a transaction id a commit record restored from another cluster holds, with a migration altering history pending", from: altering, write: took, restored: "commit"},
+		{name: "a transaction id a prune's record restored from another cluster holds, with a migration altering history pending", from: altering, write: took, restored: "prune"},
+		{name: "a change before history recorded commits", from: commitDates(t), write: change},
+		{name: "a change, with none pending altering history", from: after, write: change, commits: 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.from == after && latestMigration(t) <= rbac.HistoryAltered {
+				t.Skip("no migration after the last that alters history")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			pool := pgtest.Open(t, "")
+			migrateFiles(t, pool, "", c.from)
+			recordMigrations(t, pool, c.from)
+			if c.seed != "" {
+				if _, err := pool.Exec(ctx, c.seed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A grant's first version, which its change supersedes, for a prune, once an export has read
+			// both.
+			var through rbac.Cursor
+			var before time.Time
+			if c.prune {
+				for _, sql := range []string{change, `UPDATE rbac_grants SET note = 'changed'`} {
+					if _, err := pool.Exec(ctx, sql); err != nil {
+						t.Fatal(err)
+					}
+				}
+				h := migrated(t, pool)
+				drain(t, h, &through, 2)
+				before = dbNow(t, h)
+			}
+			if c.off {
+				if _, err := pool.Exec(ctx, `ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if c.write != "" {
+				if _, err := tx.Exec(ctx, c.write); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.prune {
+				if n, err := rbac.PruneHistory(ctx, tx, before, through); err != nil || n == 0 {
+					t.Fatalf("PruneHistory = %d, %v", n, err)
+				}
+			}
+			if c.restored != "" {
+				var txid, theirs string
+				if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text,
+					(SELECT CASE s.system_identifier WHEN 1 THEN 2 ELSE 1 END::text FROM pg_control_system() s)`).Scan(&txid, &theirs); err != nil {
+					t.Fatal(err)
+				}
+				restore := fakeCommit("2000-01-01 00:00:00", theirs, txid)
+				if c.restored == "prune" {
+					// A prune's record names no cluster.
+					restore = `INSERT INTO rbac_history (effective_at, txid, tenant, entity, key, op, after, how)
+						VALUES (timestamptz '2000-01-01 00:00:00', '` + txid + `'::xid8, '', 'history', 'restored', 'prune', '{}', 'PruneHistory')`
+				}
+				for _, sql := range []string{
+					`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`,
+					restore,
+					`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`,
+				} {
+					if _, err := pool.Exec(ctx, sql); err != nil {
+						t.Fatalf("%s: %v", sql, err)
+					}
+				}
+			}
+			if c.replica {
+				var schema string
+				if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+					t.Fatal(err)
+				}
+				replica, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = replica.Rollback(ctx) }()
+				sql, args := rbac.MigrateLock(schema)
+				if _, err := replica.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+				// The replica's migration altering history waits for the transaction, which holds
+				// history, so it can't commit before the transaction ends: what the transaction reads as
+				// applied before it waits for the replica, it would read after.
+				names, err := fs.Glob(rbac.Migrations(), altering+"_*.sql")
+				if err != nil || len(names) != 1 {
+					t.Fatalf("migration %s: %v, %v", altering, names, err)
+				}
+				migration, err := fs.ReadFile(rbac.Migrations(), names[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := replica.Exec(ctx, `SET LOCAL lock_timeout = '100ms'`); err != nil {
+					t.Fatal(err)
+				}
+				var pg *pgconn.PgError
+				if _, err := replica.Exec(ctx, string(migration)); !errors.As(err, &pg) || pg.Code != "55P03" {
+					t.Fatalf("%s beside a transaction that wrote history: %v", names[0], err)
+				}
+				// Past which a wait for the replica fails as a conflict, not a refusal.
+				if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = rbac.Migrate(ctx, tx)
+			if c.refused && !errors.Is(err, rbac.ErrInvalid) || !c.refused && err != nil {
+				t.Fatalf("Migrate on a host's transaction after %s: %v", c.name, err)
+			}
+			want := latestMigration(t)
+			if c.refused {
+				if _, err := fmt.Sscanf(c.from, "%04d", &want); err != nil {
+					t.Fatal(err)
+				}
+				want--
+			}
+			if v := migratedTo(t, tx); v != want {
+				t.Errorf("migrated to %d, not %d", v, want)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var grants, commits int
+			if err := pool.QueryRow(ctx, `SELECT count(DISTINCT g.id), count(c.id) FROM rbac_history g
+				LEFT JOIN rbac_history c ON c.txid = g.txid AND c.entity = 'commit' WHERE g.entity = 'grant'`).Scan(&grants, &commits); err != nil {
+				t.Fatal(err)
+			}
+			if c.write == change && (grants != 1 || commits != c.commits) {
+				t.Errorf("the change committed %d grants with %d commit records, not %d", grants, commits, c.commits)
+			}
+		})
+	}
+}
+
+// HistoryAltered names the last migration that may alter history's table, as PostgreSQL refuses in
+// a transaction holding events of its deferred triggers (SQLSTATE 55006), as alteringHistory finds
+// them. A migration that does so fails this until HistoryAltered names it, before Migrate on a host's
+// transaction lets a change in it through to fail the migration; and HistoryAltered naming one that
+// doesn't fails it too, before Migrate refuses a transaction no pending migration would.
+func TestHistoryAlteredNamesTheLastMigrationAlteringHistory(t *testing.T) {
+	sqls := migrationSQL(t)
+	names := slices.Sorted(maps.Keys(sqls))
+	texts := make([]string, len(names))
+	for i, name := range names {
+		texts[i] = sqls[name]
+	}
+	last := ""
+	for i, alters := range alteringHistory(texts) {
+		if alters {
+			last = names[i]
+		}
+	}
+	var version int
+	if _, err := fmt.Sscanf(last, "%04d_", &version); err != nil || version != rbac.HistoryAltered {
+		t.Errorf("the last migration altering history is %s, not the %d HistoryAltered names: %v", last, rbac.HistoryAltered, err)
+	}
+}
+
+// alteringHistory finds history's table altered however a migration writes it: in any case, quoted
+// or qualified, in dynamic SQL, in a DO block, or in a function a later migration calls; and not in
+// a comment, a message, or history's column named cluster.
+func TestAlteringHistoryIsFoundHoweverAMigrationWritesIt(t *testing.T) {
+	const alters = `CREATE FUNCTION rbac_alter() RETURNS void LANGUAGE plpgsql AS $$
+		BEGIN EXECUTE pg_catalog.format('ALTER TABLE %I.%I VALIDATE CONSTRAINT c', pg_catalog.current_schema(), 'rbac_history'); END $$;`
+	for _, c := range []struct {
+		sqls []string
+		want []bool
+	}{
+		{[]string{`alter table RBAC_HISTORY add column x int;`}, []bool{true}},
+		{[]string{`ALTER TABLE IF EXISTS ONLY "s"."rbac_history" SET (fillfactor = 90);`}, []bool{true}},
+		{[]string{`/* ALTER TABLE rbac_grants */ CREATE UNIQUE INDEX i ON ONLY public.rbac_history (id);`}, []bool{true}},
+		{[]string{`CREATE CONSTRAINT TRIGGER t AFTER INSERT ON rbac_history DEFERRABLE FOR EACH ROW EXECUTE FUNCTION f();`}, []bool{true}},
+		{[]string{`DROP TRIGGER t ON rbac_history;`, `DROP TABLE rbac_grants, rbac_history;`}, []bool{true, true}},
+		{[]string{`TRUNCATE rbac_grants, rbac_history;`, `TRUNCATE TABLE ONLY %s;`}, []bool{true, true}},
+		{[]string{`CLUSTER VERBOSE rbac_history USING rbac_history_pkey;`, `REINDEX INDEX rbac_history_entity;`}, []bool{true, true}},
+		{[]string{`DROP FUNCTION rbac_history_commit() CASCADE;`, `DROP SCHEMA s CASCADE;`}, []bool{true, true}},
+		// Its name a placeholder, or built where it runs.
+		{[]string{`DO $do$ DECLARE history text := format('%I.rbac_history', current_schema());
+			BEGIN EXECUTE format('ALTER TABLE %s SET (fillfactor = 90)', history); END $do$;`}, []bool{true}},
+		{[]string{`DO $$ BEGIN EXECUTE 'ALTER ' || 'TABLE ' || quote_ident('rbac_' || 'history') || ' SET (fillfactor = 90)'; END $$;`}, []bool{true}},
+		{[]string{`DO $$ DECLARE s text; BEGIN SELECT q INTO s FROM queued; EXECUTE s; END $$;`}, []bool{true}},
+		{[]string{`DO $$ BEGIN EXECUTE format(CASE WHEN true THEN 'ALTER TABLE x' END); END $$;`}, []bool{true}},
+		// A -- in a string hides nothing after it.
+		{[]string{`DO $$ BEGIN EXECUTE 'COMMENT ON TABLE rbac_grants IS ''--'''; ALTER TABLE rbac_history SET (fillfactor = 90); END $$;`}, []bool{true}},
+		// By a function a migration made, and one that calls it.
+		{[]string{alters, `SELECT 1;`, `SELECT rbac_alter();`}, []bool{true, false, true}},
+		{[]string{alters, `CREATE PROCEDURE rbac_both() LANGUAGE sql AS 'SELECT rbac_alter()';`, `CALL rbac_both();`}, []bool{true, true, true}},
+		{[]string{
+			`-- ALTER TABLE rbac_history
+			/* ALTER TABLE rbac_history /* nested */ TRUNCATE rbac_history */ SELECT 1;`,
+			`SELECT h.cluster FROM rbac_history h WHERE h.cluster IS NOT NULL;`,
+			`CREATE FUNCTION f() RETURNS bigint LANGUAGE sql AS $$ SELECT CASE WHEN true THEN cluster END FROM rbac_history $$;`,
+			`DO $$ BEGIN RAISE EXCEPTION 'cannot alter history' USING HINT = 'Drop or disable the trigger.'; END $$;`,
+			`ALTER TABLE rbac_grants ADD COLUMN x int; CREATE INDEX i ON rbac_grants (x); TRUNCATE rbac_grants; CLUSTER rbac_grants;`,
+			`CREATE TRIGGER t BEFORE TRUNCATE ON rbac_grants FOR EACH STATEMENT EXECUTE FUNCTION rbac_no_truncate();`,
+			`INSERT INTO rbac_history (op) VALUES ('create'), ('truncate'); SELECT has_function_privilege('f()', 'EXECUTE');`,
+			`DO $$ BEGIN EXECUTE format('GRANT SELECT ON %s TO %s', 'rbac_history', 'r'); EXECUTE 'SELECT 1' || 'FROM rbac_history'; END $$;`,
+			`LOCK TABLE rbac_history IN SHARE MODE; ANALYZE rbac_history; DROP INDEX rbac_history_entity CASCADE;`,
+		}, []bool{false, false, false, false, false, false, false, false, false}},
+	} {
+		if got := alteringHistory(c.sqls); !slices.Equal(got, c.want) {
+			t.Errorf("%q: %v, not %v", c.sqls, got, c.want)
+		}
+	}
+}
+
+// alteringHistory reports, for each of sqls, migrations in order, whether it may alter history's
+// table, as altersHistory reads a statement: by a statement of its own, of dynamic SQL in it, or of
+// the body of a function or procedure a migration made, which it, or one it calls, calls by name.
+func alteringHistory(sqls []string) []bool {
+	type migration struct {
+		statements []sqlStatement
+		owners     []string
+	}
+	ms := make([]migration, len(sqls))
+	for i, sql := range sqls {
+		words := sqlWords(sql, 0)
+		ms[i] = migration{sqlStatements(words), sqlBodies(words)}
+	}
+	functions := map[string]bool{}
+	altering := make([]bool, len(sqls))
+	for found := true; found; {
+		found = false
+		for i, m := range ms {
+			for _, s := range m.statements {
+				if !altersHistory(s) && !s.calls(functions) {
+					continue
+				}
+				altering[i] = true
+				if f := m.owners[s.at]; f != "" && !functions[f] {
+					functions[f], found = true, true
+				}
+			}
+		}
+	}
+	return altering
+}
+
+// sqlBoundary stands among sqlWords where the text of a string or a dollar-quoted body begins or
+// ends.
+const sqlBoundary = "\x00"
+
+// sqlWord is a token of SQL, and how many strings and bodies deep it stands.
+type sqlWord struct {
+	text  string
+	depth int
+}
+
+var (
+	dollarQuote = regexp.MustCompile(`^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$`)
+	placeholder = regexp.MustCompile(`^%(?:[0-9]+\$)?-?(?:[0-9]+|\*(?:[0-9]+\$)?)?[sIL]`)
+)
+
+// sqlWords splits sql into tokens, leaving out its comments: words, lowercased unless quoted;
+// numbers; format()'s placeholders, as %I and %1$s; || and each other character of punctuation; and
+// the text of each string and dollar-quoted body, split so in turn, as dynamic SQL runs it, between
+// two sqlBoundary.
+func sqlWords(sql string, depth int) []sqlWord {
+	var out []sqlWord
+	add := func(text string) { out = append(out, sqlWord{text, depth}) }
+	quoted := func(text string) {
+		add(sqlBoundary)
+		out = append(out, sqlWords(text, depth+1)...)
+		add(sqlBoundary)
+	}
+	// The text up to the quote that ends it, which two of it stand for in it, and how much of sql
+	// that takes.
+	until := func(i int, quote byte) (string, int) {
+		var b strings.Builder
+		j := i + 1
+		for ; j < len(sql); j++ {
+			if sql[j] == quote {
+				if j+1 < len(sql) && sql[j+1] == quote {
+					b.WriteByte(quote)
+					j++
+					continue
+				}
+				break
+			}
+			b.WriteByte(sql[j])
+		}
+		return b.String(), j + 1
+	}
+	for i := 0; i < len(sql); {
+		rest, c := sql[i:], sql[i]
+		switch {
+		case strings.HasPrefix(rest, "--"):
+			if n := strings.IndexByte(rest, '\n'); n >= 0 {
+				i += n
+			} else {
+				i = len(sql)
+			}
+		case strings.HasPrefix(rest, "/*"):
+			nested, j := 1, i+2
+			for j < len(sql) && nested > 0 {
+				switch {
+				case strings.HasPrefix(sql[j:], "/*"):
+					nested, j = nested+1, j+2
+				case strings.HasPrefix(sql[j:], "*/"):
+					nested, j = nested-1, j+2
+				default:
+					j++
+				}
+			}
+			i = j
+		case c == '\'':
+			var text string
+			text, i = until(i, '\'')
+			quoted(text)
+		case c == '"':
+			var text string
+			text, i = until(i, '"')
+			add(text)
+		case c == '$' && dollarQuote.MatchString(rest):
+			tag := dollarQuote.FindString(rest)
+			body := rest[len(tag):]
+			if n := strings.Index(body, tag); n >= 0 {
+				body, i = body[:n], i+2*len(tag)+n
+			} else {
+				i = len(sql)
+			}
+			quoted(body)
+		case c == '%' && placeholder.MatchString(rest):
+			p := placeholder.FindString(rest)
+			add(p)
+			i += len(p)
+		case wordByte(c, true), c >= '0' && c <= '9':
+			j := i + 1
+			for j < len(sql) && wordByte(sql[j], false) {
+				j++
+			}
+			add(strings.ToLower(sql[i:j]))
+			i = j
+		case strings.HasPrefix(rest, "||"):
+			add("||")
+			i += 2
+		case c <= ' ':
+			i++
+		default:
+			add(string(c))
+			i++
+		}
+	}
+	return out
+}
+
+// wordByte reports whether c, first or not, belongs to a word as PostgreSQL reads an identifier.
+func wordByte(c byte, first bool) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80 ||
+		!first && (c >= '0' && c <= '9' || c == '$')
+}
+
+// isWord reports whether a token is a word, a name or a keyword.
+func isWord(token string) bool {
+	return token != "" && wordByte(token[0], true)
+}
+
+// sqlStatement is a statement among sqlWords, its words from at on, and whether || joins it to what
+// stands beside it, as a string of dynamic SQL built in parts.
+type sqlStatement struct {
+	words  []string
+	at     int
+	joined bool
+}
+
+// calls reports whether s calls one of functions by name.
+func (s sqlStatement) calls(functions map[string]bool) bool {
+	for i, word := range s.words {
+		if functions[word] && i+1 < len(s.words) && s.words[i+1] == "(" {
+			return true
+		}
+	}
+	return false
+}
+
+// sqlStatements splits words at each semicolon and sqlBoundary, and after each keyword after which
+// PL/pgSQL begins a statement, so that each starts with what it does.
+func sqlStatements(words []sqlWord) []sqlStatement {
+	var out []sqlStatement
+	start := 0
+	end := func(i int) {
+		if i > start {
+			s := sqlStatement{at: start}
+			for _, w := range words[start:i] {
+				s.words = append(s.words, w.text)
+			}
+			s.joined = start >= 2 && words[start-1].text == sqlBoundary && words[start-2].text == "||" ||
+				i+1 < len(words) && words[i].text == sqlBoundary && words[i+1].text == "||"
+			out = append(out, s)
+		}
+		start = i + 1
+	}
+	for i, w := range words {
+		switch w.text {
+		case ";", sqlBoundary, "begin", "then", "else", "loop", "declare":
+			end(i)
+		}
+	}
+	end(len(words))
+	return out
+}
+
+// sqlBodies is, for each of words, the name of the function or procedure a CREATE statement makes
+// whose body it stands in, or "".
+func sqlBodies(words []sqlWord) []string {
+	owners := make([]string, len(words))
+	for i, w := range words {
+		if w.text != "create" {
+			continue
+		}
+		j := i + 1
+		for j < len(words) && (words[j].text == "or" || words[j].text == "replace") {
+			j++
+		}
+		if j >= len(words) || words[j].text != "function" && words[j].text != "procedure" {
+			continue
+		}
+		// Named last before its arguments; its body the string or dollar-quoted body after AS.
+		name := ""
+		for j++; j < len(words) && words[j].text != "("; j++ {
+			if isWord(words[j].text) {
+				name = words[j].text
+			}
+		}
+		for j < len(words) && (words[j].depth != w.depth || words[j].text != "as" && words[j].text != ";") {
+			j++
+		}
+		if j+1 >= len(words) || words[j].text != "as" || words[j+1].text != sqlBoundary {
+			continue
+		}
+		for j += 2; j < len(words) && words[j].depth > w.depth; j++ {
+			owners[j] = name
+		}
+	}
+	return owners
+}
+
+// altersHistory reports whether s may alter history's table, as PostgreSQL refuses while events of
+// its deferred triggers are pending: ALTER TABLE, CREATE INDEX, CLUSTER, VACUUM, REINDEX, TRUNCATE or
+// DROP TABLE of it, or a trigger, rule or policy made or dropped on it, by a statement that names it;
+// DROP SCHEMA, DROP OWNED, or another DROP ... CASCADE, which can reach it or its triggers; or one
+// that doesn't write out the table it alters, as a format() placeholder or a name built where it
+// runs, or dynamic SQL run from a variable, as it can't be told not to.
+func altersHistory(s sqlStatement) bool {
+	w := s.words
+	for i, word := range w {
+		if word == "execute" && hidden(w[i+1:]) {
+			return true
+		}
+	}
+	verbs := []string{"alter", "create", "drop", "truncate", "cluster", "reindex", "vacuum"}
+	if len(w) == 0 || !slices.Contains(verbs, w[0]) {
+		return false
+	}
+	if len(w) == 1 {
+		// Alone, a word in a string, as an op history records, unless the rest is built onto it.
+		return s.joined
+	}
+	names := slices.Contains(w, "rbac_history")
+	skip := func(i int, words ...string) int {
+		for i < len(w) && slices.Contains(words, w[i]) {
+			i++
+		}
+		return i
+	}
+	on := func(i int) int {
+		if j := slices.Index(w[i:], "on"); j >= 0 {
+			return skip(i+j+1, "only")
+		}
+		return len(w)
+	}
+	switch w[0] {
+	case "alter":
+		if w[1] == "table" {
+			i := skip(2, "if", "exists", "only")
+			return names || i < len(w) && w[i] == "all" || mayBeHistory(w, i)
+		}
+		return !isWord(w[1])
+	case "create":
+		i := skip(1, "or", "replace", "unique", "constraint", "temporary", "temp", "unlogged")
+		if i >= len(w) || !isWord(w[i]) {
+			return true
+		}
+		switch w[i] {
+		case "index", "trigger", "rule", "policy":
+			return names || mayBeHistory(w, on(i))
+		case "table":
+			return names
+		}
+		return false
+	case "drop":
+		switch w[1] {
+		case "table":
+			return names || anyMayBeHistory(w, skip(2, "if", "exists"))
+		case "trigger", "rule", "policy":
+			return names || mayBeHistory(w, on(2))
+		case "schema", "owned":
+			return true
+		case "index", "view", "materialized":
+			return false
+		}
+		return !isWord(w[1]) || slices.Contains(w, "cascade")
+	case "truncate":
+		return names || anyMayBeHistory(w, skip(1, "table", "only"))
+	case "cluster":
+		i := skip(1, "verbose")
+		if j := slices.Index(w[i:], ")"); i < len(w) && w[i] == "(" && j >= 0 {
+			i += j + 1
+		}
+		if i < len(w) && !isWord(w[i]) && !strings.HasPrefix(w[i], "%") {
+			// History's column named cluster.
+			return false
+		}
+		if j := i + 1; j < len(w) && w[j] == "on" {
+			i = j + 1
+		}
+		return mayBeHistory(w, i)
+	case "reindex":
+		i := 1
+		if w[1] == "(" {
+			i += slices.Index(w[1:], ")") + 1
+		}
+		if i >= len(w) {
+			return true
+		}
+		switch kind, j := w[i], skip(i+1, "concurrently"); kind {
+		case "table":
+			return names || mayBeHistory(w, j)
+		case "index":
+			name, _, ok := relation(w, j)
+			return !ok || strings.HasPrefix(name, "rbac_history")
+		}
+		return true
+	}
+	// VACUUM, which no migration runs, as it can't run in a transaction.
+	return true
+}
+
+// hidden reports whether EXECUTE, followed by rest, runs SQL whose text isn't written there: from a
+// variable, or format() of a format that isn't a literal. Not EXECUTE FUNCTION or PROCEDURE, nor the
+// privilege, nor the word alone in a string.
+func hidden(rest []string) bool {
+	if len(rest) >= 2 && rest[0] == "pg_catalog" && rest[1] == "." {
+		rest = rest[2:]
+	}
+	if len(rest) == 0 {
+		return false
+	}
+	switch rest[0] {
+	case "function", "procedure", "on":
+		return false
+	case "format":
+		return len(rest) != 2 || rest[1] != "("
+	}
+	return true
+}
+
+// relation is the name of the table named from w[i] on, qualified or not, and where its name ends,
+// unless its name isn't written out, as a placeholder.
+func relation(w []string, i int) (name string, end int, ok bool) {
+	for i+1 < len(w) && w[i+1] == "." && (isWord(w[i]) || strings.HasPrefix(w[i], "%")) {
+		i += 2
+	}
+	if i < len(w) && isWord(w[i]) {
+		return w[i], i + 1, true
+	}
+	return "", i, false
+}
+
+// mayBeHistory reports whether the table named from w[i] on is history, or isn't written out.
+func mayBeHistory(w []string, i int) bool {
+	name, _, ok := relation(w, i)
+	return !ok || name == "rbac_history"
+}
+
+// anyMayBeHistory is mayBeHistory of each table in the list from w[i] on, as TRUNCATE and DROP
+// TABLE take one.
+func anyMayBeHistory(w []string, i int) bool {
+	for {
+		name, end, ok := relation(w, i)
+		if !ok || name == "rbac_history" {
+			return true
+		}
+		if end < len(w) && w[end] == "*" {
+			end++
+		}
+		if end >= len(w) || w[end] != "," {
+			return false
+		}
+		i = end + 1
 	}
 }
 
