@@ -2984,37 +2984,58 @@ func jsonDraw(rng *rand.Rand, depth int, b *strings.Builder) {
 	space()
 }
 
-// Converting one of CEL's own values takes a check what converting Go's does, as each is charged
-// alike: told one by reflection's Implements, which reads the methods of its type, a list of CEL's
-// strings, and a map keyed by them, took three times what Go's did.
-func TestConvertingCELsOwnValuesTakesWhatConvertingGosDoes(t *testing.T) {
-	const n = 60_000
-	gos, cels := make([]any, 2*n), make([]any, 2*n)
-	for i := range gos {
-		gos[i], cels[i] = strconv.Itoa(i%10), types.String(strconv.Itoa(i%10))
+// Converting one of CEL's own values reads none of its type's methods, nor does converting a value
+// of a type without methods: told one of CEL's by reflection's Implements, which reads them, a list
+// of CEL's strings, and a map keyed by them, took a check three times what Go's did, charged alike;
+// timed against Go's, CEL's took 2.8 times as long once on a loaded machine, though read so. A type
+// of the host's own with methods is asked about, as a value, a map's key and a map's type, and its
+// values once for the type: asked of each, converting the host's messages, which no condition reads,
+// took four times what converting a list does.
+func TestConvertingCELsOwnValuesReadsNoMethodsOfTheirTypes(t *testing.T) {
+	read := rbac.CountMethodsRead(t)
+	cels := []any{
+		types.String("a"), types.Bytes("b"), types.Bytes(nil), types.Double(1.5), types.Int(-1), types.Uint(2), types.True, types.NullValue,
+		types.Timestamp{Time: time.Unix(1, 0)},
+		types.Duration{Duration: time.Second},
 	}
-	goKeyed, celKeyed := make(map[string]int, n), make(map[types.String]int, n)
-	for i := range n {
-		goKeyed[strconv.Itoa(i)], celKeyed[types.String(strconv.Itoa(i))] = i, i
-	}
-	// The least of a few, as another goroutine can run meanwhile.
-	took := func(v any) time.Duration {
-		least := time.Duration(math.MaxInt64)
-		for range 5 {
-			start := time.Now()
-			if _, read := rbac.ConvertingCharge(map[string]any{"v": v}); !read {
-				t.Fatalf("%T: not read", v)
-			}
-			least = min(least, time.Since(start))
+	for name, attributes := range map[string]map[string]any{
+		"CEL's own values": {"l": cels, "s": []types.String{"a"}, "m": map[string]types.Int{"a": 1}},
+		"maps keyed by CEL's own values": {
+			"s": map[types.String]int{"a": 1}, "i": map[types.Int]types.String{1: "a"}, "b": map[types.Bool]int{true: 1},
+			"u": map[types.Uint]int{2: 1}, "a": map[any]any{types.String("k"): types.Int(1), types.Int(2): 1},
+		},
+		"Go's own values": {
+			"s": "a", "i": 1, "l": []any{1.5, true, uint8(2), []byte("b"), [1]byte{}, json.RawMessage(`{"a": [1]}`)},
+			"m": map[string]any{"a": time.Second, "t": time.Unix(1, 0)}, "k": map[int]bool{1: true}, "p": new(int),
+		},
+	} {
+		*read = 0
+		if _, ok := rbac.ConvertingCharge(attributes); !ok || *read != 0 {
+			t.Errorf("%s: read %t, the methods of their types read %d times", name, ok, *read)
 		}
-		return least
 	}
-	for name, c := range map[string]struct{ gos, cels any }{"a list of strings": {gos, cels}, "a map keyed by strings": {goKeyed, celKeyed}} {
-		if g, cel := took(c.gos), took(c.cels); cel > 2*g {
-			t.Errorf("%s: converting CEL's took %v, and Go's %v", name, cel, g)
+	for name, attributes := range map[string]map[string]any{
+		"a value": {"v": stringer("a")}, "a map's key": {"m": map[any]int{stringer("a"): 1}}, "a map's type": {"m": map[stringer]int{}},
+	} {
+		*read = 0
+		if _, ok := rbac.ConvertingCharge(attributes); !ok || *read == 0 {
+			t.Errorf("%s of a type with methods: read %t, the methods of its type read %d times", name, ok, *read)
 		}
+	}
+	strs, messages := make([]stringer, 1000), make([]*wideMessage, 1000)
+	for i := range messages {
+		messages[i] = &wideMessage{}
+	}
+	*read = 0
+	if rbac.ConvertingCharge(map[string]any{"s": strs, "m": messages}); *read > 10 {
+		t.Errorf("1,000 strings of the host's type and 1,000 messages of the host's: the methods of their types read %d times", *read)
 	}
 }
+
+// stringer is a host's own string type with a method, which conditions read as a string.
+type stringer string
+
+func (s stringer) String() string { return string(s) }
 
 // Converting a value, or copying it for a hook, allocates no more for each unit it charges than a
 // few times what converting a string does, whatever types the host passes: nothing is made, read or

@@ -385,11 +385,17 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	}
 	// Only a type with methods is one of CEL's own, one CEL would read by its methods, or a message.
 	if t.NumMethod() > 0 {
-		if r, ok := c.typed(v); ok {
-			return r, 1
+		if celScalar(t) {
+			return c.cel(v), 1
 		}
-		if t.Implements(messageType) {
+		switch methodsOf(t) {
+		case byItsMethods:
+			// Refused by its type, as reading one of the host's copies it whole: charged one each, a list
+			// of 2,000 arrays of 8 KiB saying they are doubles allocated 16 MB.
+			return c.refuse(), 1
+		case asMessage:
 			return c.message(v)
+		default:
 		}
 	}
 	switch v.Kind() {
@@ -436,37 +442,72 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	return c.refuse(), 1
 }
 
-// typed is v, of a type with methods, as a condition reads it, where its type is one of CEL's own
-// scalars or one CEL would read by its methods, which is refused. One of CEL's own is known by its
-// type: finding by reflection's Implements that it is a ref.Val reads the methods of its type,
-// which took three times what converting a string does.
-func (c *converter) typed(v reflect.Value) (ref.Val, bool) {
-	t := v.Type()
-	if celScalar(t) {
-		v, _ := v.Interface().(ref.Val)
-		n := textSize(v) - 1
-		switch s := v.(type) {
-		case types.Timestamp:
-			v = types.Timestamp{Time: s.UTC()}
-		case types.Double:
-			v = c.double(float64(s))
-		case types.Bytes:
-			if s != nil {
-				n += bytesCost - 1
-			}
+// cel is v, one of CEL's own scalars, as a condition reads it. One is known by its type
+// (celScalar): finding by reflection's Implements that it is a ref.Val reads the methods of its
+// type, which took three times what converting a string does.
+func (c *converter) cel(v reflect.Value) ref.Val {
+	r, _ := v.Interface().(ref.Val)
+	n := textSize(r) - 1
+	switch s := r.(type) {
+	case types.Timestamp:
+		r = types.Timestamp{Time: s.UTC()}
+	case types.Double:
+		r = c.double(float64(s))
+	case types.Bytes:
+		if s != nil {
+			n += bytesCost - 1
 		}
-		return c.spend(n, v), true
 	}
-	// A value of a type of the host's own CEL would read by its methods, as one saying it is a
-	// double or a list, is read so by none. A pointer has the methods of what it points to, so one to
-	// CEL's own string is read as the string, as any other pointer is read as what it points to.
-	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
-		// Refused by its type, as reading one of the host's copies it whole: charged one each, a list
-		// of 2,000 arrays of 8 KiB saying they are doubles allocated 16 MB.
-		return c.refuse(), true
-	}
-	return nil, false
+	return c.spend(n, r)
 }
+
+// methodsRead is how of reads a value of a type with methods but CEL's own scalars: by its kind, as
+// no method of the type runs, refused, as one CEL would read by its methods, or as a message.
+type methodsRead uint8
+
+const (
+	byKind methodsRead = iota
+	byItsMethods
+	asMessage
+)
+
+// methodsOf is how of reads a value of t, a type with methods but CEL's own scalars, found once for
+// each type (methodTypes): reflection's Implements reads the methods of the type, and asked of each
+// value, converting the host's messages, which it refuses, took four times what converting a list
+// does, 500 ns a unit, and pointers to CEL's strings three times what other pointers took.
+func methodsOf(t reflect.Type) methodsRead {
+	if known, ok := methodTypes.Load(t); ok {
+		r, _ := known.(methodsRead)
+		return r
+	}
+	r := byKind
+	switch {
+	// A value of a type of the host's own CEL would read by its methods, as one saying it is a double
+	// or a list, is read so by none. A pointer has the methods of what it points to, so one to CEL's
+	// own string is read as the string, as any other pointer is read as what it points to.
+	case implements(t, refValType) && (t.Kind() != reflect.Pointer || !implements(t.Elem(), refValType)):
+		r = byItsMethods
+	case implements(t, messageType):
+		r = asMessage
+	default:
+	}
+	methodTypes.Store(t, r)
+	return r
+}
+
+// methodTypes are what methodsOf found of each type it was asked about.
+var methodTypes sync.Map
+
+// implements reports whether t implements u, which reflection finds by reading t's methods, so
+// converting asks it of no type of CEL's own, nor of one without methods, and of another once.
+func implements(t, u reflect.Type) bool {
+	readingMethods()
+	return t.Implements(u)
+}
+
+// readingMethods runs as converting asks reflection whether a type implements an interface, as a
+// test's counter.
+var readingMethods = func() {}
 
 // refuse counts a value no condition can read, which makes its kind's attributes unreadable.
 func (c *converter) refuse() ref.Val {
@@ -710,7 +751,7 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		k = k.Elem()
 	}
 	t := k.Type()
-	if t.NumMethod() > 0 && (celScalar(t) || t.Implements(refValType)) {
+	if t.NumMethod() > 0 && (celScalar(t) || implements(t, refValType)) {
 		if v, ok := k.Interface().(ref.Val); ok && keyType(t) {
 			return c.spend(textSize(v)-1, v)
 		}
@@ -792,7 +833,7 @@ func keyType(t reflect.Type) bool {
 	case celBoolType, celIntType, celStringType, celUintType:
 		return true
 	}
-	if t.Implements(refValType) {
+	if t.NumMethod() > 0 && implements(t, refValType) {
 		return false
 	}
 	switch t.Kind() {

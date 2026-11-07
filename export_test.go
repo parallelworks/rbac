@@ -1355,6 +1355,18 @@ func CountKindsConverted(t *testing.T) *int {
 	return n
 }
 
+// CountMethodsRead counts each time converting asks reflection whether a type implements an
+// interface, which reads the type's methods, until t ends, forgetting what it found of each type
+// first, so it asks again.
+func CountMethodsRead(t *testing.T) *int {
+	t.Helper()
+	methodTypes.Clear()
+	old, n := readingMethods, new(int)
+	readingMethods = func() { *n++ }
+	t.Cleanup(func() { readingMethods = old })
+	return n
+}
+
 // ConditionCost is the most evaluating expr can cost, which a check runs it within, and what
 // evaluating it on a request with attributes, which the resource carries too, costs, up to
 // maxCost, built with the package's CEL environment extended by opts.
