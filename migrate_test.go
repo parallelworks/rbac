@@ -256,6 +256,8 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := []string{
+				"rbac_expired_through search_path=pg_catalog, pg_temp",
+				"rbac_expired_until search_path=pg_catalog, pg_temp",
 				"rbac_group_members enable_seqscan=off",
 				"rbac_history_append_only search_path=pg_catalog, pg_temp",
 				"rbac_history_commit search_path=pg_catalog, pg_temp, plan_cache_mode=force_generic_plan, enable_seqscan=off",
@@ -266,6 +268,79 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 				t.Errorf("the package's functions are set as %q, want %q", settings, want)
 			}
 		})
+	}
+}
+
+// Migrating to 0032 records what rbac_expired holds, as its baseline, brings a time there past the
+// database's clock back to it, recorded too, and leaves each role that could write the table only
+// SELECT on it, and rbac_expired_through in its place: the application's role, hardened as the README
+// said before, runs DeleteExpired as before with no step of its own, and the latest time it wrote
+// stands no later than the database's clock.
+func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	var before time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	past, future := before.Add(-time.Hour).Truncate(time.Second), before.AddDate(1, 0, 0).Truncate(time.Second)
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1), ($2)`, past, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	var times []time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT array_agg(until ORDER BY until) FROM rbac_expired`).Scan(&times); err != nil {
+		t.Fatal(err)
+	}
+	var after time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if len(times) != 2 || !times[0].Equal(past) || times[1].Before(before) || times[1].After(after) {
+		t.Fatalf("rbac_expired holds %v once migrated, not %v and the time it migrated at", times, past)
+	}
+	want := [][4]string{
+		{expiredKey(past), "baseline", "Migrate", r.admin},
+		{expiredKey(future), "baseline", "Migrate", r.admin},
+		{expiredKey(future), "delete", "Migrate", r.admin},
+		{expiredKey(times[1]), "create", "Migrate", r.admin},
+	}
+	if got := expiredRecords(t, r.appPool); !slices.Equal(got, want) {
+		t.Errorf("history records rbac_expired as %q, want %q", got, want)
+	}
+	var writes, reads, executes, public bool
+	if err := r.super.QueryRow(ctx, `SELECT has_table_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER'),
+		has_table_privilege($1, $2 || '.rbac_expired', 'SELECT'),
+		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE'),
+		has_function_privilege('public', $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE')`, r.app, r.schema).Scan(&writes, &reads, &executes, &public); err != nil {
+		t.Fatal(err)
+	}
+	if writes || !reads || !executes || public {
+		t.Errorf("once migrated, the application's role writes rbac_expired %t, reads it %t and executes rbac_expired_through %t, and every role %t",
+			writes, reads, executes, public)
+	}
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	authz, err := rbac.New(r.appPool, rbac.Config{
+		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Now:           func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login', $1)`, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := authz.DeleteExpired(ctx); err != nil || n != 1 {
+		t.Errorf("DeleteExpired on the application's role once migrated removed %d rows: %v", n, err)
 	}
 }
 

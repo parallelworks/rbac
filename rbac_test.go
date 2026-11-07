@@ -9859,7 +9859,7 @@ func TestACallDecidesByItsOwnClockWhereDeleteExpiredRemovedNothingEndingAfterIt(
 				return
 			}
 			// As the change reads, last, whether a run committed since it read its actor.
-			rbac.BeforeStatement(t, "SELECT max(until) FROM rbac_expired", false, expire)
+			rbac.BeforeStatement(t, "THEN statement_timestamp() ELSE max(until) END FROM rbac_expired", false, expire)
 			err := h.authz.Apply(ctx, x, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("v"), ExpiresAt: base.Add(30 * time.Minute)}}})
 			if !expired {
 				t.Fatal("DeleteExpired didn't run as the change ended")
@@ -9944,6 +9944,199 @@ func TestDeleteExpiredRecordsNoTimePastTheDatabasesClock(t *testing.T) {
 	h.now = now
 	if !allowed(t, h, x, login, cluster) {
 		t.Error("a check decided as late as the clock a year ahead DeleteExpired ran by")
+	}
+}
+
+// A time in rbac_expired past the database's clock, which only a role that may disable the table's
+// triggers can write, or the database's clock going back can leave there, moves no call past that
+// clock: otherwise every later call of every host decided at it, for good. Here a deny of root on c1
+// names contractors, u's place in which ends in five years, v holds sudo there from four years on,
+// both hold high, and u login. Once the table holds a time at the end of 9999, u is still denied root,
+// v still holds no sudo, as AsOf of the same moment says, Holders still leaves u out, and Filter's
+// condition still keeps no row u may not have root on, and still keeps the row it may log in to.
+func TestATimePastTheDatabasesClockInExpiredMovesNoCallPastIt(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	h.now = dbNow(t, h)
+	h.groups(t, "contractors")
+	u, v := h.as(t, "u", "contractors"), h.as(t, "v")
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"), rbac.Grant{Scope: cluster.Scope(), Binding: rbac.Binding{
+		Role: "cluster.sudo", Principal: v.Principal,
+		Condition: rbac.Condition{Expression: fmt.Sprintf(`request.time >= timestamp(%q)`, h.now.AddDate(4, 0, 0).UTC().Format(time.RFC3339))},
+	}})
+	h.hold(t, "u", "level:high")
+	h.hold(t, "v", "level:high")
+	c1 := cluster
+	c1.Labels = rbac.Label{"level": {"high"}}
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND principal = 'user:u' AND group_id = 'contractors'`, []any{h.now.AddDate(5, 0, 0)}},
+		{`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, permissions) VALUES ('t1', 'cluster', 'c1', 'no-root', '{group:contractors}', ARRAY[$1::text])`, []any{root}},
+		{`CREATE TABLE secrets (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`, nil},
+		{`INSERT INTO secrets VALUES ('t1', 'c1', $1, '{level:high}')`, []any{h.path(t, c1)}},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed := func(s rbac.Subject, p rbac.Permission) []string {
+		t.Helper()
+		pred, err := h.authz.Filter(ctx, s, p, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := h.pool.Query(ctx, `SELECT id FROM secrets WHERE `+pred.SQL, pred.Args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	decided := func(when string) {
+		t.Helper()
+		if err := h.authz.Authorize(ctx, u, root, c1); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s, the deny on contractors no longer binds u: %v", when, err)
+		}
+		if err := h.authz.Authorize(ctx, v, root, c1); !errors.Is(err, rbac.ErrDenied) {
+			t.Errorf("%s, v holds sudo, which it holds only four years on: %v", when, err)
+		}
+		var now time.Time
+		if err := h.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		var uAsOf, vAsOf error
+		if err := h.authz.AsOf(ctx, "t1", now, func(a *rbac.Authorizer) error {
+			uAsOf, vAsOf = a.Authorize(ctx, u, root, c1), a.Authorize(ctx, v, root, c1)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !errors.Is(uAsOf, rbac.ErrDenied) || !errors.Is(vAsOf, rbac.ErrDenied) {
+			t.Errorf("%s, AsOf of now allows u root (%v) or v root (%v)", when, uAsOf, vAsOf)
+		}
+		holders, err := h.authz.Holders(ctx, root, c1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.ContainsFunc(holders, func(o rbac.Holder) bool { return o.Principal == u.Principal }) {
+			t.Errorf("%s, Holders lists u, whom the deny on contractors binds", when)
+		}
+		if ids := listed(u, root); len(ids) > 0 {
+			t.Errorf("%s, Filter's condition keeps %v for u's root, which the deny on contractors denies", when, ids)
+		}
+		if ids := listed(u, login); !slices.Equal(ids, []string{"c1"}) {
+			t.Errorf("%s, Filter's condition keeps %v for u's login, not c1", when, ids)
+		}
+	}
+	decided("before the time past the clock")
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	// As a role that may disable the trigger refusing such a time, where there is one.
+	refusing := func(change string) string {
+		return `DO $$ BEGIN
+			IF EXISTS (SELECT FROM pg_trigger WHERE tgrelid = 'rbac_expired'::regclass AND tgname = 'rbac_expired_until') THEN
+			  ALTER TABLE rbac_expired ` + change + ` TRIGGER rbac_expired_until;
+			END IF;
+		END $$`
+	}
+	for _, sql := range []string{refusing("DISABLE"), `INSERT INTO rbac_expired (until) VALUES ('9999-12-30 23:59:59.999999+00')`, refusing("ENABLE ALWAYS")} {
+		if _, err := tx.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	decided("once rbac_expired holds a time past the database's clock")
+}
+
+// rbac_expired refuses a time past the database's clock, whoever writes it, the table's owner too,
+// and through rbac_expired_through, which DeleteExpired records by, and isn't truncated: no write but
+// one by a role that may disable its triggers can leave such a time there.
+func TestExpiredRefusesATimePastTheDatabasesClock(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	past := dbNow(t, h).Add(-time.Hour)
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1)`, past); err != nil {
+		t.Fatal(err)
+	}
+	future := dbNow(t, h).Add(time.Hour)
+	for _, w := range []struct {
+		sql  string
+		code string
+	}{
+		{`INSERT INTO rbac_expired (until) VALUES ($1)`, "23514"},
+		{`UPDATE rbac_expired SET until = $1`, "23514"},
+		{`SELECT rbac_expired_through($1)`, "23514"},
+		{`TRUNCATE rbac_expired`, "0A000"},
+	} {
+		var args []any
+		if strings.Contains(w.sql, "$1") {
+			args = []any{future}
+		}
+		if _, err := h.pool.Exec(ctx, w.sql, args...); sqlState(err) != w.code {
+			t.Errorf("%s = %v, not refused as %s", w.sql, err, w.code)
+		}
+	}
+	var latest time.Time
+	if err := h.pool.QueryRow(ctx, `SELECT max(until) FROM rbac_expired`).Scan(&latest); err != nil || !latest.Equal(past) {
+		t.Errorf("rbac_expired's latest time is %v, not %v: %v", latest, past, err)
+	}
+}
+
+// History records every write to rbac_expired, as the entity expired in no tenant, keyed by its time:
+// the time each of DeleteExpired's batches adds, the times it deletes as later ones supersede them,
+// and a write around the package, as no one's. Here DeleteExpired by a clock an hour on removes y's
+// grant, which ended half an hour on, and by one two hours on z's, which ended an hour and a half on.
+func TestHistoryRecordsEveryWriteToExpired(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	base := h.now
+	for id, ends := range map[string]time.Duration{"y": 30 * time.Minute, "z": 90 * time.Minute} {
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+			VALUES ('t1', 'cluster', 'c1', 'user', $1, 'cluster.login', $2)`, id, base.Add(ends)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, by := range []time.Duration{time.Hour, 2 * time.Hour} {
+		h.now = base.Add(by)
+		if n, err := h.authz.DeleteExpired(ctx); err != nil || n != 1 {
+			t.Fatalf("DeleteExpired removed %d rows: %v", n, err)
+		}
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_expired (until) VALUES ($1)`, base.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	key := func(d time.Duration) string { return base.Add(d).UTC().Format("2006-01-02T15:04:05-07:00") }
+	type record struct{ tenant, key, op, how, until string }
+	want := []record{
+		{"", key(30 * time.Minute), "create", "DeleteExpired", key(30 * time.Minute)},
+		{"", key(30 * time.Minute), "delete", "DeleteExpired", key(30 * time.Minute)},
+		{"", key(90 * time.Minute), "create", "DeleteExpired", key(90 * time.Minute)},
+		{"", key(10 * time.Minute), "create", "", key(10 * time.Minute)},
+	}
+	rows, err := h.pool.Query(ctx, `SELECT tenant, key, op, how, coalesce(after, before)->>'until' FROM rbac_history WHERE entity = 'expired' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []record
+	var r record
+	if _, err := pgx.ForEachRow(rows, []any{&r.tenant, &r.key, &r.op, &r.how, &r.until}, func() error {
+		got = append(got, r)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("history records rbac_expired's writes as %+v, want %+v", got, want)
 	}
 }
 
@@ -10125,6 +10318,59 @@ func TestFilterKeepsItsRowsWhileTheSubjectsPlacesLastPastDeleteExpired(t *testin
 	}
 	if ids := listed(ofW); !slices.Equal(ids, []string{"c0"}) {
 		t.Errorf("once DeleteExpired removed x's place in crew, Filter's condition for w, whose membership and places don't end, kept %v, not c0", ids)
+	}
+}
+
+// Filter's condition with the label column keeps its rows once DeleteExpired has removed a place of
+// the subject's in a group that another path keeps it in for good: its keys, and the grants and denies
+// they reach, are what they were. Here x holds high, crew logs in on the tenant, and x is in crew for
+// good, by its place from no source or through team, and by a place from the host's directory until
+// an hour on, which DeleteExpired by a clock two hours on removes between Filter and the query.
+func TestFilterKeepsItsRowsOnceAPlaceAnotherPathOutlastsEnded(t *testing.T) {
+	for name, groups := range map[string][]string{"from another source": {"crew"}, "through a group": {"team"}} {
+		t.Run(name, func(t *testing.T) {
+			h := labeled(t)
+			ctx := t.Context()
+			h.groups(t, "crew", "team")
+			x := h.as(t, "x", groups...)
+			h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.Group, "crew"))
+			h.hold(t, "x", "level:high")
+			c0 := rbac.Resource{Tenant: "t1", Type: "cluster", ID: "c0", Ancestors: cluster.Ancestors, Labels: rbac.Label{"level": {"high"}}}
+			for _, q := range []struct {
+				sql  string
+				args []any
+			}{
+				{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'crew', 'group', 'team')`, nil},
+				{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, source, expires_at) VALUES ('t1', 'crew', 'user', 'x', 'directory', $1)`, []any{h.now.Add(time.Hour)}},
+				{`CREATE TABLE secrets (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`, nil},
+				{`INSERT INTO secrets VALUES ('t1', 'c0', $1, '{level:high}')`, []any{h.path(t, c0)}},
+			} {
+				if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cols := rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}
+			pred, err := h.authz.Filter(ctx, x, login, "t1", "cluster", cols, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(2 * time.Hour)
+			bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if n, err := h.authz.DeleteExpired(bounded); err != nil || n != 1 {
+				t.Fatalf("DeleteExpired removed %d rows: %v", n, err)
+			}
+			if !allowed(t, h, x, login, c0) {
+				t.Fatal("x may no longer log in to c0")
+			}
+			rows, err := h.pool.Query(ctx, `SELECT id FROM secrets WHERE `+pred.SQL, pred.Args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(ids, []string{"c0"}) {
+				t.Errorf("once DeleteExpired removed x's place in crew from the directory, which another path keeps it in for good, Filter's condition kept %v, not c0: %v", ids, err)
+			}
+		})
 	}
 }
 

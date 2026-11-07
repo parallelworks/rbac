@@ -102,9 +102,10 @@ a column of the type too, whose statistics count them, and index it after the te
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
 the subject's label holding and what the constraints answered, so build one for each query; the
-query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, and with the
-label column keeps no row once that is as late as a time the subject's membership, or a place in a
-group of its own or of a group it is in, ended after `Filter` read the holding. It compares the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, taken no
+later than the database's clock, and with the label column keeps no row once that is as late as the
+first time after `Filter` read the holding that the subject's membership, or its last path to one of
+its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
@@ -669,7 +670,9 @@ than as a record of its own, and each record holds the cluster that wrote it (`R
 `system_identifier`), within which a commit record dates it. A change through the package records
 its actor and the call that made it (`Record.How`), and what the host attaches with
 `rbac.WithAudit`: on whose behalf it was made, the request and the reason. An expiry `DeleteExpired` removes is recorded as
-one, made by no one. Triggers write it, so a write that bypasses the package is recorded too, as no
+one, made by no one, and so is each time it records in `rbac_expired` that every check and change
+decides no earlier than, as the entity `expired`, in no tenant, keyed by the time as JSON writes it
+in UTC (see Expiry). Triggers write it, so a write that bypasses the package is recorded too, as no
 one's. That context is what the session that wrote it says; the database role is what the database
 knows. The tables bound what they hold as the package bounds what it writes, but for the ids in
 a deny's principals and exemptions and an eligibility's approvers, which they count to
@@ -991,10 +994,14 @@ have the server load a library or run a program of its choosing; and:
    superuser gives them, or, for one a migration gives it, the schema's owner migrates, which grants
    it for the migration alone.
 3. The application's role has `USAGE` on the package's schema, without which it reads none of its
-   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history` and
-   `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the functions
-   `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`, which
-   every role has unless it is revoked; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
+   tables; `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the package's tables but `rbac_history`,
+   `rbac_expired` and `rbac_migrations`, and on any a later migration adds; `EXECUTE` on the
+   functions `rbac_group_members`, `rbac_tenant_keys`, `rbac_text_array` and `rbac_changes_grants`,
+   which every role has unless it is revoked, and on `rbac_expired_through`, through which
+   `DeleteExpired` records the times it deleted by, and which no role has unless it is granted;
+   only `SELECT` on `rbac_expired`, which every check and change reads, so that role can neither
+   record a time past the database's clock nor move back the latest, as only that function writes
+   it; and only `SELECT` on `rbac_history`, with no `UPDATE` on its
    id sequence, which a grant on all the schema's sequences can give: `setval` could number a change
    below the one before it, and `AsOf` would read the row as it was before the change. Never
    `TRIGGER`, which `ALL` includes: a trigger runs its function as whoever writes the table, and one
@@ -1285,6 +1292,25 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   20,000 to their memberships, as before, looked each up on its own, 20,179 pages that fill 856, and
   code from before it reads the places by statistics alone, every place in the table by those from
   when it was nearly empty. Code from before it and after it run beside each other, applied or not.
+  `0032_expired_writes` has history record every write to `rbac_expired`, as the entity `expired` in
+  no tenant, replacing `rbac_record`, which keeps its owner and who may execute it, and widening
+  history's check of entities, which reads no record but locks history against reads and writes
+  until migrating commits, so every change, as each writes history, and every read of history, as
+  `AsOf` and an export, waits for it. It records each time the table holds as its baseline, brings
+  one past the database's clock back to it, recorded as an update, and from then on refuses one past
+  the clock, whoever writes it, by a trigger, `rbac_expired_until`, which no role but its owner may
+  execute. It takes from every role but the table's owner every privilege on it but `SELECT`,
+  `TRIGGER` too, which would run a role's function as whoever writes the table, and gives `EXECUTE`
+  on `rbac_expired_through`, which it makes, to each that held `INSERT` on it, as
+  `0030_expired_through` gave the application's role of step 3, and to no other, so a deployment
+  that gave its roles their privileges before migrating runs `DeleteExpired` with no step of its
+  own; grant it to a role you give its privileges only after migrating. The function runs as the
+  table's owner, which it is given where another role migrates, and is SQL bound to the table as it
+  is made, so nothing a session names changes what it writes. Writes to `rbac_expired` wait for
+  migrating; checks, which only read it, don't. Code before it runs `DeleteExpired` by writing the
+  table, which the application's role of step 3 may no longer, and code after it, before it is
+  applied, by the function, which doesn't exist yet: run `DeleteExpired` only from code after it
+  once it is applied. Their checks, searches and changes run beside each other, applied or not.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two
@@ -1419,7 +1445,17 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   membership's for the places it removes with one, which ended by the run's `Config.Now` and the
   database's clock both: a host whose clock runs
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
-  a run that removes nothing records nothing. A read of an actor's or a subject's grants, groups and
+  a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
+  deletes the times no later than its own and adds its own, refusing one past the database's clock,
+  and history records each write, as one of the package's tables (History). A read takes the latest
+  time no later than the database's clock as its statement began, which takes nothing from a time a
+  run recorded. So a role that may execute the function, as the application's may, can move what a
+  call decides no earlier than up to that clock and no further, as a run could, and never back, and
+  history records each time it wrote; a time past the clock, which only a role that may disable the
+  table's triggers can leave there, or the database's clock going back, has a call of a host behind
+  that clock decide at it as each of its statements reads it, and such a host's changes tried again
+  (`rbac.ErrConflict`) until the clock passes the time.
+  A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
   host, decides no earlier than the latest time recorded that its snapshot sees: every row it finds
@@ -1435,8 +1471,10 @@ package's makes one, `AsOf` included, which reads views migrating made, so none 
   removes so while it runs: with `DeleteExpired` every 50 ms beside four sessions granting, without
   pause, roles that end 200 ms on, none of about 1,650 changes was tried again. `Filter`'s condition
   with the label column, whose holding the query doesn't read, keeps no row where the query sees a
-  time as late as the earliest that the subject's membership, or a place in a group of its own or of
-  a group it is in, ended after `Filter` read the holding: build it again. Before then, the subject's
+  time as late as the first after `Filter` read the holding that the subject's keys change by time
+  alone, as its membership, or its last path to one of its groups, ends: build it again. A place
+  that ends while another, from another source or through another group, keeps it in the group
+  changes none of them. Before then, the subject's
   keys and the denies binding it are those of `Filter`'s time, and the grants in force no more, so
   each row the query keeps the subject could read at `Filter`'s time; a run by an earlier time, as
   every one is for a subject whose membership and places don't end, leaves them as they were.

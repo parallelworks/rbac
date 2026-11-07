@@ -1181,10 +1181,12 @@ flowchart TB
   escaped the deny, a state no moment held. With no skew, `Apply` granting, `SetEligibility`,
   `Activate`'s check of its approver and a change to members read the time before the actor; with
   `DeleteExpired`'s clock ahead, every change and check could. So each batch records in
-  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), the latest time one of
-  them ended at, which commits with them: a snapshot seeing any row a batch removed sees it. A read
-  of an actor or a subject, `readHeld` and `keysOf`, decides at the later of the call's time and the
-  latest time recorded that its snapshot sees (`decidedSQL`), every expiry it compares too: every
+  `rbac_expired`, in the statement removing its rows (`expiredThroughSQL`), through
+  `rbac_expired_through`, the latest time one of them ended at, which commits with them: a snapshot
+  seeing any row a batch removed sees it. A read of an actor or a subject, `readHeld` and `keysOf`,
+  decides at the later of the call's time and the latest time recorded that its snapshot sees, but
+  no later than the database's clock as its statement began (`decidedSQL`, `expiredUntil`), which
+  takes nothing from a time a run recorded, every expiry it compares too: every
   row it finds removed had ended by then, or is a place of an identity whose membership had, which
   gives nothing once it has, and the rows still there it decides by their ends, so it
   reads the state of that moment. The condition `Filter` gives the host decides so in the host's own
@@ -1208,11 +1210,12 @@ flowchart TB
   goes on, which its transaction decides again, so there the call decides later where it finds a
   later time. The condition `Filter` gives with the label column holds the subject's label holding,
   which the query doesn't read, decided at `Filter`'s time. `Filter` reads with it when the
-  subject's keys first change by time alone, the earliest end after then of its membership, or of a
-  place in a group of its own or of a group it is in (`lapseSQL`), and the condition keeps no row
-  where the query decides at that time or later (`filterHolding`): by then a run can have removed
-  the place a deny binds it by and passed over the one its value came through. Before then its
-  keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
+  subject's keys first change by time alone, the earliest end after then of its membership, or of
+  its last path to one of its groups, as `endsSQL` walks them (`lapseSQL`): a place another path
+  outlasts, from another source or through another group, changes none of them. The condition keeps
+  no row where the query decides at that time or later (`filterHolding`): by then a run can have
+  removed the place a deny binds it by and passed over the one its value came through. Before then
+  its keys, and the denies binding and exempting it by them, are those of `Filter`'s time, and the
   grants in force at the query's time are no more than at `Filter`'s, so each row kept the subject
   could read at `Filter`'s time by the holding, with what runs removed since, which had all ended by
   then. Keeping no row at any later time, a run between `Filter` and the query would have emptied
@@ -1220,8 +1223,9 @@ flowchart TB
   `Members`, `GroupsOf`, `Memberships`, `MembershipsOf` and `Conflicts` read by the call's time:
   each lists what only grows with the rows in force, so an element listed was in force then, and
   one left out had ended by then or by a run's time. A batch adds its own time and deletes those no
-  later that no other run is deleting (`SKIP LOCKED`), which only `DeleteExpired` writes, so runs
-  never wait for each other, a run in a host's transaction left open too, the latest time stays,
+  later that no other run is deleting (`SKIP LOCKED`), through `rbac_expired_through`, which alone
+  writes the table, as its owner, refusing a time past the database's clock, so runs never wait for
+  each other, a run in a host's transaction left open too, the latest time stays,
   and a batch removing what ended sooner leaves it as it is. One time for every tenant: a run
   removes what has ended in every tenant, and recording a time for each would read them all first.
   The time is what the batch removed, not the run's clock: its rows ended by the run's `Config.Now`
@@ -1235,7 +1239,14 @@ flowchart TB
   gives nothing once the membership has ended, which it records. `Activate`
   ends an activation its duration after the time it read once it held the places it rests on,
   which those places last until: deciding later shortens it, never extends it past them. History
-  doesn't record the time, and `AsOf` doesn't read it: as of a time, a read decides at that time.
+  records each write to the table, as the entity `expired`, and `AsOf` doesn't read it: as of a
+  time, a read decides at that time. Without the bound on what a read takes, one row of a time far
+  ahead, which the application's role could write around the package, had every later call of every
+  host decide then, for good, a deny binding through a place that ends before then lifted, and a
+  condition reading `request.time` met. A time past the clock now only the table's owner disabling
+  its trigger (`rbac_expired_until`), or the database's clock going back, can leave there: a call of
+  a host behind the clock then decides at it as each statement reads it, and that host's changes are
+  tried again until the clock passes the time.
 - **Races** PostgreSQL refuses, such as a serialization failure, a deadlock between host
   transactions, or a lock waited for past `lock_timeout`, as one a migration holds, match
   `ErrConflict`, still wrapping PostgreSQL's error: try again. Every exported call maps them, as it
@@ -1309,13 +1320,14 @@ flowchart LR
   database role that wrote it, and the actor and call it was made through, with what the host
   attached. A change takes effect when its statement began, or its transaction where that began
   later, as in a procedure that commits as it goes, and an expiry when it expired, but never before
-  the row's last record. A write that bypassed the package is recorded too, with no actor. The
-  tables bound its row as the package bounds what it writes, but for the ids in a deny's or an
-  eligibility's lists of principals, which they count in characters rather than bytes. A row of more
-  than 1 MiB as jsonb, or a context of more than 1 MiB, fails its write, so no record is one
-  `History` can't return. A row written before history was installed has one record from migrating,
-  its baseline, dated when it was created, or at the epoch where that was before year 1 or at its
-  first instant.
+  the row's last record. A write that bypassed the package is recorded too, with no actor. So is
+  each time `DeleteExpired` records in `rbac_expired`, as the entity `expired`, in no tenant, keyed
+  by the time, which its row holds too, so the chain covers it. The tables bound its row as the
+  package bounds what it writes, but for the ids in a deny's or an eligibility's lists of
+  principals, which they count in characters rather than bytes. A row of more than 1 MiB as jsonb,
+  or a context of more than 1 MiB, fails its write, so no record is one `History` can't return. A
+  row written before history was installed has one record from migrating, its baseline, dated when
+  it was created, or at the epoch where that was before year 1 or at its first instant.
 - **Commit records.** No other session sees a change before its transaction commits, which a host's
   transaction, or the package's own while `Config.OnChange` runs, can put off. So each transaction
   that changes the tables writes, as it commits, a record of when it did (entity and op `commit`, in

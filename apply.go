@@ -3341,7 +3341,9 @@ func removing[T any](a *Authorizer, table, columns string, collect func(pgx.Rows
 // reads a state its batches left that no moment held; as each ended by Config.Now and the
 // database's clock both, a host whose clock runs ahead, or one setting Config.Now wrong, can't have
 // a later call decide past the database's clock, and a call decides later than its own clock only
-// where a run removed a row that ended after it. A race PostgreSQL refuses matches ErrConflict.
+// where a run removed a row that ended after it. It records the time through rbac_expired_through,
+// which the application's database role executes in place of writing rbac_expired, and history
+// records it. A race PostgreSQL refuses matches ErrConflict.
 func (a *Authorizer) DeleteExpired(ctx context.Context) (n int64, err error) {
 	defer a.refused(ctx, &err, "", Principal{}, "DeleteExpired")
 	defer conflicting(&err)
@@ -3398,7 +3400,7 @@ func (a *Authorizer) deleteExpired(ctx context.Context) (int64, error) {
 		return statement(`WITH d AS (DELETE FROM ` + table + ` WHERE ` + key + ` = ANY(ARRAY(
 			SELECT ` + key + ` FROM ` + table + ` WHERE expires_at <= least($1, statement_timestamp())
 			ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED)) RETURNING expires_at), ` + expiredThroughSQL("d") + `
-		SELECT count(*), count(*) FROM d`)
+		SELECT count(*), count(*) FROM d, recorded`)
 	}
 	var total int64
 	for _, batch := range []func(pgx.Tx) (int64, int64, error){
@@ -3468,30 +3470,27 @@ func endMemberships(ctx context.Context, tx pgx.Tx, now time.Time) (picked, all 
 		), left_groups AS (
 		  DELETE FROM rbac_members m USING ended e WHERE m.tenant = e.tenant AND m.principal = e.principal RETURNING 1
 		), `+expiredThroughSQL("ended")+`
-		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups)`, tenants, principals))
+		SELECT (SELECT count(*) FROM ended) + (SELECT count(*) FROM left_groups) FROM recorded`, tenants, principals))
 	return picked, all, err
 }
 
 // expiredThroughSQL is SQL defining, in a WITH of a batch of DeleteExpired, after removed, the rows
-// it removes with their expires_at, the statements recording in rbac_expired the latest of those,
-// where it removes any, and deleting the times recorded no later, passing over those another run
-// is deleting: every check and change decides no earlier than the latest time recorded that it
-// sees (decidedSQL), and one seeing a row the batch removed sees the time too, as they commit
-// together, so it reads no state the batch left that no moment held, as a later-ending place a deny
-// binds a subject by removed and an earlier-ending one its power comes through passed over or not
-// reached yet. The time is of what it removes, which ended by Config.Now and the database's clock
-// both, so a call decides later than its own clock only where a row that ended after it is gone:
-// recorded as the run's clock, every run, whatever it removed, had every call of a host whose clock
-// is behind the run's decide later than it reads, and a change in flight tried again. Only
-// DeleteExpired writes the table, so neither of two runs waits for the other, and the latest stays.
+// it removes with their expires_at, recorded(n), which the batch's statement reads so that it runs:
+// the latest of those recorded in rbac_expired, where it removes any, through rbac_expired_through,
+// which deletes the times recorded no later, passing over those another run is deleting. Every
+// check and change decides no earlier than the latest time recorded that it sees (decidedSQL), and
+// one seeing a row the batch removed sees the time too, as they commit together, so it reads no
+// state the batch left that no moment held, as a later-ending place a deny binds a subject by
+// removed and an earlier-ending one its power comes through passed over or not reached yet. The
+// time is of what it removes, which ended by Config.Now and the database's clock both, so a call
+// decides later than its own clock only where a row that ended after it is gone: recorded as the
+// run's clock, every run, whatever it removed, had every call of a host whose clock is behind the
+// run's decide later than it reads, and a change in flight tried again. Only rbac_expired_through
+// writes the table, as its owner, refusing a time past the database's clock, so neither of two runs
+// waits for the other, the latest stays, and history records each time.
 func expiredThroughSQL(removed string) string {
-	return `expired_through(until) AS (
-		  SELECT max(expires_at) FROM ` + removed + `
-		), passed AS (
-		  DELETE FROM rbac_expired WHERE ctid = ANY(ARRAY(SELECT ctid FROM rbac_expired
-		    WHERE until <= (SELECT until FROM expired_through) FOR UPDATE SKIP LOCKED))
-		), recorded AS (
-		  INSERT INTO rbac_expired (until) SELECT until FROM expired_through WHERE until IS NOT NULL
+	return `recorded(n) AS (
+		  SELECT count(rbac_expired_through(e.until)) FROM (SELECT max(expires_at) AS until FROM ` + removed + `) e WHERE e.until IS NOT NULL
 		)`
 }
 
