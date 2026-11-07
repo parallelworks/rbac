@@ -432,7 +432,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   type, as lists; a scope's conditions looping over map literals are bounded a little higher too,
   so they may be past a bound as an upgrade leaves them. Adding
   to `request.time`, or converting it, was bounded at all a condition
-  may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
+  may cost and is now bounded as the timestamp it is, a few units. CEL now refuses ordering numbers
+  of different types, as `[1, 2].exists(i, i < 2u)`, which it accepted before once it had checked a
+  loop, so a condition stored so no longer compiles: a grant's gives nothing and a deny's applies.
+  Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
   reading their kind, and so are ones holding an empty or nil slice, map or pointer of values no

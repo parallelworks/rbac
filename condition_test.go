@@ -4868,8 +4868,8 @@ func (o otherwise) ID() int64 { return o.id }
 
 // A loop whose condition CEL plans as neither of those of its macros, or where no decorator sees
 // it, as another version of CEL may, isn't a condition: its steps would be neither counted nor
-// dropped, so it would run unbounded. Nor is one whose range it plans under another id: its first
-// step wouldn't find the range, so a loop over a map would copy its keys uncharged. Nor is one
+// dropped, so it would run unbounded. Nor is one whose range it plans under another id, where
+// nothing would order a map's keys or charge them as the loop starts. Nor is one
 // whose range, which may be a map, it plans as something else, which nothing orders, so a loop
 // over it would give its keys as Go ranges over it, but where CEL checks the range as a list.
 func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
@@ -4907,7 +4907,7 @@ func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
 // CEL reads a variable a condition names from the root where a loop's variable of the same name
 // hides it, as `.request` in `l.all(request, ...)`, from what the check passed, outside the
 // evaluation, and indexes it there, where nothing is charged: a key it computed, and whatever
-// computing it evaluated, ran uncharged, so a key searching a string of 100,000 bytes at each of
+// computing it evaluated, ran uncharged, so a key searching a string of 99,990 bytes at each of
 // 3,000 steps of a loop cost 6,003. A condition indexing one by anything but a literal isn't one;
 // reading it by its fields or a literal key, or one past a loop's variable of another name, is.
 func TestAVariableNamedFromTheRootPastALoopsVariableIsIndexedOnlyByALiteral(t *testing.T) {
