@@ -7508,8 +7508,49 @@ func TestAChangeHoldsWhatDeleteExpiredDeletesBeforeItReadsItsTime(t *testing.T) 
 // which a write around the package holds, without the group's lock.
 func TestTheTestsSeeAChangeWaitForARowOnceItHasReadItsTime(t *testing.T) {
 	h := grouped(t)
+	h.groups(t, "crew")
+	if p, _ := waitForTheGroupsRow(t, h).(string); !strings.Contains(p, "waits for a row lock") || !strings.Contains(p, "INSERT INTO rbac_groups") {
+		t.Errorf("SetGroup waiting for the group's row, having read its time, panicked with %q", p)
+	}
+}
+
+// The watch that sees those waits outlives its connection: it connects again, failing the change
+// it was watching as the connection ended, which could have waited unseen, so a change after it is
+// seen to wait, or fails, and none passes unwatched.
+func TestTheTestsWatchForRowWaitsPastALostConnection(t *testing.T) {
+	h := grouped(t)
 	ctx := t.Context()
 	h.groups(t, "crew")
+	// A change that reads its time starts the watch, if none has yet.
+	if err := h.authz.SetGroup(ctx, h.as(t, "groups"), "t1", rbac.GroupDefinition{ID: "crew", Name: "Crew"}); err != nil {
+		t.Fatal(err)
+	}
+	wait, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	pid, err := rbac.RowWaitWatch(wait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ended bool
+	if err := h.pool.QueryRow(ctx, `SELECT pg_terminate_backend($1, 10000)`, int32(pid)).Scan(&ended); err != nil || !ended {
+		t.Fatalf("ending the watch's session %d: %t, %v", pid, ended, err)
+	}
+	if p, _ := waitForTheGroupsRow(t, h).(string); !strings.Contains(p, "waits for a row lock") && !strings.Contains(p, "lost its connection") {
+		t.Errorf("SetGroup waiting for the group's row once the watch's session ended panicked with %q", p)
+	}
+	if p, _ := waitForTheGroupsRow(t, h).(string); !strings.Contains(p, "waits for a row lock") {
+		t.Errorf("SetGroup waiting for the group's row once the watch connected again panicked with %q", p)
+	}
+	if again, err := rbac.RowWaitWatch(wait); err != nil || again == pid {
+		t.Errorf("the watch is on session %d, ended as %d was: %v", again, pid, err)
+	}
+}
+
+// waitForTheGroupsRow has SetGroup of the group crew wait for its row, which a transaction of the
+// test's holds until SetGroup has waited, and returns what SetGroup panicked with.
+func waitForTheGroupsRow(t *testing.T, h *harness) any {
+	t.Helper()
+	ctx := t.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -7541,7 +7582,11 @@ func TestTheTestsSeeAChangeWaitForARowOnceItHasReadItsTime(t *testing.T) {
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if p, _ := (<-panicked).(string); !strings.Contains(p, "waits for a row lock") || !strings.Contains(p, "INSERT INTO rbac_groups") {
-		t.Errorf("SetGroup waiting for the group's row, having read its time, panicked with %q", p)
+	select {
+	case p := <-panicked:
+		return p
+	case <-time.After(10 * time.Second):
+		t.Fatal("SetGroup never ended")
+		return nil
 	}
 }

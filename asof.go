@@ -4,36 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
-
-// asOfEntities are the tables history records, by the entity it records each as, and the columns
-// history records beside each of a table's rows, by the table's column each copies. A role's id is
-// its key, which history's index of an entity's versions seeks with its tenant: its role column is
-// indexed beside every grant and eligibility of the role, and a plan that counts the tenant's
-// roles as a few reads them all rather than seek that index. So are a membership's principal and a
-// group's id: by its principal or group column, which history indexes beside the entity, a plan by
-// statistics that count the tenant's memberships or groups as a few read every one of them by the
-// entity to find one. A grant, an eligibility and a place in a group are read by columns other
-// than their key, as their principal, and that index holds their versions only for a read that
-// names their key, as history's index of scopes holds them only for one that names a scope: so by
-// whichever of history's indexes leading to those columns a plan reads them, it seeks them.
-var asOfEntities = []struct {
-	table, entity string
-	columns       map[string]string
-}{
-	{"rbac_grants", "grant", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
-	{"rbac_roles", "role", map[string]string{"tenant": "tenant", "id": "key"}},
-	{"rbac_denies", "deny", map[string]string{"tenant": "tenant", "scope": "scope"}},
-	{"rbac_eligibilities", "eligibility", map[string]string{"tenant": "tenant", "principal": "principal", "role": "role", "scope": "scope"}},
-	{"rbac_memberships", "membership", map[string]string{"tenant": "tenant", "principal": "key"}},
-	{"rbac_groups", "group", map[string]string{"tenant": "tenant", "id": "key"}},
-	{"rbac_members", "member", map[string]string{"tenant": "tenant", "group_id": "group_id", "principal": "principal"}},
-}
 
 // AsOf runs read on an Authorizer that reads a tenant as it was at a time, from its history: who
 // held what, who was in which group, what was denied, and what custom roles gave. Its checks,
@@ -71,22 +46,48 @@ var asOfEntities = []struct {
 // called on: one bound to a transaction, as WithTx's, runs in AsOf's savepoint until AsOf returns,
 // and so reads the past, and one on a pool reads the tables as they are now.
 //
-// It reads in one transaction, or a savepoint of the host's under WithTx, in which temporary
-// views named as the package's tables stand in for them, and rolls it back, even once ctx is
-// done. Every statement there is planned for its arguments, the host's under WithTx too, as
-// plan_cache_mode force_custom_plan plans them, and without JIT, until the rollback restores both
-// settings: planned so over history, a check or a host's query of a Filter condition costs past
-// jit_above_cost for an ordinary subject, and compiling it took several times as long as running
-// it. It needs a transaction that may write, on a primary, as a role that may create temporary
-// tables. Making the views takes a transaction id, which AsOf's transaction holds until it rolls
-// back, and under WithTx the host's until it ends: as any transaction holding one does, it holds
-// History and Export back, in every database of the cluster, for as long as read runs. So keep
-// read short, as an access review of many subjects reads them in several calls rather than one. A
-// search_path that names pg_temp after the package's schema would read the tables as they are
-// now, and one that names it first the session's own tables as history, so AsOf refuses both. It
-// orders a row's changes by their ids in rbac_history, which sessions take out of order once its
-// id sequence caches more than one, so AsOf refuses that too. It refuses a time before 4714 BC,
-// the earliest PostgreSQL holds, or after 9999-12-30, the last the package stores.
+// It reads in one transaction, or a savepoint of the host's under WithTx, which it makes READ ONLY
+// and rolls back, even once ctx is done, with the schema of history's views that migrating makes
+// beside the package's, named as it with _as_of after, first on the search_path: each view is
+// named as the table it stands in for and reads history as of the time, so every statement there,
+// the host's too, reads a table by its name as it was, and the current schema is the views'. Every
+// statement there is planned for its arguments, the host's under WithTx too, as plan_cache_mode
+// force_custom_plan plans them, and without JIT, until the rollback restores the settings: planned
+// so over history, a check or a host's query of a Filter condition costs past jit_above_cost for an
+// ordinary subject, and compiling it took several times as long as running it. It makes no object
+// and takes no transaction id, so the role reading needs no TEMPORARY, only USAGE on the views'
+// schema and SELECT on them, which it is refused without, and its read holds no History or Export
+// back; under WithTx, a host's transaction that has taken one holds them back as it would anyway,
+// as does a statement of read that writes a session's temporary table, which READ ONLY lets
+// through. So it reads on a hot standby too, as of what the standby has replayed, where History
+// fails. It drops the session's cached plans (DISCARD PLANS), under WithTx the host's too, which
+// their statements plan again at their next run. The search_path it reads by names the views'
+// schema, then pg_temp, then the session's, as one that doesn't name pg_temp reads a session's own
+// tables first: one that names pg_temp after the package's schema would have them read before the
+// package's, and one that names it first reads them as history, so AsOf refuses both. A function,
+// operator or type in the views' schema is found before the package's and run as whoever reads, so
+// it refuses that schema where it holds more than its owner's views, another role may create in it,
+// or it isn't the role's that owns the package's tables. A statement looks each name up by the
+// catalog as it is then, whatever its transaction's snapshot, so it checks that schema again once
+// read returns: on its own transaction, once that has rolled back, as a query of the catalog there,
+// at REPEATABLE READ, reads its snapshot, and under WithTx in the savepoint. A statement of read
+// that sets the search_path, the role, or the settings the views read the tenant, the time and the
+// cluster by, or another session revoking the role's USAGE on the views' schema, dropping one of
+// the views or making something there, has the statements after it read another tenant or time, or
+// the tables as they are now, or call what was made, so AsOf fails once read returns where one
+// stays so: read's answers stand only where it returns nil. One made and undone within read it
+// can't tell, and the package's statements run between the two read by it: a call read makes
+// meanwhile, and those of a call after a hook of it that made it. So set them, or the role, in read
+// or a hook only within a savepoint rolled back before the package's next statement. Nor can it
+// tell what was made in the views' schema and dropped again as read ran, which only a role that may
+// create there can make: its owner, the role that migrated, a member of it, a superuser, or one
+// either let. And under WithTx in a host's transaction at REPEATABLE READ or SERIALIZABLE, whose
+// queries read the catalog as of its first statement, both checks of that schema read past what was
+// made there, or let another create there, since: read where that matters on a pool's Authorizer,
+// or under WithTx at READ COMMITTED. It orders a row's changes by their ids in rbac_history, which
+// sessions take out of order once its id sequence caches more than one, so AsOf refuses that too.
+// It refuses a time before 4714 BC, the earliest PostgreSQL holds, or after 9999-12-30, the last
+// the package stores.
 func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read func(*Authorizer) error) (err error) {
 	defer conflicting(&err)
 	if !validID(tenant) {
@@ -105,10 +106,12 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 		return fmt.Errorf("%w: a read as of a time is of one from 4714 BC to 9999-12-30", ErrInvalid)
 	}
 	var tx pgx.Tx
+	host := false
 	switch conn := a.db.(type) {
 	case ownTx:
 		tx, err = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	case pgx.Tx:
+		host = true
 		tx, err = conn.Begin(ctx)
 	default:
 		tx, err = repeatableRead(ctx, conn)
@@ -117,13 +120,32 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 		return err
 	}
 	// Once ctx is done, a rollback on it isn't sent: a savepoint of the host's left standing keeps
-	// the views in its transaction, which then reads the past, and in its session once it commits.
+	// its settings in its transaction, which then reads the past, and can't write.
+	var stood standIns
 	defer func() {
 		if rerr := finish(ctx, tx.Rollback); rerr != nil {
 			err = errors.Join(err, rerr)
+		} else if err == nil && !host && stood.views != "" {
+			err = finish(ctx, func(c context.Context) error { return a.stoodBy(c, stood) })
 		}
 	}()
-	return a.readAsOf(ctx, tx, tenant, at, read)
+	stood, err = a.readAsOf(ctx, tx, tenant, at, read, host)
+	return err
+}
+
+// stoodBy refuses, once AsOf's read on a transaction of its own has rolled back, the views it read
+// by, as stand does, on the DB AsOf was called on: as it is, a pool or a connection, or in what its
+// Begin begins, as a host's wrapper's can be a savepoint of the host's transaction, which a failure
+// would otherwise abort. A statement of the read looked each name up by the catalog as it was then,
+// but AsOf's own transaction is REPEATABLE READ, whose queries, of the catalog too, read the
+// snapshot it took at its first: stand there would read past a function made in the views' schema
+// since, which a statement after it called. Under WithTx stand reads in AsOf's savepoint
+// (readAsOf), as here it would read on the host's transaction.
+func (a *Authorizer) stoodBy(ctx context.Context, stood standIns) error {
+	if _, own := a.db.(ownTx); own {
+		return stood.stand(ctx, a.db)
+	}
+	return savepoint(ctx, a.db, func(tx pgx.Tx) error { return stood.stand(ctx, tx) })
 }
 
 // historySchema returns the schema tx reads history in, as packageSchema does, refusing it where
@@ -147,18 +169,190 @@ func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
 	return schema, nil
 }
 
-// asOfTime is the format AsOf writes its time in, and reads it back by, in rbac.as_of: TZH writes
-// a timestamp without a time zone, as UTC's here, as +00.
-const asOfTime = `YYYY-MM-DD HH24:MI:SS.US TZH BC`
+// standIns are the views of history in schema that 0028_as_of_views makes, which AsOf's read finds
+// the package's tables by: their schema, views, of oid id, and the name and oid of each view, one
+// for each table.
+type standIns struct {
+	schema, views string
+	id            uint32
+	names         []string
+	oids          []uint32
+}
 
-// readAsOf runs read on tx, with history standing in for the package's tables.
-func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at time.Time, read func(*Authorizer) error) error {
-	schema, err := historySchema(ctx, tx)
-	if err != nil {
+// planted is SQL for whether the schema n, an alias of pg_namespace, as that of AsOf's views,
+// isn't the role's that owns the package's tables in the schema of oid here, SQL for it, lets
+// another role create in it, or holds anything but views of its owner's, but for default
+// privileges, which hold no object: a function, operator or type made there, as by a grant of
+// CREATE or an extension installed there, would be called in place of the package's, as whoever
+// reads. Every object in a schema, of whatever catalog, depends on it (pg_depend), but for a type
+// made with another object, as a relation's row type or a type's array type, which depends on that.
+func planted(n, here string) string {
+	return `(` + n + `.nspowner IS DISTINCT FROM (SELECT t.relowner FROM pg_catalog.pg_class t
+		    WHERE t.relnamespace = ` + here + ` AND t.relname = 'rbac_grants' AND t.relkind IN ('r', 'p'))
+		  OR EXISTS (SELECT FROM pg_catalog.aclexplode(` + n + `.nspacl) a WHERE a.privilege_type = 'CREATE' AND a.grantee <> ` + n + `.nspowner)
+		  OR EXISTS (SELECT FROM pg_catalog.pg_depend d
+		    WHERE d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.refobjid = ` + n + `.oid
+		      AND d.classid <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+		      AND NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+		        AND c.oid = d.objid AND c.relkind = 'v' AND c.relowner = ` + n + `.nspowner)))`
+}
+
+// errPlanted is the error of AsOf refusing the schema views of the views of history in schema, as
+// planted is true of it.
+func errPlanted(views, schema string) error {
+	return fmt.Errorf("%w: schema %s, of AsOf's views, holds more than its owner's views, isn't the role's that owns %s's tables, or lets another role create in it: what is made there is called in place of the package's", ErrInvalid, views, schema)
+}
+
+// asOfViews returns the views of history in schema, which it finds by what they read, whatever
+// either schema is named, and the search_path q reads by: refusing them where they are of no one
+// schema, where theirs holds no view of one of the package's tables, those of schema prefixed
+// rbac_ but rbac_expired, which no read as of a time reads, as it would be read as it is now, or, as
+// migrating does, where planted is true of it.
+func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, error) {
+	s := standIns{schema: schema}
+	var views, bare []string
+	var path string
+	var refused bool
+	if err := q.QueryRow(ctx, `WITH v AS (
+		  SELECT DISTINCT c.relnamespace AS oid FROM pg_catalog.pg_depend d
+		  JOIN pg_catalog.pg_rewrite w ON w.oid = d.objid
+		  JOIN pg_catalog.pg_class c ON c.oid = w.ev_class
+		  WHERE d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+		    AND d.refobjid = $1::pg_catalog.text::pg_catalog.regclass AND c.relkind = 'v' AND c.relname = 'rbac_grants'),
+		  here AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2),
+		  tables AS (SELECT t.relname, c.oid AS view FROM pg_catalog.pg_class t
+		    LEFT JOIN (pg_catalog.pg_class c JOIN v ON c.relnamespace = v.oid) ON c.relname = t.relname AND c.relkind = 'v'
+		    WHERE t.relnamespace = (SELECT here.oid FROM here)
+		      AND t.relkind IN ('r', 'p') AND pg_catalog.starts_with(t.relname, 'rbac_') AND t.relname NOT IN ('rbac_history', 'rbac_migrations', 'rbac_expired'))
+		SELECT ARRAY(SELECT n.nspname::pg_catalog.text FROM v JOIN pg_catalog.pg_namespace n ON n.oid = v.oid ORDER BY 1),
+		  coalesce((SELECT pg_catalog.min(v.oid) FROM v), 0),
+		  ARRAY(SELECT t.relname::pg_catalog.text FROM tables t WHERE t.view IS NULL ORDER BY t.relname),
+		  ARRAY(SELECT t.relname::pg_catalog.text FROM tables t WHERE t.view IS NOT NULL ORDER BY t.relname),
+		  ARRAY(SELECT t.view FROM tables t WHERE t.view IS NOT NULL ORDER BY t.relname),
+		  pg_catalog.current_setting('search_path'),
+		  EXISTS (SELECT FROM v JOIN pg_catalog.pg_namespace n ON n.oid = v.oid WHERE `+planted("n", "(SELECT here.oid FROM here)")+`)`,
+		historyTable(schema), schema).Scan(&views, &s.id, &bare, &s.names, &s.oids, &path, &refused); err != nil {
+		return standIns{}, "", err
+	}
+	switch {
+	case len(views) == 0:
+		return standIns{}, "", fmt.Errorf("%w: no views of history stand beside schema %s: migrate it to 0028_as_of_views", ErrInvalid, schema)
+	case len(views) > 1:
+		return standIns{}, "", fmt.Errorf("%w: views of %s.rbac_history stand in schemas %s", ErrInvalid, schema, strings.Join(views, ", "))
+	case len(bare) > 0:
+		return standIns{}, "", fmt.Errorf("%w: schema %s holds no view of %s, which would be read as it is now", ErrInvalid, views[0], strings.Join(bare, ", "))
+	case refused:
+		return standIns{}, "", errPlanted(views[0], schema)
+	}
+	s.views = views[0]
+	return s, path, nil
+}
+
+// stand refuses, on q, the schema of the views s found, where planted is true of it by the catalog
+// as q reads it now, or it is gone: what was made there since, or granted, a statement of the read
+// that looked a name up since could have found. It reads the catalog as of q's snapshot, which in a
+// transaction at REPEATABLE READ is that of its first statement, whereas a name is looked up by the
+// catalog as it is (stoodBy). A view dropped, or the schema left off the search_path, kept refuses.
+func (s standIns) stand(ctx context.Context, q DB) error {
+	var refused bool
+	if err := q.QueryRow(ctx, `SELECT coalesce((SELECT `+planted("n", "(SELECT h.oid FROM pg_catalog.pg_namespace h WHERE h.nspname = $2)")+`
+		FROM pg_catalog.pg_namespace n WHERE n.oid = $1), true)`, s.id, s.schema).Scan(&refused); err != nil {
 		return err
 	}
-	if err := unpruned(ctx, tx, schema, at); err != nil {
+	if refused {
+		return errPlanted(s.views, s.schema)
+	}
+	return nil
+}
+
+// namesTemp reports whether the search_path setting names pg_temp, as PostgreSQL reads its names:
+// one quoted as it is but for each "" in it, and one unquoted with its ASCII letters in lower case.
+func namesTemp(setting string) bool {
+	const space = " \t\n\r\v\f"
+	for s := setting; ; {
+		if s = strings.TrimLeft(s, ","+space); s == "" {
+			return false
+		}
+		var name strings.Builder
+		if s[0] == '"' {
+			for s = s[1:]; s != ""; s = s[1:] {
+				if s[0] == '"' {
+					if s = s[1:]; s == "" || s[0] != '"' {
+						break
+					}
+				}
+				name.WriteByte(s[0])
+			}
+		} else {
+			end := strings.IndexAny(s, ","+space)
+			if end < 0 {
+				end = len(s)
+			}
+			for _, c := range []byte(s[:end]) {
+				if 'A' <= c && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				name.WriteByte(c)
+			}
+			s = s[end:]
+		}
+		if name.String() == "pg_temp" {
+			return true
+		}
+	}
+}
+
+// asOfTime is the format AsOf writes its time in, and its views read it back by, in rbac.as_of: TZH
+// writes a timestamp without a time zone, as UTC's here, as +00.
+const asOfTime = `YYYY-MM-DD HH24:MI:SS.US TZH BC`
+
+// asOfSet is what AsOf set its read's transaction to read by: the views' settings and the
+// search_path, as set_config returned them, and the views that stand in for the tables by it, the
+// current schema being theirs.
+type asOfSet struct {
+	tenant, at, cluster, path string
+	standIns
+}
+
+// kept refuses, on tx, what a statement of AsOf's read left set otherwise, or another session left
+// otherwise since. The search_path alone doesn't keep the views first: a role without USAGE on
+// their schema, as a SET ROLE can make the session's, or once another session revokes it, reads by
+// it the tables as they are now, as it does one whose view is dropped. So each table's name is
+// looked up as a statement of the read looks it up, by the catalog as it is, whatever tx's
+// snapshot, and must name the view it named as the read began.
+func (s asOfSet) kept(ctx context.Context, tx pgx.Tx) error {
+	var kept bool
+	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_setting('rbac.as_of_tenant') = $1 AND pg_catalog.current_setting('rbac.as_of') = $2
+		AND pg_catalog.current_setting('rbac.as_of_cluster') = $3 AND pg_catalog.current_setting('search_path') = $4
+		AND pg_catalog.current_schema() IS NOT DISTINCT FROM $5::pg_catalog.text
+		AND NOT EXISTS (SELECT FROM ROWS FROM (pg_catalog.unnest($6::pg_catalog.text[]), pg_catalog.unnest($7::pg_catalog.oid[])) AS v(name, oid)
+		  WHERE pg_catalog.to_regclass(pg_catalog.quote_ident(v.name))::pg_catalog.oid IS DISTINCT FROM v.oid)`,
+		s.tenant, s.at, s.cluster, s.path, s.views, s.names, s.oids).Scan(&kept); err != nil {
 		return err
+	}
+	if !kept {
+		return fmt.Errorf("%w: a statement of the read set the search_path, the role, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, or the tables as they are now", ErrInvalid)
+	}
+	return nil
+}
+
+// readAsOf runs read on tx, with history's views standing in for the package's tables, and returns
+// those views. Under WithTx, host, tx is a savepoint of the host's transaction, on which it checks
+// them again as read returns, as stoodBy does once a transaction of AsOf's own has rolled back.
+func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at time.Time, read func(*Authorizer) error, host bool) (standIns, error) {
+	schema, err := historySchema(ctx, tx)
+	if err != nil {
+		return standIns{}, err
+	}
+	views, path, err := asOfViews(ctx, tx, schema)
+	if err != nil {
+		return standIns{}, err
+	}
+	if namesTemp(path) {
+		return standIns{}, fmt.Errorf("%w: the search_path names pg_temp after %s, whose tables AsOf would read the session's own before", ErrInvalid, schema)
+	}
+	if err := unpruned(ctx, tx, schema, at); err != nil {
+		return standIns{}, err
 	}
 	// Each statement is planned for its arguments until AsOf rolls back. A connection prepares a
 	// statement once, as of a time and now alike, and from its sixth run can plan it generically,
@@ -175,122 +369,62 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// (inUTC), and the format reads the era as its own field. JIT is off: planned for their
 	// arguments over history's views, statements cost past jit_above_cost though they read little,
 	// and a host's query of a Filter condition for a subject of a few hundred grants spent most of
-	// its time compiling.
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
+	// its time compiling. Read only, so no statement of read writes, or takes the transaction id a
+	// write would, but to a session's temporary table, and none can set the transaction to write
+	// again; under WithTx the savepoint's rollback leaves the host's as writable as it was. A
+	// statement the session prepared earlier is parsed again, as PostgreSQL does once the
+	// search_path it was parsed by changes, so it reads the views. The current schema is then the
+	// views', unless the role has no USAGE on them, which the search_path leaves out, and the tables
+	// would be read as they are now.
+	// And the plans the session's statements took in an earlier read are dropped (DISCARD PLANS),
+	// as that read's search_path was this one's: a generic plan a host's read forced there, made for
+	// its time and tenant and by the settings of the call that first ran it, would stand, so the
+	// pages of history a search read turned on which reads its connection had run before.
+	set := asOfSet{standIns: views}
+	var current string
+	if err := tx.QueryRow(ctx, `SELECT set_config('rbac.as_of_tenant', $1, true),
 		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
 		set_config('rbac.as_of_cluster', (pg_catalog.pg_control_system()).system_identifier::pg_catalog.text, true),
-		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true)`,
-		tenant, at); err != nil {
-		return err
+		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true),
+		set_config('transaction_read_only', 'on', true),
+		set_config('search_path', pg_catalog.quote_ident($3) || ', pg_temp, ' || pg_catalog.current_setting('search_path'), true),
+		pg_catalog.current_schema()`,
+		tenant, at, views.views).Scan(&set.tenant, &set.at, &set.cluster, nil, nil, nil, &set.path, &current); err != nil {
+		return standIns{}, err
 	}
-	// Each table as the last version of each of its rows counted by the time left it: none where
-	// that was a delete or an expiry. A version counts from its date, or its transaction's commit
-	// record where that is later (counts), which is always but for a transaction that committed
-	// before history kept them: no other session sees a change before it commits. A row's versions
-	// are written one at a time, each after the last committed, so their ids order them, as their
-	// dates do only since none is dated before the last: one dated by its transaction's start, as
-	// before 0006, can have been written after a version dated later. The view reads its tenant and
-	// time from settings of the transaction, so no value is spliced into its definition. Each row's
-	// record is built once, where `(f(x)).*` builds it once a column. A version is its row's last
-	// unless a later one counts by then, and gives the columns history copied beside it as its
-	// row's, so a statement's condition on one, as a check's on its subject's principals, reads
-	// history by its index for the rows it names, rather than every version of every row in the
-	// tenant. Tested in a subquery the planner can't make a join of (later), each version reads
-	// its row's later ones by their key in history's index of an entity's versions: a few pages for
-	// each version, whatever their dates. As a join, planned by statistics from before most of
-	// history was written, as autovacuum leaves them until a tenth of it is new, it read every version
-	// of the entity in the tenant for each version it found, the key only a filter.
-	names := make([]string, len(asOfEntities))
-	for i, e := range asOfEntities {
-		names[i] = e.table
+	if current != views.views {
+		return standIns{}, fmt.Errorf("%w: the role has no USAGE on schema %s, so its views can't stand in for the package's tables", ErrInvalid, views.views)
 	}
-	rows, err := tx.Query(ctx, `SELECT c.relname::pg_catalog.text, array_agg(a.attname::pg_catalog.text ORDER BY a.attnum)
-		FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
-		WHERE c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1)
-		  AND c.relname = ANY($2::pg_catalog.text[]) AND a.attnum > 0 AND NOT a.attisdropped
-		GROUP BY c.relname`, schema, names)
-	if err != nil {
-		return err
-	}
-	tables := map[string][]string{}
-	var table string
-	var columns []string
-	if _, err := pgx.ForEachRow(rows, []any{&table, &columns}, func() error {
-		tables[table] = slices.Clone(columns)
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, e := range asOfEntities {
-		selected := make([]string, len(tables[e.table]))
-		for i, name := range tables[e.table] {
-			selected[i] = "r." + pgx.Identifier{name}.Sanitize()
-			if h, ok := e.columns[name]; ok {
-				selected[i] = "h." + h + " AS " + pgx.Identifier{name}.Sanitize()
-			}
-			// The keys a deny names, by the expression history's index on them reads them by
-			// (0015), so a list finds the denies naming its subject as it does now, by that index.
-			if e.table == "rbac_denies" && name == "principals" {
-				selected[i] = pgx.Identifier{schema}.Sanitize() + `.rbac_text_array(h.after -> 'principals') COLLATE "C" AS principals`
-			}
-			// A version recorded before the tables refused an infinite expiry reads as migrating
-			// rewrote its row: a time.Time holds no infinity.
-			if name == "expires_at" {
-				selected[i] = `CASE r.expires_at WHEN 'infinity' THEN NULL WHEN '-infinity' THEN pg_catalog.timestamptz 'epoch' ELSE r.expires_at END AS expires_at`
-			}
-		}
-		b := byTime{history: "%[1]s.rbac_history", at: "%[5]s", cluster: `current_setting('rbac.as_of_cluster')::pg_catalog.int8`}
-		view := `SELECT %[4]s FROM %[1]s.rbac_history h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
-			WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s'
-			  AND h.op NOT IN ('delete', 'expire') AND h.effective_at <= %[5]s
-			  AND ` + b.byAnother("h") + `
-			  AND CASE WHEN ` + b.later("h", "'%[3]s'") + ` IS NOT NULL THEN false
-			    ELSE ` + b.byCommit("h", "NOT "+b.writtenLater("h", "'%[3]s'"), "c.at <= %[5]s") + ` END`
-		// Roles are read by their ids, the key, or all at once, as Grantable reads them: their view
-		// takes each one's newest version counted by then, which a condition on the key reaches
-		// into, so each version is read once, where the test for a later one, joined to every
-		// version of the tenant's roles, is planned generically by reading them all again for each.
-		// One on another column, as a grant's principal, wouldn't reach in.
-		if e.entity == "role" {
-			view = `SELECT %[4]s FROM (SELECT DISTINCT ON (h.key) h.* FROM %[1]s.rbac_history h
-			    WHERE h.tenant = current_setting('rbac.as_of_tenant') AND h.entity = '%[3]s' AND ` + b.counts("h") + `
-			    ORDER BY h.key, h.id DESC) h, LATERAL pg_catalog.jsonb_populate_record(NULL::%[1]s.%[2]s, h.after) r
-			WHERE h.op NOT IN ('delete', 'expire')`
-		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TEMP VIEW %[2]s AS `+view,
-			pgx.Identifier{schema}.Sanitize(), e.table, e.entity, strings.Join(selected, ", "),
-			`pg_catalog.to_timestamp(current_setting('rbac.as_of'), '`+asOfTime+`')`)); err != nil {
-			return err
-		}
-	}
-	// A statement the session prepared earlier would still read the tables: PostgreSQL parses a
-	// prepared statement again when the search_path or what it reads changes, and once the
-	// session has its temporary schema, a view made there changes neither.
 	if _, err := tx.Exec(ctx, `DISCARD PLANS`); err != nil {
-		return err
-	}
-	// Unless the search_path names pg_temp after the package's schema, its tables' names are
-	// the views'.
-	var shadowed bool
-	if err := tx.QueryRow(ctx, `SELECT 'rbac_grants'::pg_catalog.regclass = 'pg_temp.rbac_grants'::pg_catalog.regclass`).Scan(&shadowed); err != nil {
-		return err
-	}
-	if !shadowed {
-		return fmt.Errorf("%w: the search_path names pg_temp after %s, so history can't stand in for the package's tables", ErrInvalid, schema)
+		return standIns{}, err
 	}
 	b := *a
-	b.db, b.asOf, b.history = tx, true, historyTable(schema)
+	b.db, b.asOf, b.history, b.schema = tx, true, historyTable(schema), schema
 	b.cfg.Now = func() time.Time { return at }
 	// A change is refused before its transaction, so the host is never asked about one that can't
 	// be made.
 	b.cfg.ValidateGrant = func(context.Context, DB, GrantInput) error { return b.writable() }
 	if err := read(&b); err != nil {
-		return err
+		return standIns{}, err
 	}
 	// At READ COMMITTED, as a host's transaction under WithTx is, each of read's queries reads what
 	// has committed by then, so one after a prune that committed since the check read what it
-	// removed. Checked once ctx is done too, as read's answers stand only if this passes.
-	return finish(ctx, func(c context.Context) error { return unpruned(c, tx, schema, at) })
+	// removed, and one after a function was made in the views' schema called it, as each looks a
+	// name up by the catalog as it is. Checked once ctx is done too, as read's answers stand only if
+	// this passes: the views' schema under WithTx here, in the savepoint, as a query failing on the
+	// host's transaction once it has rolled back would abort that, and on AsOf's own transaction
+	// once it has rolled back (stoodBy).
+	return views, finish(ctx, func(c context.Context) error {
+		if err := set.kept(c, tx); err != nil {
+			return err
+		}
+		if host {
+			if err := views.stand(c, tx); err != nil {
+				return err
+			}
+		}
+		return unpruned(c, tx, schema, at)
+	})
 }
 
 // byTime is SQL for what a read as of a time tests history's versions by: history, its table; at,

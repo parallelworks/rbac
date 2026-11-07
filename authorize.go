@@ -1119,7 +1119,7 @@ func insideSQL(groups, now, principals string, standing bool) string {
 
 // standingSQL is insideSQL of every identity in the groups, with standing, as Holders lists them.
 // As of a time, each identity's membership of the tenant is looked up on its own, by its key in
-// history's index of an entity's versions (asOfEntities). Joined to the members in
+// history's index of an entity's versions (0028_as_of_views). Joined to the members in
 // rbac_group_members, by statistics from before the group's members were written, as autovacuum
 // leaves them until a tenth of history is new, the planner counted the members and the tenant's
 // memberships as a row each, and read every membership in the tenant again for each member, testing

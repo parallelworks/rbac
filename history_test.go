@@ -375,8 +375,9 @@ func TestHistoryRecordsRowsWhateverItsSchemaHolds(t *testing.T) {
 }
 
 // readmeRoles are the README's database roles, made for a test and dropped when it ends: the
-// administrator's, which owns a schema of its own and is a member of history's, and the
-// application's, each with a pool on that schema.
+// administrator's, which owns a schema of its own and the one beside it for AsOf's views, made for
+// it as it may make no schema, and is a member of history's; and the application's, each with a
+// pool on that schema.
 type readmeRoles struct {
 	admin, history, app, schema string
 	super                       *pgx.Conn
@@ -406,6 +407,7 @@ func newReadmeRolesIn(t *testing.T, base string) *readmeRoles {
 			`CREATE ROLE ` + r.admin + ` LOGIN`, `CREATE ROLE ` + r.history, `CREATE ROLE ` + r.app + ` LOGIN`,
 			`GRANT ` + r.history + ` TO ` + r.admin,
 			`CREATE SCHEMA ` + r.schema + ` AUTHORIZATION ` + r.admin,
+			`CREATE SCHEMA ` + r.schema + `_as_of AUTHORIZATION ` + r.admin,
 		} {
 			if _, err := tx.Exec(ctx, sql); err != nil {
 				return fmt.Errorf("%s: %w", sql, err)
@@ -422,7 +424,7 @@ func newReadmeRolesIn(t *testing.T, base string) *readmeRoles {
 	t.Cleanup(func() {
 		ctx := context.WithoutCancel(ctx)
 		for _, sql := range []string{
-			`DROP SCHEMA ` + r.schema + ` CASCADE`,
+			`DROP SCHEMA ` + pgtest.WithViews(r.schema) + ` CASCADE`,
 			`DROP OWNED BY ` + r.admin + `, ` + r.history + `, ` + r.app + ` CASCADE`,
 			`DROP ROLE ` + r.app + `, ` + r.admin + `, ` + r.history,
 		} {
@@ -452,10 +454,16 @@ func newReadmeRolesIn(t *testing.T, base string) *readmeRoles {
 // harden gives history to history's role, and the application's role its privileges, exactly as
 // the README's steps 2 and 3 say, with no role executing a function of the package's that they
 // don't list, as every role may unless it is revoked. The application's makes no schema and
-// creates in none, as step 4 says, unless the database's owner or a grant lets it.
+// creates in none, as step 4 says, unless the database's owner or a grant lets it. Hardened before
+// the migration that makes AsOf's views, the application's role is given none of them, as that
+// migration gives them, and their schema, to each role that may read history.
 func (r *readmeRoles) harden(t *testing.T) {
 	t.Helper()
 	s := r.schema
+	var views bool
+	if err := r.super.QueryRow(t.Context(), `SELECT to_regclass($1 || '_as_of.rbac_grants') IS NOT NULL`, s).Scan(&views); err != nil {
+		t.Fatal(err)
+	}
 	// Of those step 3 lists, the functions made by now: hardened before a later migration made one,
 	// the schema gets it as every role does, from PUBLIC.
 	var made []string
@@ -464,26 +472,135 @@ func (r *readmeRoles) harden(t *testing.T) {
 		s, []string{"rbac_group_members", "rbac_tenant_keys", "rbac_text_array", "rbac_changes_grants"}).Scan(&made); err != nil {
 		t.Fatal(err)
 	}
-	for _, sql := range []string{
+	// Of the functions step 2 lists, the commit record's, where a migration has made it.
+	var commit bool
+	if err := r.super.QueryRow(t.Context(), `SELECT to_regprocedure($1 || '.rbac_history_commit()') IS NOT NULL`, s).Scan(&commit); err != nil {
+		t.Fatal(err)
+	}
+	owned := []string{`ALTER FUNCTION ` + s + `.rbac_record() OWNER TO ` + r.history}
+	if commit {
+		owned = append(owned, `ALTER FUNCTION `+s+`.rbac_history_commit() OWNER TO `+r.history)
+	}
+	grants := slices.Concat([]string{
 		`REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA ` + s + ` FROM PUBLIC`,
-		// 2. History's role owns history and rbac_record, given them by a superuser, and needs
-		// USAGE on the schema and EXECUTE on rbac_tenant_keys and rbac_text_array.
+		// 2. History's role owns history, rbac_record and rbac_history_commit, given them by a
+		// superuser, and needs USAGE on the schema and EXECUTE on rbac_tenant_keys and
+		// rbac_text_array.
 		`ALTER TABLE ` + s + `.rbac_history OWNER TO ` + r.history,
-		`ALTER FUNCTION ` + s + `.rbac_record() OWNER TO ` + r.history,
+	}, owned, []string{
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.history,
 		`GRANT EXECUTE ON FUNCTION ` + s + `.rbac_tenant_keys, ` + s + `.rbac_text_array TO ` + r.history,
 		// 3. The application's role has USAGE on the schema, SELECT, INSERT, UPDATE and DELETE on
 		// its tables but rbac_history and rbac_migrations, EXECUTE on rbac_group_members,
-		// rbac_tenant_keys, rbac_text_array and rbac_changes_grants, and only SELECT on rbac_history.
+		// rbac_tenant_keys, rbac_text_array and rbac_changes_grants, only SELECT on rbac_history, and
+		// USAGE on the schema of AsOf's views and SELECT on them.
 		`GRANT USAGE ON SCHEMA ` + s + ` TO ` + r.app,
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + s + ` TO ` + r.app,
 		`REVOKE ALL ON ` + s + `.rbac_migrations FROM ` + r.app,
 		`GRANT EXECUTE ON FUNCTION ` + strings.Join(made, ", ") + ` TO ` + r.app,
 		`REVOKE INSERT, UPDATE, DELETE ON ` + s + `.rbac_history FROM ` + r.app,
-	} {
+	})
+	if views {
+		grants = append(grants, `GRANT USAGE ON SCHEMA `+s+`_as_of TO `+r.app, `GRANT SELECT ON ALL TABLES IN SCHEMA `+s+`_as_of TO `+r.app)
+	}
+	for _, sql := range grants {
 		if _, err := r.super.Exec(t.Context(), sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
 		}
+	}
+}
+
+// The commit record's function, which writes history as its owner, is given as it is made to the
+// owner of rbac_record, history's role where the README's roles are set up: where history's role may
+// create in the schema; where it may not but the role migrating owns the schema, which lends it
+// CREATE for the migration alone; and where neither holds, or the role migrating may not SET ROLE to
+// history's role, migrating fails, saying which to fix, and lending nothing, and once fixed gives it.
+// Whatever the schema's default privileges grant, no role may execute it, nor rbac_record, which
+// writes history as its owner too, and a change by the application's role commits with its commit
+// record.
+func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
+	var made string
+	sqls := migrationSQL(t)
+	for _, name := range slices.Sorted(maps.Keys(sqls)) {
+		if strings.Contains(sqls[name], "CREATE FUNCTION rbac_history_commit()") {
+			made = name
+			break
+		}
+	}
+	if made == "" {
+		t.Fatal("no migration makes the commit record's function")
+	}
+	for _, c := range []string{"history's role creates", "the schema's owner lends", "no one lends", "the role migrating may not SET ROLE"} {
+		t.Run(c, func(t *testing.T) {
+			ctx := t.Context()
+			r := newReadmeRoles(t)
+			super := func(sqls ...string) {
+				t.Helper()
+				for _, sql := range sqls {
+					if _, err := r.super.Exec(ctx, sql); err != nil {
+						t.Fatalf("%s: %v", sql, err)
+					}
+				}
+			}
+			// As a host's own default privileges might, for the functions it makes there, rbac_record
+			// among them.
+			super(`ALTER DEFAULT PRIVILEGES FOR ROLE ` + r.admin + ` IN SCHEMA ` + r.schema + ` GRANT EXECUTE ON FUNCTIONS TO ` + r.app)
+			if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", made); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, r.adminPool, made)
+			r.harden(t)
+			// Migrating fails, with hint, and leaves history's role no CREATE it was lent.
+			refused := func(where, hint string) {
+				t.Helper()
+				err := rbac.Migrate(ctx, r.adminPool)
+				if pgErr := (*pgconn.PgError)(nil); !errors.As(err, &pgErr) || pgErr.Code != "42501" ||
+					!strings.Contains(pgErr.Message, "rbac_history_commit") || !strings.Contains(pgErr.Hint, hint) {
+					t.Fatalf("migrating where %s: %v", where, err)
+				}
+				var creates bool
+				if err := r.super.QueryRow(ctx, `SELECT has_schema_privilege($1, $2, 'CREATE')`, r.history, r.schema).Scan(&creates); err != nil || creates {
+					t.Fatalf("history's role may create in the schema after migrating failed: %t, %v", creates, err)
+				}
+			}
+			switch c {
+			case "history's role creates":
+				super(`GRANT CREATE ON SCHEMA ` + r.schema + ` TO ` + r.history)
+			case "no one lends":
+				super(`ALTER SCHEMA `+r.schema+` OWNER TO CURRENT_USER`, `GRANT USAGE, CREATE ON SCHEMA `+r.schema+` TO `+r.admin)
+				refused("no role may give history's role CREATE on the schema", "Grant "+r.history+" CREATE on schema "+r.schema)
+				super(`GRANT CREATE ON SCHEMA ` + r.schema + ` TO ` + r.history)
+			case "the role migrating may not SET ROLE":
+				// A member still, with the rights of history's owner.
+				super(`GRANT ` + r.history + ` TO ` + r.admin + ` WITH SET FALSE`)
+				refused("the role migrating may not SET ROLE to history's role", "Grant "+r.history+" to "+r.admin+" with the SET option")
+				super(`GRANT ` + r.history + ` TO ` + r.admin + ` WITH SET TRUE`)
+			}
+			if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+				t.Fatal(err)
+			}
+			var owner string
+			var executes, records, creates bool
+			if err := r.super.QueryRow(ctx, `SELECT p.proowner::regrole::text, has_function_privilege($2, p.oid, 'EXECUTE'),
+				has_function_privilege($2, ($1 || '.rbac_record()')::regprocedure, 'EXECUTE'), has_schema_privilege($3, $1, 'CREATE')
+				FROM pg_proc p WHERE p.oid = ($1 || '.rbac_history_commit()')::regprocedure`, r.schema, r.app, r.history).Scan(&owner, &executes, &records, &creates); err != nil {
+				t.Fatal(err)
+			}
+			if owner != r.history || executes || records {
+				t.Errorf("the commit record's function is %s's, not %s's, and the application's role may execute it: %t, and rbac_record: %t", owner, r.history, executes, records)
+			}
+			if lent := c == "the schema's owner lends" || c == "the role migrating may not SET ROLE"; creates == lent {
+				t.Errorf("history's role may create in the schema after migrating: %t", creates)
+			}
+			var commits int
+			if _, err := r.appPool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'u')`); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history c WHERE c.entity = 'commit'
+				AND c.txid = (SELECT m.txid FROM rbac_history m WHERE m.entity = 'membership' AND m.key = 'user:u')`).Scan(&commits); err != nil || commits != 1 {
+				t.Errorf("the application's change has %d commit records: %v", commits, err)
+			}
+		})
 	}
 }
 
@@ -622,11 +739,11 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 // The commit-record checks refuse a change committed with a session's own enabled deferrable trigger
 // on a temporary table, which only a session with the TEMPORARY privilege can make. The README's
 // application role is denied TEMPORARY (revoked from PUBLIC on the database, granted to no one), so
-// it can make no temporary object and can't plant such a trigger: every package call but AsOf runs
-// without one. AsOf alone makes temporary views, so it needs TEMPORARY; a deployment that runs AsOf
-// as the application role grants it back, and the commit-record checks are then a best-effort
-// defense against that role, as the README and 0027 say.
-func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
+// it can make no temporary object and can't plant such a trigger, and every call of the package's
+// runs without it: AsOf too, which reads history through the views migrating made, in a read that
+// takes no transaction id and writes nothing, whose every statement reads the past, a hook's and the
+// host's, rbac_group_members's too, on its own transaction and under WithTx.
+func TestTheApplicationRoleNeedsNoTemporary(t *testing.T) {
 	ctx := t.Context()
 	name, base := pgtest.Database(t, "")
 	r := newReadmeRolesIn(t, base)
@@ -638,9 +755,22 @@ func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
 	if _, err := r.super.Exec(ctx, `REVOKE TEMPORARY ON DATABASE `+name+` FROM PUBLIC`); err != nil {
 		t.Fatal(err)
 	}
+	// What a constraint reads on the DB it is given: its transaction's id, and the grants of u.
+	type seen struct {
+		xid    *string
+		grants int
+	}
+	var hooked []seen
 	cfg := rbac.Config{
-		Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
-		ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Catalog:        append(slices.Clone(catalog), rbac.RoleDefinition{ID: "tenant.groups", Permissions: []rbac.Permission{rbac.ManageGroups}, ResourceTypes: []string{rbac.TenantScope}}),
+		ContainerTypes: []string{"org", "workspace"},
+		ValidateGrant:  func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+		Constraints: []rbac.Constraint{{Name: "reads", Deny: func(ctx context.Context, q rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			var s seen
+			err := q.QueryRow(ctx, `SELECT pg_current_xact_id_if_assigned()::text, (SELECT count(*) FROM rbac_grants WHERE principal = 'user:u')`).Scan(&s.xid, &s.grants)
+			hooked = append(hooked, s)
+			return false, err
+		}}},
 	}
 	authz, err := rbac.New(r.appPool, cfg)
 	if err != nil {
@@ -648,6 +778,7 @@ func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
 	}
 	for _, q := range []string{
 		creatorGrant,
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'tenant', 't1', 'user', 'owner', 'tenant.groups')`,
 		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'owner'), ('t1', 'user', 'u')`,
 	} {
 		if _, err := r.appPool.Exec(ctx, q); err != nil {
@@ -662,19 +793,41 @@ func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
 			t.Fatalf("the application's role makes a temporary table without TEMPORARY: %v", err)
 		}
 	}
-	// Every call but AsOf works without TEMPORARY.
 	check := func(what string, err error) {
 		t.Helper()
 		if err != nil {
 			t.Errorf("%s without TEMPORARY: %v", what, err)
 		}
 	}
-	check("Apply", authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: u.Principal}}}))
-	check("Authorize", authz.Authorize(ctx, owner, login, cluster))
-	var cursor rbac.Cursor
-	if _, cursor, err = authz.History(ctx, cursor, rbac.MaxHistory); err != nil {
-		t.Errorf("History without TEMPORARY: %v", err)
+	check("SetGroup", authz.SetGroup(ctx, owner, "t1", rbac.GroupDefinition{ID: "ops"}))
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := r.appPool.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
 	}
+	exec(`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('t1', 'ops', 'user', 'u')`)
+	check("Apply", authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{
+		{Role: "cluster.login", Principal: u.Principal}, {Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "ops"}},
+	}}))
+	var at time.Time
+	if err := r.appPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	// Since: u's grants were revoked, and u left ops.
+	check("Apply", authz.Apply(ctx, owner, cluster, rbac.Change{Revoke: []rbac.Binding{
+		{Role: "cluster.login", Principal: u.Principal}, {Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.Group, ID: "ops"}},
+	}}))
+	exec(`DELETE FROM rbac_members WHERE tenant = 't1' AND principal = 'user:u'`)
+	check("Authorize", authz.Authorize(ctx, owner, login, cluster))
+	// Every record, read once every transaction older than the last has ended, as other sessions
+	// sharing the cluster can hold one for a while.
+	var n int
+	if err := r.appPool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	var cursor rbac.Cursor
+	drain(t, &harness{ctx: ctx, pool: r.appPool, authz: authz, cfg: cfg}, &cursor, n)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -685,19 +838,75 @@ func TestTheApplicationRoleNeedsTemporaryOnlyForAsOf(t *testing.T) {
 	if _, err := rbac.PruneHistory(ctx, r.adminPool, time.Unix(0, 0), cursor); err != nil {
 		t.Errorf("PruneHistory without TEMPORARY: %v", err)
 	}
-	// AsOf makes temporary views, so it needs TEMPORARY: without it, it is refused.
-	asOf := func() error {
-		return authz.AsOf(ctx, "t1", time.Now(), func(a *rbac.Authorizer) error { return a.Authorize(ctx, owner, login, cluster) })
+	// As of then, every read finds u's grant and place in ops, as does the host's query on the read's
+	// transaction, and rbac_group_members.
+	reads := func(a *rbac.Authorizer, q pgx.Tx) error {
+		if err := a.Authorize(ctx, u, login, cluster); err != nil {
+			return err
+		}
+		holders, err := a.Holders(ctx, login, cluster)
+		if err == nil && !slices.ContainsFunc(holders, func(h rbac.Holder) bool { return h.Principal == u.Principal && slices.Equal(h.Groups, []string{"ops"}) }) {
+			err = fmt.Errorf("Holders = %+v", holders)
+		}
+		if err != nil {
+			return err
+		}
+		if members, err := a.Members(ctx, "t1", "ops"); err != nil || len(members) != 1 {
+			return fmt.Errorf("Members = %+v, %w", members, err)
+		}
+		if groups, err := a.GroupsOf(ctx, "t1", u.Principal); err != nil || !slices.Equal(groups, []string{"ops"}) {
+			return fmt.Errorf("GroupsOf = %v, %w", groups, err)
+		}
+		if grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{u.Principal}}); err != nil || len(grants) != 1 {
+			return fmt.Errorf("Grants = %+v, %w", grants, err)
+		}
+		if _, err := a.Filter(ctx, u, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1); err != nil {
+			return fmt.Errorf("Filter: %w", err)
+		}
+		if _, err := a.Reachable(ctx, u, view, "t1", "cluster"); err != nil {
+			return fmt.Errorf("Reachable: %w", err)
+		}
+		if _, err := a.Denies(ctx, "t1", []rbac.Scope{cluster.Scope()}); err != nil {
+			return fmt.Errorf("Denies: %w", err)
+		}
+		if _, _, err := a.History(ctx, rbac.Cursor{}, 1); err != nil {
+			return fmt.Errorf("History: %w", err)
+		}
+		if q == nil {
+			return nil
+		}
+		var grants, members int
+		var xid *string
+		if err := q.QueryRow(ctx, `SELECT (SELECT count(*) FROM rbac_grants WHERE principal IN ('user:u', 'group:ops')),
+			(SELECT count(*) FROM rbac_group_members('t1', '{ops}', $1, NULL, true)), pg_current_xact_id_if_assigned()::text`, at).Scan(&grants, &members, &xid); err != nil {
+			return err
+		}
+		if grants != 2 || members != 1 || xid != nil {
+			return fmt.Errorf("the host's query on the read's transaction reads %d grants and %d members, in transaction %v", grants, members, xid)
+		}
+		// Nor can it write, though it names the table itself rather than its view: the read only reads.
+		err = pgx.BeginFunc(ctx, q, func(s pgx.Tx) error {
+			_, err := s.Exec(ctx, `INSERT INTO `+r.schema+`.rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'w')`)
+			return err
+		})
+		if pg := (*pgconn.PgError)(nil); !errors.As(err, &pg) || pg.Code != "25006" {
+			return fmt.Errorf("a write in the read: %w", err)
+		}
+		return nil
 	}
-	if pg := (*pgconn.PgError)(nil); !errors.As(asOf(), &pg) || pg.Code != "42501" {
-		t.Errorf("AsOf without TEMPORARY: %v", asOf())
+	hooked = nil
+	check("AsOf", authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return reads(a, nil) }))
+	if len(hooked) == 0 || slices.ContainsFunc(hooked, func(s seen) bool { return s.xid != nil || s.grants != 1 }) {
+		t.Errorf("as of then, a constraint read %+v", hooked)
 	}
-	// Granted TEMPORARY, as a deployment that runs AsOf as this role grants it, AsOf works.
-	if _, err := r.super.Exec(ctx, `GRANT TEMPORARY ON DATABASE `+name+` TO `+r.app); err != nil {
+	tx, err := r.appPool.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := asOf(); err != nil {
-		t.Errorf("AsOf once granted TEMPORARY: %v", err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	check("AsOf under WithTx", authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return reads(a, tx) }))
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'w')`); err != nil {
+		t.Errorf("the host's transaction once AsOf returned: %v", err)
 	}
 }
 
@@ -5545,11 +5754,12 @@ func TestAsOfReadsOnlyTheLatestPrune(t *testing.T) {
 }
 
 // commitDates is the name of the migration from which history records when each transaction that
-// changes the package's tables commits.
+// changes the package's tables commits: the first to make the trigger that records it.
 func commitDates(t *testing.T) string {
 	t.Helper()
-	for name, sql := range migrationSQL(t) {
-		if strings.Contains(sql, "CREATE CONSTRAINT TRIGGER rbac_history_committed") {
+	sqls := migrationSQL(t)
+	for _, name := range slices.Sorted(maps.Keys(sqls)) {
+		if strings.Contains(sqls[name], "CREATE CONSTRAINT TRIGGER rbac_history_committed") {
 			return name
 		}
 	}

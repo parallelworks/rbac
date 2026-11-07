@@ -257,6 +257,7 @@ func TestNoFunctionKeepsItsSchemasName(t *testing.T) {
 			}
 			want := []string{
 				"rbac_history_append_only search_path=pg_catalog, pg_temp",
+				"rbac_history_commit search_path=pg_catalog, pg_temp, plan_cache_mode=force_generic_plan, enable_seqscan=off",
 				"rbac_history_pruned search_path=pg_catalog, pg_temp",
 				"rbac_record search_path=pg_catalog, pg_temp, TimeZone=UTC, plan_cache_mode=force_generic_plan, enable_seqscan=off",
 			}
@@ -651,5 +652,189 @@ func TestMigrateDoesntWaitOutAClientsVacuum(t *testing.T) {
 	}
 	if limit := time.Duration(ms) * time.Millisecond; took >= limit {
 		t.Errorf("Migrate took %v beside a client's vacuum, past deadlock_timeout's %v", took, limit)
+	}
+}
+
+// viewsDiverged is each of the package's tables in the schema of pool's connections, but history,
+// rbac_migrations and rbac_expired, whose view beside it for AsOf is missing or gives other columns than it holds: by
+// name, type, its modifier and collation, in its order.
+func viewsDiverged(t *testing.T, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `SELECT t.relname::text FROM pg_class t
+		CROSS JOIN LATERAL (SELECT to_regclass(quote_ident(current_schema() || '_as_of') || '.' || quote_ident(t.relname)) AS oid) v
+		WHERE t.relnamespace = current_schema()::regnamespace AND t.relkind = 'r' AND starts_with(t.relname, 'rbac_')
+		  AND t.relname NOT IN ('rbac_history', 'rbac_migrations', 'rbac_expired')
+		  AND (v.oid IS NULL OR EXISTS (
+		    (SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped
+		     EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = v.oid)
+		    UNION ALL
+		    (SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = v.oid
+		     EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped)))
+		ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diverged, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return diverged
+}
+
+// Every one of the package's tables but history and rbac_migrations has a view of its history
+// beside it, which AsOf reads it by, of the columns it holds, migrated from none or from before the
+// views were made, of a table holding rows: one that gave fewer would fail a host's query of a
+// column it lacks, or, given in another order, the package's statements prepared before AsOf, which
+// read the table. A migration that changes a table makes the views again (rbac_as_of_views), so a
+// column it adds is one its view gives.
+func TestEveryTableHasAViewOfItsColumns(t *testing.T) {
+	for _, from := range []string{"", "0028"} {
+		t.Run(fmt.Sprintf("from=%q", from), func(t *testing.T) {
+			ctx := t.Context()
+			pool := pgtest.Open(t, "")
+			if from != "" {
+				migrateFiles(t, pool, "", from)
+				recordMigrations(t, pool, from)
+				if _, err := pool.Exec(ctx, creatorGrant); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := rbac.Migrate(ctx, pool); err != nil {
+				t.Fatal(err)
+			}
+			if diverged := viewsDiverged(t, pool); len(diverged) != 0 {
+				t.Errorf("the views of %v give other columns than their tables hold", diverged)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE rbac_grants ADD COLUMN later text COLLATE "C"`); err != nil {
+				t.Fatal(err)
+			}
+			if diverged := viewsDiverged(t, pool); !slices.Equal(diverged, []string{"rbac_grants"}) {
+				t.Errorf("with a column added to rbac_grants alone, the views of %v give other columns than their tables hold", diverged)
+			}
+			if _, err := pool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+				t.Fatal(err)
+			}
+			if diverged := viewsDiverged(t, pool); len(diverged) != 0 {
+				t.Errorf("made again, the views of %v give other columns than their tables hold", diverged)
+			}
+		})
+	}
+}
+
+// Migrating makes the schema of AsOf's views, or, where the role migrating may make no schema, as
+// the README's administrator's may not, takes one made for it, empty and that role's: AsOf names it
+// first on its search_path, so one holding anything, another role's or one another may create in is
+// refused, as a function made there would be called in place of the package's, as whoever reads.
+// Made, the views read history with the rights of whoever reads them, and are given to each role
+// that may read history and use the package's schema, not to the public, which may read history
+// but not reach it, until it is given that schema and they are made again. Made again, as a later
+// migration makes them, they are refused alike where another role may since create there or the
+// schema holds more than them, though not for its default privileges.
+func TestMigratingMakesAsOfsViewsInASchemaOfTheirOwn(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	views := r.schema + "_as_of"
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	// Up to the views, with history readable by the application's role, and by the public, which has
+	// no USAGE on the package's schema.
+	migrateFiles(t, r.adminPool, "", "0028")
+	recordMigrations(t, r.adminPool, "0028")
+	exec(`GRANT USAGE ON SCHEMA ` + r.schema + ` TO ` + r.app)
+	exec(`GRANT SELECT ON ` + r.schema + `.rbac_history TO ` + r.app + `, PUBLIC`)
+	for _, c := range []struct {
+		what, set, unset, code string
+	}{
+		{"another role's", `ALTER SCHEMA ` + views + ` OWNER TO ` + r.app, `ALTER SCHEMA ` + views + ` OWNER TO ` + r.admin, "42P15"},
+		{"one another may create in", `GRANT CREATE ON SCHEMA ` + views + ` TO ` + r.app, `REVOKE CREATE ON SCHEMA ` + views + ` FROM ` + r.app, "42P15"},
+		{"one holding a table", `CREATE TABLE ` + views + `.held (a int)`, `DROP TABLE ` + views + `.held`, "42P15"},
+		{"none, which the role may not make", `DROP SCHEMA ` + views, `CREATE SCHEMA ` + views + ` AUTHORIZATION ` + r.admin, "42501"},
+	} {
+		exec(c.set)
+		if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != c.code {
+			t.Errorf("migrating with %s as the schema of AsOf's views: %v", c.what, err)
+		}
+		exec(c.unset)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("migrating with an empty schema of the role's made for AsOf's views: %v", err)
+	}
+	var n, invoker, given int
+	if err := r.super.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE 'security_invoker=true' = ANY(reloptions)),
+		count(*) FILTER (WHERE has_table_privilege($2, oid, 'SELECT') AND has_schema_privilege($2, relnamespace, 'USAGE'))
+		FROM pg_class WHERE relnamespace = $1::regnamespace AND relkind = 'v' AND relowner = $3::regrole`, views, r.app, r.admin).Scan(&n, &invoker, &given); err != nil {
+		t.Fatal(err)
+	}
+	if n != 7 || invoker != 7 || given != 7 {
+		t.Errorf("the administrator's role made %d views, %d read with their reader's rights, %d given to the application's role", n, invoker, given)
+	}
+	var public int
+	if err := r.super.QueryRow(ctx, `SELECT count(*) FROM pg_namespace n, aclexplode(n.nspacl) a WHERE n.oid = $1::regnamespace AND a.grantee = 0`, views).Scan(&public); err != nil || public != 0 {
+		t.Errorf("the public, which may read history but not use the package's schema, was given the views' schema %d times: %v", public, err)
+	}
+	// Given the package's schema since, as a role can be after migrating, the public is given the
+	// views once they are made again, as the README says.
+	exec(`GRANT USAGE ON SCHEMA ` + r.schema + ` TO PUBLIC`)
+	if _, err := r.adminPool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+		t.Fatal(err)
+	}
+	var reads bool
+	if err := r.super.QueryRow(ctx, `SELECT has_schema_privilege('public', $1::regnamespace, 'USAGE') AND has_table_privilege('public', $1 || '.rbac_grants', 'SELECT')`,
+		views).Scan(&reads); err != nil || !reads {
+		t.Errorf("the public, given the package's schema since the views were made, was given them as they were made again %t: %v", reads, err)
+	}
+	for _, c := range []struct {
+		what, set, unset string
+		refused          bool
+	}{
+		{"another may create in it", `GRANT CREATE ON SCHEMA ` + views + ` TO ` + r.app, `REVOKE CREATE ON SCHEMA ` + views + ` FROM ` + r.app, true},
+		{"it holds a table", `CREATE TABLE ` + views + `.held (a int)`, `DROP TABLE ` + views + `.held`, true},
+		{
+			"it has default privileges", `ALTER DEFAULT PRIVILEGES FOR ROLE ` + r.admin + ` IN SCHEMA ` + views + ` GRANT SELECT ON TABLES TO ` + r.app,
+			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + r.admin + ` IN SCHEMA ` + views + ` REVOKE SELECT ON TABLES FROM ` + r.app, false,
+		},
+	} {
+		exec(c.set)
+		_, err := r.adminPool.Exec(ctx, `SELECT rbac_as_of_views()`)
+		if c.refused && sqlState(err) != "42P15" || !c.refused && err != nil {
+			t.Errorf("making the views again where %s: %v", c.what, err)
+		}
+		exec(c.unset)
+	}
+}
+
+// A schema the role migrating makes for AsOf's views takes that role's default privileges, as one a
+// superuser makes for it does: where they let another role create in each schema the role makes,
+// migrating refuses the one it made, as AsOf would call what that role made there.
+func TestMigratingRefusesAViewsSchemaTheRolesDefaultPrivilegesOpen(t *testing.T) {
+	ctx := t.Context()
+	name, base := pgtest.Database(t, "")
+	r := newReadmeRolesIn(t, base)
+	views := r.schema + "_as_of"
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	// The administrator's role makes the schema itself.
+	exec(`DROP SCHEMA ` + views)
+	exec(`GRANT CREATE ON DATABASE ` + name + ` TO ` + r.admin)
+	exec(`ALTER DEFAULT PRIVILEGES FOR ROLE ` + r.admin + ` GRANT CREATE ON SCHEMAS TO ` + r.app)
+	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42P15" {
+		t.Errorf("migrating where the role's default privileges let another create in the schema it makes: %v", err)
+	}
+	exec(`ALTER DEFAULT PRIVILEGES FOR ROLE ` + r.admin + ` REVOKE CREATE ON SCHEMAS FROM ` + r.app)
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("migrating where the role's default privileges let no other create: %v", err)
+	}
+	var owned, creates bool
+	if err := r.super.QueryRow(ctx, `SELECT nspowner = $2::regrole, has_schema_privilege($3, oid, 'CREATE') FROM pg_namespace WHERE oid = $1::regnamespace`,
+		views, r.admin, r.app).Scan(&owned, &creates); err != nil || !owned || creates {
+		t.Errorf("the schema of AsOf's views the administrator's role made is its own %t, and the application's may create in it %t: %v", owned, creates, err)
 	}
 }
