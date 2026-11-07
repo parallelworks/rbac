@@ -1815,6 +1815,29 @@ func PlanKeysOtherwise(t *testing.T, expr string, replan func(interpreter.Interp
 	return err
 }
 
+// PlanRootedOtherwise is why expr can't be planned as a condition where CEL plans each variable it
+// names from the root past a loop's variable of its name as replan makes it, as another version of
+// CEL may, or nil.
+func PlanRootedOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	names := newRooting(c.env, checked.NativeRep()).names
+	if len(names) == 0 {
+		t.Fatalf("%s names no variable from the root past a loop's variable of its name", expr)
+	}
+	_, err = plan(c.env, checked, patterns, maxCost, cel.CustomDecoratorV2(func(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+		if _, ok := names[i.ID()]; ok {
+			return replan(i), nil
+		}
+		return i, nil
+	}))
+	return err
+}
+
 // PlanLiteralsOtherwise is why expr can't be planned as a condition where CEL plans each list or map
 // literal holding any as replan makes it, as another version of CEL may, or nil.
 func PlanLiteralsOtherwise(t *testing.T, expr string, replan func(interpreter.InterpretableV2) interpreter.InterpretableV2) error {

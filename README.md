@@ -272,11 +272,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   misnamed, or as another type, is refused when stored, and one stored under other declarations
   fails where it no longer passes them. A condition building a message, as
   `google.protobuf.Struct{...}`, is refused, and one stored before fails: a grant's gives nothing
-  and a deny's applies. So is one indexing a variable it names from the root where a loop's variable
-  of the same name hides it, as `.request` in `l.all(request, ...)`, by anything but a literal: CEL
-  reads such a variable outside the evaluation, where nothing computing the key evaluated was
-  charged, and one charged 10,000 took 200 ms. What the host passes as attributes is converted into
-  CEL's own values where a condition is read, the subject's and the request's once for each call, however many scopes a
+  and a deny's applies. What the host passes as attributes is converted into CEL's own values where
+  a condition is read, the subject's and the request's once for each call, however many scopes a
   change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
   named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
@@ -435,6 +432,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   may cost and is now bounded as the timestamp it is, a few units. CEL now refuses ordering numbers
   of different types, as `[1, 2].exists(i, i < 2u)`, which it accepted before once it had checked a
   loop, so a condition stored so no longer compiles: a grant's gives nothing and a deny's applies.
+  A condition naming a variable from the root where a loop's
+  variable of the same name hides it, as `.request` in `l.all(request, ...)`, and indexing it by a
+  key naming a loop's variable, as `.request.attributes.m.exists(k, .request.attributes.m[k] > 0)`,
+  failed, as CEL read the key outside the loop, and now reads it there; and each field or key such a
+  variable is read by costs 1 as it does of any other, which CEL charged nothing for, though its
+  bound counted it.
   Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition

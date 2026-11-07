@@ -4029,20 +4029,24 @@ func TestALiteralCostsWhatItBuilds(t *testing.T) {
 // otherwise, comparisons cost 1 less, reading a time in a zone 100 less, and a loop's range and a
 // map literal's key read from an attribute 1 less, than they did. CEL charges a condition as a check
 // plans it what it charges it planned as CEL plans it, and 1 more for each key of a map a loop
-// starts over.
+// starts over. CEL charges the qualifiers of a variable named from the root past a loop's variable
+// of its name where the check passes the variables as a map, as here, and not where it passes them
+// as the activation a check passes, which a check plans such a variable to charge them all the same.
 func TestAConditionIsChargedWhatCELChargesIt(t *testing.T) {
 	attributes := map[string]any{
 		"n": 4, "s": "ab", "k": "a", "zone": "Asia/Tokyo", "l": []any{"a", "b", "c"}, "m": map[string]any{"a": 1, "b": 2, "c": 3},
 	}
 	for expr, keys := range map[string]uint64{
-		`request.attributes.n > 3 && request.attributes.s != "x" && request.attributes.s in ["ab"]`:                  0,
-		`request.time.getHours("Europe/Paris") >= 0 && request.time.getMinutes(request.attributes.zone) >= 0`:        0,
-		`request.attributes.l.all(x, x != "q") && request.attributes.l.map(x, x + x).size() == 3`:                    0,
-		`(request.attributes.n > 3 ? request.attributes.l : []).exists_one(x, x == "a")`:                             0,
-		`{request.attributes.s: 1}[request.attributes.s] == 1 && request.attributes.m[request.attributes.k] == 1`:    0,
-		`request.attributes.m.all(k, request.attributes.m[k] > 0) && request.attributes.m.filter(k, k != "a") != []`: 6,
-		`[request.attributes.m, {"x": 1}].all(m, m.all(k, k != ""))`:                                                 4,
-		`dyn(request.attributes.m).all(k, true)`:                                                                     3,
+		`request.attributes.n > 3 && request.attributes.s != "x" && request.attributes.s in ["ab"]`:                               0,
+		`request.time.getHours("Europe/Paris") >= 0 && request.time.getMinutes(request.attributes.zone) >= 0`:                     0,
+		`request.attributes.l.all(x, x != "q") && request.attributes.l.map(x, x + x).size() == 3`:                                 0,
+		`(request.attributes.n > 3 ? request.attributes.l : []).exists_one(x, x == "a")`:                                          0,
+		`{request.attributes.s: 1}[request.attributes.s] == 1 && request.attributes.m[request.attributes.k] == 1`:                 0,
+		`request.attributes.m.all(k, request.attributes.m[k] > 0) && request.attributes.m.filter(k, k != "a") != []`:              6,
+		`[request.attributes.m, {"x": 1}].all(m, m.all(k, k != ""))`:                                                              4,
+		`dyn(request.attributes.m).all(k, true)`:                                                                                  3,
+		`[1].all(request, .request.attributes.n > 3 && has(.request.attributes.s) && (true ? .request : {}).attributes.s != "x")`: 0,
+		`[1].all(request, .request.attributes.m[.request.attributes.k] == 1 && .request.attributes["m"]["b"] == 2)`:               0,
 	} {
 		planned, alone := rbac.ConditionCharged(t, expr, attributes)
 		if planned != alone+keys {
@@ -4906,43 +4910,82 @@ func TestALoopPlannedOtherwiseIsNoCondition(t *testing.T) {
 
 // CEL reads a variable a condition names from the root where a loop's variable of the same name
 // hides it, as `.request` in `l.all(request, ...)`, from what the check passed, outside the
-// evaluation, and indexes it there, where nothing is charged: a key it computed, and whatever
+// evaluation, and qualifies it there, where nothing is charged: a key it computed, and whatever
 // computing it evaluated, ran uncharged, so a key searching a string of 99,990 bytes at each of
-// 3,000 steps of a loop cost 6,003. A condition indexing one by anything but a literal isn't one;
-// reading it by its fields or a literal key, or one past a loop's variable of another name, is.
-func TestAVariableNamedFromTheRootPastALoopsVariableIsIndexedOnlyByALiteral(t *testing.T) {
+// 3,000 steps of a loop cost 6,003, and so did each of its fields, so a loop reading one 24 deep
+// cost about half what reading another so does; and a key naming a loop's variable it read outside
+// the loop, where it failed. Such a variable is charged, and decides, as one read beside a loop's
+// variable of another name, and a type named so, as `.int`, is still the type.
+func TestAVariableNamedFromTheRootPastALoopsVariableIsReadAsAnyOther(t *testing.T) {
 	n := rbac.CountSearches(t)
 	l := make([]any, 3000)
 	for i := range l {
 		l[i] = fmt.Sprint(i)
 	}
-	attributes := map[string]any{"l": l, "s": strings.Repeat("x", 99_990), "m": map[string]any{"0": 1, "a": 2}, "k": "a"}
+	var d any = 1
+	for range 22 {
+		d = map[string]any{"a": d}
+	}
+	attributes := map[string]any{
+		"l": l, "ten": l[:10], "s": strings.Repeat("x", 99_990), "m": map[string]any{"0": 1, "a": 2}, "k": "a", "d": d,
+	}
+	deep := `.attributes.d` + strings.Repeat(".a", 22)
+	reads := []string{
+		`%[1]s` + deep + ` == 1`, `has(%[1]s` + deep + `)`, `(true ? %[1]s : {})` + deep + ` == 1`,
+		`%[1]s.attributes.m.exists(k, %[1]s.attributes.m[k] == 2)`,
+	}
 	searching := `%[1]s.attributes.l.filter(x, %[1]s.attributes.s.contains(x)).size()`
 	for _, key := range []string{
 		`string(` + searching + `)`, `[string(` + searching + `)][0]`, `(` + searching + ` > 0 ? "a" : "0")`,
-		`%[1]s.attributes.k`, `string(size(%[1]s.attributes.s) - 99990)`,
+		`%[1]s.attributes.k`, `string(size(%[1]s.attributes.s) - 99990)`, `y`,
 	} {
-		for _, read := range []string{
-			`%[1]s.attributes.m[` + key + `] == 1`, `(true ? %[1]s.attributes.m : {})[` + key + `] == 1`, `%[1]s.attributes["m"][` + key + `] == 1`,
-		} {
+		reads = append(reads, `%[1]s.attributes.m[`+key+`] == 2`, `(true ? %[1]s.attributes.m : {})[`+key+`] == 2`,
+			`%[1]s.attributes["m"][`+key+`] == 2`)
+	}
+	for _, read := range reads {
+		var decided [2][]rbac.Decided
+		for i, named := range [][2]string{{"request", ".request"}, {"other", "request"}} {
+			expr := `request.attributes.ten.all(z, ["a"].all(y, [1].all(` + named[0] + `, ` + fmt.Sprintf(read, named[1]) + `)))`
 			*n = 0
-			past := `[1].all(request, ` + fmt.Sprintf(read, ".request") + `)`
-			if _, _, _, err := rbac.EvaluateCondition(t, past, attributes); err == nil || *n > 0 {
-				t.Errorf("%s, searching %d times, is a condition: %v", past, *n, err)
+			var err error
+			if decided[i], err = rbac.Evaluations(t, expr, attributes, 1); err != nil || *n > 1 {
+				t.Errorf("%s, searching %d times: %v", expr, *n, err)
 			}
-			beside := `[1].all(other, ` + fmt.Sprintf(read, "request") + `)`
-			if _, _, _, err := rbac.EvaluateCondition(t, beside, attributes); err != nil {
-				t.Errorf("%s: %v", beside, err)
-			}
+		}
+		if !slices.Equal(decided[0], decided[1]) {
+			t.Errorf("%s read past a loop's variable of its name: %+v, and beside one of another: %+v", read, decided[0], decided[1])
 		}
 	}
 	for _, expr := range []string{
 		`[1].all(request, .request.attributes.m["a"] == 2)`, `[1].all(request, (true ? .request.attributes : {}).m.a == 2)`,
 		`[resource.attributes].exists(subject, subject.k == "a" && .subject.id == "u")`,
-		`[1].all(request, .request.attributes.m == {"0": 1, "a": 2})`,
+		`[1].all(request, .request.attributes.m == {"0": 1, "a": 2})`, `["a"].all(y, [1].all(request, .request.attributes.m[y] == 2))`,
+		`[1].all(int, type(1) == .int)`,
 	} {
 		if held, _, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || !held {
 			t.Errorf("%s: held %t, %v", expr, held, err)
+		}
+	}
+}
+
+// A condition whose variable named from the root past a loop's variable of its name CEL plans as
+// something else than an attribute reading it, or under another id, as another version of CEL may,
+// isn't a condition: what qualifies it would run uncharged again.
+func TestAVariableNamedFromTheRootPlannedOtherwiseIsNoCondition(t *testing.T) {
+	for _, expr := range []string{
+		`[1].all(request, .request.attributes.k == "a")`, `["x"].all(action, .action == "cluster:login")`,
+		`[1].all(request, .request.attributes.m[.request.attributes.k] == 2)`,
+	} {
+		for how, replan := range map[string]func(interpreter.InterpretableV2) interpreter.InterpretableV2{
+			"as something else": func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, i.ID()} },
+			"under another id":  func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return otherwise{i, -i.ID()} },
+		} {
+			if err := rbac.PlanRootedOtherwise(t, expr, replan); err == nil {
+				t.Errorf("%s with its variable named from the root planned %s is a condition", expr, how)
+			}
+		}
+		if err := rbac.PlanRootedOtherwise(t, expr, func(i interpreter.InterpretableV2) interpreter.InterpretableV2 { return i }); err != nil {
+			t.Errorf("%s planned as CEL plans it: %v", expr, err)
 		}
 	}
 }

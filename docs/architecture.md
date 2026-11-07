@@ -723,14 +723,15 @@ sequenceDiagram
   the next check plans it again: kept, a real zone failed until the process dropped it. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
   as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
-  key or a loop's condition where the package can't charge or refuse it isn't a condition, and nor
-  is one indexing a variable it names from the root past a loop's variable of its name, as
-  `.request` in `l.all(request, ...)`, by anything but a literal (`indexedPastLoop`): CEL reads such
-  a variable from what the check passed, outside the evaluation, and indexes it there, so the key and
-  whatever computing it evaluates ran on a frame of their own, which charges nothing, and a key
-  searching a string costing 10,000 at each of 3,000 steps cost 6,003. CEL charges each call it
-  plans as the call runs, so the call planned in place of one (`charged`)
-  charges CEL as that call once it has run, and a key or a loop's range read from an attribute is
+  key, a loop's condition or a variable named from the root past a loop's variable of its name
+  where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
+  `.request` in `l.all(request, ...)`, from what the check passed, outside the evaluation, and
+  qualifies it there, where nothing is charged: a key searching a string costing 10,000 at each of
+  3,000 steps cost 6,003, its fields cost nothing, and a key naming a loop's variable failed. So it
+  is planned as an attribute of the variable read from what the check passed (`rooting`), which CEL
+  qualifies, and evaluates a key or a choice of, on the evaluation's frame, charged as anywhere
+  else. CEL charges each call it plans as the call runs, so the call planned in place of one
+  (`charged`) charges CEL as that call once it has run, and a key or a loop's range read from an attribute is
   evaluated by what CEL planned, so CEL charges each as it would: otherwise a comparison cost 1
   less, and reading a time in a zone `zoneCost` less, than their bounds count. What a
   check reads together is bounded where it is stored, for each scope: an identity's conditional

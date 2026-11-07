@@ -60,10 +60,8 @@ import (
 // Condition is none, and one with a title or description has an expression. A pattern it matches
 // is a string literal,
 // of bounded size; it nests at most 32 deep; it builds no message, as `google.protobuf.Struct{}`;
-// it indexes a variable it names from the root where a loop's variable of the same name hides it,
-// as `.request` in `l.all(request, ...)`, by literals alone; and a comparison, or a search of a
-// list, that would read more than a condition may spend, or reading a time in a zone whose name is
-// longer than 64 bytes, holds a byte no zone's name does, as
+// and a comparison, or a search of a list, that would read more than a condition may spend, or
+// reading a time in a zone whose name is longer than 64 bytes, holds a byte no zone's name does, as
 // tzdata.zi's dot, or has a part that is Local, the zone the process runs in, or localtime, in any
 // case, as posix/localtime, fails before it runs. request.time is the host's clock (Config.Now) in
 // UTC, and a time the host passes is read in UTC too (Attributes), so string() of one writes the
@@ -464,22 +462,24 @@ func (c *conditions) build(expr string) (program, error) {
 // plan plans checked to run within limit, as costs charges its calls, once the options before
 // have, as a test plans a loop as another version of CEL may.
 func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint64, before ...cel.ProgramOption) (cel.Program, error) {
-	if indexedPastLoop(checked.NativeRep()) {
-		return nil, errors.New("a variable named from the root past a loop's variable of its name is indexed by a key it computes, which CEL evaluates where nothing charges it")
-	}
-	s, k := newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
+	r, s, k := newRooting(env, checked.NativeRep()), newStepping(checked.NativeRep(), limit), newKeying(env, checked.NativeRep(), limit)
 	l, str, g := newLiterals(checked.NativeRep(), limit), &stringing{env: env}, newGuards(checked.NativeRep(), limit)
 	prg, err := env.Program(checked, slices.Concat(before, []cel.ProgramOption{
 		cel.CostLimit(limit), cel.CostTracking(costs{patterns}), cel.OptimizeRegex(matching(patterns, g)),
-		cel.CustomDecorator(g.bounded), cel.CustomDecorator(str.decorate), cel.CustomDecoratorV2(s.decorate),
-		cel.CustomDecoratorV2(k.decorate), cel.CustomDecoratorV2(l.decorate), cel.CustomDecoratorV2(s.order),
+		cel.CustomDecoratorV2(r.decorate), cel.CustomDecorator(g.bounded), cel.CustomDecorator(str.decorate),
+		cel.CustomDecoratorV2(s.decorate), cel.CustomDecoratorV2(k.decorate), cel.CustomDecoratorV2(l.decorate),
+		cel.CustomDecoratorV2(s.order),
 	})...)
 	if err != nil {
 		return nil, err
 	}
-	// Another version of CEL may plan a loop's condition, a key, a literal, or a call refused before
-	// it runs where no decorator sees it, which would run unbounded too, and a loop's range where
-	// none orders it, which would loop over a map as Go happens to range over it.
+	// Another version of CEL may plan a variable named from the root, a loop's condition, a key, a
+	// literal, or a call refused before it runs where no decorator sees it, which would run
+	// unbounded too, and a loop's range where none orders it, which would loop over a map as Go
+	// happens to range over it.
+	if len(r.planned) != len(r.names) {
+		return nil, errors.New("a variable named from the root past a loop's variable of its name is planned where this package can't charge what qualifies it")
+	}
 	if len(s.stepped) != len(s.ranges) {
 		return nil, errors.New("a loop's condition is planned where this package can't bound it")
 	}
@@ -498,44 +498,112 @@ func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint
 	return prg, nil
 }
 
-// indexedPastLoop reports whether checked indexes a variable it names from the root where a loop's
-// variable of the same name hides it, as `.request` in `l.all(request, ...)`, by anything but a
-// literal, at once or past selects, indexes and either side of a choice. CEL reads such a variable
-// from what the check passed, outside the evaluation, and indexes it there, where nothing is charged,
-// so the key and whatever computing it evaluated ran uncharged: a key searching a string costing
-// 10,000 at each of 3,000 steps of a loop cost 6,003, and one concatenating strings at each took
-// 200 ms where 10,000 covers 1.5 at most. Read there by its fields or literal keys, it reads a value
-// for each, uncharged too, but no more than the condition names.
-func indexedPastLoop(checked *ast.AST) bool {
-	refs := checked.ReferenceMap()
-	var rooted func(e ast.Expr) bool
-	rooted = func(e ast.Expr) bool {
-		switch e.Kind() {
-		case ast.IdentKind, ast.SelectKind:
-			if ref, ok := refs[e.ID()]; ok {
-				return strings.HasPrefix(ref.Name, ".")
-			}
-			return e.Kind() == ast.SelectKind && !e.AsSelect().IsTestOnly() && rooted(e.AsSelect().Operand())
-		case ast.CallKind:
-			args := e.AsCall().Args()
-			switch fn := e.AsCall().FunctionName(); {
-			case fn == operators.Index && len(args) == 2:
-				return rooted(args[0])
-			case fn == operators.Conditional && len(args) == 3:
-				return rooted(args[1]) || rooted(args[2])
-			}
-		default:
-			// A literal, a list, a map or a loop is a value of its own.
-		}
-		return false
+// rooting plans each variable checked names from the root where a loop's variable of the same name
+// hides it, as `.request` in `l.all(request, ...)`, as an attribute of the variable read from what
+// the check passed (rootRead), so CEL applies each of its qualifiers on the evaluation's frame, as
+// it applies those of any value a condition computes, charging each, and evaluates a key or a
+// choice there, charged as anywhere else. CEL plans such a variable as an attribute that reads it,
+// and applies its qualifiers, on the activation the check passed (counting), unwrapped from the
+// evaluation's frames so that no loop's variable hides it, where nothing is charged: a key, and
+// whatever computing it evaluated, ran on a frame of its own, uncharged, so a key searching a string
+// costing 10,000 at each of 3,000 steps of a loop cost 6,003; read only by its fields, 28 deep at
+// each step, each unit charged took two to three times what reading another variable so took; and
+// a key naming a loop's variable was read outside the loop, where it failed.
+type rooting struct {
+	// names are such variables, by the ids of the identifiers naming them, and planned those planned
+	// so.
+	names   map[int64]string
+	planned map[int64]bool
+	fac     interpreter.AttributeFactory
+}
+
+func newRooting(env *cel.Env, checked *ast.AST) *rooting {
+	r := &rooting{
+		names: map[int64]string{}, planned: map[int64]bool{},
+		fac: interpreter.NewAttributeFactory(env.Container, env.CELTypeAdapter(), env.CELTypeProvider()),
 	}
-	return len(ast.MatchDescendants(ast.NavigateAST(checked), func(e ast.NavigableExpr) bool {
-		if e.Kind() != ast.CallKind || e.AsCall().FunctionName() != operators.Index {
-			return false
+	// A constant or a type, as `.int` past a loop's variable named int, CEL plans as the value it is.
+	for id, ref := range checked.ReferenceMap() {
+		if name, ok := strings.CutPrefix(ref.Name, "."); ok && ref.Value == nil && checked.GetType(id).Kind() != types.TypeKind {
+			r.names[id] = name
 		}
-		args := e.AsCall().Args()
-		return len(args) == 2 && args[1].Kind() != ast.LiteralKind && rooted(args[0])
-	})) > 0
+	}
+	return r
+}
+
+func (r *rooting) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
+	name, ok := r.names[i.ID()]
+	if !ok || r.planned[i.ID()] {
+		return i, nil
+	}
+	// Planned otherwise, as another version of CEL may, plan refuses it.
+	a, ok := i.(interpreter.InterpretableAttribute)
+	if !ok {
+		return i, nil
+	}
+	v, ok := a.Attr().(interpreter.NamespacedAttribute)
+	if !ok || len(v.Qualifiers()) > 0 || !slices.Equal(v.CandidateVariableNames(), []string{name}) {
+		return i, nil
+	}
+	r.planned[i.ID()] = true
+	read := rootRead{id: i.ID(), name: name, adapter: a.Adapter()}
+	return &rootedAttribute{Attribute: r.fac.RelativeAttribute(i.ID(), read), adapter: a.Adapter()}, nil
+}
+
+// rootedAttribute is a variable named from the root as rooting plans it, which CEL qualifies, and
+// evaluates, as any other attribute of a value a condition computes, on the frame it is given.
+type rootedAttribute struct {
+	interpreter.Attribute
+	adapter types.Adapter
+}
+
+func (a *rootedAttribute) Attr() interpreter.Attribute { return a.Attribute }
+
+func (a *rootedAttribute) Adapter() types.Adapter { return a.adapter }
+
+// Exec resolves the attribute, charged as CEL charges each attribute it evaluates.
+func (a *rootedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	var out ref.Val
+	if v, err := a.Resolve(frame); err != nil {
+		out = types.LabelErrNode(a.ID(), types.WrapErr(err))
+	} else {
+		out = a.adapter.NativeToValue(v)
+	}
+	if costs := frame.CostTracker(); costs != nil {
+		costs.EvalAttribute(a.ID(), false, out)
+	}
+	return out
+}
+
+func (a *rootedAttribute) Eval(vars interpreter.Activation) ref.Val {
+	return interpreter.EvalActivation(vars, a.Exec)
+}
+
+// rootRead is the variable named, read from what the check passed, whatever loop's variable of its
+// name the evaluation is in.
+type rootRead struct {
+	id      int64
+	name    string
+	adapter types.Adapter
+}
+
+func (r rootRead) ID() int64 { return r.id }
+
+func (r rootRead) Exec(frame *interpreter.ExecutionFrame) ref.Val {
+	c, _ := frame.ResolveName(stepsName)
+	counted, ok := c.(*counting)
+	if !ok {
+		return types.NewErrWithNodeID(r.id, "rbac: %s is read outside a check", r.name)
+	}
+	v, ok := counted.vars[r.name]
+	if !ok {
+		return types.NewErrWithNodeID(r.id, "no such attribute(s): %s", r.name)
+	}
+	return r.adapter.NativeToValue(v)
+}
+
+func (r rootRead) Eval(vars interpreter.Activation) ref.Val {
+	return interpreter.EvalActivation(vars, r.Exec)
 }
 
 // typeCheck returns why expr doesn't check against the declared attributes: it reads one they
