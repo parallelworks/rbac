@@ -48,9 +48,12 @@
 -- itself, so its DeleteExpired fails on such a role, which may no longer (SQLSTATE 42501); its
 -- checks and changes, which only read it, run as before.
 --
--- Writes to the table wait for migrating from the baseline on, so none goes unrecorded between it
--- and the triggers; checks, which only read it, don't. History first, as a run writes history
--- before the table, and taking the table first would deadlock with one.
+-- Writes to the table wait for migrating, so none goes unrecorded between the baseline and the
+-- triggers; checks, which only read it, don't. The table is locked before history: a batch of
+-- DeleteExpired of the code before this locks the table as its statement begins and writes history
+-- only as it ends, as the triggers recording what it removes fire, so taking history first
+-- deadlocked with a batch in flight. A run in a host's transaction that changed the tables before it
+-- takes history first, and gives way to migrating, or migrating to it, by lock_timeout.
 
 -- As 0029 wrote it, recording rbac_expired's rows too. Replacing it keeps its owner and who may
 -- execute it, but not its settings, so they are set here, as 0029 set them. It takes no lock on the
@@ -173,11 +176,11 @@ BEGIN
     RETURN NULL;
 END $$;
 
+LOCK TABLE rbac_expired IN SHARE ROW EXCLUSIVE MODE;
+
 ALTER TABLE rbac_history DROP CONSTRAINT rbac_history_entity_check,
     ADD CONSTRAINT rbac_history_entity_check
         CHECK (entity IN ('grant', 'role', 'deny', 'eligibility', 'membership', 'group', 'member', 'history', 'commit', 'expired')) NOT VALID;
-
-LOCK TABLE rbac_expired IN SHARE ROW EXCLUSIVE MODE;
 
 -- Before anything writes the table as its owner, as the update below does.
 DO $$

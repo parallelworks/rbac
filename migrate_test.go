@@ -456,6 +456,72 @@ func TestDeleteExpiredBeforeItsMigrationSaysToMigrate(t *testing.T) {
 	}
 }
 
+// A batch of DeleteExpired of the code before 0032 locks rbac_expired as its statement begins, and
+// writes history only as it ends, as the triggers recording what it removes fire: migrating, which
+// locked history first and then waited for the table, deadlocked with such a batch in flight, which
+// waited for history, until one of them gave way. Here a transaction stands in for the batch: it
+// writes rbac_expired, and once migrating, on a host's transaction that waits for locks as long as
+// it takes, waits for it, removes a grant, which history records, and commits. Both go on.
+func TestMigratingToExpiredWritesWaitsForABatchOfTheCodeBefore(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, pool, "0032")
+	if _, err := pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'y', 'cluster.login')`); err != nil {
+		t.Fatal(err)
+	}
+	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	batch, err := pool.Begin(bounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = batch.Rollback(context.WithoutCancel(ctx)) }()
+	var pid int32
+	if err := batch.QueryRow(bounded, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.Exec(bounded, `INSERT INTO rbac_expired (until) VALUES (clock_timestamp() - interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	host, err := pool.Begin(bounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := host.Exec(bounded, `SET LOCAL lock_timeout = 0`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- rbac.Migrate(bounded, host) }()
+	for waiting := false; !waiting; {
+		select {
+		case err := <-done:
+			t.Fatalf("migrating didn't wait for the batch: %v", err)
+		default:
+			if err := pool.QueryRow(bounded, `SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))`,
+				pid).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := batch.Exec(bounded, `DELETE FROM rbac_grants WHERE tenant = 't1' AND principal = 'user:y'`); err != nil {
+		t.Errorf("the batch, as migrating waited for it: %v", err)
+	}
+	if err := batch.Commit(bounded); err != nil {
+		t.Errorf("the batch's commit: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("migrating beside the batch: %v", err)
+	}
+	if err := host.Commit(bounded); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Migrate on a host's transaction waits as long as that transaction's lock_timeout says, and leaves
 // it so, through a host's wrapper around the transaction too, whose Begin gives a savepoint of it
 // that can set the isolation it is at again: taken for a transaction of its own, the savepoint was
