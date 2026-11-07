@@ -215,7 +215,7 @@ erDiagram
   alone reads its permissions, and each listing reaching it only its id. Carrying whole rows, the
   walk read, detoasted and hashed a role's every permission once for each role listing it: beside
   300 roles of 1,000 permissions for 50 types, each listing 64 others, it passed 19,200 rows
-  through its `UNION` and read 171,912 buffers, in 1.3 s, and a change granting one took 2.5 s,
+  through its `UNION` and read 171,912 buffers, in 1.3 s, and a change granting one took 2.6 s,
   half of it under its locks; walking ids, it reads 300 rows and 900 buffers, in 5 ms, and the
   change takes 83 ms. Only a read needing every one reads the tenant's by the tenant
   (`everyCustomRole`): `CustomRoles` and `Roles`, which list them, `Grantable`, which offers any,
