@@ -319,33 +319,48 @@ func TestMigrateOnAHostsTransactionLeavesItsLockTimeout(t *testing.T) {
 
 // Migrate on a host's transaction comes before any change in it to the package's tables: from
 // 0027_commit_dates on, each record of history a change writes holds an event deferred to the
-// commit, and PostgreSQL alters no table whose events are pending, as migrations up to
-// rbac.HistoryAltered alter history. Where one of those is pending, Migrate refuses a transaction
-// holding such events, as ErrInvalid, before it applies any, or waits for another replica's
-// migration, which can't alter history while the transaction holds it, and the transaction goes on
-// to commit its change with its commit record; so too one that pruned history, whose record names no
-// cluster. It migrates one that took a transaction id writing no history, one a record restored from
-// another cluster holds too; one that wrote history before 0027, whose records hold no events, and
-// whose change counts from its own date, with no commit record; and one that wrote history once no
-// migration pending alters it, which a later migration that does fails until HistoryAltered names
-// it.
+// commit, as from 0020_recorded_prunes on each record a prune deletes does, and PostgreSQL alters no
+// table whose events are pending, as migrations up to rbac.HistoryAltered alter history. Where one
+// of those is pending, Migrate refuses a transaction holding such events, as ErrInvalid, before it
+// applies any, or waits for another replica's migration, whose migration altering history can't
+// commit while the transaction holds history, and the transaction goes on to commit its change with
+// its commit record: one that changed the tables; pruned history, with the commit record's trigger
+// on or off, or before 0027, as a release then pruned; or wrote a record of history as its owner,
+// naming no cluster. It migrates one that took a transaction id writing no history, also where a
+// commit record or a prune's record restored from another cluster holds that id; one that changed
+// the tables before 0027, whose records hold no events, and whose change counts from its own date,
+// with no commit record; and one that changed them once no migration pending alters history, which
+// a later migration that does fails until HistoryAltered names it.
 func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 	const (
 		change = `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
 		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.login')`
 		took = `SELECT pg_current_xact_id()`
+		// As a host's tool restoring history writes it.
+		owned = `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+		VALUES (now(), 't1', 'grant', 'restored', 'create', '{}', 'restore')`
+		// As PruneHistory of a release before 0027 pruned a grant's version.
+		pruned = `SET LOCAL rbac.prune = 'on';
+		WITH gone AS (DELETE FROM rbac_history WHERE entity = 'grant' RETURNING txid, id)
+		INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+		SELECT now(), '', 'history', 'pruned', 'prune', jsonb_build_object('last', jsonb_build_object('txid', txid::text, 'id', id)), 'PruneHistory'
+		FROM gone`
 	)
 	altering, after := fmt.Sprintf("%04d", rbac.HistoryAltered), fmt.Sprintf("%04d", rbac.HistoryAltered+1)
 	for _, c := range []struct {
-		name, from, write                 string
-		refused, replica, restored, prune bool
+		name, from, seed, write, restored string
+		refused, replica, prune, off      bool
 		commits                           int
 	}{
 		{name: "a change, with a migration altering history pending", from: altering, write: change, refused: true, commits: 1},
 		{name: "a change, with a migration altering history pending, as another replica migrates", from: altering, write: change, refused: true, replica: true, commits: 1},
 		{name: "a prune, with a migration altering history pending", from: altering, refused: true, prune: true},
+		{name: "a prune, with the commit record's trigger off and a migration altering history pending", from: altering, refused: true, prune: true, off: true},
+		{name: "a prune before history recorded commits", from: commitDates(t), seed: change, write: pruned, refused: true},
+		{name: "a record history's owner writes naming no cluster, with a migration altering history pending", from: altering, write: owned, refused: true},
 		{name: "a transaction id, with a migration altering history pending", from: altering, write: took},
-		{name: "a transaction id a record restored from another cluster holds, with a migration altering history pending", from: altering, write: took, restored: true},
+		{name: "a transaction id a commit record restored from another cluster holds, with a migration altering history pending", from: altering, write: took, restored: "commit"},
+		{name: "a transaction id a prune's record restored from another cluster holds, with a migration altering history pending", from: altering, write: took, restored: "prune"},
 		{name: "a change before history recorded commits", from: commitDates(t), write: change},
 		{name: "a change, with none pending altering history", from: after, write: change, commits: 1},
 	} {
@@ -358,6 +373,11 @@ func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 			pool := pgtest.Open(t, "")
 			migrateFiles(t, pool, "", c.from)
 			recordMigrations(t, pool, c.from)
+			if c.seed != "" {
+				if _, err := pool.Exec(ctx, c.seed); err != nil {
+					t.Fatal(err)
+				}
+			}
 			// A grant's first version, which its change supersedes, for a prune, once an export has read
 			// both.
 			var through rbac.Cursor
@@ -372,11 +392,16 @@ func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 				drain(t, h, &through, 2)
 				before = dbNow(t, h)
 			}
+			if c.off {
+				if _, err := pool.Exec(ctx, `ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`); err != nil {
+					t.Fatal(err)
+				}
+			}
 			tx, err := pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			defer func() { _ = tx.Rollback(ctx) }()
 			if c.write != "" {
 				if _, err := tx.Exec(ctx, c.write); err != nil {
 					t.Fatal(err)
@@ -387,15 +412,21 @@ func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 					t.Fatalf("PruneHistory = %d, %v", n, err)
 				}
 			}
-			if c.restored {
+			if c.restored != "" {
 				var txid, theirs string
 				if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text,
 					(SELECT CASE s.system_identifier WHEN 1 THEN 2 ELSE 1 END::text FROM pg_control_system() s)`).Scan(&txid, &theirs); err != nil {
 					t.Fatal(err)
 				}
+				restore := fakeCommit("2000-01-01 00:00:00", theirs, txid)
+				if c.restored == "prune" {
+					// A prune's record names no cluster.
+					restore = `INSERT INTO rbac_history (effective_at, txid, tenant, entity, key, op, after, how)
+						VALUES (timestamptz '2000-01-01 00:00:00', '` + txid + `'::xid8, '', 'history', 'restored', 'prune', '{}', 'PruneHistory')`
+				}
 				for _, sql := range []string{
 					`ALTER TABLE rbac_history DISABLE TRIGGER rbac_history_committed`,
-					fakeCommit("2000-01-01 00:00:00", theirs, txid),
+					restore,
 					`ALTER TABLE rbac_history ENABLE ALWAYS TRIGGER rbac_history_committed`,
 				} {
 					if _, err := pool.Exec(ctx, sql); err != nil {
@@ -412,10 +443,28 @@ func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = replica.Rollback(context.WithoutCancel(ctx)) }()
+				defer func() { _ = replica.Rollback(ctx) }()
 				sql, args := rbac.MigrateLock(schema)
 				if _, err := replica.Exec(ctx, sql, args...); err != nil {
 					t.Fatal(err)
+				}
+				// The replica's migration altering history waits for the transaction, which holds
+				// history, so it can't commit before the transaction ends: what the transaction reads as
+				// applied before it waits for the replica, it would read after.
+				names, err := fs.Glob(rbac.Migrations(), altering+"_*.sql")
+				if err != nil || len(names) != 1 {
+					t.Fatalf("migration %s: %v, %v", altering, names, err)
+				}
+				migration, err := fs.ReadFile(rbac.Migrations(), names[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := replica.Exec(ctx, `SET LOCAL lock_timeout = '100ms'`); err != nil {
+					t.Fatal(err)
+				}
+				var pg *pgconn.PgError
+				if _, err := replica.Exec(ctx, string(migration)); !errors.As(err, &pg) || pg.Code != "55P03" {
+					t.Fatalf("%s beside a transaction that wrote history: %v", names[0], err)
 				}
 				// Past which a wait for the replica fails as a conflict, not a refusal.
 				if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
@@ -428,7 +477,10 @@ func TestMigrateOnAHostsTransactionComesBeforeItsChanges(t *testing.T) {
 			}
 			want := latestMigration(t)
 			if c.refused {
-				want = rbac.HistoryAltered - 1
+				if _, err := fmt.Sscanf(c.from, "%04d", &want); err != nil {
+					t.Fatal(err)
+				}
+				want--
 			}
 			if v := migratedTo(t, tx); v != want {
 				t.Errorf("migrated to %d, not %d", v, want)
