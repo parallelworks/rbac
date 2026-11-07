@@ -550,8 +550,11 @@ sequenceDiagram
   what it is charged, and whether the kinds after it fit `maxConverted`, can turn on map order,
   failing closed. A map of structs, which no condition reads, is refused unread at 2 for each entry
   (`refusedWhole`), as reading an entry copies it whole: a map of 2,000 structs of 64 KiB took 7 ms,
-  charged as much. An empty or nil one is refused too, as a map keyed by a double is, so whether its
-  kind can be read doesn't turn on whether it held a struct at the time. Converting reads each of a
+  charged as much. An empty or nil one is refused too, as a map keyed by a double is, and so is a
+  slice, a pointer or a map of any value refused by its type, as a struct, a channel, a func or
+  another message, or an array holding one, so whether its kind can be read doesn't turn on whether
+  it held one at the time: an empty slice of structs was read as `[]`, and a nil pointer to one as
+  null. Converting reads each of a
   map's entries into one value it makes room for (`dict`), moving it whole, so it makes none for an
   empty map, nor where what the entries hold in place, at least one for each 24 bytes
   (`leastCopied`), costs more than is left, and charges an entry at least that where converting its
@@ -581,12 +584,17 @@ sequenceDiagram
   and of 2,000 entries keyed by arrays of 4 KiB 8 ms, and charged their bytes in place alone, of 50
   keyed by structs each holding a string of 1 MiB 1.4 ms, for 167. Nor does it move a slice's
   elements or a map's values, or make room for what a pointer points to or for an array, where what
-  they hold in place, at least one for each 24 bytes, costs more than is left (`leastCopied`), nor
-  make anything more once it is past what a copy holds, as what it made is dropped (`copy` returns
-  none), where it made the zero value of each value it found so, to set in its place: a map holding
-  an array of 4 MiB allocated 12 MB, 2,000 arrays of 4,096 interfaces 133 MB, a pointer to an array
-  of 128 MiB 268 MB, and an array of two structs each holding a map beside 64 MiB 335 MB, before
-  being found past what a copy holds. A copy holds
+  they hold in place, at least one for each 24 bytes, costs more than is left (`leastCopied`), as
+  copying any value costs, a struct's padding counted too, nor make anything more once it is past
+  what a copy holds, as what it made is dropped (`copy` and `message` return none), where it made
+  the zero value of each value it found so, to set in its place: a map holding an array of 4 MiB
+  allocated 12 MB, 2,000 arrays of 4,096 interfaces 133 MB, a pointer to an array of 128 MiB 268 MB,
+  and an array of two structs each holding a map beside 64 MiB 335 MB, before being found past what
+  a copy holds. A map's entry is read only where what is left holds its value, which the entries
+  before it can have spent. A message of the host's own type, which a copy makes whole, set or not,
+  costs what it holds in place where that is more than a message costs (`making`), and which type a
+  message makes is told by its type's empty message (`itself`): charged a message's 4, copying
+  2,000 of a type of 8 KiB allocated 50 MB, and one making another to tell 8 KiB each. A copy holds
   nothing nesting past `maxCopied`: it is
   refused there (`overflow`), where it held the zero value, or the copy of a value reached less
   deep before, as map order decided, so a constraint was given a value on one call and its zero

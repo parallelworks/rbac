@@ -271,7 +271,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   change checks, and the resource's once for each check, and conditions read nothing else: `nil`; a
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
   named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
-  of bytes; slices, arrays and pointers of these, a nil pointer read as null; maps of these keyed by a bool, a
+  of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
+  reads, below; maps of these keyed by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
@@ -292,8 +293,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
   lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
-  struct, a channel, a func, any other message, a map of structs, or one keyed by anything else, as
-  a double or an array, holding none too, a map holding two keys read as the same value, as `1`
+  struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
+  array, and a slice, a pointer or a map of any of these, or an array holding one, holding none
+  too, as an empty slice of structs or a nil pointer to one, read as `[]` or `null`, left a kind
+  readable until it held one, a map holding two keys read as the same value, as `1`
   and `1u`, and so JSON text naming a member of an object twice, once unescaped, or an `Any`
   packing a message that sets a field twice, as a `Struct` with two entries of `role`: each is read
   as the last, where a host reading the first reads another. A `Struct` the host passes holds each
@@ -311,8 +314,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
   but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
   for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
-  a map of structs, which none reads and reading copies whole, is refused unread at 2 for each
-  entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
+  a map of values none reads, as structs, which reading copies whole, is refused unread at 2 for
+  each entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
   another costs at least 1 for each 24 bytes its value holds in place, which reading it moves,
   where 19,000 empty maps of a type of 64 KiB, charged 8 each, took 1.4 GB and 270 ms making room
   for a value they didn't hold. That is about a map of
@@ -423,17 +426,21 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   may cost and is now bounded as the timestamp it is, a few units. Attributes holding JSON text or
   a packed message that sets a key twice, JSON text that isn't UTF-8 or escapes half a surrogate
   pair, or a `json.Number` JSON doesn't write, were read and now can't be, failing every condition
-  reading their kind, and so are ones holding an empty or nil map of structs, read as `{}` where one
-  holding a struct couldn't be read; and a map's values no condition reads, as a host's own array
-  saying it is a double, or nesting past 10,000 deep, each cost at least 1 for each 24 bytes they
-  hold in place, so the kinds converted after them can be past what a check converts. Attributes
+  reading their kind, and so are ones holding an empty or nil slice, map or pointer of values no
+  condition reads, as structs, channels, funcs or messages of other types, read as `[]`, `{}` or
+  `null` where one holding such a value couldn't be read; and a map's values no condition reads,
+  as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
+  for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
+  converts. Attributes
   holding maps, lists, pointers or messages are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
   maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
-  interface, which a hook's copy sets whole and is now charged their bytes, as it charged a struct
-  holding none, or maps keyed by arrays or structs, or by interfaces holding them, whose keys it is
+  interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
+  it charged a struct holding none, or messages of the host's own types, which a copy makes whole
+  and is now charged what they hold in place, set or not, as 1 for each 24 bytes, or maps keyed by
+  arrays or structs, or by interfaces holding them, whose keys it is
   now charged the bytes of, and of the strings they hold and what their interfaces hold, as hashing
   them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as
   its zero value, and ones holding themselves that reach 20,000 maps, lists, pointers, structs,

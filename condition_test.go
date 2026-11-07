@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/runtime/protoimpl"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -214,6 +215,22 @@ func (d wideDouble) Equal(other ref.Val) ref.Val      { return types.Double(d[0]
 func (d wideDouble) Type() ref.Type                   { return types.DoubleType }
 func (d wideDouble) Value() any                       { return d[0] }
 
+// intByte is a host's own byte type CEL reads as an int, a slice or an array of which is bytes.
+type intByte byte
+
+func (b intByte) ConvertToNative(t reflect.Type) (any, error) {
+	return types.Int(b).ConvertToNative(t)
+}
+func (b intByte) ConvertToType(t ref.Type) ref.Val { return types.Int(b).ConvertToType(t) }
+func (b intByte) Equal(other ref.Val) ref.Val      { return types.Int(b).Equal(other) }
+func (b intByte) Type() ref.Type                   { return types.IntType }
+func (b intByte) Value() any                       { return int64(b) }
+
+// intMessage is a host's own message that isn't a struct.
+type intMessage int32
+
+func (m *intMessage) ProtoReflect() protoreflect.Message { return nil }
+
 // hostString is a host's own type CEL reads as a string, which compares as CEL's own does.
 type hostString string
 
@@ -371,6 +388,50 @@ func TestAMapOfStructsFailsItsConditionsEmptyToo(t *testing.T) {
 	} {
 		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.m == {}`, map[string]any{"m": m}); err != nil || !held {
 			t.Errorf("an empty map of %s: held %t, %v", name, held, err)
+		}
+	}
+}
+
+// A slice, an array, a pointer or a map of values no condition reads, as structs, channels, funcs,
+// complex numbers, a host's own ref.Val or another message, is refused by its type, empty or nil
+// too, as a map of structs is: read as [], {} or null, an empty slice of structs, or a nil pointer
+// to one, left a kind readable until it held one. A slice or an array of a byte type is bytes,
+// whatever its type's methods, an array of none holds none whatever its value, and a type holding
+// itself, as `type list []list`, holds nothing else: each is read.
+func TestAListOrAPointerOfValuesNoConditionReadsFailsItsConditionsEmptyToo(t *testing.T) {
+	type tag struct{ Name string }
+	type list []list
+	for name, v := range map[string]any{
+		"an empty slice of structs": []tag{}, "a nil slice of structs": []tag(nil), "a nil pointer to a struct": (*tag)(nil),
+		"a nil pointer to an array of structs": (*[2]tag)(nil), "an empty slice of slices of structs": [][]tag{},
+		"an empty slice of arrays of a struct": [][1]tag{}, "an array of nil slices of structs": [1][]tag{},
+		"an empty slice of pointers to structs": []*tag{}, "a slice of nil pointers to structs": []*tag{nil},
+		"an empty map of pointers to structs": map[string]*tag{}, "an empty slice of maps of structs": []map[string]tag{},
+		"an empty slice of funcs": []func(){}, "an empty map of channels": map[string]chan int{},
+		"an empty slice of complex numbers": []complex128{}, "an empty slice of uintptrs": []uintptr{},
+		"an empty map of a host's doubles": map[string]hostDouble{}, "a nil pointer to a host's double": (*hostDouble)(nil),
+		"a nil message of another type": (*emptypb.Empty)(nil), "an empty slice of messages of another type": []*emptypb.Empty{},
+		"an empty slice of maps keyed by doubles": []map[float64]int{}, "an empty slice of messages of an int": []*intMessage{},
+	} {
+		for _, expr := range []string{`request.attributes.v != 1`, `request.attributes.ok == true`} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v, "ok": true}); err != nil || evaluated {
+				t.Errorf("%s of %s: evaluated %t, %v", expr, name, evaluated, err)
+			}
+		}
+	}
+	for name, v := range map[string]any{
+		"an array of no structs": [0]tag{}, "an empty slice of arrays of no structs": [][0]tag{},
+		"an empty slice of bytes saying they are ints": []intByte{}, "an empty slice of arrays of them": [][2]intByte{},
+		"an empty map of slices of them": map[string][]intByte{}, "a nil pointer to a slice of them": (*[]intByte)(nil),
+		"an empty slice of times": []time.Time{}, "an empty slice of CEL's strings": []types.String{},
+		"a nil pointer to CEL's timestamp": (*types.Timestamp)(nil), "a nil Struct": (*structpb.Struct)(nil),
+		"an empty slice of Values": []*structpb.Value{}, "a nil pointer to an int": (*int)(nil),
+		"an empty slice of interfaces": []any{}, "an empty slice of maps keyed by an interface": []map[any]int{},
+		"a nil list holding lists": list(nil), "an empty list holding lists": list{},
+	} {
+		expr := `request.attributes.v != 1 && request.attributes.ok`
+		if held, _, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v, "ok": true}); err != nil || !held {
+			t.Errorf("%s: held %t, %v", name, held, err)
 		}
 	}
 }
@@ -1412,6 +1473,47 @@ var registeringHostType = sync.OnceValue(func() error {
 	}
 	return protoregistry.GlobalTypes.RegisterMessage(hostMessageType{dynamicpb.NewMessageType(file.Messages().Get(0))})
 })
+
+// wideMessage is a message of the host's own type holding 8 KiB in place, as one of a few hundred
+// fields does, and wideMessages one holding a list of them.
+type (
+	wideMessage  struct{ _ [8 << 10]byte }
+	wideMessages struct {
+		Items []*wideMessage `protobuf:"bytes,1,rep,name=items"`
+	}
+)
+
+func (m *wideMessage) ProtoReflect() protoreflect.Message  { return wideTypes()[0].MessageOf(m) }
+func (m *wideMessages) ProtoReflect() protoreflect.Message { return wideTypes()[1].MessageOf(m) }
+
+// wideTypes are wideMessage's and wideMessages' types, as generated code makes a message's.
+var wideTypes = sync.OnceValue(func() [2]*protoimpl.MessageInfo {
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name: proto.String("rbac_test/wide.proto"), Package: proto.String("rbac_test"), Syntax: proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("Wide")}, {
+			Name: proto.String("Wides"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name: proto.String("items"), Number: proto.Int32(1), JsonName: proto.String("items"),
+				Label: descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(),
+				Type:  descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(), TypeName: proto.String(".rbac_test.Wide"),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+	return [2]*protoimpl.MessageInfo{
+		{GoReflectType: reflect.TypeFor[*wideMessage](), Desc: file.Messages().Get(0)},
+		{GoReflectType: reflect.TypeFor[*wideMessages](), Desc: file.Messages().Get(1)},
+	}
+})
+
+// wideReflecting is a host's type that is its own reflection by a wideMessage's it embeds, so it
+// makes a wideMessage.
+type wideReflecting struct{ protoreflect.Message }
+
+func (m *wideReflecting) Interface() protoreflect.ProtoMessage { return m }
+func (m *wideReflecting) ProtoReflect() protoreflect.Message   { return m }
 
 // An Any packing a message of another type than those a condition reads was unpacked through the
 // registry, which ran the host's own code for it, its type's New, or a message's own Unmarshal of
@@ -2679,6 +2781,9 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		"slices of arrays of two holding a map and 64 KiB":       listed(func(int) any { return [][2]hidden{{}} }),
 		"maps of arrays of two structs holding a map and 64 KiB": listed(func(int) any { return map[string][2]hidden{"a": {}} }),
 		"a map keyed by arrays of 4 KiB":                         {"m": arrayKeyed},
+		"messages of the host's of 8 KiB":                        listed(func(int) any { return &wideMessage{} }),
+		"a message of the host's holding nil ones of 8 KiB":      {"m": &wideMessages{Items: make([]*wideMessage, n)}},
+		"the host's own reflections making messages of 8 KiB":    listed(func(int) any { return &wideReflecting{(&wideMessage{}).ProtoReflect()} }),
 	} {
 		for doing, work := range map[string]func(map[string]any) rbac.Work{"converting": rbac.ConvertingWork, "copying": rbac.CopyingWork} {
 			w := least(work, attributes)
@@ -2714,6 +2819,27 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		if w := rbac.CopyingWork(attributes); w.Done || w.Bytes > 1<<20 {
 			t.Errorf("copying %s copied it %t, allocating %d bytes", name, w.Done, w.Bytes)
 		}
+	}
+	// Nor does it read a map's entry where what the entries before it held left less than its value
+	// holds in place: one of two arrays of 100,000 interfaces, past what a copy holds once the other
+	// was copied, was read, 1.6 MB, only to be found so. The other is read, copied and set, three
+	// times its bytes.
+	type wideAny [100_000]any
+	if w := rbac.CopyingWork(map[string]any{"m": map[string]wideAny{"a": {}, "b": {}}}); w.Done || w.Bytes > 7*uint64(reflect.TypeFor[wideAny]().Size())/2 {
+		t.Errorf("copying a map of two arrays of 100,000 interfaces copied it %t, allocating %d bytes", w.Done, w.Bytes)
+	}
+	// A copy charges a struct's padding too, which moving it moves, so it reserves for a value no more
+	// than copying the value costs: uncounted, an array of 60,000 structs of a bool, each padded to 16
+	// bytes, cost 6,000, where 40,000 were reserved for a pointer to it, so a copy reaching it after a
+	// string past 30,000 was refused, and one reaching it first wasn't.
+	type padded struct {
+		A bool
+		_ [0]int64
+	}
+	spaced, long := &struct{ X [60_000]padded }{}, strings.Repeat("s", 1_300_000)
+	_, first := rbac.CopyingCharge(map[string]any{"l": []any{spaced, long}})
+	if _, after := rbac.CopyingCharge(map[string]any{"l": []any{long, spaced}}); first != after {
+		t.Errorf("a copy reaching an array of padded structs first copied it %t, and after a long string %t", first, after)
 	}
 	// Converting reads a map's entries into one value it makes room for, which reading each moves
 	// whole, so it makes none where what the map's values hold in place costs more than is left: it
