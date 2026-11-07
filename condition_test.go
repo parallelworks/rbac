@@ -4772,6 +4772,23 @@ func TestAZoneThatFailsToLoadForAWhileLoadsOnceItCan(t *testing.T) {
 	}
 }
 
+// A condition reading a time in a zone a literal names is one, though the platform's files fail to
+// give the zone for a while, so a change bounding what a check reads together counts it at all a
+// condition may cost: counted nothing, as one that isn't a condition, a change could add another
+// past that bound while they failed, which checks then read once the zone loads.
+func TestAConditionWhoseZoneFailsToLoadForAWhileIsBoundedAsAnyCondition(t *testing.T) {
+	const zone = "Pacific/Chatham"
+	h := setup(t)
+	expr := `request.time.getMinutes("` + zone + `") >= 0`
+	rbac.ForgetZones(zone)
+	restore := rbac.FailZoneLoads(t, syscall.EMFILE)
+	failing := rbac.ConditionLimit(h.authz, expr)
+	restore()
+	if limit := rbac.ConditionLimit(h.authz, expr); limit == 0 || failing < limit {
+		t.Errorf("a condition whose zone fails to load is bounded at %d, and at %d once it loads", failing, limit)
+	}
+}
+
 // The host's clock is read in UTC, as a time it passes as an attribute is, and as CEL reads one
 // with no zone: string() writes a time in its own zone, so a clock or a database returning times in
 // each replica's local zone decided by where the replica runs, a deny comparing the request's time

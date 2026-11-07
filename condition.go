@@ -363,10 +363,11 @@ func (c *conditions) limit(expr string) uint64 {
 		return limit
 	}
 	prg, err := c.build(expr)
-	// Nothing is kept for one that failed as the platform's files failed to give a time zone for a
-	// while (settled), which a check plans again.
+	// One that failed as the platform's files failed to give a time zone for a while (settled) is a
+	// condition a check plans again, so it counts all a condition may, and nothing is kept: counted
+	// nothing, a change could add another past what a check reads together while they failed.
 	if err != nil && !settled(err) {
-		return 0
+		return maxCost
 	}
 	c.keepLimit(expr, prg.limit)
 	return prg.limit

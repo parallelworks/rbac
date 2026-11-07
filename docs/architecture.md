@@ -729,7 +729,9 @@ sequenceDiagram
   of dyn may hold, but where a loop's variable named `request` hides it. Where reading the
   platform's files failed, as once the process
   ran out of file descriptors, it keeps nothing (`settled`), and a literal's zone isn't planned, so
-  the next check plans it again: kept, a real zone failed until the process dropped it. A
+  the next check plans it again: kept, a real zone failed until the process dropped it. Meanwhile a
+  change bounding what a check reads together counts such a condition at all a condition may cost
+  (`conditions.limit`), as it is one: counted nothing, a change could add another past the bound. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
   as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
   key, a loop's condition or a variable named from the root past a loop's variable of its name
