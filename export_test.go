@@ -1393,6 +1393,37 @@ func ConditionCostOn(t *testing.T, expr string, s Subject, p Permission, r Resou
 	return prg.limit, evaluate(program{Program: unlimited, limit: maxCost}, vars).cost
 }
 
+// ConditionCharged is what CEL's cost tracking charges evaluating expr on a request with attributes,
+// which the resource carries too, as a check plans it, and as CEL plans it with none of the
+// package's planning but what costs charges calls.
+func ConditionCharged(t *testing.T, expr string, attributes map[string]any) (planned, alone uint64) {
+	t.Helper()
+	c, err := newConditions(Attributes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prg, err := c.build(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, patterns := compiled(t, c, expr)
+	own, err := c.env.Program(checked, cel.CostTracking(costs{patterns}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Authorizer{cfg: Config{Now: time.Now}, conds: c}
+	vars := a.vars(WithRequest(t.Context(), attributes), Subject{Principal: Principal{Kind: User, ID: "u"}}, "cluster:login",
+		Resource{Tenant: "t", Type: "cluster", ID: "c", Attributes: attributes})
+	charged := func(p cel.Program, in any) uint64 {
+		out, details, err := p.Eval(in)
+		if err != nil || out != types.True || details == nil || details.ActualCost() == nil {
+			t.Fatalf("%s: %v, %v", expr, out, err)
+		}
+		return *details.ActualCost()
+	}
+	return charged(prg.Program, &counting{vars: vars}), charged(own, vars)
+}
+
 // EvaluateCondition evaluates expr as a check does, on a request with attributes, which the
 // resource carries too, and reports whether it held, whether it could be evaluated and the bytes
 // evaluating it allocated, or why it isn't a condition.
@@ -1839,8 +1870,8 @@ func PlanIn(t *testing.T, env *cel.Env, expr string) error {
 }
 
 // probing plans each uint literal as a probe, which evaluates and is charged as the literal, but
-// which CEL's cost tracking reads as a call of an argument none of the values it holds is of, so
-// it reads them all.
+// which CEL's cost tracking, where it holds values, reads as a call of an argument none of them is
+// of, so it reads them all.
 type probing struct{ read, most, reached int }
 
 func (p *probing) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {

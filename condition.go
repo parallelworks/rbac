@@ -478,7 +478,7 @@ func plan(env *cel.Env, checked *cel.Ast, patterns map[string]uint64, limit uint
 	if len(s.stepped) != len(s.ranges) {
 		return nil, errors.New("a loop's condition is planned where this package can't bound it")
 	}
-	if len(s.ordered) != len(s.planned) {
+	if len(s.ordered) != len(s.over) {
 		return nil, errors.New("a loop's range is planned where this package can't order a map's keys")
 	}
 	if len(k.planned) != len(k.keys) {
@@ -520,21 +520,19 @@ type costs struct{ patterns map[string]uint64 }
 func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 	n := uint64(1)
 	switch function {
-	case looping, operators.NotStrictlyFalse:
-		if function == looping {
-			n = 0
-		}
-		// A loop's first step finds the loop's range where each after finds the step before
-		// (stepping). CEL copies the keys of a map the host passes, as a map[string]any, before a
-		// loop over it takes a step, however few it takes, so a loop over one inside another would
-		// otherwise take time growing with the map's size and the outer loop's steps, charged only
-		// for the steps. It walks others, as a literal or a map[string]int, without copying, but
-		// each is charged alike, so what a loop costs doesn't depend on how the host passed it.
+	case looping:
+		// A loop over a map, as it starts, 1 for each of its keys, however few steps it takes, as
+		// collecting them to order them reads each (stepping.inOrder): a loop over one inside
+		// another would otherwise take time growing with the map's size and the outer loop's steps,
+		// charged only for the steps.
+		n = 0
 		if len(args) > 0 {
-			if m, ok := args[0].(traits.Mapper); ok && m.Type().HasTrait(traits.IterableType) {
-				n += count(m)
+			if m, ok := args[0].(traits.Mapper); ok {
+				n = count(m)
 			}
 		}
+	case operators.NotStrictlyFalse:
+		// 1, as the condition of a step of all() or exists().
 	case overloads.Matches:
 		if len(args) != 2 {
 			return nil
@@ -1020,8 +1018,10 @@ func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable
 }
 
 // charged is a call bounded plans, run on what the condition evaluating it reads, so it can charge
-// what it reads before it runs (chargePast), as CEL charges a call only once it has run. CEL still
-// charges it as the call it is.
+// what it reads before it runs (chargePast), as CEL charges a call only once it has run. Once it has
+// run, it charges CEL's tracking as the call it is, as each call CEL plans charges itself as it
+// runs: the call it is planned in place of never runs, and left so, a comparison cost 1 less, and
+// reading a time in a zone zoneCost less, than the bound counts.
 type charged struct {
 	interpreter.InterpretableCall
 	run func(vars interpreter.Activation, args []ref.Val) ref.Val
@@ -1036,10 +1036,16 @@ func (c *charged) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 			return args[i]
 		}
 	}
-	return types.LabelErrNode(c.ID(), c.run(frame, args))
+	out := types.LabelErrNode(c.ID(), c.run(frame, args))
+	if costs := frame.CostTracker(); costs != nil {
+		costs.EvalVarArgs(frame, c.ID(), c, args, out)
+	}
+	return out
 }
 
-func (c *charged) Eval(vars interpreter.Activation) ref.Val { return c.Exec(interpreter.AsFrame(vars)) }
+func (c *charged) Eval(vars interpreter.Activation) ref.Val {
+	return interpreter.EvalActivation(vars, c.Exec)
+}
 
 // guarded reports whether bounded plans a call of function with args arguments to fail before it
 // runs: a comparison, a search of a list or a string, or reading a part of a time in a zone.
@@ -1344,42 +1350,33 @@ func timePart(function string) bool {
 	return false
 }
 
-// looping is what costs charges a loop's literal condition as: nothing, as CEL charges a literal.
+// looping is what costs charges a loop over a map as when it starts (stepping.inOrder).
 const looping = "@looping"
 
-// stepping keeps CEL's cost tracking from holding what each step of checked's loops evaluated
-// until the loop ends. The tracking holds each value evaluated, to charge a call by its arguments,
-// and drops it once what reads it is charged, but nothing reads a step's value or its condition's,
-// so it drops what a loop's steps kept only once the loop ends, and each search for a value that
-// wasn't evaluated, as a branch not taken, an identifier's own or the argument a failing call
-// never reached, reads all of it. A loop over a list the host passes would take time growing with
-// the square of its length, past what it is charged, and one whose steps fail, charged little, the
-// most. Each step evaluates its condition first, so a loop's condition is planned instead as a call
-// whose first argument is the loop's range: charging it drops what the steps before kept, and
-// costs what charging the condition did, and at a loop's first step 1 more for each key of a map
-// it ranges over (costs). It counts the steps too, each costing at least 1, and charges each 1 more
-// for each logical operator and choice it may evaluate (free), which limit bounds (counting). A
-// loop's range it plans to give a map's keys in one order (order).
+// stepping plans each of checked's loops' conditions as a step, which a loop evaluates first at each
+// of its steps: it counts the steps, each costing at least 1, and charges each 1 more for each
+// logical operator and choice it may evaluate (free), which limit bounds (counting). A loop's range
+// it plans to give a map's keys in one order, charging each key as the loop starts (order).
 type stepping struct {
-	// ranges are the ids of the ranges of checked's loops, by those of their conditions, planned
-	// whether each range has been planned, by its id, and stepped those of the conditions planned
-	// as steps. operators are what each of a loop's steps may evaluate (free), by its condition's id.
-	// lists are the ranges CEL checks as lists, by their ids, and ordered those order planned.
-	ranges                           map[int64]int64
-	planned, stepped, lists, ordered map[int64]bool
-	operators                        map[int64]uint64
-	limit                            uint64
+	// ranges are the ids of the ranges of checked's loops, by those of their conditions, and stepped
+	// those of the conditions planned as steps. operators are what each of a loop's steps may
+	// evaluate (free), by its condition's id. over are the ranges' ids, lists those CEL checks as
+	// lists, and ordered those order planned.
+	ranges                        map[int64]int64
+	over, stepped, lists, ordered map[int64]bool
+	operators                     map[int64]uint64
+	limit                         uint64
 }
 
 func newStepping(checked *ast.AST, limit uint64) *stepping {
 	s := &stepping{
-		ranges: map[int64]int64{}, planned: map[int64]bool{}, stepped: map[int64]bool{}, lists: map[int64]bool{},
+		ranges: map[int64]int64{}, over: map[int64]bool{}, stepped: map[int64]bool{}, lists: map[int64]bool{},
 		ordered: map[int64]bool{}, operators: map[int64]uint64{}, limit: limit,
 	}
 	for _, e := range ast.MatchDescendants(ast.NavigateAST(checked), ast.KindMatcher(ast.ComprehensionKind)) {
 		comp := e.AsComprehension()
 		s.ranges[comp.LoopCondition().ID()] = comp.IterRange().ID()
-		s.planned[comp.IterRange().ID()] = false
+		s.over[comp.IterRange().ID()] = true
 		s.lists[comp.IterRange().ID()] = checked.GetType(comp.IterRange().ID()).Kind() == types.ListKind
 		s.operators[comp.LoopCondition().ID()] = free(comp.LoopCondition()) + free(comp.LoopStep())
 	}
@@ -1426,24 +1423,8 @@ func free(e ast.Expr) uint64 {
 }
 
 func (s *stepping) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
-	if _, ok := s.planned[i.ID()]; ok {
-		s.planned[i.ID()] = true
-	}
-	over, ok := s.ranges[i.ID()]
-	if !ok {
+	if _, ok := s.ranges[i.ID()]; !ok {
 		return i, nil
-	}
-	// A loop's first step finds its range by this id to charge a map's keys (costs). Another
-	// version of CEL may plan the range under another id, or after the condition, and a loop over
-	// a map the host passes, inside another, would copy its keys uncharged again.
-	if !s.planned[over] {
-		return nil, errors.New("a loop's range is planned where this package can't charge its keys")
-	}
-	// The tracking finds what it holds by id, the range's before the steps', and drops it with all
-	// held after it.
-	st := &step{
-		cond: i, over: over, function: looping, args: []interpreter.InterpretableV2{interpreter.NewConstValue(over, types.NullValue)},
-		operators: s.operators[i.ID()], limit: s.limit,
 	}
 	switch cond := i.(type) {
 	case interpreter.InterpretableConst:
@@ -1452,32 +1433,23 @@ func (s *stepping) decorate(i interpreter.InterpretableV2) (interpreter.Interpre
 		if cond.Function() != operators.NotStrictlyFalse {
 			return nil, fmt.Errorf("a loop's condition is planned as %s, which this package doesn't bound", cond.Function())
 		}
-		st.function, st.overload, st.args = cond.Function(), cond.OverloadID(), append(st.args, cond.Args()...)
 	default:
 		// Another version of CEL may plan a loop otherwise, which would run unbounded.
 		return nil, fmt.Errorf("a loop's condition is planned as %T, which this package doesn't bound", i)
 	}
 	s.stepped[i.ID()] = true
-	return st, nil
+	return &step{InterpretableV2: i, operators: s.operators[i.ID()], limit: s.limit}, nil
 }
 
-// step is a loop's condition as stepping plans it. It has the id of the loop's range, so the
-// tracking holds its value as the range's, which the next step's condition drops.
+// step is a loop's condition as stepping plans it, which CEL evaluates, and charges, as it planned it.
 type step struct {
-	cond               interpreter.InterpretableV2
-	over               int64
-	function, overload string
-	args               []interpreter.InterpretableV2
+	interpreter.InterpretableV2
 	// operators are what each step may evaluate that CEL charges nothing (free), and limit the
 	// condition's, which its loops' steps and what it was charged past CEL together may not pass.
 	operators, limit uint64
 }
 
-func (s *step) ID() int64                             { return s.over }
-func (s *step) Function() string                      { return s.function }
-func (s *step) OverloadID() string                    { return s.overload }
-func (s *step) Args() []interpreter.InterpretableV2   { return s.args }
-func (s *step) Eval(a interpreter.Activation) ref.Val { return s.Exec(interpreter.AsFrame(a)) }
+func (s *step) Eval(a interpreter.Activation) ref.Val { return interpreter.EvalActivation(a, s.Exec) }
 
 // Exec counts the step, charges its operators past what CEL charges, and cancels the evaluation past
 // its limit, as CEL cancels one costing more. The keys and literals charged count too: a loop after
@@ -1494,7 +1466,7 @@ func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 	if !ok || cost.SafeAdd(n.steps, n.charged) > s.limit {
 		panic(interpreter.EvalCancelledError{Cause: interpreter.CostLimitExceeded, Message: "rbac: a condition's loops take more steps than it may cost"})
 	}
-	return s.cond.Exec(frame)
+	return s.InterpretableV2.Exec(frame)
 }
 
 // order plans each of checked's loops' ranges to give a map's keys in one order (inOrder), not as
@@ -1504,18 +1476,14 @@ func (s *step) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 // `request.attributes.scopes.map(k, k)[0] == "read"` held in 55 of 100 identical checks, Explain
 // disagreeing with the check before it in 51, and a deny's
 // `request.attributes.scopes.filter(k, true)[0] == "admin"` lifted in 84, so a requester could ask
-// until it lifted. A range is planned as CEL planned it, of the same kind, so the tracking observes
-// and charges it as it did: an attribute is resolved here, as keyedAttribute resolves one, since
-// CEL plans a select already watched. One CEL plans as something else, as a loop, it leaves where
-// CEL checks it as a list, and plan refuses otherwise. A loop's condition, which decorate plans
-// under its range's id, is no range.
+// until it lifted. A range is planned as CEL planned it, of the same kind, and evaluated by what CEL
+// planned, so CEL charges it as it would. One CEL plans as something else, as a loop, it leaves where
+// CEL checks it as a list, and plan refuses otherwise.
 func (s *stepping) order(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
-	if _, ok := s.planned[i.ID()]; !ok {
+	if !s.over[i.ID()] {
 		return i, nil
 	}
 	switch r := i.(type) {
-	case *step:
-		return i, nil
 	case interpreter.InterpretableAttribute:
 		i = &orderedAttribute{InterpretableAttribute: r, s: s}
 	case interpreter.InterpretableConstructor:
@@ -1532,7 +1500,7 @@ func (s *stepping) order(i interpreter.InterpretableV2) (interpreter.Interpretab
 }
 
 // inOrder is v, the value of the loop's range id, giving its keys in one order where it is a map of
-// more than one: sorted (sortKeys), once the condition evaluating on vars is charged what sorting
+// more than one: sorted (sortKeys), once the condition evaluating on frame is charged what sorting
 // them costs, before any is sorted, as worst bounds it (sortCost). That is 1 for each two keys at
 // each of sortLevels, as comparing and moving a key took 13 to 15 ns, where a unit charged covers
 // 20 to 145 ns of what the package does elsewhere, and what reading each key costs past 1
@@ -1541,19 +1509,34 @@ func (s *stepping) order(i interpreter.InterpretableV2) (interpreter.Interpretab
 // charging them once covers. Charged 1 for each key and what reading it costs at each level,
 // sorting 500 keys of 36 bytes, as ids, cost 18,000, past what a condition may, for 64 µs of work,
 // and 500 short keys, which a loop costing about half what a condition may reads, 4,500, for 57 µs.
+// CEL's tracking is charged 1 for each key first, as the loop starts (costs), whatever their number.
 // A map keyed by another type than keyRank orders, as a map literal keyed by lists can be, has no
 // order, and a loop over it fails.
-func (s *stepping) inOrder(vars interpreter.Activation, id int64, v ref.Val) ref.Val {
-	m, ok := v.(traits.Mapper)
-	if !ok || !m.Type().HasTrait(traits.IterableType) {
+func (s *stepping) inOrder(frame *interpreter.ExecutionFrame, id int64, v ref.Val) ref.Val {
+	if types.IsUnknownOrError(v) {
 		return v
+	}
+	// CEL loops over a value that is a list or a map in Go whatever type it says it is, so one that
+	// says it can't be looped over, as attributes no condition reads (refusing), is refused here:
+	// looped over, `subject.attributes.all(k, false)` held where they were empty, and
+	// `dyn(request.attributes).exists(k, k == "mfa_at")` where mfa_at was declared and passed as
+	// another type, its key found.
+	if !v.Type().HasTrait(traits.IterableType) {
+		return types.LabelErrNode(id, types.NewErr("rbac: a value of type %s can't be looped over", v.Type().TypeName()))
+	}
+	m, ok := v.(traits.Mapper)
+	if !ok {
+		return v
+	}
+	if costs := frame.CostTracker(); costs != nil {
+		costs.EvalUnary(frame, id, loopStart{}, m, nil)
 	}
 	n := count(m)
 	if n < 2 {
 		return v
 	}
 	// Charged before any key is read.
-	chargePast(vars, sortSteps(n), s.limit)
+	chargePast(frame, sortSteps(n), s.limit)
 	keys := make([]ref.Val, 0, n)
 	if native := entries(m); native != nil {
 		for k := range native {
@@ -1571,11 +1554,19 @@ func (s *stepping) inOrder(vars interpreter.Activation, id int64, v ref.Val) ref
 		}
 		text += textSize(k) - 1
 	}
-	chargePast(vars, text, s.limit)
+	chargePast(frame, text, s.limit)
 	return orderedMap{Mapper: m, keys: types.NewRefValList(types.DefaultTypeAdapter, sortKeys(keys))}
 }
 
-// orderedMap is a map whose keys a loop gives in the order keys holds them.
+// loopStart is a loop over a map starting, as CEL's tracking charges it (costs).
+type loopStart struct{}
+
+func (loopStart) Function() string   { return looping }
+func (loopStart) OverloadID() string { return "" }
+
+// orderedMap is a map whose keys a loop gives in the order keys holds them. CEL loops over a map
+// that folds itself by folding it, as Go ranges over it, and over any other by its iterator, so it
+// has no Fold of its own: the map it embeds has one, which embedded as a traits.Mapper it hides.
 type orderedMap struct {
 	traits.Mapper
 	keys traits.Lister
@@ -1583,23 +1574,19 @@ type orderedMap struct {
 
 func (m orderedMap) Iterator() traits.Iterator { return m.keys.Iterator() }
 
-// orderedAttribute is a loop's range CEL plans as an attribute, as a select or an index, resolved
-// as CEL resolves one and ordered.
+// orderedAttribute is a loop's range CEL plans as an attribute, as a select or an index, ordered
+// once resolved.
 type orderedAttribute struct {
 	interpreter.InterpretableAttribute
 	s *stepping
 }
 
 func (a *orderedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
-	v, err := a.Attr().Resolve(frame)
-	if err != nil {
-		return types.LabelErrNode(a.ID(), types.WrapErr(err))
-	}
-	return a.s.inOrder(frame, a.ID(), a.Adapter().NativeToValue(v))
+	return a.s.inOrder(frame, a.ID(), a.InterpretableAttribute.Exec(frame))
 }
 
 func (a *orderedAttribute) Eval(vars interpreter.Activation) ref.Val {
-	return a.Exec(interpreter.AsFrame(vars))
+	return interpreter.EvalActivation(vars, a.Exec)
 }
 
 // orderedConstructor is a loop's range CEL plans as a literal, ordered once built.
@@ -1613,7 +1600,7 @@ func (c *orderedConstructor) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 }
 
 func (c *orderedConstructor) Eval(vars interpreter.Activation) ref.Val {
-	return c.Exec(interpreter.AsFrame(vars))
+	return interpreter.EvalActivation(vars, c.Exec)
 }
 
 // orderedCall is a loop's range CEL plans as a call, as dyn(), ordered once it has run.
@@ -1627,7 +1614,7 @@ func (c *orderedCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 }
 
 func (c *orderedCall) Eval(vars interpreter.Activation) ref.Val {
-	return c.Exec(interpreter.AsFrame(vars))
+	return interpreter.EvalActivation(vars, c.Exec)
 }
 
 // keyRank is where keys of v's type come in a loop over a map: bools, ints, uints, doubles, strings
@@ -1907,8 +1894,7 @@ func newLiterals(checked *ast.AST, limit uint64) *literals {
 	return l
 }
 
-// decorate plans a literal as one charged before it builds; a loop's condition planned under its
-// range's id (stepping) is no literal.
+// decorate plans a literal as one charged before it builds.
 func (l *literals) decorate(i interpreter.InterpretableV2) (interpreter.InterpretableV2, error) {
 	n, ok := l.sizes[i.ID()]
 	c, constructs := i.(interpreter.InterpretableConstructor)
@@ -1991,7 +1977,9 @@ func misheld(v ref.Val, named int) ref.Val {
 	return nil
 }
 
-func (l *literal) Eval(vars interpreter.Activation) ref.Val { return l.Exec(interpreter.AsFrame(vars)) }
+func (l *literal) Eval(vars interpreter.Activation) ref.Val {
+	return interpreter.EvalActivation(vars, l.Exec)
+}
 
 // keyedAttribute is a key CEL plans as an attribute: an index qualifies a map by it, and a map
 // literal evaluates it, each as CEL does, once charged.
@@ -2001,20 +1989,15 @@ type keyedAttribute struct {
 }
 
 // Exec charges the key once converted, as the map reads it: one a check passes as a Go value, as
-// the subject's id, is CEL's only then. It resolves the attribute itself, as CEL plans a
-// select already watched, whose tracking would charge the key twice.
+// the subject's id, is CEL's only then.
 func (a *keyedAttribute) Exec(frame *interpreter.ExecutionFrame) ref.Val {
-	v, err := a.Attr().Resolve(frame)
-	if err != nil {
-		return types.LabelErrNode(a.ID(), types.WrapErr(err))
-	}
-	key := a.Adapter().NativeToValue(v)
+	key := a.InterpretableAttribute.Exec(frame)
 	a.k.charge(frame, a, key)
 	return comparableKey(key)
 }
 
 func (a *keyedAttribute) Eval(vars interpreter.Activation) ref.Val {
-	return a.Exec(interpreter.AsFrame(vars))
+	return interpreter.EvalActivation(vars, a.Exec)
 }
 
 // Qualify qualifies obj by the key, as CEL qualifies a map by an attribute.
@@ -2090,7 +2073,7 @@ func (c *keyedCall) Exec(frame *interpreter.ExecutionFrame) ref.Val {
 }
 
 func (c *keyedCall) Eval(vars interpreter.Activation) ref.Val {
-	return c.Exec(interpreter.AsFrame(vars))
+	return interpreter.EvalActivation(vars, c.Exec)
 }
 
 // ordering is x compared with y by an ordering operator, as CEL orders them, once bounded has
@@ -2842,7 +2825,8 @@ func (r refusedAttributes) Find(k ref.Val) (ref.Val, bool) {
 	return r.Mapper.Find(k)
 }
 
-// refusedAttributesType has none of a map's traits, so CEL has no size(), in or macro for it.
+// refusedAttributesType has none of a map's traits, so CEL has no size() or in for it, and a loop
+// over it fails (stepping.inOrder).
 var refusedAttributesType = types.NewOpaqueType("rbac.RefusedAttributes")
 
 func (refusedAttributes) Type() ref.Type { return refusedAttributesType }
