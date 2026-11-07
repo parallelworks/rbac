@@ -446,7 +446,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   them reads; and so are ones nesting past 20,000 deep, of which a hook was given what lay deeper as
   its zero value, and ones holding themselves that reach 20,000 maps, lists, pointers, structs,
   arrays and messages, counting each time one is reached, however shallow, which were copied
-  whole; and a condition building a list or a map holding attributes no condition can
+  whole, and ones holding a lock, an unsafe pointer or a struct's unexported field holding a
+  pointer, a slice, a map or an interface, which a hook was given copied whole, sharing what the
+  field held with the host; and a condition building a list or a map holding attributes no condition can
   read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
@@ -511,8 +513,14 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
   deep a path around the cycle nests turns on where the copy enters it, which the order a map's
   entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
-  of them, were copied on one call and refused on the next. Where the attributes hold more, nest
-  deeper or hold themselves so, the hook can't be asked, rather than be given part of them,
+  of them, were copied on one call and refused on the next. Nor does it hold what can't be copied
+  as a value: a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
+  value holds, an unsafe pointer, as a `reflect.Value` holds, or a struct's unexported field, which
+  a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
+  keep their state in; a host's type that is its own reflection by a generated message's it embeds
+  is given holding the reflection of a copy of the message. Where the attributes hold more, nest
+  deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be
+  given part of them,
   and the call is refused as any other, a `DeniedError` of the permission on the resource
   asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
   users can write what takes attributes past it, as a resource's tags, and the message named the

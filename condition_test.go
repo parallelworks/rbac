@@ -1272,6 +1272,12 @@ func (t typedReflectingType) Zero() protoreflect.Message {
 	return &typedReflecting{made}
 }
 
+// reflected is a host's type that is its own reflection by a generated message's it embeds.
+type reflected struct{ protoreflect.Message }
+
+func (m *reflected) Interface() protoreflect.ProtoMessage { return m }
+func (m *reflected) ProtoReflect() protoreflect.Message   { return m }
+
 // hostListValue is a host's type embedding a ListValue.
 type hostListValue struct{ *structpb.ListValue }
 

@@ -499,7 +499,14 @@ sequenceDiagram
   while its elements are copied, before a longer length outgrew that copy, a slice of its own, whose
   elements are copied too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
-  the interface. A call keeps what the host passed with each copy until it returns, so where it
+  the interface. A copy copies each value in place before what it holds, as setting it does, so it
+  copies none holding a lock or an unsafe pointer there, nor a struct whose unexported field, which
+  it can't set, holds a pointer, a slice, a map or an interface (`copyable`): the hook can't be
+  asked. Such a value is another package's state, as protobuf's reflection of a generated message
+  is, whose methods find the message by where it lies, so a hook reading a copy of it alone, as a
+  host's type that is its own reflection by one held, read past it; or it holds the host's, which
+  the copy shared. A message's reflection is copied as that of a copy of the message (`pointer`),
+  and refused where that isn't of its type. A call keeps what the host passed with each copy until it returns, so where it
   points is no other value's meanwhile: known only by where it points, a value dropped and collected
   during the call would leave its place to one made after, which would be given the first one's
   copy.
