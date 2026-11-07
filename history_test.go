@@ -607,7 +607,7 @@ func TestMigratingGivesTheCommitRecordsFunctionToHistorysRole(t *testing.T) {
 // The README's database roles, set up as its steps say and given nothing more, run the package: as
 // the administrator's role, Migrate, on a new schema or one history's role took history over in
 // before the last migration, and PruneHistory; and as the application's, changes to every table,
-// checks, lists, a read as of a time, History and Export.
+// checks, lists, DeleteExpired, a read as of a time, History and Export.
 func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 	names, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {
@@ -694,6 +694,10 @@ func TestThePackageRunsAsTheReadmesDatabaseRoles(t *testing.T) {
 			check("Holders, Members, GroupsOf, Filter and Reachable", reads(authz))
 			check("SetGroup", authz.SetGroup(ctx, boss, "t1", rbac.GroupDefinition{ID: "spare"}))
 			check("DeleteGroup", authz.DeleteGroup(ctx, boss, "t1", "spare"))
+			// It records the time it deletes by, which every check above read, in the table the last
+			// migration added, which an upgrade gives the role no privilege on by a step of its own.
+			_, err = authz.DeleteExpired(ctx)
+			check("DeleteExpired", err)
 			check("AsOf", authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
 				if err := a.Authorize(ctx, u, login, cluster); err != nil {
 					return err

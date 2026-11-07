@@ -488,7 +488,8 @@ func TestAsOfRebuildsEveryTableAsItIs(t *testing.T) {
 	rebuilt(t, h, dbNow(t, h))
 }
 
-// rebuilt checks that AsOf as of at reads each of the package's tables as t1's rows of it are now.
+// rebuilt checks that AsOf as of at reads each of the package's tables as t1's rows of it are now,
+// but the times DeleteExpired deleted by, which no tenant has and AsOf doesn't read.
 func rebuilt(t *testing.T, h *harness, at time.Time) {
 	t.Helper()
 	ctx := t.Context()
@@ -498,7 +499,7 @@ func rebuilt(t *testing.T, h *harness, at time.Time) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	rows, err := tx.Query(ctx, `SELECT quote_ident(current_schema()), relname::text FROM pg_class
-		WHERE relnamespace = current_schema()::regnamespace AND relkind = 'r' AND relname NOT IN ('rbac_history', 'rbac_migrations') ORDER BY 2`)
+		WHERE relnamespace = current_schema()::regnamespace AND relkind = 'r' AND relname NOT IN ('rbac_history', 'rbac_migrations', 'rbac_expired') ORDER BY 2`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3085,7 +3086,7 @@ func TestAsOfViewsReadHistoryAsPruningKeepsIt(t *testing.T) {
 	defer func() { _ = tx.Rollback(ctx) }()
 	rows, err := tx.Query(ctx, `SELECT current_schema()::text, t.relname::text, array_agg(a.attname::text ORDER BY a.attnum)
 		FROM pg_class t JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
-		WHERE t.relnamespace = current_schema()::regnamespace AND t.relkind = 'r' AND t.relname NOT IN ('rbac_history', 'rbac_migrations')
+		WHERE t.relnamespace = current_schema()::regnamespace AND t.relkind = 'r' AND t.relname NOT IN ('rbac_history', 'rbac_migrations', 'rbac_expired')
 		GROUP BY t.relname ORDER BY t.relname`)
 	if err != nil {
 		t.Fatal(err)

@@ -397,26 +397,26 @@ func (a *Authorizer) decidedOn(p Permission, r Resource) Resource {
 
 // holdingOn is holding read on q, asking the constraints through cs, which is on the tenant.
 func (a *Authorizer) holdingOn(ctx context.Context, q DB, s Subject, cs *constrained) (Holding, map[Permission]bool, error) {
-	h, byCondition, _, err := a.holdingRead(ctx, q, s, cs, false)
+	h, byCondition, _, err := a.holdingRead(ctx, q, s, cs, alsoRead{})
 	return h, byCondition, err
 }
 
-// holdingRead is holdingOn, and with keys and labels declared, s's keys in the tenant, as keysOf
-// reads them, in the statement that reads what its values are decided by, so they are of one
-// moment.
-func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *constrained, keys bool) (Holding, map[Permission]bool, []string, error) {
+// holdingRead is holdingOn, and with labels declared, what with says of s's keys in the tenant, as
+// keys and lapse, read in the statement that reads what its values are decided by, so they are of
+// one moment.
+func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *constrained, with alsoRead) (Holding, map[Permission]bool, grantsRead, error) {
 	if len(a.labels) == 0 {
 		h, byCondition, err := a.holdingFrom(ctx, q, s, cs, nil, a.labelPermission, nil)
-		return h, byCondition, nil, err
+		return h, byCondition, grantsRead{}, err
 	}
 	tenant := cs.on.Tenant
-	got, err := a.readHeld(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, "", namedRoles, alsoRead{keys: keys})
+	got, err := a.readHeld(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, "", namedRoles, with)
 	if err != nil {
-		return Holding{}, nil, nil, err
+		return Holding{}, nil, grantsRead{}, err
 	}
 	readingRoles()
 	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, a.labeling(&valuesRead{held: got.held, ds: got.ds, roles: got.roles}), a.labelPermission, nil)
-	return h, byCondition, got.keys, err
+	return h, byCondition, got, err
 }
 
 // valuesOn reads on q what s's label values in a tenant are decided by, the conditions of its

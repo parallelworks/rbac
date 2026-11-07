@@ -297,7 +297,7 @@ func (a *Authorizer) Activate(ctx context.Context, s Subject, on Resource, act A
 	}
 	b.ExpiresAt = stored(a.cfg.Now().Add(act.Duration))
 	// Whether any allows it, before asking the host: which, under the locks.
-	keys, _, err := a.keysAt(ctx, a.db, on.Tenant, s, b.ExpiresAt)
+	keys, _, err := a.keysAt(ctx, a.db, on.Tenant, s, b.ExpiresAt, false)
 	if err != nil {
 		return Grant{}, err
 	}

@@ -206,7 +206,8 @@ func errPlanted(views, schema string) error {
 // asOfViews returns the views of history in schema, which it finds by what they read, whatever
 // either schema is named, and the search_path q reads by: refusing them where they are of no one
 // schema, where theirs holds no view of one of the package's tables, those of schema prefixed
-// rbac_, which would be read as it is now, or, as migrating does, where planted is true of it.
+// rbac_ but rbac_expired, which no read as of a time reads, as it would be read as it is now, or, as
+// migrating does, where planted is true of it.
 func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, error) {
 	s := standIns{schema: schema}
 	var views, bare []string
@@ -222,7 +223,7 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 		  tables AS (SELECT t.relname, c.oid AS view FROM pg_catalog.pg_class t
 		    LEFT JOIN (pg_catalog.pg_class c JOIN v ON c.relnamespace = v.oid) ON c.relname = t.relname AND c.relkind = 'v'
 		    WHERE t.relnamespace = (SELECT here.oid FROM here)
-		      AND t.relkind IN ('r', 'p') AND pg_catalog.starts_with(t.relname, 'rbac_') AND t.relname NOT IN ('rbac_history', 'rbac_migrations'))
+		      AND t.relkind IN ('r', 'p') AND pg_catalog.starts_with(t.relname, 'rbac_') AND t.relname NOT IN ('rbac_history', 'rbac_migrations', 'rbac_expired'))
 		SELECT ARRAY(SELECT n.nspname::pg_catalog.text FROM v JOIN pg_catalog.pg_namespace n ON n.oid = v.oid ORDER BY 1),
 		  coalesce((SELECT pg_catalog.min(v.oid) FROM v), 0),
 		  ARRAY(SELECT t.relname::pg_catalog.text FROM tables t WHERE t.view IS NULL ORDER BY t.relname),

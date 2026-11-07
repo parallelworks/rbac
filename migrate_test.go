@@ -655,15 +655,15 @@ func TestMigrateDoesntWaitOutAClientsVacuum(t *testing.T) {
 	}
 }
 
-// viewsDiverged is each of the package's tables in the schema of pool's connections, but history and
-// rbac_migrations, whose view beside it for AsOf is missing or gives other columns than it holds: by
+// viewsDiverged is each of the package's tables in the schema of pool's connections, but history,
+// rbac_migrations and rbac_expired, whose view beside it for AsOf is missing or gives other columns than it holds: by
 // name, type, its modifier and collation, in its order.
 func viewsDiverged(t *testing.T, pool *pgxpool.Pool) []string {
 	t.Helper()
 	rows, err := pool.Query(t.Context(), `SELECT t.relname::text FROM pg_class t
 		CROSS JOIN LATERAL (SELECT to_regclass(quote_ident(current_schema() || '_as_of') || '.' || quote_ident(t.relname)) AS oid) v
 		WHERE t.relnamespace = current_schema()::regnamespace AND t.relkind = 'r' AND starts_with(t.relname, 'rbac_')
-		  AND t.relname NOT IN ('rbac_history', 'rbac_migrations')
+		  AND t.relname NOT IN ('rbac_history', 'rbac_migrations', 'rbac_expired')
 		  AND (v.oid IS NULL OR EXISTS (
 		    (SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped
 		     EXCEPT SELECT attnum, attname, atttypid, atttypmod, attcollation FROM pg_attribute WHERE attrelid = v.oid)
