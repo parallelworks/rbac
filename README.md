@@ -432,7 +432,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   may cost and is now bounded as the timestamp it is, a few units. CEL now refuses ordering numbers
   of different types, as `[1, 2].exists(i, i < 2u)`, which it accepted before once it had checked a
   loop, so a condition stored so no longer compiles: a grant's gives nothing and a deny's applies.
-  A condition naming a variable from the root where a loop's
+  To find those stored, list each condition stored, `SELECT condition FROM rbac_grants UNION SELECT
+  condition FROM rbac_denies UNION SELECT requires FROM rbac_eligibilities`, and compile each but
+  the empty one with CEL's `cel.NewEnv` declaring `subject`, `resource` and `request` as
+  `cel.MapType(cel.StringType, cel.DynType)` and `action` as `cel.StringType`, as the package
+  compiles them: one whose `Compile` gives issues no longer compiles, and storing it again is
+  refused with them (`rbac.ErrInvalid`). A condition naming a variable from the root where a loop's
   variable of the same name hides it, as `.request` in `l.all(request, ...)`, and indexing it by a
   key naming a loop's variable, as `.request.attributes.m.exists(k, .request.attributes.m[k] > 0)`,
   failed, as CEL read the key outside the loop, and now reads it there; and each field or key such a
