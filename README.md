@@ -102,10 +102,10 @@ a column of the type too, whose statistics count them, and index it after the te
 pages sort by, as `(tenant, type, id)`, or a sorted page of a type of few rows reads the rows of
 every type until it is full. A condition holds for the query it was built for: it fixes the time,
 the subject's label holding and what the constraints answered, so build one for each query; the
-query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, taken no
-later than the database's clock, and with the label column keeps no row once that is as late as the
-first time after `Filter` read the holding that the subject's membership, or its last path to one of
-its groups, ended. It compares the
+query decides no earlier than the latest time `DeleteExpired` deleted by that it sees, keeps no row
+where that is past the database's clock, where a check is refused (Expiry), and with the label
+column keeps no row once that is as late as the first time after `Filter` read the holding that the
+subject's membership, or its last path to one of its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
 which their indexes still serve. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
@@ -172,7 +172,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   takes. Custom roles follow the catalog: one gives only what the catalog still has, and is
   privileged when it gives what only privileged roles do, or changes access. A check, `Activate`
   and a change read only the custom roles they and the grants they read name, a change with those
-  the roles it grants list, through others too, so the tenant's other roles cost them nothing;
+  the roles it grants list, through others too, each once however many roles list it, at two
+  lookups by its key and one read of its permissions, so the tenant's other roles cost them nothing;
   `CustomRoles`, `Roles`, `Grantable`, `SetRole` and `DeleteRole` read every one, which
   `rbac.MaxCustomRoles` bounds.
 - **Labels on data:** a mandatory layer above every grant. A host declares label dimensions
@@ -1566,26 +1567,35 @@ the package's uses foreign data, so none of the roles needs any.
   ahead, or a `Config.Now` set wrong, can't have a later call decide past the database's clock, and
   a run that removes nothing records nothing. It records it through `rbac_expired_through`, which
   deletes the times no later than its own and adds its own, refusing one past the database's clock,
-  and history records each write, as one of the package's tables (History). A read takes the latest
-  time no later than the database's clock as it reads it, which takes nothing from a time a run
-  recorded: no write records one past the clock as its own statement began, which is before it
-  commits, and so before a read that sees it takes its snapshot. Bounded by the clock as the read's
-  statement began, a statement sent in a simple query, as by a pool that prepares none, which takes
-  its snapshot once it is planned, after any lock it waited for, could find a run's removals and
-  decide before what they removed ended. So a role that may execute the function, as the
-  application's may, can move what a
-  call decides no earlier than up to that clock and no further, as a run could, and never back, and
-  history records each time it wrote; a time past the clock, which only a role that may disable the
-  table's triggers can leave there, or the database's clock going back, has a call of a host behind
-  that clock decide at it as each of its statements reads it, and such a host's changes tried again
-  (`rbac.ErrConflict`) until the clock passes the time. The bound takes nothing from a time a run
-  recorded only where a read bounds it by the clock the run recorded it by, which hasn't gone back
-  since: where that clock has gone back, or on a hot standby, whose own clock can be behind the
-  primary's, a read can cut a run's time to before what the run removed ended, and until the clock
-  passes that time decide by the state the run left, which no moment held. Keep the database's
-  clock from stepping back, and make checks, and run `Filter`'s conditions, on the primary, or on a
-  standby whose clock is kept with it; `AsOf`, which doesn't read the table, reads on a standby as
-  before.
+  and history records each write, as one of the package's tables (History). So a role that may
+  execute the function, as the application's may, can move what a call decides no earlier than up to
+  that clock and no further, as a run could, and never back, and history records each time it wrote.
+  A read that finds the latest time past the database's clock, as it reads the clock once it has its
+  snapshot, decides neither at that time nor at the clock, but is refused (`rbac.ErrConflict`), a
+  check and a list too, and `Filter`'s condition keeps no row: decided at that time, it would lift a
+  deny binding through a place that ends before then, and meet a condition reading `request.time`,
+  and decided at the clock, find the place a deny binds by, which a run removed, gone, and the
+  membership or place a power comes through, which ended sooner and the run passed over, still
+  there, a state no moment held. On a primary whose clock doesn't go back, no read is refused so: no
+  write records a time past the clock as its own statement began, which is before it commits, and so
+  before a read that sees it takes its snapshot. Compared with the clock as the read's statement
+  began, a statement sent in a simple query, as by a pool that prepares none, which takes its
+  snapshot once it is planned, after any lock it waited for, could find a time a run recorded after
+  that, and be refused. A time is past the clock on a hot standby whose clock is behind its
+  primary's, which replays what a run on the primary recorded, where the database's clock has gone
+  back since a run recorded it, or where a role that may disable the table's triggers wrote it:
+  there every check, list and change that reads it is refused until the clock passes the time, and
+  from then on decides at it, as before. The comparison has no margin for the clocks' drift: however
+  little the clock is behind the time, a row the run passed over could have ended between them. Keep
+  the database's clock from stepping back, and a standby's synchronized with its primary's, or make
+  checks, and run `Filter`'s conditions, on the primary. A time a run recorded while the database's
+  clock was set far ahead, which then went back, refuses every call reading it until the clock
+  passes it again. The table's owner can bring it back to the clock, as migrating to
+  `0032_expired_writes` did, which history records, but reads then decide by the state the run left
+  until the clock passes the time: what the run removed that hadn't ended by the clock, as the place
+  a deny binds a subject by, gone, and what it passed over still there, a state no moment held. So
+  first restore what the run removed that hadn't ended by the clock, which history records with each
+  row, or wait for the clock. `AsOf`, which doesn't read the table, reads on a standby as before.
   A read of an actor's or a subject's grants, groups and
   the denies binding it, as `Authorize`, `Explain`, `Permissions`, `Grantable`, `Holding`,
   `Reachable` and every change make, `Holders`' snapshot, and the condition `Filter` gives the
