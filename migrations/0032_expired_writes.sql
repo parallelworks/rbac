@@ -30,18 +30,23 @@
 -- bounds all the same.
 --
 -- No role but the table's owner may write it, nor hold TRIGGER on it: a trigger runs as whoever
--- writes the table, which below is its owner. DeleteExpired records a time through
--- rbac_expired_through, which deletes the times no later than its own, passing over those another
--- run is deleting, and adds its own, as the table's owner, so the latest only moves on, and never
--- past the clock. Its body is SQL bound as it is made, to the table in this schema and to
--- pg_catalog's operators, so no name a session resolves, no search_path and nothing it makes in
--- pg_temp changes what it writes, and renaming the schema leaves it naming the table; its
--- search_path is pinned all the same. It is given to the table's owner where another role migrates,
--- and each role that held INSERT on the table, as 0030 granted it, may execute it in its place, so
--- a deployment that gave its roles their privileges before migrating runs DeleteExpired after it
--- with no step of its own; no other role may, whatever the schema's default privileges grant. Code
--- before this writes the table itself, so its DeleteExpired fails on such a role, which may no
--- longer; its checks and changes, which only read it, run as before.
+-- writes the table, which below is its owner. INSERT and UPDATE on its column are taken too, from a
+-- role holding them there alone, which a revoke from the roles holding the table's passes over. A
+-- trigger already there, as a role holding TRIGGER could have made, whose function a role other
+-- than the owner or a superuser owns, is refused before anything writes the table: it would run
+-- that role's code as the owner, from the update below on, whenever a role writes through
+-- rbac_expired_through. DeleteExpired records a time through rbac_expired_through, which deletes
+-- the times no later than its own, passing over those another run is deleting, and adds its own, as
+-- the table's owner, so the latest only moves on, and never past the clock. Its body is SQL bound
+-- as it is made, to the table in this schema and to pg_catalog's operators, so no name a session
+-- resolves, no search_path and nothing it makes in pg_temp changes what it writes, and renaming the
+-- schema leaves it naming the table; its search_path is pinned all the same. It is given to the
+-- table's owner where another role migrates, and each role that held INSERT on the table or its
+-- column, as 0030 granted it, may execute it in its place, so a deployment that gave its roles
+-- their privileges before migrating runs DeleteExpired after it with no step of its own; no other
+-- role may, whatever the schema's default privileges grant. Code before this writes the table
+-- itself, so its DeleteExpired fails on such a role, which may no longer (SQLSTATE 42501); its
+-- checks and changes, which only read it, run as before.
 --
 -- Writes to the table wait for migrating from the baseline on, so none goes unrecorded between it
 -- and the triggers; checks, which only read it, don't. History first, as a run writes history
@@ -174,6 +179,25 @@ ALTER TABLE rbac_history DROP CONSTRAINT rbac_history_entity_check,
 
 LOCK TABLE rbac_expired IN SHARE ROW EXCLUSIVE MODE;
 
+-- Before anything writes the table as its owner, as the update below does.
+DO $$
+DECLARE
+    expired pg_catalog.regclass := (pg_catalog.quote_ident(pg_catalog.current_schema()) || '.rbac_expired')::pg_catalog.regclass;
+    planted pg_catalog.text;
+BEGIN
+    SELECT pg_catalog.string_agg(pg_catalog.format('%I, which runs %s of %s', t.tgname, t.tgfoid::pg_catalog.regprocedure,
+            p.proowner::pg_catalog.regrole), '; ' ORDER BY t.tgname)
+        INTO planted
+        FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+        WHERE t.tgrelid = expired AND NOT t.tgisinternal
+          AND p.proowner <> (SELECT c.relowner FROM pg_catalog.pg_class c WHERE c.oid = expired)
+          AND NOT (SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = p.proowner);
+    IF planted IS NOT NULL THEN
+        RAISE EXCEPTION 'rbac_expired has a trigger running another role''s function, which would run as the table''s owner once rbac_expired_through writes it: %', planted
+            USING ERRCODE = 'insufficient_privilege', HINT = 'Drop the trigger, revoke TRIGGER on rbac_expired from that role, and migrate again.';
+    END IF;
+END $$;
+
 -- Written as rbac_record writes a record, its time as JSON in UTC, as TimeZone is set back to the
 -- session's after: on a host's transaction it would stay set until that transaction ends.
 DO $$
@@ -235,15 +259,20 @@ BEGIN
         WHERE p.oid IN (through, refusing) AND a.grantee <> p.proowner ORDER BY 1, 2 LOOP
         EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION %s FROM %s CASCADE', g.fn, g.grantee);
     END LOOP;
+    -- The table's and its column's: a revoke of the table's takes the column's with it.
     FOR g IN SELECT DISTINCT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE a.grantee::pg_catalog.regrole::pg_catalog.text END AS grantee
-        FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
-        WHERE c.oid = expired AND a.privilege_type = 'INSERT' AND a.grantee <> owner ORDER BY 1 LOOP
+        FROM (SELECT c.relacl AS acl FROM pg_catalog.pg_class c WHERE c.oid = expired
+              UNION ALL SELECT t.attacl FROM pg_catalog.pg_attribute t WHERE t.attrelid = expired AND t.attnum > 0) l,
+          pg_catalog.aclexplode(l.acl) a
+        WHERE a.privilege_type = 'INSERT' AND a.grantee <> owner ORDER BY 1 LOOP
         EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s TO %s', through, g.grantee);
     END LOOP;
     FOR g IN SELECT DISTINCT a.privilege_type AS privilege,
             CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE a.grantee::pg_catalog.regrole::pg_catalog.text END AS grantee
-        FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
-        WHERE c.oid = expired AND a.privilege_type <> 'SELECT' AND a.grantee <> owner ORDER BY 2, 1 LOOP
+        FROM (SELECT c.relacl AS acl FROM pg_catalog.pg_class c WHERE c.oid = expired
+              UNION ALL SELECT t.attacl FROM pg_catalog.pg_attribute t WHERE t.attrelid = expired AND t.attnum > 0) l,
+          pg_catalog.aclexplode(l.acl) a
+        WHERE a.privilege_type <> 'SELECT' AND a.grantee <> owner ORDER BY 2, 1 LOOP
         EXECUTE pg_catalog.format('REVOKE %s ON %s FROM %s CASCADE', g.privilege, expired, g.grantee);
     END LOOP;
 END $$;

@@ -345,6 +345,86 @@ func TestMigratingRecordsAndBoundsWhatExpiredHolds(t *testing.T) {
 	}
 }
 
+// A role holding INSERT and UPDATE on rbac_expired's column alone, not on the table, which a revoke
+// of the table's privileges from the roles holding them never reaches, holds neither once migrated
+// to 0032, and executes rbac_expired_through in place of its INSERT, as a role holding the table's
+// does.
+func TestMigratingTakesTheWritesOfExpiredsColumnToo(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	for _, sql := range []string{
+		`REVOKE INSERT, UPDATE, DELETE ON rbac_expired FROM ` + r.app,
+		`GRANT INSERT (until), UPDATE (until) ON rbac_expired TO ` + r.app,
+	} {
+		if _, err := r.adminPool.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	const write = `INSERT INTO rbac_expired (until) VALUES (clock_timestamp() - interval '1 hour')`
+	if _, err := r.appPool.Exec(ctx, write); err != nil {
+		t.Fatalf("by its column's INSERT, before migrating: %v", err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatal(err)
+	}
+	var writes, executes bool
+	if err := r.super.QueryRow(ctx, `SELECT has_any_column_privilege($1, $2 || '.rbac_expired', 'INSERT, UPDATE'),
+		has_function_privilege($1, $2 || '.rbac_expired_through(timestamptz)', 'EXECUTE')`, r.app, r.schema).Scan(&writes, &executes); err != nil {
+		t.Fatal(err)
+	}
+	if writes || !executes {
+		t.Errorf("once migrated, the application's role writes rbac_expired's column %t and executes rbac_expired_through %t", writes, executes)
+	}
+	if _, err := r.appPool.Exec(ctx, write); sqlState(err) != "42501" {
+		t.Errorf("once migrated, the application's role wrote rbac_expired by its column's INSERT: %v", err)
+	}
+}
+
+// A trigger on rbac_expired that runs a function a role other than the table's owner or a
+// superuser owns, as a role holding TRIGGER on it could have made, which the README's roles never
+// do, would run that role's code as the table's owner once rbac_expired_through writes the table,
+// whoever calls it: migrating to 0032 refuses it, having changed nothing, and goes on once it is
+// dropped.
+func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", "0032"); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, "0032")
+	r.harden(t)
+	// As a superuser: the application's role, which may make no function, can't here.
+	for _, sql := range []string{
+		`CREATE FUNCTION ` + r.schema + `.planted() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`ALTER FUNCTION ` + r.schema + `.planted() OWNER TO ` + r.app,
+		`CREATE TRIGGER planted BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.planted()`,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42501" {
+		t.Fatalf("migrating with a trigger on rbac_expired running the application's role's function: %v", err)
+	}
+	var applied int
+	var through bool
+	if err := r.adminPool.QueryRow(ctx, `SELECT max(version), to_regprocedure('rbac_expired_through(timestamptz)') IS NOT NULL
+		FROM rbac_migrations`).Scan(&applied, &through); err != nil || applied != 31 || through {
+		t.Fatalf("migrating, refused, applied up to %d and made rbac_expired_through %t: %v", applied, through, err)
+	}
+	if _, err := r.super.Exec(ctx, `DROP TRIGGER planted ON `+r.schema+`.rbac_expired`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("migrating once the trigger is dropped: %v", err)
+	}
+}
+
 // Code from 0032_expired_writes on, run before it is applied, fails DeleteExpired as ErrInvalid,
 // saying to migrate, as each of its batches calls rbac_expired_through, rather than as a call to a
 // function that doesn't exist, with PostgreSQL's hint to cast its arguments; and removes nothing.
