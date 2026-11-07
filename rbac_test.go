@@ -11911,18 +11911,155 @@ func TestPermissionsReadEachDenysListOnce(t *testing.T) {
 			}
 		}
 	}
+	listing := func(s rbac.Subject, want int) {
+		t.Helper()
+		if perms, err := h.authz.Permissions(ctx, s, cluster); err != nil || len(perms) != want {
+			t.Fatalf("Permissions = %d permissions, %v", len(perms), err)
+		}
+	}
 	allocs := func(s rbac.Subject, want int) float64 {
 		t.Helper()
-		return testing.AllocsPerRun(3, func() {
-			if perms, err := h.authz.Permissions(ctx, s, cluster); err != nil || len(perms) != want {
-				t.Fatalf("Permissions = %d permissions, %v", len(perms), err)
-			}
-		})
+		return testing.AllocsPerRun(3, func() { listing(s, want) })
 	}
 	// Reading the denies allocates alike for both, and each permission decided more allocates no more
 	// as the denies grow: compared with each deny's list, it allocated twice for each.
 	if more := (allocs(m, len(held)) - allocs(f, few)) / float64(len(held)-few); more > float64(n)/4 {
 		t.Errorf("Permissions allocates %.0f times more for each permission beside %d denies", more, n)
+	}
+	read := 0
+	rbac.SetReadingDenies(t, func(k int) { read += k })
+	reads := func(s rbac.Subject, want int) int {
+		t.Helper()
+		read = 0
+		listing(s, want)
+		return read
+	}
+	// Nor reads any more of them: compared with each deny's list, it read every one for each.
+	if more := (reads(m, len(held)) - reads(f, few)) / (len(held) - few); more > n*rbac.MaxDenyEntries/4 {
+		t.Errorf("Permissions reads %d entries of denies more for each permission beside %d denies of %d", more, n, rbac.MaxDenyEntries)
+	}
+}
+
+// A change's read of its actor's authority decides each permission the actor hands on by the
+// denies listing it alone, as Permissions does: compared with every deny's list for each, an actor
+// granting a role of 300 permissions beside 368 denies of 256 others read 85 million entries of
+// them, in 350 ms, and indexed, 750,000, in 36. Each is decided as before: by a deny listing it, it
+// twice or the wildcard covering it, under each request, and by one the actor is exempt from only
+// until a time.
+func TestAChangeReadsEachDenysListOnceForWhatItHandsOn(t *testing.T) {
+	var held, others []rbac.Permission
+	for i := range 300 {
+		held = append(held, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	for i := range rbac.MaxDenyEntries {
+		others = append(others, rbac.Permission(fmt.Sprintf("cluster:o%03d", i)))
+	}
+	const few = 30
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog),
+			rbac.RoleDefinition{ID: "many", Permissions: held, ResourceTypes: []string{"cluster"}},
+			rbac.RoleDefinition{ID: "few", Permissions: held[:few], ResourceTypes: []string{"cluster"}},
+			rbac.RoleDefinition{ID: "late", Permissions: held[201:], ResourceTypes: []string{"cluster"}},
+		)
+	})
+	request := func(mfa string, wild bool) context.Context {
+		return rbac.WithRequest(t.Context(), map[string]any{"mfa": mfa, "wild": wild})
+	}
+	ctx := request("yes", false)
+	var seeded []rbac.Grant
+	for _, id := range []string{"m", "x"} {
+		seeded = append(seeded, grant(cluster.Scope(), "many", rbac.User, id), grant(cluster.Scope(), "cluster.admin", rbac.User, id))
+	}
+	h.seed(t, seeded...)
+	// Both on call for an hour, which exempts them from some denies until then.
+	m, x := h.as(t, "m", "oncall"), h.as(t, "x", "oncall")
+	hour := h.now.Add(time.Hour)
+	if _, err := h.pool.Exec(ctx, `UPDATE rbac_members SET expires_at = $1 WHERE tenant = 't1' AND group_id = 'oncall'`, hour); err != nil {
+		t.Fatal(err)
+	}
+	deny := func(s rbac.Scope, id, principal string, exempt []string, perms []rbac.Permission, condition string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions, condition)
+			VALUES ('t1', $1, $2, $3, ARRAY[$4], $5::text[], $6::text[], $7)`, s.Type, s.ID, id, principal, append([]string{}, exempt...), perms, condition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// On each scope of the path, denies binding everyone of permissions no one holds, half of them
+	// conditional, and a quarter exempting those on call, until then.
+	n := 0
+	for _, s := range append([]rbac.Scope{cluster.Scope(), rbac.TenantRoot("t1")}, cluster.Ancestors...) {
+		for i := range rbac.MaxDenies - 8 {
+			var exempt []string
+			if i%4 == 3 {
+				exempt = []string{"group:oncall"}
+			}
+			deny(s, fmt.Sprint("o", i), "public:", exempt, others, []string{"", "request.attributes.mfa != 'yes'"}[i%2])
+			n++
+		}
+	}
+	// And on the cluster, denies binding x alone of what it holds, each read once x has been asked
+	// about more than a few: of every permission on the type, but only for one; of one permission,
+	// and another type's; of one listed twice; of one under any request; and of one x is exempt from
+	// while on call.
+	deny(cluster.Scope(), "w", "user:x", nil, []rbac.Permission{"cluster:*"}, `request.attributes.wild == true && action == "cluster:p100"`)
+	deny(cluster.Scope(), "a", "user:x", nil, []rbac.Permission{"workspace:*", held[120]}, "request.attributes.mfa == 'no'")
+	deny(cluster.Scope(), "b", "user:x", nil, []rbac.Permission{held[150], held[150]}, "request.attributes.mfa == 'yes'")
+	deny(cluster.Scope(), "c", "user:x", nil, held[200:201], "")
+	deny(cluster.Scope(), "e", "user:x", []string{"group:oncall"}, held[250:251], "")
+	granted := 0
+	granting := func(ctx context.Context, actor rbac.Subject, role rbac.Role, until time.Time) error {
+		t.Helper()
+		granted++
+		to := h.as(t, fmt.Sprint("to", granted)).Principal
+		return h.authz.Apply(ctx, actor, cluster, rbac.Change{Grant: []rbac.Binding{{Role: role, Principal: to, ExpiresAt: until}}})
+	}
+	for _, c := range []struct {
+		mfa  string
+		wild bool
+		role rbac.Role
+		// until is when the grant ends, and lacks what x can't hand on, the first the role gives.
+		until time.Time
+		lacks rbac.Permission
+	}{
+		{"yes", true, "many", time.Time{}, held[100]},
+		{"yes", false, "many", time.Time{}, held[150]},
+		{"no", false, "many", time.Time{}, held[120]},
+		{"maybe", false, "many", time.Time{}, held[200]},
+		{"maybe", false, "late", time.Time{}, held[250]},
+		{"maybe", false, "late", hour.Add(time.Microsecond), held[250]},
+		{"maybe", false, "late", hour, ""},
+	} {
+		ctx := request(c.mfa, c.wild)
+		err := granting(ctx, x, c.role, c.until)
+		var denied *rbac.DeniedError
+		switch {
+		case c.lacks == "" && err != nil:
+			t.Errorf("x granting %s until %v under mfa %q: %v", c.role, c.until, c.mfa, err)
+		case c.lacks != "" && (!errors.As(err, &denied) || denied.Permission != c.lacks):
+			t.Errorf("x granting %s until %v under mfa %q and wild %v: %v, want it to lack %s", c.role, c.until, c.mfa, c.wild, err, c.lacks)
+		}
+		// As a check of each decides it now, while x is on call.
+		for _, p := range []rbac.Permission{held[100], held[120], held[150], held[200], held[250], held[299]} {
+			removed := p == held[200] || p == held[100] && c.wild || p == held[120] && c.mfa == "no" || p == held[150] && c.mfa == "yes"
+			if err := h.authz.Authorize(ctx, x, p, cluster); removed != errors.Is(err, rbac.ErrDenied) || !removed && err != nil {
+				t.Errorf("under mfa %q and wild %v, Authorize of %s: %v", c.mfa, c.wild, p, err)
+			}
+		}
+	}
+	read := 0
+	rbac.SetReadingDenies(t, func(k int) { read += k })
+	reads := func(role rbac.Role) int {
+		t.Helper()
+		read = 0
+		if err := granting(ctx, m, role, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	// Each permission handed on more reads no more of the denies as they grow: compared with each
+	// deny's list, it read each binding m twice in each phase, and each m is exempt from until then.
+	if more := (reads("many") - reads("few")) / (len(held) - few); more > n*rbac.MaxDenyEntries/4 {
+		t.Errorf("granting a role reads %d entries of denies more for each permission beside %d denies of %d", more, n, rbac.MaxDenyEntries)
 	}
 }
 

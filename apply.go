@@ -1462,18 +1462,37 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		}
 		return spends[action]
 	}
+	// Each permission is decided by the denies listing it alone, indexed once it is asked about a few
+	// (askingDenies), by what its grants give, all it can hand on.
+	var gives map[Permission]bool
+	giving := func() map[Permission]bool {
+		if gives == nil {
+			gives = map[Permission]bool{}
+			read := map[Role]bool{}
+			for _, h := range held {
+				if def, ok := b.role(h.Role); ok && !read[h.Role] {
+					read[h.Role] = true
+					readingEntries(len(def.Permissions))
+					for _, p := range def.Permissions {
+						gives[p] = true
+					}
+				}
+			}
+		}
+		return gives
+	}
+	denials := &askingDenies{ds: ds, asked: giving}
 	deny := func(vars func() map[string]any) func(Permission) bool {
 		denied := map[Permission]bool{}
 		return func(p Permission) bool {
 			if d, ok := denied[p]; ok {
 				return d
 			}
-			var read map[string]any
-			if conditionallyDenied(ds, p) {
-				read = with(vars, p)
+			d, conditional := denials.next().of(p)
+			if !d && len(conditional) > 0 {
+				// On a budget of its own, as a check of p would be.
+				_, d = a.conditionallyDeniedBy(conditional, newDenyBudget(on.path()), with(vars, p))
 			}
-			// On a budget of its own, as a check of p would be.
-			_, d := a.deniedBy(ds, p, newDenyBudget(on.path()), read)
 			denied[p] = d
 			return d
 		}
@@ -1499,6 +1518,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 		for i, e := range ex {
 			exempting[i] = e.denial
 		}
+		exemptions := &askingDenies{ds: exempting, asked: giving}
 		ends := map[Permission]time.Time{}
 		exemptUntil = func(p Permission) time.Time {
 			if until, ok := ends[p]; ok {
@@ -1506,15 +1526,19 @@ func (a *Authorizer) authorityOf(ctx context.Context, actor Subject, on Resource
 			}
 			var until time.Time
 			var v map[string]any
-			if conditionallyDenied(exempting, p) {
-				v = with(reached, p)
-			}
 			spend := newDenyBudget(on.path())
-			for _, e := range ex {
-				if _, d := a.deniedBy([]denial{e.denial}, p, spend, v); d {
-					until = e.until
-					break
+			for i := range exemptions.next().listing(p) {
+				e := ex[i]
+				if e.condition != "" {
+					if v == nil {
+						v = with(reached, p)
+					}
+					if _, d := a.conditionallyDeniedBy([]denial{e.denial}, spend, v); !d {
+						continue
+					}
 				}
+				until = e.until
+				break
 			}
 			ends[p] = until
 			return until
