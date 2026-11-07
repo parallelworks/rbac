@@ -2985,9 +2985,9 @@ func (a *Authorizer) deleteScopes(ctx context.Context, actor Principal, tenant, 
 // to the public, as when a tenant stops allowing public access. An identity or group leaves the
 // denies that exempt it and the approvers of the eligibilities it approves, as DeleteGroups takes
 // groups out of them: an eligibility only it approves goes too, rather than activate without
-// approval. A deny or eligibility naming an identity that commits while it runs, as SetDeny and
-// SetEligibility take no lock of the identities they name, is left naming it, as if set after it,
-// for a later removal. A deny naming it still binds it, as it would if it joined again.
+// approval. A deny or eligibility naming an identity that commits once it has found those, as
+// SetDeny and SetEligibility take no lock of the identities they name, is left naming it, as if set
+// after it, for a later removal. A deny naming it still binds it, as it would if it joined again.
 func (a *Authorizer) DeletePrincipal(ctx context.Context, actor Principal, tenant string, p Principal) (err error) {
 	a = a.still()
 	defer a.refused(ctx, &err, tenant, actor, "DeletePrincipal")
