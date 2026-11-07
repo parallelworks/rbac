@@ -543,9 +543,9 @@ sequenceDiagram
   where it starts, its length and its type (`copiedKeyOf`), converting each length once, a list of
   its own, and a copy by where it starts and its type, copying its elements once, as many as the
   longest length it is reached with, each length a slice of that copy. So a copy costs no more than
-  converting the same, each slice holds in the copy what it holds in the host, and one holding
-  itself ends either, as a slice reached again while it is copied is a slice of the copy, and one
-  reached again while it is converted can't be read. Slices of one array that start apart are
+  converting the same, each slice holds in the copy what it holds in the host, and copying or
+  converting one holding itself ends, as a slice reached again while it is copied is a slice of the
+  copy, and one reached again while it is converted can't be read. Slices of one array that start apart are
   copied apart, each as converting converts it. A copy knew a slice by its capacity too, so one
   array's 2,000 strings reached at one length with 100 capacities were copied, and charged, 100
   times, past what a copy holds, where converting counted them once, and so were lists and JSON
