@@ -980,10 +980,12 @@ func TestMigrateAsARoleNotOwningTheTablesIsRefused(t *testing.T) {
 // and AsOf, which reads only the views of the role owning the tables, refuses every read, saying
 // what a superuser and that role run, and once they have, reads as of a time, as it does where the
 // views' schema is gone; from 0028 on, it failed at 0033, and once given back migrates on. Either
-// way it made rbac_expired and its functions its own, which the README's statements give back, so
-// every object of both schemas is the administrator's role's or history's, and DeleteExpired runs as
-// the application's role. AsOf said to migrate to 0028_as_of_views, which was recorded, as that
-// role, which couldn't run the function, and a superuser's migration failed at 0033 again.
+// way it made rbac_expired and its functions its own, and from earlier still, what each migration
+// it applied made, as rbac_changes_grants, which the README's statements give back, so every
+// object of both schemas is the administrator's role's or history's, and DeleteExpired runs as the
+// application's role. AsOf said to migrate to 0028_as_of_views, which was recorded, as that role,
+// which couldn't run the function, a superuser's migration failed at 0033 again, and from earlier
+// still, the README left rbac_changes_grants the superuser's.
 func TestASuperusersMigrationAsItselfIsGivenBackAsTheReadmeSays(t *testing.T) {
 	names, err := fs.Glob(rbac.Migrations(), "*.sql")
 	if err != nil {
@@ -991,20 +993,27 @@ func TestASuperusersMigrationAsItselfIsGivenBackAsTheReadmeSays(t *testing.T) {
 	}
 	made, _ := madeViews(t)
 	last := names[len(names)-1]
+	sqls := migrationSQL(t)
+	var grantsDenied string
+	for _, name := range names {
+		if strings.Contains(sqls[name], "CREATE FUNCTION rbac_changes_grants(") {
+			grantsDenied = name
+		}
+	}
 	quoted := func(name string) string { return pgx.Identifier{name}.Sanitize() }
-	for _, before := range []bool{true, false} {
-		t.Run(fmt.Sprintf("from before AsOf's views %t", before), func(t *testing.T) {
+	// From before the views, whose schema wasn't made for the administrator's role, to the last, and
+	// from earlier still; and from after them, as far as the last, which failed.
+	for _, c := range []struct{ from, to string }{{made, ""}, {grantsDenied, ""}, {names[slices.Index(names, made)+1], last}} {
+		before := c.to == ""
+		t.Run(fmt.Sprintf("from %s", c.from), func(t *testing.T) {
 			ctx := t.Context()
 			r := newReadmeRoles(t)
 			views := r.schema + "_as_of"
-			// From before the views, whose schema wasn't made for the administrator's role, to the last;
-			// and from after them, as far as the last, which failed.
-			from, to := names[slices.Index(names, made)+1], last
+			from, to := c.from, c.to
 			if before {
 				if _, err := r.super.Exec(ctx, `DROP SCHEMA `+views); err != nil {
 					t.Fatal(err)
 				}
-				from, to = made, ""
 			}
 			if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", from); err != nil {
 				t.Fatal(err)
@@ -1022,13 +1031,25 @@ func TestASuperusersMigrationAsItselfIsGivenBackAsTheReadmeSays(t *testing.T) {
 					}
 				}
 			}
-			// The README's statements, as a superuser with the package's schema first on its search_path.
-			for _, sql := range []string{
-				`ALTER TABLE rbac_expired OWNER TO <administrator>`,
-				`ALTER FUNCTION rbac_expired_until() OWNER TO <administrator>`,
-				`ALTER FUNCTION rbac_expired_through(timestamptz) OWNER TO <administrator>`,
-			} {
-				if _, err := superuser.Exec(ctx, strings.ReplaceAll(sql, "<administrator>", r.admin)); err != nil {
+			// The README's statements, as a superuser with the package's schema first on its search_path,
+			// and the same for each other table, function or statistics object there still its own, but
+			// history's.
+			var others []string
+			if err := superuser.QueryRow(ctx, `SELECT ARRAY(
+				SELECT 'ALTER TABLE ' || c.oid::regclass FROM pg_class c
+				WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind IN ('r', 'p') AND c.relowner = current_user::regrole
+				  AND c.relname NOT IN ('rbac_expired', 'rbac_history')
+				UNION ALL SELECT 'ALTER FUNCTION ' || p.oid::regprocedure FROM pg_proc p
+				WHERE p.pronamespace = current_schema()::regnamespace AND p.proowner = current_user::regrole
+				  AND p.proname NOT IN ('rbac_expired_until', 'rbac_expired_through', 'rbac_record', 'rbac_history_commit')
+				UNION ALL SELECT 'ALTER STATISTICS ' || pg_catalog.quote_ident(x.stxname) FROM pg_statistic_ext x
+				WHERE x.stxnamespace = current_schema()::regnamespace AND x.stxowner = current_user::regrole)`).Scan(&others); err != nil {
+				t.Fatal(err)
+			}
+			for _, sql := range append([]string{
+				`ALTER TABLE rbac_expired`, `ALTER FUNCTION rbac_expired_until()`, `ALTER FUNCTION rbac_expired_through(timestamptz)`,
+			}, others...) {
+				if _, err := superuser.Exec(ctx, sql+` OWNER TO `+r.admin); err != nil {
 					t.Fatal(err)
 				}
 			}
