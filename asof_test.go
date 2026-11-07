@@ -1229,23 +1229,42 @@ func TestAsOfListsAPrincipalsMembershipsAloneWhateverTheSessionsPlans(t *testing
 // reads fewer, so a statement that reads more on every run reads more here too.
 func leastPages(ctx context.Context, t *testing.T, tx pgx.Tx, f func() error) (int64, error) {
 	t.Helper()
-	least, seen := int64(-1), 0
-	for run := 1; run <= 10; run++ {
+	pages, err := least(func() (map[string]int64, error) {
 		start := historyPages(ctx, t, tx)
 		if err := f(); err != nil {
-			return 0, err
+			return nil, err
 		}
-		switch n := historyPages(ctx, t, tx) - start; {
-		case least < 0 || n < least:
-			least, seen = n, 1
-		case n == least:
-			seen++
+		return map[string]int64{"rbac_history": historyPages(ctx, t, tx) - start}, nil
+	})
+	return pages["rbac_history"], err
+}
+
+// least is the least of each value f measures in a run, once two runs have measured that least of
+// every value and three have run, or the least of ten, as leastPages is of history's pages: a run
+// that other work lands in, as planning statements again, measures more, and none measures less, so
+// what costs more on every run costs more here too.
+func least[K comparable, V cmp.Ordered](f func() (map[K]V, error)) (map[K]V, error) {
+	fewest, seen := map[K]V{}, map[K]int{}
+	for run := 1; run <= 10; run++ {
+		values, err := f()
+		if err != nil {
+			return nil, err
 		}
-		if seen >= 2 && run >= 3 {
+		settled := run >= 3
+		for k, v := range values {
+			switch l, ok := fewest[k]; {
+			case !ok || v < l:
+				fewest[k], seen[k] = v, 1
+			case v == l:
+				seen[k]++
+			}
+			settled = settled && seen[k] >= 2
+		}
+		if settled {
 			break
 		}
 	}
-	return least, nil
+	return fewest, nil
 }
 
 // customRolesAsOf is how many pages of history each of reads reads as of now, beside many tenants'
