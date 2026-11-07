@@ -1069,27 +1069,28 @@ flowchart TB
   row a change locks in a transaction of their own, and check that it waits for them in this order
   under each plan.
 - **One snapshot for reads in several statements.** Explain, Reachable and Holders read in one
-  REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ one
-  it rolls back. Explain, Reachable and Holders read what label values are decided by in it, and
-  decide them after it, as the constraints are asked outside it. Under `WithTx` they read on the
-  host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement reads
-  a moment of its own, so a change committing between two can mix two states, and for AsOf, history
-  of a time not yet final. Conflicts reads in one statement, the custom roles with their grants, as
-  a check and `broadExcludes` read them, so it lists what one moment held under `WithTx` too, with
-  JIT off for it (`withoutJIT`). A read that sets planner settings for its own statements alone
-  (`planned`, `plannedSteps`, `plannedQuery`), as that, `Holders`' read of label values, every read
-  and change of the tables (`indexed`) and a change bounding a scope's conditions (`seeking`) do,
-  sends them in one batch between a statement setting them, which keeps each one's value in a
-  variable of the package's own, and one putting them back, so the server puts the host's back however the call ends once it has
-  sent the batch: where the statement fails, nothing after it runs, and the rollback puts them back;
-  and the batch is read to its end where the call's reading of its rows fails or panics, so the
-  pool, or a host recovering in its transaction, has the connection back. Set and put back in
-  statements of their own, under `WithTx` a `Holders` refused for its ctx once its read had run left
-  the host's transaction JIT off, as did one whose panic the host recovered from, as no savepoint of
-  the call's rolls them back. Nothing else runs on the session within one batch, so no read, of the
-  schema's tables or another's, can change the variables in between. A read holding settings across
-  several statements (`planning`), as `AsOf`'s and `History`'s do, keeps the host's in the call
-  instead, as a read between them may be planned, which changes the variables.
+  REPEATABLE READ, READ ONLY transaction of their own on a pool, and AsOf in a REPEATABLE READ, READ
+  ONLY one it rolls back. Explain, Reachable and Holders read what label values are decided by in
+  it, and decide them after it, as the constraints are asked outside it. Under `WithTx` they read on
+  the host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement
+  reads a moment of its own, so a change committing between two can mix two states, and for AsOf,
+  history of a time not yet final. Conflicts reads in one statement, the custom roles with their
+  grants, as a check and `broadExcludes` read them, so it lists what one moment held under `WithTx`
+  too, with JIT off for it (`withoutJIT`). A read that sets planner settings for its own statements
+  alone (`planned`, `plannedSteps`, `plannedQuery`), as that, `Holders`' read of label values, every
+  read and change of the tables (`indexed`) and a change bounding a scope's conditions (`seeking`)
+  do, sends them in one batch between a statement setting them, which keeps each one's value in a
+  variable of the package's own, and one putting them back, so the server puts the host's back
+  however the call ends once it has sent the batch: where the statement fails, nothing after it
+  runs, and the rollback puts them back; and the batch is read to its end where the call's reading
+  of its rows fails or panics, so the pool, or a host recovering in its transaction, has the
+  connection back. Set and put back in statements of their own, under `WithTx` a `Holders` refused
+  for its ctx once its read had run left the host's transaction JIT off, as did one whose panic the
+  host recovered from, as no savepoint of the call's rolls them back. Nothing else runs on the
+  session within one batch, so no read, of the schema's tables or another's, can change the
+  variables in between. A read holding settings across several statements (`planning`), as `AsOf`'s
+  and `History`'s do, keeps the host's in the call instead, as a read between them may be planned,
+  which changes the variables.
 - **One time for a call.** A call reads `Config.Now` once, where it first needs the time: every
   statement it makes compares expiry with it, and every condition reads it as `request.time`, so a
   grant or a membership ending as the call runs can't meet a deny, a condition or label values of a
@@ -1182,7 +1183,7 @@ flowchart LR
     hist -->|"History(cursor): committed records<br/>in (txid, id) order"| exp["Export(from, limit, signer)"]
     exp -->|"records and a signed checkpoint:<br/>SHA-256 chain"| store[("Host's write-once store")]
     store -->|"VerifyChain(from, records, to, key)"| verify(["records unaltered,<br/>none dropped"])
-    hist -->|"temporary views of each table<br/>as it was at a time"| asof["AsOf(tenant, time, read)"]
+    hist -->|"views of each table as it was at a time,<br/>first on its search_path"| asof["AsOf(tenant, time, read)"]
     hist -->|"PruneHistory(before, through)"| prune["superseded versions, and rows<br/>ended, that an export has read"]
     prune -->|"records the last it deleted;<br/>History refuses an earlier export's cursor before it"| hist
 ```
@@ -1215,8 +1216,8 @@ flowchart LR
   refused. The temporary-table check reads the catalog as the commit record is written, so it is a
   best-effort defense that assumes the README's roles: it holds against a session with no
   `TEMPORARY` privilege, which can make no temporary object, and is best-effort against one with it.
-  The roles revoke `TEMPORARY` from `PUBLIC` and grant it only where needed; the application's role
-  needs it only for `AsOf`, which makes temporary views. What runs after the commit record is the
+  The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
+  package's makes a temporary object, `AsOf`'s included. What runs after the commit record is the
   rest of the commit: the host's own deferred triggers and constraints of statements after its last
   change, the session's temporary tables dropped or emptied, about half a millisecond each at the
   default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
@@ -1235,7 +1236,7 @@ flowchart LR
   committed a change to it is read first, though its change came after. A row's versions are in
   the order of their records' ids, in which they were written, as AsOf and PruneHistory read
   them, and a consumer replaying an export applies them so. Any transaction holding an id holds
-  every read back, AsOf's too, whose views take one. It, `Export` and `PruneHistory` name history
+  every read back; AsOf's takes none. It, `Export` and `PruneHistory` name history
   by its
   schema, as `AsOf` does, and their types by pg_catalog's, so a session's temporary table or type
   stands in for none of it. A schema the application's role made or can create in, first on its
@@ -1281,13 +1282,51 @@ flowchart LR
   the checkpoint with the host's `crypto.Signer`: ECDSA on P-256, P-384 or P-521, Ed25519, or RSA
   of at least 3072 bits, each verified with the Go standard library. `VerifyChain` checks a run of
   records between two checkpoints.
-- **AsOf** stands temporary views of history in for the tables, in a transaction it rolls back,
-  so every check, list and search answers as it would have at a past time, with the catalog and
-  the label dimensions as they are now. Making the views takes a transaction id, which holds every
-  export in the cluster back while the read runs. Every statement is planned for its arguments and
-  runs without JIT, which such plans over history cost past `jit_above_cost` for any subject. It
-  takes a time from PostgreSQL's earliest to 9999-12-30, to the microsecond, rounded down, as pgx
-  sends it, and a later one as another.
+- **AsOf** stands views of history in for the tables, so every check, list and search answers as it
+  would have at a past time, with the catalog and the label dimensions as they are now. Migrating
+  makes them (`0028_as_of_views`, and `rbac_as_of_views` again for a later migration that changes a
+  table), in a schema beside the package's, named as it with `_as_of` after, one named as each
+  table, and AsOf names that schema first on the search_path of its transaction, or a savepoint of
+  the host's, which it makes READ ONLY and rolls back: so the package's statements, a hook's on the
+  `DB` it is given, the host's on that transaction and `rbac_group_members`, which reads by its
+  caller's search_path, read the tables by name as they were. It makes no object and takes no
+  transaction id, so the role reading needs no `TEMPORARY`, and the read holds no export back but
+  where a statement in it writes a session's temporary table, which READ ONLY lets through; and it
+  reads on a hot standby too, as of what the standby has replayed. Each view reads the tenant, the
+  time and the cluster from settings of the transaction (`rbac.as_of_tenant`, `rbac.as_of`,
+  `rbac.as_of_cluster`), with the reader's rights (`security_invoker`), so a session that sets them
+  itself reads through the views only the history it may read anyway, as row security policies on
+  history apply to it, and unset, outside a read, they read nothing or fail, never the tables. The
+  views name history by its oid, so whoever reads them is asked for no `USAGE` on the package's
+  schema: migrating gives them only to the roles that may read history and use that schema. The
+  views are owned by the role that migrated, in a schema no other role may create in, as a function,
+  operator or type made there would be found before the package's, and called as whoever reads;
+  migrating refuses a schema made for it, or that it made, as by the role's default privileges, that
+  holds anything, is another's, or another may create in, and one that came to be so since the views
+  were made, and AsOf refuses alike one that holds more than its owner's views, another may create
+  in, or isn't the role's that owns the package's tables, as a grant, an extension installed there
+  or a change of owner can make it. AsOf finds the views by the history they read, whatever either
+  schema is named, as `rbac_as_of_views` does by any of them left, and refuses where one of the
+  package's tables has none, which would be read as it is now, or where the role has no `USAGE` on
+  their schema, which the search_path would leave out; it refuses a search_path that names pg_temp
+  after the package's schema, as it reads the session's own tables after its views and before the
+  session's schemas, as a search_path that doesn't name it does. A statement of the read that leaves
+  the search_path, the role or those settings set otherwise, or another session revoking the role's
+  `USAGE` on the views' schema or dropping one of the views, would read another tenant or time, or
+  the tables as they are now, so AsOf fails once read returns where one did, by the settings, the
+  current schema and the view each table's name finds; one made and undone within the read it can't
+  tell, and the package's statements between the two read by it. A statement looks a name up by the
+  catalog as it is, whatever its transaction's snapshot, so AsOf checks the views' schema again once
+  read returns: in the savepoint under `WithTx`, and on its own transaction once that has rolled
+  back, as a query of the catalog at its REPEATABLE READ reads the snapshot it began with. What was
+  made there and dropped again as the read ran it can't tell, nor, under `WithTx` at REPEATABLE READ
+  or SERIALIZABLE, what was made there since the host's transaction took its snapshot. Each read
+  drops the session's plans (`DISCARD PLANS`), under `WithTx` the host's too: with the search_path
+  alike in every read, a generic plan a host forced in an earlier one, made for its time and tenant,
+  would stand. Every statement is planned for its arguments and runs without JIT, which such plans
+  over history cost past `jit_above_cost` for any subject. It takes a time from PostgreSQL's
+  earliest to 9999-12-30, to the microsecond, rounded down, as pgx sends it, and a later one as
+  another.
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
@@ -1350,8 +1389,9 @@ flowchart LR
   each row's last version counted by its time, as AsOf counts it, so AsOf answers as before for any
   later time, and refuses an earlier one; of a row whose last version by then ended it, it deletes
   every version, the end last; and a transaction's commit record once no other record of the
-  transaction stays. Each version is tested for a later one counted by then as AsOf tests it, by
-  its key and id. It reads history `MaxPrune` records at a time, each in a transaction of
+  transaction stays. Each version is tested for a later one counted by then as AsOf's views test
+  it, by its key and id, in the same SQL (`byTime`), which a test holds the views to, as migrating
+  made them. It reads history `MaxPrune` records at a time, each in a transaction of
   its own, so none holds exports back for long however long history is, and each planned for its
   arguments: the plan cache gave a connection one plan for every window, and planned a window twice
   once history's statistics changed. Each that deleted records
@@ -1374,9 +1414,9 @@ file, nor `SET` or `ALTER SYSTEM` on a parameter only a superuser may set. The R
 
 ```mermaid
 flowchart LR
-    admin["Administrator's role<br/>runs Migrate, owns the tables"]
+    admin["Administrator's role<br/>runs Migrate, owns the tables<br/>and AsOf's views"]
     histrole["History's role<br/>owns rbac_history and rbac_record"]
-    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants"]
+    app["Application's role<br/>USAGE on the schema, DML on the tables,<br/>SELECT on history, EXECUTE rbac_group_members,<br/>rbac_tenant_keys, rbac_text_array<br/>and rbac_changes_grants, USAGE on the<br/>views' schema and SELECT on its views"]
     admin -->|"member of"| histrole
     app -->|"writes"| tables[("rbac_* tables")]
     tables -->|"rbac_record runs as"| histrole
