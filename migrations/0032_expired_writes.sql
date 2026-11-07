@@ -195,7 +195,7 @@ DECLARE
     expired pg_catalog.regclass := (pg_catalog.quote_ident(pg_catalog.current_schema()) || '.rbac_expired')::pg_catalog.regclass;
     planted pg_catalog.text;
 BEGIN
-    SELECT pg_catalog.string_agg(pg_catalog.format('%I, which runs %s of %s', t.tgname, t.tgfoid::pg_catalog.regprocedure,
+    SELECT pg_catalog.string_agg(pg_catalog.format('trigger %I runs %s, which %s owns', t.tgname, t.tgfoid::pg_catalog.regprocedure,
             p.proowner::pg_catalog.regrole), '; ' ORDER BY t.tgname)
         INTO planted
         FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
@@ -203,7 +203,7 @@ BEGIN
           AND p.proowner <> (SELECT c.relowner FROM pg_catalog.pg_class c WHERE c.oid = expired)
           AND NOT (SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.oid = p.proowner);
     IF planted IS NOT NULL THEN
-        RAISE EXCEPTION 'rbac_expired has a trigger running another role''s function, which would run as the table''s owner once rbac_expired_through writes it: %', planted
+        RAISE EXCEPTION 'rbac_expired has a trigger whose function neither the table''s owner nor a superuser owns, which would run as the table''s owner whenever rbac_expired_through writes it: %', planted
             USING ERRCODE = 'insufficient_privilege', HINT = 'Drop the trigger, revoke TRIGGER on rbac_expired from that role, and migrate again.';
     END IF;
 END $$;

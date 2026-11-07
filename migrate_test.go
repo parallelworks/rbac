@@ -396,7 +396,8 @@ func TestMigratingTakesTheWritesOfExpiredsColumnToo(t *testing.T) {
 // superuser owns, as a role holding TRIGGER on it could have made, which the README's roles never
 // do, would run that role's code as the table's owner once rbac_expired_through writes the table,
 // whoever calls it: migrating to 0032 refuses it, having changed nothing, and goes on once it is
-// dropped.
+// dropped, beside triggers whose functions the table's owner and a superuser own, which run only
+// what they wrote.
 func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
@@ -415,7 +416,8 @@ func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42501" {
+	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42501" ||
+		!strings.Contains(err.Error(), "trigger planted runs planted(), which "+r.app+" owns") {
 		t.Fatalf("migrating with a trigger on rbac_expired running the application's role's function: %v", err)
 	}
 	var applied int
@@ -424,8 +426,17 @@ func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing
 		FROM rbac_migrations`).Scan(&applied, &through); err != nil || applied != 31 || through {
 		t.Fatalf("migrating, refused, applied up to %d and made rbac_expired_through %t: %v", applied, through, err)
 	}
-	if _, err := r.super.Exec(ctx, `DROP TRIGGER planted ON `+r.schema+`.rbac_expired`); err != nil {
-		t.Fatal(err)
+	for _, sql := range []string{
+		`DROP TRIGGER planted ON ` + r.schema + `.rbac_expired`,
+		`CREATE FUNCTION ` + r.schema + `.owners() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`ALTER FUNCTION ` + r.schema + `.owners() OWNER TO ` + r.admin,
+		`CREATE TRIGGER owners BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.owners()`,
+		`CREATE FUNCTION ` + r.schema + `.superusers() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+		`CREATE TRIGGER superusers BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.superusers()`,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
 	}
 	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
 		t.Fatalf("migrating once the trigger is dropped: %v", err)
