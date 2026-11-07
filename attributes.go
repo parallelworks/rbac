@@ -1,12 +1,9 @@
 package rbac
 
 import (
-	"bytes"
 	"cmp"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"math"
 	"reflect"
@@ -118,14 +115,16 @@ import (
 // below. A check converts at most maxConverted of what the host passes, counted as reading it costs
 // a condition, one for each value and a tenth of each string's, bytes', JSON number's, JSON text's
 // or packed type URL's length, and half a packed message's, as a packed value takes as few as two
-// bytes, but for what building a value costs more: 8 for each map, Struct or JSON object, and 4 for
-// each list, ListValue or JSON array, each pointer, but to a message, and each other message, and a
-// map's entry at least 1 for each 24 bytes its value holds in place, which reading it moves. So a
-// unit converted costs about what one read does, 20 to 115 ns, and a check converts no more than
-// its conditions may spend reading, about 20 ms, where charged one each, as a number is, 160,000
-// empty maps took 93 ms. Each kind is converted whole, whether it can be read or not, but a map of
-// values refused by their type, as structs, is refused unread, charged 2 for each entry: reading an
-// entry copies it whole, and a map of 2,000 structs of 64 KiB, charged as much, took 7 ms. Past
+// bytes, but for what building a value costs more: 8 for each map, Struct or JSON object, 4 for
+// each list, ListValue or JSON array, each pointer, but to a message, and each other message, 3 for
+// each slice of bytes and JSON text, and a map's entry at least 1 for each 24 bytes its value holds
+// in place, which reading it moves. So a unit converted costs about what one read does, 20 to 145
+// ns, and a check converts no more than its conditions may spend reading, about 20 ms, where
+// charged one each, as a number is, 160,000 empty maps took 93 ms, and charged one and a tenth of
+// its length, 79,000 JSON texts of a byte 80 ms. Each kind is converted whole, whether it can be
+// read or not, but a map of values refused by their type, as structs, is refused unread, charged 2
+// for each entry: reading an entry copies it whole, and a map of 2,000 structs of 64 KiB, charged
+// as much, took 7 ms. Past
 // that, every condition reading an attribute of any kind fails, as it does where JSON text may cost
 // more than that, by its brackets, braces, commas and colons, which isn't parsed. A call converts
 // the subject's and the request's attributes once, the first time one of its checks reads a
@@ -211,17 +210,23 @@ func allStrings(it traits.Iterator, m traits.Mapper) bool {
 const maxConverted = 2 * maxCheckCost
 
 // What converting a value costs, and a hook's copy of it (deepCopy), counted alike, where building
-// it costs more than the one each value costs: each map, Struct or JSON object, each list, ListValue
-// or JSON array, each pointer, but to a message, and each other message, each kept by where it
-// points and allocated, and a copied message built by reflection. Counted one, as a number is,
-// 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to copy, where as many ints took
-// 12 ms and 6 ms; so weighed, a unit takes 20 to 115 ns to convert and 25 to 200 ns to copy,
-// whatever holds it, a copied message the most.
+// it costs more than the one each value costs: each map, Struct or JSON object, each list,
+// ListValue or JSON array, each pointer, but to a message, and each other message, each kept by
+// where it points and allocated, a copied message built by reflection, and each slice of bytes and
+// JSON text, which a copy keeps by where it starts and allocates, and converting keeps and parses.
+// Counted one, as a number is, 160,000 empty maps took a check 93 ms to convert and a hook 83 ms to
+// copy, where as many ints took 12 ms and 6 ms, and counted one and a tenth of their length,
+// 150,000 slices of a byte took a hook 76 ms to copy, and 79,000 JSON texts of a byte a check 80 ms
+// to convert; so weighed, a unit takes 20 to 145 ns to convert and 25 to 400 ns to copy, whatever
+// holds it, a copied message the most, a dynamic one of the host's up to 361, but for a message of
+// the host's own type whose reflection panics, which a copy asks of each (itself), and which took a
+// microsecond a unit.
 const (
 	mapCost     = 8
 	listCost    = 4
 	pointerCost = 4
 	messageCost = 4
+	bytesCost   = 3
 )
 
 // maxNested is how deep a value a host passes may nest, as JSON text may (encoding/json): a kind's
@@ -233,11 +238,11 @@ const maxNested = 10000
 // converter converts what a host passes into CEL's own values (Attributes), a kind's attributes at
 // a time, spending no more than left on them all: a call's subject's and request's together, and a
 // check's resource's on one of its own, from what they left (asking). It keeps each list, map,
-// pointer, message and JSON text it converts by where it points, its length and its type
-// (copiedKey), with what it found of it, so one reached twice is converted once, for any kind it
-// converts that reaches it. It is kept only while it converts, which runs none of the host's code,
-// so what the host passed stays where it is, and no check knows a value by where one another
-// converter converted was.
+// pointer, message and JSON text it converts by where it points, its length, a slice's capacity and
+// its type (copiedKeyOf), with what it found of it, so one reached twice is converted once, for any
+// kind it converts that reaches it. It is kept only while it converts, which runs none of the
+// host's code, so what the host passed stays where it is, and no check knows a value by where one
+// another converter converted was.
 type converter struct {
 	left uint64
 	// over is set once converting cost more than was left, which fails every kind's attributes.
@@ -380,26 +385,20 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	if wellKnown[t] {
 		return c.message(v)
 	}
-	// A value of a type of the host's own CEL would read by its methods, as one saying it is a
-	// double or a list, is read so by none. A pointer has the methods of what it points to, so one to
-	// CEL's own string is read as the string, as any other pointer is read as what it points to.
-	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
-		// Refused by its type, as reading one of the host's copies it whole: charged one each, a list
-		// of 2,000 arrays of 8 KiB saying they are doubles allocated 16 MB.
-		if !celScalar(t) {
+	// Only a type with methods is one of CEL's own, one CEL would read by its methods, or a message.
+	if t.NumMethod() > 0 {
+		if celScalar(t) {
+			return c.cel(v), 1
+		}
+		switch methodsOf(t) {
+		case byItsMethods:
+			// Refused by its type, as reading one of the host's copies it whole: charged one each, a list
+			// of 2,000 arrays of 8 KiB saying they are doubles allocated 16 MB.
 			return c.refuse(), 1
+		case asMessage:
+			return c.message(v)
+		default:
 		}
-		v, _ := v.Interface().(ref.Val)
-		switch s := v.(type) {
-		case types.Timestamp:
-			v = types.Timestamp{Time: s.UTC()}
-		case types.Double:
-			v = c.double(float64(s))
-		}
-		return c.spend(textSize(v)-1, v), 1
-	}
-	if t.Implements(messageType) {
-		return c.message(v)
 	}
 	switch v.Kind() {
 	case reflect.Bool:
@@ -445,6 +444,74 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 	return c.refuse(), 1
 }
 
+// cel is v, one of CEL's own scalars, as a condition reads it. One is known by its type
+// (celScalar): finding by reflection's Implements that it is a ref.Val reads the methods of its
+// type, which took three times what converting a string does.
+func (c *converter) cel(v reflect.Value) ref.Val {
+	r, _ := v.Interface().(ref.Val)
+	n := textSize(r) - 1
+	switch s := r.(type) {
+	case types.Timestamp:
+		r = types.Timestamp{Time: s.UTC()}
+	case types.Double:
+		r = c.double(float64(s))
+	case types.Bytes:
+		if s != nil {
+			n += bytesCost - 1
+		}
+	}
+	return c.spend(n, r)
+}
+
+// methodsRead is how of reads a value of a type with methods but CEL's own scalars: by its kind, as
+// no method of the type runs, refused, as one CEL would read by its methods, or as a message.
+type methodsRead uint8
+
+const (
+	byKind methodsRead = iota
+	byItsMethods
+	asMessage
+)
+
+// methodsOf is how of reads a value of t, a type with methods but CEL's own scalars, and whether
+// keyType takes it, found once for each type (methodTypes): reflection's Implements reads the
+// methods of the type, and asked of each value, converting the host's messages, which it refuses,
+// took four times what converting a list does, 500 ns a unit, and pointers to CEL's strings three
+// times what other pointers took.
+func methodsOf(t reflect.Type) methodsRead {
+	if known, ok := methodTypes.Load(t); ok {
+		r, _ := known.(methodsRead)
+		return r
+	}
+	r := byKind
+	switch {
+	// A value of a type of the host's own CEL would read by its methods, as one saying it is a double
+	// or a list, is read so by none. A pointer has the methods of what it points to, so one to CEL's
+	// own string is read as the string, as any other pointer is read as what it points to.
+	case implements(t, refValType) && (t.Kind() != reflect.Pointer || !implements(t.Elem(), refValType)):
+		r = byItsMethods
+	case implements(t, messageType):
+		r = asMessage
+	default:
+	}
+	methodTypes.Store(t, r)
+	return r
+}
+
+// methodTypes are what methodsOf found of each type it was asked about.
+var methodTypes sync.Map
+
+// implements reports whether t implements u, which reflection finds by reading t's methods, so
+// converting asks it of no type of CEL's own, nor of one without methods, and of another once.
+func implements(t, u reflect.Type) bool {
+	readingMethods()
+	return t.Implements(u)
+}
+
+// readingMethods runs as converting asks reflection whether a type implements an interface, as a
+// test's counter.
+var readingMethods = func() {}
+
 // refuse counts a value no condition can read, which makes its kind's attributes unreadable.
 func (c *converter) refuse() ref.Val {
 	c.unread++
@@ -463,13 +530,18 @@ func (c *converter) double(d float64) ref.Val {
 // celScalar reports whether t is one of CEL's own values that holds no other.
 func celScalar(t reflect.Type) bool {
 	switch t {
-	case reflect.TypeFor[types.Bool](), reflect.TypeFor[types.Bytes](), reflect.TypeFor[types.Double](), celDurationType,
-		reflect.TypeFor[types.Int](), reflect.TypeFor[types.Null](), reflect.TypeFor[types.String](), celTimestampType,
-		reflect.TypeFor[types.Uint]():
+	case celBoolType, celBytesType, celDoubleType, celDurationType, celIntType, celNullType, celStringType, celTimestampType,
+		celUintType:
 		return true
 	}
 	return false
 }
+
+var (
+	celBoolType, celBytesType, celDoubleType = reflect.TypeFor[types.Bool](), reflect.TypeFor[types.Bytes](), reflect.TypeFor[types.Double]()
+	celIntType, celNullType, celStringType   = reflect.TypeFor[types.Int](), reflect.TypeFor[types.Null](), reflect.TypeFor[types.String]()
+	celUintType                              = reflect.TypeFor[types.Uint]()
+)
 
 // textLength is what reading text of n bytes costs, as textSize counts it.
 func textLength(n int) uint64 { return 1 + length(n)/10 }
@@ -557,9 +629,14 @@ func (c *converter) once(v reflect.Value, convert func() (ref.Val, int)) (ref.Va
 
 // bytes is v, a slice or an array of bytes, as bytes, an array's copied into one of its own type:
 // reflection copies only between arrays of one element type, and panicked, outside any condition,
-// copying an array of a byte type of the host's own into a []byte.
+// copying an array of a byte type of the host's own into a []byte. A slice costs what a hook's copy
+// of it does (bytesCost), as converting and copying count alike.
 func (c *converter) bytes(v reflect.Value) ref.Val {
-	if !c.pay(length(v.Len()) / 10) {
+	n := length(v.Len()) / 10
+	if v.Kind() == reflect.Slice && !v.IsNil() {
+		n += bytesCost - 1
+	}
+	if !c.pay(n) {
 		return nil
 	}
 	if v.Kind() == reflect.Slice {
@@ -665,7 +742,12 @@ func (c *converter) dict(v reflect.Value) (ref.Val, int) {
 	return types.NewRefValMap(types.DefaultTypeAdapter, out), height + 1
 }
 
-// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or nil.
+// key is k, a map's key, as a condition reads it: a bool, a string, an int or a uint, or nil. Its
+// type is one keyType takes, found of the map's own once for the map (dict), and here of one with
+// methods an interface holds, by its type (methodsOf): asking reflection of each key, a map of
+// interfaces holding CEL's timestamps as keys, which no condition keys one by, took 335 ns a unit
+// to convert, and holding the host's own ref.Val 184. So it is read by its kind, CEL's own too, as
+// the same values, and one of another kind is refused.
 func (c *converter) key(k reflect.Value) ref.Val {
 	if !c.pay(1) {
 		return nil
@@ -674,14 +756,9 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		if k.IsNil() {
 			return c.refuse()
 		}
-		k = k.Elem()
-	}
-	t := k.Type()
-	if t.Implements(refValType) {
-		if v, ok := k.Interface().(ref.Val); ok && keyType(t) {
-			return c.spend(textSize(v)-1, v)
+		if k = k.Elem(); k.Type().NumMethod() > 0 && !keyType(k.Type()) {
+			return c.refuse()
 		}
-		return c.refuse()
 	}
 	switch k.Kind() {
 	case reflect.Bool:
@@ -753,13 +830,14 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 	}
 }
 
-// keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too.
+// keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too,
+// and so whether a key of type t an interface holds is one a condition reads.
 func keyType(t reflect.Type) bool {
-	if t.Implements(refValType) {
-		switch t {
-		case reflect.TypeFor[types.Bool](), reflect.TypeFor[types.Int](), reflect.TypeFor[types.String](), reflect.TypeFor[types.Uint]():
-			return true
-		}
+	switch t {
+	case celBoolType, celIntType, celStringType, celUintType:
+		return true
+	}
+	if t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) == byItsMethods) {
 		return false
 	}
 	switch t.Kind() {
@@ -791,18 +869,19 @@ func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
 	return other != nil && ok
 }
 
-// json is v, JSON text, parsed, at a tenth of its length, once for each text c converts, and how
-// deep it nests. Text whose values may cost more than a check converts isn't parsed: a value takes
-// as few as two bytes, as `0,`, and parsing a mebibyte of them, only to find more than a check may
-// convert, took a tenth of a second and 80 MB. That is of the text alone, not of what is left: what
-// it may hold is more than it holds where it is invalid, holds an empty list or object, or a key
-// twice, so compared with what was left, a text of `[]` beside a resource's string just fitting
-// what a check converts failed every kind's attributes where the string was converted first, and
-// not where the text was, as the order a map's entries come in decides. A converter so parses at
-// most one text it can't afford, which then fails every kind, of no more values than one it can.
+// json is v, JSON text, parsed, at what a slice of bytes costs (bytesCost), once for each text c
+// converts, and how deep it nests. Text whose values may cost more than a check converts isn't
+// parsed: a value takes as few as two bytes, as `0,`, and parsing a mebibyte of them, only to find
+// more than a check may convert, took a tenth of a second and 80 MB. That is of the text alone, not
+// of what is left: what it may hold is more than it holds where it is invalid, holds an empty list
+// or object, or a key twice, so compared with what was left, a text of `[]` beside a resource's
+// string just fitting what a check converts failed every kind's attributes where the string was
+// converted first, and not where the text was, as the order a map's entries come in decides. A
+// converter so parses at most one text it can't afford, which then fails every kind, of no more
+// values than one it can.
 func (c *converter) json(v reflect.Value) (ref.Val, int) {
 	return c.once(v, func() (ref.Val, int) {
-		if !c.pay(length(v.Len()) / 10) {
+		if !c.pay(bytesCost - 1 + length(v.Len())/10) {
 			return nil, 0
 		}
 		if jsonValues(v.Bytes()) > maxConverted {
@@ -825,106 +904,245 @@ func (c *converter) json(v reflect.Value) (ref.Val, int) {
 // a name as it likes, encoding/json the last, so a host checking the first read "user" of
 // `{"role": "user", "role": "admin"}` where a condition read "admin", as a map of the host's holding
 // two keys read as one would have it. Text nested deeper than maxNested is refused, as
-// encoding/json refuses it, so jsonValue recurses no deeper: built without jsonv2
-// (GOEXPERIMENT=nojsonv2), the decoder counts no depth of the brackets and braces Token returns, so
-// objects nested 79,000 deep were parsed, taking 70 ms and 48 MB, where json.Unmarshal refused them.
+// encoding/json refuses it, so parsing recurses no deeper: built without jsonv2
+// (GOEXPERIMENT=nojsonv2), a json.Decoder counts no depth of the brackets and braces Token returns,
+// so objects nested 79,000 deep were parsed, taking 70 ms and 48 MB, where json.Unmarshal refused
+// them. It parses the text itself (jsonParser): a json.Decoder made for each text took most of a
+// microsecond, so 79,000 texts of a byte took a check 80 ms to convert.
 func parseJSON(text []byte) (any, bool) {
-	if !utf8.Valid(text) || !pairedSurrogates(text) {
+	if !utf8.Valid(text) {
 		return nil, false
 	}
-	dec := json.NewDecoder(bytes.NewReader(text))
-	v, err := jsonValue(dec, 0)
-	if err != nil {
-		return nil, false
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return nil, false
-	}
-	return v, true
+	p := jsonParser{text: text}
+	v, ok := p.value(0)
+	p.next()
+	return v, ok && p.at == len(text)
 }
 
-var errJSON = errors.New("rbac: JSON text no condition can read")
-
-// jsonValue is the next value dec reads, inside depth lists and objects, as encoding/json parses it
-// into an any, or why no condition can read it (parseJSON).
-func jsonValue(dec *json.Decoder, depth int) (any, error) {
-	token, err := dec.Token()
-	if err != nil {
-		return nil, err
-	}
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return token, nil
-	}
-	if depth++; depth > maxNested {
-		return nil, errJSON
-	}
-	switch delim {
-	case '[':
-		list := []any{}
-		for dec.More() {
-			v, err := jsonValue(dec, depth)
-			if err != nil {
-				return nil, err
-			}
-			list = append(list, v)
-		}
-		_, err := dec.Token()
-		return list, err
-	case '{':
-		object := map[string]any{}
-		for dec.More() {
-			token, err := dec.Token()
-			if err != nil {
-				return nil, err
-			}
-			name, _ := token.(string)
-			if _, twice := object[name]; twice {
-				return nil, errJSON
-			}
-			if object[name], err = jsonValue(dec, depth); err != nil {
-				return nil, err
-			}
-		}
-		_, err := dec.Token()
-		return object, err
-	}
-	return nil, errJSON
+// jsonParser reads JSON text as encoding/json reads it into an any: an object as a map[string]any,
+// an array as a []any, a number as a float64, and a string, a bool and null as themselves.
+type jsonParser struct {
+	text []byte
+	at   int
 }
 
-// pairedSurrogates reports whether each surrogate text escapes in a string, as `\ud83d\ude00`, is
-// half of a pair, the high one followed by the low one: encoding/json reads either half alone as
-// U+FFFD, as it reads bytes that aren't UTF-8.
-func pairedSurrogates(text []byte) bool {
-	// escaped is the code unit of the escape at text[i:], if it is one.
-	escaped := func(i int) (rune, bool) {
-		if i+6 > len(text) || text[i] != '\\' || text[i+1] != 'u' {
+// next is the byte at the next value or delimiter, past whitespace, or 0 at the end of the text.
+func (p *jsonParser) next() byte {
+	for ; p.at < len(p.text); p.at++ {
+		switch b := p.text[p.at]; b {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return b
+		}
+	}
+	return 0
+}
+
+// value is the value at p.at, inside depth arrays and objects, or false where there is none a
+// condition can read (parseJSON).
+func (p *jsonParser) value(depth int) (any, bool) {
+	switch b := p.next(); b {
+	case '[', '{':
+		if depth++; depth > maxNested {
+			return nil, false
+		}
+		p.at++
+		if b == '[' {
+			return p.list(depth)
+		}
+		return p.object(depth)
+	case '"':
+		s, ok := p.str()
+		return s, ok
+	case 't':
+		return true, p.literal("true")
+	case 'f':
+		return false, p.literal("false")
+	case 'n':
+		return nil, p.literal("null")
+	}
+	return p.number()
+}
+
+// list is the rest of an array, whose elements are depth deep.
+func (p *jsonParser) list(depth int) (any, bool) {
+	list := []any{}
+	if p.next() == ']' {
+		p.at++
+		return list, true
+	}
+	for {
+		v, ok := p.value(depth)
+		if !ok {
+			return nil, false
+		}
+		list = append(list, v)
+		switch p.next() {
+		case ',':
+			p.at++
+		case ']':
+			p.at++
+			return list, true
+		default:
+			return nil, false
+		}
+	}
+}
+
+// object is the rest of an object, whose values are depth deep.
+func (p *jsonParser) object(depth int) (any, bool) {
+	object := map[string]any{}
+	if p.next() == '}' {
+		p.at++
+		return object, true
+	}
+	for {
+		if p.next() != '"' {
+			return nil, false
+		}
+		name, ok := p.str()
+		if _, twice := object[name]; !ok || twice || p.next() != ':' {
+			return nil, false
+		}
+		p.at++
+		if object[name], ok = p.value(depth); !ok {
+			return nil, false
+		}
+		switch p.next() {
+		case ',':
+			p.at++
+		case '}':
+			p.at++
+			return object, true
+		default:
+			return nil, false
+		}
+	}
+}
+
+// literal reports whether the text at p.at is word, which it reads past.
+func (p *jsonParser) literal(word string) bool {
+	if len(p.text)-p.at < len(word) || string(p.text[p.at:p.at+len(word)]) != word {
+		return false
+	}
+	p.at += len(word)
+	return true
+}
+
+// number is the number at p.at, read as far as a character a number may hold, which no value or
+// delimiter after one starts with, and as strconv reads it, which fails past a float64's range.
+func (p *jsonParser) number() (any, bool) {
+	start := p.at
+	for ; p.at < len(p.text); p.at++ {
+		if b := p.text[p.at]; (b < '0' || b > '9') && b != '-' && b != '+' && b != '.' && b != 'e' && b != 'E' {
+			break
+		}
+	}
+	n := p.text[start:p.at]
+	if !jsonNumber(n) {
+		return nil, false
+	}
+	f, err := strconv.ParseFloat(string(n), 64)
+	return f, err == nil
+}
+
+// str is the string at p.at, unescaped.
+func (p *jsonParser) str() (string, bool) {
+	start := p.at + 1
+	for p.at = start; p.at < len(p.text); p.at++ {
+		switch b := p.text[p.at]; {
+		case b == '"':
+			p.at++
+			return string(p.text[start : p.at-1]), true
+		case b == '\\':
+			return p.escaped(start)
+		case b < 0x20:
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// escaped is the rest of the string that starts at start, where p.at is at an escape.
+func (p *jsonParser) escaped(start int) (string, bool) {
+	out := append([]byte(nil), p.text[start:p.at]...)
+	for p.at < len(p.text) {
+		switch b := p.text[p.at]; {
+		case b == '"':
+			p.at++
+			return string(out), true
+		case b < 0x20:
+			return "", false
+		case b != '\\':
+			out = append(out, b)
+			p.at++
+		default:
+			r, n := p.escape()
+			if n == 0 {
+				return "", false
+			}
+			out, p.at = utf8.AppendRune(out, r), p.at+n
+		}
+	}
+	return "", false
+}
+
+// escape is what the escape at p.at stands for, and its length, or 0 where it stands for nothing a
+// condition can read: half a surrogate pair, the high one not followed by the low one, which
+// encoding/json reads as U+FFFD, as it reads bytes that aren't UTF-8.
+func (p *jsonParser) escape() (rune, int) {
+	if p.at+1 >= len(p.text) {
+		return 0, 0
+	}
+	switch e := p.text[p.at+1]; e {
+	case '"', '\\', '/':
+		return rune(e), 2
+	case 'b':
+		return '\b', 2
+	case 'f':
+		return '\f', 2
+	case 'n':
+		return '\n', 2
+	case 'r':
+		return '\r', 2
+	case 't':
+		return '\t', 2
+	case 'u':
+	default:
+		return 0, 0
+	}
+	switch r, ok := p.unit(p.at + 2); {
+	case !ok:
+		return 0, 0
+	case !utf16.IsSurrogate(r):
+		return r, 6
+	case r < 0xdc00 && p.at+12 <= len(p.text) && p.text[p.at+6] == '\\' && p.text[p.at+7] == 'u':
+		if low, ok := p.unit(p.at + 8); ok && 0xdc00 <= low && low <= 0xdfff {
+			return utf16.DecodeRune(r, low), 12
+		}
+	}
+	return 0, 0
+}
+
+// unit is the UTF-16 code unit the four hex digits at text[i:] write.
+func (p *jsonParser) unit(i int) (rune, bool) {
+	if i+4 > len(p.text) {
+		return 0, false
+	}
+	var r rune
+	for _, b := range p.text[i : i+4] {
+		switch {
+		case '0' <= b && b <= '9':
+			r = r<<4 | rune(b-'0')
+		case 'a' <= b && b <= 'f':
+			r = r<<4 | rune(b-'a'+10)
+		case 'A' <= b && b <= 'F':
+			r = r<<4 | rune(b-'A'+10)
+		default:
 			return 0, false
 		}
-		n, err := strconv.ParseUint(string(text[i+2:i+6]), 16, 16)
-		return rune(n), err == nil
 	}
-	quoted := false
-	for i := 0; i < len(text); i++ {
-		switch b := text[i]; {
-		case quoted && b == '\\':
-			r, ok := escaped(i)
-			switch {
-			case ok && utf16.IsSurrogate(r) && r < 0xdc00:
-				if low, ok := escaped(i + 6); !ok || low < 0xdc00 || low > 0xdfff {
-					return false
-				}
-				i += 11
-			case ok && utf16.IsSurrogate(r):
-				return false
-			default:
-				i++
-			}
-		case b == '"':
-			quoted = !quoted
-		}
-	}
-	return true
+	return r, true
 }
 
 // jsonValues is the most converting the values and keys JSON text text holds may cost, each one but
@@ -973,7 +1191,7 @@ func (c *converter) number(n string) ref.Val {
 
 // jsonNumber reports whether n is a number as JSON writes one: an optional minus, an integer with
 // no leading zero, then optionally a fraction and an exponent.
-func jsonNumber(n string) bool {
+func jsonNumber[T string | []byte](n T) bool {
 	digits := func(i int) int {
 		for i < len(n) && '0' <= n[i] && n[i] <= '9' {
 			i++
@@ -1534,19 +1752,25 @@ type copied struct {
 type rise struct{ at, height int }
 
 type copiedKey struct {
-	t   reflect.Type
-	at  uintptr
-	len int
+	t        reflect.Type
+	at       uintptr
+	len, cap int
 }
 
 // copiedKeyOf is how copier and converter know v: a map, pointer, slice or string by where it
-// points, its length and its type. One held by value, which points nowhere, has no key.
+// points, its length, a slice's capacity and its type. One held by value, which points nowhere, has
+// no key. Two slices of one array, one with room to grow, are two values, which a copy copies apart
+// (sliceKey), as appending to one writes to the array and appending to the other doesn't: known by
+// their length alone, converting counted them once, so lists of them a check converted were past
+// what a hook's copy holds.
 func copiedKeyOf(v reflect.Value) (copiedKey, bool) {
 	switch v.Kind() {
 	case reflect.Map, reflect.Pointer:
-		return copiedKey{v.Type(), v.Pointer(), 0}, true
-	case reflect.Slice, reflect.String:
-		return copiedKey{v.Type(), v.Pointer(), v.Len()}, true
+		return copiedKey{t: v.Type(), at: v.Pointer()}, true
+	case reflect.Slice:
+		return copiedKey{t: v.Type(), at: v.Pointer(), len: v.Len(), cap: v.Cap()}, true
+	case reflect.String:
+		return copiedKey{t: v.Type(), at: v.Pointer(), len: v.Len()}, true
 	default:
 		return copiedKey{}, false
 	}
@@ -1857,7 +2081,7 @@ func sliceKey(v reflect.Value) copiedKey {
 	if v.Kind() != reflect.Slice {
 		return copiedKey{}
 	}
-	return copiedKey{v.Type(), v.Pointer(), v.Cap()}
+	return copiedKey{t: v.Type(), at: v.Pointer(), cap: v.Cap()}
 }
 
 // slice is a copy of v, a slice that isn't nil, which is depth deep: a slice of the copy of its
@@ -1939,20 +2163,24 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 	}
 	// Each element costs what converting it does, one and what it holds, where it holds nothing a
 	// copy would share as converting it costs (payWhole), and bytes a tenth of each, and the copy
-	// what building a list does, once for where it starts. Each costs at least one, but a byte, so a
-	// slice of more than is left isn't made. Counted once more for each, a list of 100,000 short
-	// strings, which a check converts, couldn't be copied, so a constrained check of it was refused.
-	// Elements of another type are moved whole here before each is copied, and so charged the
-	// structs they hold in place (inlineTenths), as each costs again when copied, and moved only
-	// where what they hold in place costs no more than is left (leastCopied): 2,000 arrays of 4,096
-	// interfaces allocated 133 MB before being found past what a copy holds.
+	// what building a list does, or a slice of bytes (bytesCost), once for where it starts. Each
+	// costs at least one, but a byte, so a slice of more than is left isn't made. Counted once more
+	// for each, a list of 100,000 short strings, which a check converts, couldn't be copied, so a
+	// constrained check of it was refused. Elements of another type are moved whole here before
+	// each is copied, and so charged the structs they hold in place (inlineTenths), as each costs
+	// again when copied, and moved only where what they hold in place costs no more than is left
+	// (leastCopied): 2,000 arrays of 4,096 interfaces allocated 133 MB before being found past what
+	// a copy holds.
 	elem, made := v.Type().Elem(), uint64(listCost-1)
+	if elem.Kind() == reflect.Uint8 {
+		made = bytesCost - 1
+	}
 	if s != nil {
 		made = 0
 	}
 	switch {
 	case elem.Kind() == reflect.Uint8:
-		if !c.pay(length(n-had) / 10) {
+		if !c.pay(made + length(n-had)/10) {
 			return nil
 		}
 	case shared(elem):

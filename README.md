@@ -323,18 +323,22 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   them, and a value the resource's share with them included again, as the resource's are converted
   apart, counted as reading them costs a condition, one for each value and a tenth of each string's,
   bytes', JSON number's, JSON text's or `Any`'s type URL's length, and half an `Any`'s packed bytes,
-  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, and 4
-  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message;
+  but what building a value costs where that is more: 8 for each map, `Struct` or JSON object, 4
+  for each list, `ListValue` or JSON array, each pointer, but to a message, and each other message,
+  and 3 for each slice of bytes or JSON text, which a hook's copy keeps apart and converting parses;
   a map of values none reads, as structs, which reading copies whole, is refused unread at 2 for
   each entry, where one of 2,000 structs of 64 KiB, charged as much, took 7 ms, and each entry of
   another costs at least 1 for each 24 bytes its value holds in place, which reading it moves,
   where 19,000 empty maps of a type of 64 KiB, charged 8 each, took 1.4 GB and 270 ms making room
   for a value they didn't hold. That is about a map of
-  50,000 short strings, nearly 16,000 maps of one entry each, or nearly 40,000 timestamps, and a
+  50,000 short strings, nearly 16,000 maps of one entry each, nearly 40,000 timestamps or JSON texts
+  of a byte, or 53,000 slices of a byte, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
   may reading, about 20 ms: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
-  empty maps took 108 ms. Past that every condition reading an attribute fails, as it does where
+  empty maps took 108 ms, and each JSON text or slice of bytes charged as one value and a tenth of
+  its length, a check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy
+  150,000 slices of a byte. Past that every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
@@ -443,9 +447,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
   for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
   converts. Attributes
-  holding maps, lists, pointers or messages are charged what building
+  holding maps, lists, pointers, messages, slices of bytes or JSON text are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps are, failing every condition reading an attribute, and past what a hook's copy holds, so a
+  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are, or lists and JSON texts that
+  are slices of one array, one with room to grow, now each converted, as a hook's copy copies each,
+  failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
   interface, which a hook's copy sets whole and is now charged their bytes, their padding too, as
