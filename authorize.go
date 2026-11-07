@@ -414,6 +414,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	kept := func(p Permission) bool { return only == nil || only(p) }
 	byCondition := map[Permission]bool{}
 	given := map[Permission]bool{}
+	// What the grants give, under a condition or not: all a deny is asked about (listDenies).
+	asked := map[Permission]bool{}
 	var conditional []holding
 	for _, h := range held {
 		def, ok := roles.role(h.Role)
@@ -421,14 +423,20 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		case !ok || !def.GrantableOn(r.Type):
 		case h.conditional:
 			readingEntries(len(def.Permissions))
-			if slices.ContainsFunc(def.Permissions, kept) {
+			gives := false
+			for _, p := range def.Permissions {
+				if kept(p) {
+					gives, asked[p] = true, true
+				}
+			}
+			if gives {
 				conditional = append(conditional, h)
 			}
 		default:
 			readingEntries(len(def.Permissions))
 			for _, p := range def.Permissions {
 				if kept(p) {
-					given[p] = given[p] || h.carries(def, p)
+					given[p], asked[p] = given[p] || h.carries(def, p), true
 				}
 			}
 		}
@@ -457,25 +465,27 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		}
 		return spends[p]
 	}
-	// A deny is settled before a grant's condition, as checks settle it. always are those a deny
-	// without a condition takes, whatever the request.
-	denied, always := map[Permission]bool{}, map[Permission]bool{}
+	// A deny is settled before a grant's condition, as checks settle it, by the denies listing the
+	// permission alone, read once (listedDenies). always are those a deny without a condition takes,
+	// whatever the request, and conditionally those a deny with one lists where none without does.
+	listed := listDenies(ds, asked)
+	denied, always, conditionally := map[Permission]bool{}, map[Permission]bool{}, map[Permission]bool{}
 	isDenied := func(p Permission) bool {
 		if d, ok := denied[p]; ok {
 			return d
 		}
-		if shared.unevaluated {
-			always[p] = slices.ContainsFunc(ds, func(d denial) bool { return d.condition == "" && denies(d.permissions, p) })
-			denied[p] = always[p] || conditionallyDenied(ds, p)
-			return denied[p]
+		var conditional []denial
+		always[p], conditional = listed.of(p)
+		conditionally[p] = len(conditional) > 0
+		switch {
+		case always[p] || !conditionally[p]:
+			denied[p] = always[p]
+		case shared.unevaluated:
+			denied[p] = true
+		default:
+			_, denied[p] = a.conditionallyDeniedBy(conditional, newDenyBudget(r.path()).sharing(on(p).ran), on(p).read(p))
 		}
-		var vars map[string]any
-		if conditionallyDenied(ds, p) {
-			vars = on(p).read(p)
-		}
-		d, ok := a.deniedBy(ds, p, newDenyBudget(r.path()).sharing(on(p).ran), vars)
-		denied[p], always[p] = ok, ok && d.condition == ""
-		return ok
+		return denied[p]
 	}
 	// Holders asks a constraint about s without the request's attributes, where it answers true if
 	// it removes p with any: what it removes another request may keep, unless a deny takes it
@@ -533,15 +543,11 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			perms = append(perms, p)
 		}
 	}
-	// What is given here, a conditional deny may take under another request, or give back.
-	for _, d := range ds {
-		if d.condition == "" {
-			continue
-		}
-		for p, ok := range given {
-			if ok && !removed[p] && !always[p] && denies(d.permissions, p) {
-				byCondition[p] = true
-			}
+	// What is given here, a conditional deny may take under another request, or give back: each
+	// permission given was decided above.
+	for p, ok := range given {
+		if ok && !removed[p] && !always[p] && conditionally[p] {
+			byCondition[p] = true
 		}
 	}
 	return perms, byCondition, shared.excluded, nil

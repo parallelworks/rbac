@@ -1109,10 +1109,17 @@ flowchart TB
   group's key. `DeleteScopes` holds its scopes' locks and `DeletePrincipal` its principal's, so
   neither waits for the other, and both delete the principal's grants and eligibilities on those
   scopes: each locks them in the order of their scopes first, eligibilities before grants, so they
-  don't deadlock. A revoke locks the grants it deletes in that order too, as a change ending places
-  in groups ends activations among them without their scope's lock. `DeleteRole` removes a role's
-  grants before its eligibilities, which it holds already, and holds the tenant's lock exclusive, so
-  no change runs beside it but `DeleteExpired`, which waits on no row. A host transaction making
+  don't deadlock. `DeletePrincipal` takes its principal out of the approvers and exemptions it
+  locked alone, by their ids and the versions it locked, in its next round trip: `SetEligibility`
+  and `SetDeny` take no lock of the identities they name, so one naming it can commit in between,
+  which, matched again by its key, would be locked out of order, and two removals of identities it
+  names both would deadlock. It is left naming it, as one set after the removal is, for a later
+  removal. `DeleteGroups` needs no such care, as setting either takes the lock of each group it
+  names, which the removal holds. A revoke locks the grants it deletes in that order too, as a
+  change ending places in groups ends activations among them without their scope's lock.
+  `DeleteRole` removes a role's grants before its eligibilities, which it holds already, and holds
+  the tenant's lock exclusive, so no change runs beside it but `DeleteExpired`, which waits on no
+  row. A host transaction making
   several changes takes each one's rows in this order, but not all of them together: two that make
   the same changes in opposite orders can deadlock (above). The order a statement locks its sorted
   rows in is how PostgreSQL plans it, not a promise of SQL: a subquery holding `FOR UPDATE`,
@@ -1583,7 +1590,7 @@ refuses a row of more than 1 MiB as jsonb all the same.
 | `MaxID` | 512 bytes | A tenant's, scope's or principal's id. |
 | `MaxBindings` | 1,000 | Bindings in one `Apply`, and the grants, memberships, groups or members one `Import`, `DeleteGrants`, `SetMemberships`, `ImportGroups`, `DeleteGroups`, `ImportMembers`, `ChangeMembers` or `DeleteMembers` takes, and the grants and eligibilities the members one `ChangeMembers` adds gain, each member's counted apart, by its principal, as `ValidateGrant` is asked about each, but no more than one place alone gains, whatever its group and those it is in hold. The host's own `ImportMembers` is asked about each with no such bound. |
 | `MaxGrantsPerRole` | 20 | Grants in force of one role to one principal on one scope, differing by source, expiry or condition. Those from each source the host owns count apart. |
-| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
+| `MaxDenies`, `MaxDenyEntries` | 100, 256 | Denies on a scope, and the principals, exemptions or permissions one names. A check, a list and a change's read of its actor's authority look each principal and exemption a deny names up in objects of the keys their subject is bound and exempted by, built once for the statement, so a deny costs them about its own length however many groups the subject is in; a check of a permission passes over a deny of another before looking any up, but on the tenant where it decides label values too, which every deny binding its subject there decides. `Permissions`, a check deciding label values and a change's read of its actor's authority read each such deny's permissions once however many permissions they decide, each entry looked up among those the grants give, or for fewer than four compared with each (`listedDenies`); a change, which doesn't know what it will hand on, compares the first three it asks about, and one its actor holds none of (`askingDenies`). So each permission is decided by the denies listing it alone: compared with each permission's, `Permissions` of 300 beside 400 denies of 256 other permissions took 300 ms, and takes 12, and granting a role of 300 beside 368 such denies binding the actor took 350 ms, and takes 36. `Holders` of a labeled resource indexes once the keys that the denies on the tenant of a label value or a power to release name and exempt, and looks each holder's own keys up in them, so such a deny costs the list its length once however many holders it binds, and one of any other permission is matched to none: compared with each holder's keys, 100 denies of another permission, each naming 256 of 4,000 holders, took a second and a half. |
 | `MaxCustomRoles`, `MaxRoleEntries`, `MaxGrantableRoles` | 300, 1,000, 64 | Custom roles in a tenant, the permissions one gives and the types it is for, and roles one lists in `GrantableRoles`. |
 | `MaxApprovers`, `MaxActivation` | 16, 366 days | An eligibility's approvers, and its longest activation. |
 | `MaxGroupDepth` | 8 | How deeply groups nest. |
