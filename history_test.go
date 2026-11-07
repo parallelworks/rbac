@@ -784,7 +784,8 @@ func madeViews(t *testing.T) (string, int) {
 // where it had made only the first tables, from before AsOf's views or after them, or with one
 // migration pending, a superuser's migration, on transactions of its own or a host's, leaves the
 // package's schema and the views', and every object in them, that role's or history's, and the
-// host's transaction the superuser's again; and the application's role reads as of a time, and the
+// host's transaction running as the superuser it set its role to before, not as the session's; and
+// the application's role reads as of a time, and the
 // administrator's makes the views again. Migrating as itself, a superuser made what it migrated
 // its own, and failed at the first migration making AsOf's views, whose schema was the
 // administrator's: 0028 where that was pending, and 0033 after it, having made rbac_expired and
@@ -817,16 +818,30 @@ func TestASuperuserMigratesTheTablesAsTheirOwner(t *testing.T) {
 			}
 			superuser := superuserOn(t, r.schema)
 			if c.host {
+				// The host's transaction runs as another superuser, by SET LOCAL ROLE, which it runs as again
+				// after, and not as the session's.
+				other := "rbac_super_" + strings.TrimPrefix(r.schema, "rbac_")
+				if _, err := r.super.Exec(ctx, `CREATE ROLE `+other+` SUPERUSER`); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if _, err := r.super.Exec(context.WithoutCancel(ctx), `DROP ROLE `+other); err != nil {
+						t.Errorf("DROP ROLE %s: %v", other, err)
+					}
+				})
 				err = pgx.BeginFunc(ctx, superuser, func(tx pgx.Tx) error {
+					if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+other); err != nil {
+						return err
+					}
 					if err := rbac.Migrate(ctx, tx); err != nil {
 						return err
 					}
-					var current, session string
-					if err := tx.QueryRow(ctx, `SELECT current_user, session_user`).Scan(&current, &session); err != nil {
+					var current string
+					if err := tx.QueryRow(ctx, `SELECT current_user`).Scan(&current); err != nil {
 						return err
 					}
-					if current != session {
-						return fmt.Errorf("the host's transaction runs as %s after Migrate, not as %s", current, session)
+					if current != other {
+						return fmt.Errorf("the host's transaction runs as %s after Migrate, not as %s", current, other)
 					}
 					return nil
 				})
