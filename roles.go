@@ -193,6 +193,18 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids stri
 	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
 
+// givingCustomSQL is SQL for an array of the custom roles of a tenant that give perm on a resource
+// type, as givingSQL tests a custom role, of which it keeps those it is given: so a search reading
+// grants a role at a time (heldByType, broadOn) reads every grant givingSQL can keep, in the same
+// statement, which sees each role as it does. Empty without custom, for none.
+func givingCustomSQL(custom bool, tenant, perm, resourceType string) string {
+	if !custom {
+		return ""
+	}
+	return fmt.Sprintf(`ARRAY(SELECT cr.id FROM rbac_roles cr WHERE cr.tenant = %s::text AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types))`,
+		tenant, perm, resourceType)
+}
+
 // broadArgs are a search's arguments for the roles giving p on a resource type that give it
 // through grants to the public and the tenant's members: the custom ones that are public, NULL
 // where no grant to the public gives p, as Filter and Reachable then read none and Holders drops
