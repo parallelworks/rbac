@@ -5406,6 +5406,7 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 		} {
 			t.Run(plan+"/"+other.what, func(t *testing.T) {
 				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+				unvacuumed(t, h, "rbac_grants")
 				ctx := t.Context()
 				c0 := hostTable(t, h)[0]
 				m := h.as(t, "m", "g")
@@ -5444,7 +5445,8 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 				}
 				// Under a generic plan, Filter's statements are planned on whichever search runs them first
 				// after ANALYZE, Filter or a query of its condition, in the map's order, which read 80 pages
-				// more: so each is counted on its second run (searchPages).
+				// more: so each is counted on its second run (searchPages), with autovacuum kept off the
+				// grants, whose vacuum between the two had them planned again.
 				more(500)
 				few := searchPages(ctx, t, h, plan, searches)
 				more(5000)
@@ -5603,6 +5605,7 @@ func TestSearchesReadOnlyTheCustomGrantsOfRolesGivingThePermission(t *testing.T)
 		} {
 			t.Run(plan+"/"+other.what, func(t *testing.T) {
 				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+				unvacuumed(t, h, "rbac_grants")
 				ctx := t.Context()
 				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
 					t.Fatal(err)
@@ -5653,6 +5656,7 @@ func TestSearchesReadByTheScopeBesideManyRolesGivingThePermission(t *testing.T) 
 						})
 					}
 				})
+				unvacuumed(t, h, "rbac_grants")
 				ctx := t.Context()
 				c0 := hostTable(t, h)[0]
 				var groups []string
