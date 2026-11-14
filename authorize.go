@@ -2025,8 +2025,9 @@ type valuesRead struct {
 	// each value once for each read.
 	decided map[*constrained]*decidedHolding
 	// narrowed is set where held and roles are only what gives values already, as Holders narrows
-	// its read of every holder's (valuesOfAll), so labeling narrows them no more. Its roles are then
-	// every holder's, shared, so a decision reads of them only those held names, and changes none.
+	// its read of every holder's (valuesOfAll), and Reachable and Explain theirs (valuesOn), so
+	// labeling narrows them no more. Holders' roles are then every holder's, shared, so a decision
+	// reads of them only those held names, and changes none.
 	narrowed bool
 }
 

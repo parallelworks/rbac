@@ -1211,7 +1211,10 @@ flowchart TB
   many or large, cost a label nothing. A check deciding a subject's values, as `Authorize` of a
   labeled resource, `Holding`, `Filter` and `Reachable` do, narrows its read so too, and `Holders`
   its one read of every identity's values, once for all of them, so each identity's decision walks
-  that read as it is (`narrowed`).
+  that read as it is (`narrowed`). `Reachable` and `Explain` narrow theirs before they read the
+  conditions of its grants (`valuesOn`), so they look up those of roles giving values alone: read
+  first, a group's grants of a role giving none on the tenant under a condition, 2,000 of them, cost
+  each 6,200 pages, against 220 with no condition.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
