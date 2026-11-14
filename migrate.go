@@ -456,7 +456,9 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (planted *string,
 // packageTriggers are the triggers the migrations make on the package's tables, as rows of table,
 // trigger, function in the table's schema, pg_trigger.tgtype, and whether it is a constraint
 // trigger deferred to the commit: rbac_history_committed runs rbac_record from 0027_commit_dates
-// and rbac_history_commit from 0029_commit_trigger on.
+// and rbac_history_commit from 0029_commit_trigger on. A trigger a migration adds that isn't a row
+// here fails TestMigrateIsRepeatable and TestMigrateWaitsForAReplicaAsLongAsTheSessionsLockTimeout,
+// and a row removed fails TestMigrateGoesOnFromEachVersionWithTheTriggersItsMigrationsMade.
 const packageTriggers = `('rbac_grants', 'rbac_grants_history', 'rbac_record', 29, false),
 		  ('rbac_roles', 'rbac_roles_history', 'rbac_record', 29, false),
 		  ('rbac_denies', 'rbac_denies_history', 'rbac_record', 29, false),
