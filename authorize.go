@@ -2295,7 +2295,7 @@ var readingConditions = func(n int) {}
 // its id, so each principal's grants on each scope are read once, and found there by their ids:
 // looked up a grant at a time, each was read again for each grant of the principal on the scope.
 func (a *Authorizer) conditionsSQL() string {
-	if false {
+	if a.history != "" {
 		return `SELECT g.condition, array_agg(g.id::text) FROM (SELECT principal, scope, array_agg(id) AS ids
 		    FROM unnest($1::uuid[], $3::text[], $4::text[]) AS w(id, principal, scope) GROUP BY principal, scope) w
 		  CROSS JOIN LATERAL (SELECT id, condition FROM rbac_grants
