@@ -1327,8 +1327,9 @@ the package's uses foreign data, so none of the roles needs any.
   create in. A superuser gives the schema to the administrator's role,
   `ALTER SCHEMA <schema> OWNER TO <administrator>`, and revokes `CREATE` from each other role it
   names, `REVOKE CREATE ON SCHEMA <schema> FROM <role>`, or `FROM PUBLIC`, and then the
-  administrator's role migrates. While migrating, the search_path is the package's schema and then
-  `pg_temp`, whatever the host's names, so nothing in another schema runs in place of PostgreSQL's,
+  administrator's role migrates. While `Migrate` checks the schema, the search_path is `pg_catalog`
+  and `pg_temp` alone, so nothing made in the schema runs before it is refused; while migrating, it
+  is the package's schema and then `pg_temp`, whatever the host's names, so nothing in another schema runs in place of PostgreSQL's,
   and no temporary table of the session is read in place of the package's, as one named
   `rbac_migrations` holding every version made `Migrate` apply nothing. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
   role's, as the administrator's is in [History](#history), a first `Migrate` as any other role, a

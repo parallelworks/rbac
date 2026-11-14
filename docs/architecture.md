@@ -1585,7 +1585,11 @@ flowchart TB
   the rights of, the tables' owner, history's or a superuser don't, as they could act as that one
   anyway, nor do those holding `ADMIN` on the tables' owner or history's, as the role that made it
   with `CREATEROLE` does, which can grant itself that role. On a schema holding none of the tables it refuses that only under
-  the lock, as the replica it waited for can make them, whose owner may then create. While
+  the lock, as the replica it waited for can make them, whose owner may then create. Until those
+  checks pass under the lock, the search_path is `pg_catalog, pg_temp`: the checks compare an oid
+  with an integer or a regclass, for which pg_catalog has no operator taking both exactly, so an
+  operator another role made in the schema, `=(oid, integer)`, was chosen, and ran as the role
+  migrating, a superuser too, over a thousand times before the refusal (pinSchema). While
   migrating, the search_path is the schema and then `pg_temp`, after pg_catalog, so nothing in a
   schema later on the host's search_path is called in place of pg_catalog's, and no temporary
   table of the session is read in place of the schema's, as `pg_temp` named nowhere is searched

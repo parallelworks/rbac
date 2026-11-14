@@ -337,6 +337,9 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked, guard bool) 
 	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('role', $1, true)`, *owner); err != nil {
 		return nil, err
 	}
+	if err := pinSchema(ctx, tx, schema); err != nil {
+		return nil, err
+	}
 	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_schema()`).Scan(&current); err != nil {
 		return nil, err
 	}
@@ -349,10 +352,23 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked, guard bool) 
 	}, nil
 }
 
-// plantedFor names, as "table s.rbac_migrations, role's", an object in schema or the schema of
+// pinSchema has tx's search_path name schema alone, once asOwner has refused what another role made
+// there: after pg_catalog, which PostgreSQL searches first, so a function or operator in a schema
+// after it on the host's search_path, another role's, as public's is where that role owns the
+// database, isn't called by a migration's statement it matches better than pg_catalog's, as
+// format(text, name) would be by format(..., current_schema()), and run as the role migrating. And
+// pg_temp after it, which PostgreSQL otherwise searches first for a relation or type: a table the
+// session made there, as rbac_migrations holding versions, would be read in place of the schema's.
+func pinSchema(ctx context.Context, tx pgx.Tx, schema string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('search_path', pg_catalog.quote_ident($1) OPERATOR(pg_catalog.||) ', pg_temp', true)`, schema)
+	return err
+}
+
+// plantedFor names, as "table rbac_migrations, role's", an object in schema or the schema of
 // AsOf's views beside it that a role other than the one owning the package's tables made, where a
 // migration would find it in place of its own, run it, or call it, as the role migrating, or nil
-// where there is none. A role that may create in the schema, as the application's can where it is
+// where there is none. It runs with pg_catalog alone on the search_path, as
+// migrateOnce sets it, so pg_describe_object qualifies what is in schema, which it names unqualified. A role that may create in the schema, as the application's can where it is
 // given CREATE there or owns the database and so public, could otherwise make rbac_migrations
 // first, which CREATE TABLE IF NOT EXISTS keeps, with versions that skip migrations or a trigger
 // that runs as the role migrating, a superuser too, on each version recorded. So a relation, type
@@ -428,7 +444,7 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (planted *string,
 		    WHERE d.dictowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass, x.oid, x.stxowner, 1 FROM pg_catalog.pg_statistic_ext x JOIN s ON x.stxnamespace = s.oid
 		    WHERE x.stxowner NOT IN (SELECT t.oid FROM trusted t))
-		SELECT pg_catalog.pg_describe_object(p.class, p.oid, 0) || CASE WHEN p.owner <> 0 THEN ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s' ELSE '' END,
+		SELECT pg_catalog.replace(pg_catalog.pg_describe_object(p.class, p.oid, 0), pg_catalog.quote_ident($1) || '.', '') || CASE WHEN p.owner <> 0 THEN ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s' ELSE '' END,
 		  p.owner = 0
 		FROM planted p ORDER BY p.rank, 1 LIMIT 1`, schema).Scan(&planted, &trigger)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -531,14 +547,13 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		if schema == nil {
 			return errors.New("rbac: no schema in the search_path exists to migrate in")
 		}
-		// The schema alone, after pg_catalog, which PostgreSQL searches first: a function or operator
-		// in a schema after it on the host's search_path, another role's, as public's is where that
-		// role owns the database, would otherwise be called by a migration's statement it matches
-		// better than pg_catalog's, as format(text, name) does format(..., current_schema()), and run
-		// as the role migrating. asOwner refuses another's in the schema itself. And pg_temp after it,
-		// which PostgreSQL otherwise searches first for a relation or type: a table the session made
-		// there, as rbac_migrations holding versions, would be read in place of the schema's.
-		if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('search_path', pg_catalog.quote_ident($1) || ', pg_temp', true)`, *schema); err != nil {
+		// pg_catalog alone, until asOwner, under the lock, has refused what another role made in the
+		// schema, and pinSchema names it: asOwner's checks compare an oid with an integer or a
+		// regclass, for which pg_catalog has no operator taking both exactly, so an operator another
+		// role made in the schema would be, and would run as the role migrating, a superuser too,
+		// before any refusal. And pg_temp after it, which PostgreSQL otherwise searches first for a
+		// relation or type.
+		if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true)`); err != nil {
 			return err
 		}
 		// A session with it off reads a backslash in a literal as an escape, so a pattern would check
@@ -587,6 +602,9 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		}
 		restore, err := asOwner(ctx, tx, *schema, true, true)
 		if err != nil {
+			return err
+		}
+		if err := pinSchema(ctx, tx, *schema); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS rbac_migrations (

@@ -1925,6 +1925,60 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 	}
 }
 
+// Migrate's checks for what another role made in the schema compare an oid with an integer or a
+// regclass, which no operator of pg_catalog's takes exactly: one another role makes in the schema,
+// as the application's role may where it holds CREATE there, would be chosen, and run as the role
+// migrating, a superuser too, before any refusal, so Migrate refuses it having run none of it, in a
+// transaction of its own or on a host's, where it reads history's locks and triggers before the lock.
+func TestMigrateChecksWhatAnotherMadeRunningNoneOfItsOperators(t *testing.T) {
+	ctx := t.Context()
+	_, version := madeViews(t)
+	to := fmt.Sprintf("%04d", version+2)
+	r := newReadmeRoles(t)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", to); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, to)
+	r.harden(t)
+	if _, err := r.super.Exec(ctx, `GRANT USAGE, CREATE ON SCHEMA `+r.schema+` TO `+r.app); err != nil {
+		t.Fatal(err)
+	}
+	p := newPlanter(t, r.super, r.appPool, r.app, r.schema+"_planted")
+	p.plant(t,
+		`CREATE SEQUENCE {own}.ran_admin`, `CREATE SEQUENCE {own}.ran_super`,
+		`GRANT USAGE, UPDATE ON {own}.ran_admin, {own}.ran_super TO PUBLIC`,
+		`CREATE FUNCTION `+r.schema+`.eq(a oid, b integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN
+		  IF pg_catalog.current_setting('is_superuser') = 'on' THEN PERFORM pg_catalog.nextval('{own}.ran_super'); ELSE PERFORM pg_catalog.nextval('{own}.ran_admin'); END IF;
+		  RETURN a OPERATOR(pg_catalog.=) b::pg_catalog.oid; END $$`,
+		`CREATE OPERATOR `+r.schema+`.= (LEFTARG = oid, RIGHTARG = integer, FUNCTION = `+r.schema+`.eq)`,
+		`CREATE OPERATOR `+r.schema+`.<> (LEFTARG = oid, RIGHTARG = integer, FUNCTION = `+r.schema+`.eq)`,
+	)
+	superuser := superuserOn(t, r.schema)
+	host := func(db rbac.DB) error {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		return rbac.Migrate(ctx, tx)
+	}
+	for _, migrate := range []func() error{
+		func() error { return rbac.Migrate(ctx, r.adminPool) },
+		func() error { return rbac.Migrate(ctx, superuser) },
+		func() error { return host(r.adminPool) },
+		func() error { return host(superuser) },
+	} {
+		plantedRefused(t, migrate(), "eq(oid,integer), "+r.app+"'s")
+		var admin, super bool
+		if err := r.super.QueryRow(ctx, `SELECT a.is_called, s.is_called FROM `+p.own+`.ran_admin a, `+p.own+`.ran_super s`).Scan(&admin, &super); err != nil {
+			t.Fatal(err)
+		}
+		if admin || super {
+			t.Errorf("the planted operator ran as the administrator: %v, as a superuser: %v", admin, super)
+		}
+	}
+}
+
 // Migrate refuses every trigger on the package's tables but those its migrations make, so from each
 // version a database can stand at, under the README's roles from the views on, the triggers there are
 // only those, and Migrate goes on to the latest.
