@@ -1563,14 +1563,18 @@ flowchart TB
   owner, which `CREATE TABLE IF NOT EXISTS` would keep, with versions that skip migrations or a
   trigger that runs on each version recorded; a function or operator, which a statement whose
   arguments it matches better than pg_catalog's would call, as an overload of `hashtextextended`
-  would be bound into `rbac_grants_key` and run as the tables' owner on every insert; a trigger on
-  one of the tables calling such a function, or depending on one or on such an operator or type,
-  as its `WHEN` clause can while it runs a trusted function, which ran another role's function as
-  the administrator on each version recorded, and one with a `WHEN` clause or arguments at all,
-  whoever made it, as pg_catalog's own functions run SQL text, as `query_to_xml('SELECT f()', ...)`
-  does, which depends on nothing another role owns, and a superuser's trigger function can run what
-  its arguments name, as contrib `refint`'s `check_primary_key` reads the relation they do, which
-  can be another role's view calling its function (none of the package's triggers has either); and
+  would be bound into `rbac_grants_key` and run as the tables' owner on every insert; any trigger
+  on one of the tables, or on a relation in the views' schema, but those the migrations make, by
+  table, name, function in the schema, timing and events, with no `WHEN` clause, arguments, column
+  list or transition tables (`packageTriggers`), whoever made it: a trigger runs as the role
+  migrating on a migration's writes and names no owner to trust. Refusing only one running another
+  role's function let through, one review after another, what a trusted function runs: its `WHEN`
+  clause, which ran another role's function as the administrator, or SQL text through pg_catalog's
+  own functions, as `query_to_xml('SELECT f()', ...)`, depending on nothing another role owns; its
+  arguments, which a superuser's function can run, as contrib `refint`'s `check_primary_key` reads
+  the relation they name, which can be another role's view calling its function; and a table a
+  superuser's function writes, as a host's audit trigger, whose own trigger is another role's. So a
+  host's own trigger on a package table is dropped before migrating and made again after; and
   a type, domain, composite type, collation,
   conversion, text search configuration or dictionary, statistics object, foreign table or sequence
   no column owns. And it refuses a schema in which any other role, or `PUBLIC`, may create
