@@ -622,7 +622,7 @@ func (a *Authorizer) denying(actor Subject, on Resource, cs *constrained) error 
 func (au authority) setsDenies(on Resource) error {
 	perm := DenyPermission(on.Type)
 	if !au.may(perm, on.Type) {
-		return &DeniedError{Permission: perm, Scope: on.Scope(), Reason: "the actor may not set denies here"}
+		return cmp.Or(au.reads.failed(), error(&DeniedError{Permission: perm, Scope: on.Scope(), Reason: "the actor may not set denies here"}))
 	}
 	return nil
 }

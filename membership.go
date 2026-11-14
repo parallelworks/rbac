@@ -1186,7 +1186,7 @@ func (a *Authorizer) managesGroups(ctx context.Context, q DB, actor Subject, per
 			}
 		}
 		if !aus[i].may(perm, r.Type) {
-			return &DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}
+			return cmp.Or(aus[i].reads.failed(), error(&DeniedError{Permission: perm, Scope: scope, Reason: "the actor may not manage these groups here"}))
 		}
 		// As a check of perm on it refuses who can't see it, read again under the change's locks, so a
 		// value revoked meanwhile changes nothing; by the values read with its power there, so it held

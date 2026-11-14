@@ -1165,6 +1165,10 @@ type Authorizer struct {
 	// copies are what the call under way gave each hook of what the host passed (copiedFor), nil
 	// outside one.
 	copies map[givenKey]given
+	// conditions are the conditions of grants the call under way read, by id (conditionsOf), nil
+	// outside one: a grant's condition never changes, as a change to one stores a new grant, so a
+	// change reads each once, before its transaction, rather than again under its locks.
+	conditions map[string]string
 }
 
 // permissionOn is a permission on a type of resource.
@@ -1390,6 +1394,7 @@ func (a *Authorizer) still() *Authorizer {
 	b.cfg.Now = b.clock.now
 	b.asked = map[askingKey]*asking{}
 	b.copies = map[givenKey]given{}
+	b.conditions = map[string]string{}
 	return &b
 }
 
