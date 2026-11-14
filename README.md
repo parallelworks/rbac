@@ -156,7 +156,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   change grants there, and what the role gives, on a resource for that resource's type alone;
   without `Config.ResourceOf`, about each scope as stored where that is all of it, and otherwise of
   no resource, which then stands for every such scope, so a constraint answering false of no
-  resource doesn't stop it there (see Host policy). A grant widens by what
+  resource doesn't stop it there (see Host policy). On a resource, a `<type>:grant` of another of
+  the role's types is a permission like any other, so widening a role already granted on a resource
+  of one type to give another of its types' `:grant` is allowed where the actor may change grants on
+  that other type, but granting the role again on such a resource then asks the actor to hold that
+  permission for the resource's type, as `Apply` asks of every permission, and may be refused: grant
+  it on a container or the tenant instead. A grant widens by what
   it gives through its principal, as checks read it: one to the tenant's members of a privileged
   role, or to the public of a role not marked `Public`, gives nothing, so widening the role asks
   nothing about it, and a redefinition that has it give something, as narrowing the role so that it

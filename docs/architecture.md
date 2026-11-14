@@ -1049,7 +1049,11 @@ sequenceDiagram
   resource, and of what the role gives where the grant reaches, as `Apply` walks it: on a resource,
   for that resource's type alone, a `<type>:grant` of another type being a permission like any
   other there, which only the constraints are asked about, as `mayDefine` decides holding it
-  (`handsOnAt`). Their answers are read back under the lock, where a scope it gives more on that
+  (`handsOnAt`). So widening a role granted on a resource of one type to give another of its
+  types' `:grant` needs only the power to change grants on that other type (`holdsRole`), but
+  `Apply` granting the role again on such a resource asks the actor to hold that permission for the
+  resource's type, which no role gives, and refuses it: an accepted limit, failing closed, as the
+  role can still be granted on a container or the tenant. Their answers are read back under the lock, where a scope it gives more on that
   they weren't asked about refuses it with `ErrConflict` (`handedOnStopped`, `handing`). Without
   `Config.ResourceOf`, a scope is asked about as stored where that is all of it (`resolves`), and
   otherwise of no resource, which stands for every such scope. A scope where a role listing it is
