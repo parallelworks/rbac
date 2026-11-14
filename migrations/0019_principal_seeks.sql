@@ -35,6 +35,6 @@ CREATE INDEX rbac_grants_custom_principal ON rbac_grants (principal, tenant, sco
 -- all of history; the analysis after it gives a plan the statistics of the types, which autovacuum
 -- would take long after migrating.
 DROP INDEX rbac_history_principal;
-CREATE INDEX rbac_history_principal ON rbac_history (tenant, principal, entity, (split_part(scope, ':', 1)), scope, effective_at DESC)
+CREATE INDEX rbac_history_principal ON rbac_history (tenant, principal, entity, (pg_catalog.split_part(scope, ':', 1)), scope, effective_at DESC)
     WHERE principal IS NOT NULL;
 ANALYZE rbac_history;

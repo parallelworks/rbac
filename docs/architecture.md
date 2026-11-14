@@ -1551,10 +1551,55 @@ flowchart TB
   the session takes a relation's lock, which the advisory lock isn't, and only a table, not
   another relation so named. Where none are made, the role migrating makes them as itself, a
   superuser too, never as the schema's owner or the database's, which can be the application's
-  role; under the lock it refuses any role, a superuser too, as `ErrInvalid`, naming the other,
+  role, and is refused where either is another role that may create there, below; under the lock it refuses any role, a superuser too, as `ErrInvalid`, naming the other,
   where `<schema>_as_of` is made and another role's, as `0028_as_of_views` would fail there after
   making every table before it the role migrating's, and before the lock and under it, where the
   schema is named in more than 57 bytes, which `0028_as_of_views` refuses for every role.
+  Under the lock, and on a host's transaction before it too, where `historyUnwritten` reads the
+  schema's tables there, it refuses as `ErrInvalid`, having made nothing, a schema holding
+  what a migration would find in place of its own, run, or call as the role migrating, a superuser
+  too, that neither the tables' owner (the role migrating, where none are made), nor history's once
+  they are, nor a superuser owns (`plantedFor`): a relation, type or function named `rbac_`, in the
+  schema or `<schema>_as_of`, and an `rbac_migrations` that isn't an ordinary table of the tables'
+  owner, which `CREATE TABLE IF NOT EXISTS` would keep, with versions that skip migrations or a
+  trigger that runs on each version recorded; a function or operator, which a statement whose
+  arguments it matches better than pg_catalog's would call, as an overload of `hashtextextended`
+  would be bound into `rbac_grants_key` and run as the tables' owner on every insert; any trigger
+  on one of the tables, or on a relation in the views' schema, but those the migrations make, by
+  table, name, function in the schema, timing and events, with no `WHEN` clause, arguments, column
+  list or transition tables (`packageTriggers`), whoever made it: a trigger runs as the role
+  migrating on a migration's writes and names no owner to trust. Refusing only one running another
+  role's function let through, one review after another, what a trusted function runs: its `WHEN`
+  clause, which ran another role's function as the administrator, or SQL text through pg_catalog's
+  own functions, as `query_to_xml('SELECT f()', ...)`, depending on nothing another role owns; its
+  arguments, which a superuser's function can run, as contrib `refint`'s `check_primary_key` reads
+  the relation they name, which can be another role's view calling its function; and a table a
+  superuser's function writes, as a host's audit trigger, whose own trigger is another role's. So a
+  host's own trigger on a package table is dropped before migrating and made again after; and
+  a type, domain, composite type, collation,
+  conversion, text search configuration or dictionary, statistics object, foreign table or sequence
+  no column owns. And it refuses a schema in which any other role, or `PUBLIC`, may create
+  (`creatorIn`), as one could make such an object between the check and a migration's statement:
+  the schema's owner counts, as the owner can grant itself `CREATE`, and so does a role that may act
+  as it (`USAGE`, `SET` or `ADMIN` on it, not membership alone), as does the database's owner where
+  `pg_database_owner` owns the schema, as it does `public`; roles that may `SET ROLE` to, or use
+  the rights of, the tables' owner, history's or a superuser don't, as they could act as that one
+  anyway, nor do those holding `ADMIN` on the tables' owner or history's, as the role that made it
+  with `CREATEROLE` does, which can grant itself that role. On a schema holding none of the tables it refuses that only under
+  the lock, as the replica it waited for can make them, whose owner may then create. Until those
+  checks pass under the lock, the search_path is `pg_catalog, pg_temp`: the checks compare an oid
+  with an integer or a regclass, for which pg_catalog has no operator taking both exactly, so an
+  operator another role made in the schema, `=(oid, integer)`, was chosen, and ran as the role
+  migrating, a superuser too, over a thousand times before the refusal (pinSchema). While
+  migrating, the search_path is the schema and then `pg_temp`, after pg_catalog, so nothing in a
+  schema later on the host's search_path is called in place of pg_catalog's, and no temporary
+  table of the session is read in place of the schema's, as `pg_temp` named nowhere is searched
+  first for relations, where a temporary `rbac_migrations` made `Migrate` apply nothing, and the migrations call PostgreSQL's
+  functions by pg_catalog's name. Right after the advisory lock it locks the schema as an object
+  (`pg_get_object_address`), which has the session take in the catalog changes committed while it
+  waited, which the advisory lock doesn't: otherwise, where the replica it waited for gave the
+  schema and the tables to another role, the session's search_path cache still reads that role as
+  having no `USAGE` on the schema, and a superuser setting its role to it finds no current schema.
 
 ```mermaid
 flowchart TB
@@ -1565,7 +1610,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes (asOwner)"| invalid(["ErrInvalid"])
+    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes; under it, and before it<br/>on a host's transaction: another role's object<br/>a migration could find, run or call (plantedFor); another<br/>role or PUBLIC may create there, only under the lock where<br/>none are made (creatorIn) (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
