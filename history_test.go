@@ -1835,10 +1835,18 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 		undo        string
 	}{
 		{"nothing planted", "", nil, nil, ""},
-		{"rbac_migrations given to another role", "table rbac_migrations", []string{`ALTER TABLE {schema}.rbac_migrations OWNER TO {app}`}, nil,
-			`ALTER TABLE {schema}.rbac_migrations OWNER TO {admin}`},
-		{"rbac_migrations given to history's role", "table rbac_migrations", []string{`ALTER TABLE {schema}.rbac_migrations OWNER TO {history}`}, nil,
-			`ALTER TABLE {schema}.rbac_migrations OWNER TO {admin}`},
+		{
+			"rbac_migrations given to another role", "table rbac_migrations",
+			[]string{`ALTER TABLE {schema}.rbac_migrations OWNER TO {app}`},
+			nil,
+			`ALTER TABLE {schema}.rbac_migrations OWNER TO {admin}`,
+		},
+		{
+			"rbac_migrations given to history's role", "table rbac_migrations",
+			[]string{`ALTER TABLE {schema}.rbac_migrations OWNER TO {history}`},
+			nil,
+			`ALTER TABLE {schema}.rbac_migrations OWNER TO {admin}`,
+		},
 		{"a trigger on rbac_migrations", "trigger planted on table rbac_migrations", []string{`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`}, []string{
 			`CREATE TRIGGER planted AFTER INSERT ON rbac_migrations FOR EACH ROW EXECUTE FUNCTION {own}.rbac_planted_fire()`,
 		}, `DROP OWNED BY {app} CASCADE`},
