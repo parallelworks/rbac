@@ -66,7 +66,8 @@ import (
 // bytes, a timestamp, a duration, null, and lists and maps of them. A host may pass, as an
 // attribute or within one:
 //
-//   - nil, and a nil pointer, read as null, but one to a value no condition reads (below);
+//   - nil, and a nil pointer, read as null, but one to a value no condition reads, or to a Struct,
+//     a ListValue, a Timestamp, a Duration or an Any (below);
 //   - a bool, a string, or an int, a uint or a float of any size, of a type of its own too, as a
 //     named string, read by its kind, as no method of the type runs;
 //   - a time.Time, a time.Duration, and CEL's own scalar values (types.String and the rest), a
@@ -82,7 +83,8 @@ import (
 //     read as null, as encoding/json writes it;
 //   - the protobuf well-known types: a Struct, a ListValue, a Value or a NullValue, a wrapper, a
 //     Timestamp, a Duration, and an Any packing one of them but another Any, by its type's name,
-//     as no packed message of another type is decoded.
+//     as no packed message of another type is decoded, a Value holding a nil Struct or ListValue
+//     read as an empty one, as CEL reads it and protobuf writes it.
 //
 // A kind's attributes holding anything else, however deep, are unreadable as a whole, as a policy
 // engine fails input it can't read: every condition reading any of them fails, a test of one's
@@ -93,15 +95,19 @@ import (
 // infinite float64 risk, where the same infinity as JSON text, 1e400, which a host reading JSON
 // reads none of, applied it. So are those holding a ref.Val of the host's own, though it says it is
 // of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
-// func, a complex number, a uintptr, any other message, a map keyed by any other value, as a double
-// or an array, and a slice, a pointer or a map of any of these, or an array holding one, empty or
-// nil too, as one holding none, read as [], {} or null, left whether its kind could be read to
-// whether it held one at the time, a map holding two keys read as the same value, as 1 and 1u, or
-// "a" twice of two string types, and so JSON text naming a member of an object twice, as "role" and
-// "r\u006fle" are once unescaped, or an Any packing a message that sets a field twice, as a Struct
-// with two entries of "role", which decoding reads as the last, where a reader of the first reads
-// another: a Struct the host passes holds each key once, as a Go map does. So are invalid JSON,
-// JSON text that isn't UTF-8 or escapes half a surrogate pair, which encoding/json reads as U+FFFD,
+// func, a complex number, a uintptr, a lock of the host's own, as an integer a pointer to which
+// spins, which no hook can be given either, any other message, a map keyed by any other value, as a
+// double, an array or a lock, and a slice, a pointer or a map of any of these, or an array holding
+// one, empty or nil too, as one holding none, read as [], {} or null, left whether its kind could
+// be read to whether it held one at the time, a map holding two keys read as the same value, as 1
+// and 1u, or "a" twice of two string types, and so JSON text naming a member of an object twice, as
+// "role" and "r\u006fle" are once unescaped, or an Any packing a message that sets a field twice,
+// as a Struct with two entries of "role", which decoding reads as the last, where a reader of the
+// first reads another: a Struct the host passes holds each key once, as a Go map does. So are those
+// holding a nil Struct, ListValue, Timestamp, Duration or Any, which CEL reads as {}, [], the epoch
+// or zero, or fails on, where a nil pointer is null: `request.attributes.v == null` held where CEL
+// found it false. So are invalid JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair,
+// which encoding/json reads as U+FFFD,
 // a json.Number that isn't a number as JSON writes one, as "0x1p4" or "Inf", a value holding
 // itself, or holding one that does, however long the cycle, and a value nested deeper than JSON
 // text may, 10,000 deep, along the longest path through what the kind holds, wherever a value it
@@ -218,7 +224,9 @@ const maxConverted = 2 * maxCheckCost
 // copy, where as many ints took 12 ms and 6 ms, and counted one and a tenth of their length,
 // 150,000 slices of a byte took a hook 76 ms to copy, and 79,000 JSON texts of a byte a check 80 ms
 // to convert; so weighed, a unit takes 20 to 145 ns to convert and 25 to 400 ns to copy, whatever
-// holds it, a copied message the most, a dynamic one of the host's up to 361, but for a message of
+// holds it, a copied message the most, a dynamic one of the host's up to 361, and times an
+// interface holds each in a zone of the host's own, as parsing text with an offset of part of an
+// hour makes them, about 290, as a copy copies each such zone (copier.zone), but for a message of
 // the host's own type whose reflection panics, which a copy asks of each (itself), and which took a
 // microsecond a unit.
 const (
@@ -238,11 +246,11 @@ const maxNested = 10000
 // converter converts what a host passes into CEL's own values (Attributes), a kind's attributes at
 // a time, spending no more than left on them all: a call's subject's and request's together, and a
 // check's resource's on one of its own, from what they left (asking). It keeps each list, map,
-// pointer, message and JSON text it converts by where it points, its length, a slice's capacity and
-// its type (copiedKeyOf), with what it found of it, so one reached twice is converted once, for any
-// kind it converts that reaches it. It is kept only while it converts, which runs none of the
-// host's code, so what the host passed stays where it is, and no check knows a value by where one
-// another converter converted was.
+// pointer, message and JSON text it converts by where it points, its length and its type
+// (copiedKeyOf), with what it found of it, so one reached twice is converted once, for any kind it
+// converts that reaches it. It is kept only while it converts, which runs none of the host's code,
+// so what the host passed stays where it is, and no check knows a value by where one another
+// converter converted was.
 type converter struct {
 	left uint64
 	// over is set once converting cost more than was left, which fails every kind's attributes.
@@ -400,6 +408,9 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 		default:
 		}
 	}
+	if hostLock(t) {
+		return c.refuse(), 1
+	}
 	switch v.Kind() {
 	case reflect.Bool:
 		return types.Bool(v.Bool()), 1
@@ -428,12 +439,12 @@ func (c *converter) of(v reflect.Value) (ref.Val, int) {
 			return to, height + 1
 		})
 	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
+		if byteKind(t.Elem()) {
 			return c.bytes(v), 1
 		}
 		return c.once(v, func() (ref.Val, int) { return c.list(v) })
 	case reflect.Array:
-		if t.Elem().Kind() == reflect.Uint8 {
+		if byteKind(t.Elem()) {
 			return c.bytes(v), 1
 		}
 		return c.list(v)
@@ -756,7 +767,9 @@ func (c *converter) key(k reflect.Value) ref.Val {
 		if k.IsNil() {
 			return c.refuse()
 		}
-		if k = k.Elem(); k.Type().NumMethod() > 0 && !keyType(k.Type()) {
+		// A lock is refused as keyType refuses a map keyed by one, though its type, whose pointer
+		// locks and unlocks, can have no methods of its own.
+		if k = k.Elem(); hostLock(k.Type()) || k.Type().NumMethod() > 0 && !keyType(k.Type()) {
 			return c.refuse()
 		}
 	}
@@ -808,7 +821,7 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
 		return !celScalar(t)
 	}
-	if t.Implements(messageType) {
+	if t.Implements(messageType) || hostLock(t) {
 		return true
 	}
 	outer = append(outer, t)
@@ -819,9 +832,9 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 	case reflect.Pointer:
 		return refusedType(t.Elem(), outer)
 	case reflect.Slice:
-		return t.Elem().Kind() != reflect.Uint8 && refusedType(t.Elem(), outer)
+		return !byteKind(t.Elem()) && refusedType(t.Elem(), outer)
 	case reflect.Array:
-		return t.Elem().Kind() != reflect.Uint8 && t.Len() > 0 && refusedType(t.Elem(), outer)
+		return !byteKind(t.Elem()) && t.Len() > 0 && refusedType(t.Elem(), outer)
 	case reflect.Map:
 		kt := t.Key()
 		return kt.Kind() != reflect.Interface && !keyType(kt) || refusedType(t.Elem(), outer)
@@ -837,7 +850,7 @@ func keyType(t reflect.Type) bool {
 	case celBoolType, celIntType, celStringType, celUintType:
 		return true
 	}
-	if t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) == byItsMethods) {
+	if hostLock(t) || t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) == byItsMethods) {
 		return false
 	}
 	switch t.Kind() {
@@ -848,6 +861,25 @@ func keyType(t reflect.Type) bool {
 	}
 	return false
 }
+
+// byteKind reports whether a slice or an array of t is read as bytes: t is a byte, of a type of
+// the host's own too, read by its kind, but a lock (hostLock), a slice or an array of which is read
+// as a list of what it holds, so refused: read as bytes, one in an array or a slice was read where
+// no hook could be given it.
+func byteKind(t reflect.Type) bool { return t.Kind() == reflect.Uint8 && !hostLock(t) }
+
+// hostLock reports whether t, the type of a value or a key the host passes, is a lock (lockType):
+// one of the host's own read by its kind, as an integer a pointer to which spins, is read no more
+// than a hook's copy holds it (copyable), so a kind holding one, however deep, can't be read. Read,
+// it was read where no hook could be given it, so every call asking one was refused. Only a type of
+// the host's own, or a struct embedding one, has methods, and structs are refused whatever they
+// hold; what it finds of each is kept (hostLocks).
+func hostLock(t reflect.Type) bool {
+	return t.PkgPath() != "" && typeFact(&hostLocks, t, lockType)
+}
+
+// hostLocks are what hostLock found of each type it was asked about.
+var hostLocks sync.Map
 
 // holdsKey reports whether m holds k, or a key CEL finds equal to it, as 1u for 1.
 func holdsKey(m map[ref.Val]ref.Val, k ref.Val) bool {
@@ -1241,7 +1273,14 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		return c.refuse(), 1
 	}
 	if v.IsNil() {
-		return types.NullValue, 1
+		// CEL reads a nil Value or wrapper as null, as a nil pointer is read, but a nil Struct,
+		// ListValue, Timestamp or Duration as an empty one, the epoch or zero, and fails on a nil
+		// Any. Read as null, `request.attributes.v == null` held where CEL found it false, and read as
+		// CEL reads it, a declared timestamp passed as one met a grant's condition, so none is read.
+		if nilNull[v.Type()] {
+			return types.NullValue, 1
+		}
+		return c.refuse(), 1
 	}
 	m, _ := v.Interface().(proto.Message)
 	unknown := length(len(m.ProtoReflect().GetUnknown())) / 10
@@ -1309,7 +1348,8 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		if k := reflect.ValueOf(m.GetKind()); k.IsValid() && k.IsNil() {
 			return types.NullValue, 1
 		}
-		var held reflect.Value
+		var held proto.Message
+		var empty ref.Val
 		switch k := m.GetKind().(type) {
 		case *structpb.Value_NumberValue:
 			return c.double(k.NumberValue), 1
@@ -1318,13 +1358,23 @@ func (c *converter) message(v reflect.Value) (ref.Val, int) {
 		case *structpb.Value_BoolValue:
 			return types.Bool(k.BoolValue), 1
 		case *structpb.Value_StructValue:
-			held = reflect.ValueOf(k.StructValue)
+			held, empty = k.StructValue, noAttributes
 		case *structpb.Value_ListValue:
-			held = reflect.ValueOf(k.ListValue)
+			held, empty = k.ListValue, noValues
 		default:
 			return types.NullValue, 1
 		}
-		to, height := c.of(held)
+		// A nil Struct or ListValue it holds is an empty one, as CEL reads it, protobuf writes it, an
+		// Any packs it and a hook's copy holds it: read as null, `request.attributes.v == null` held
+		// where CEL found it false. It costs what a nil value does.
+		if !held.ProtoReflect().IsValid() {
+			to, height := c.of(reflect.Value{})
+			if to != nil {
+				to = empty
+			}
+			return to, height + 1
+		}
+		to, height := c.of(reflect.ValueOf(held))
 		return to, height + 1
 	case *wrapperspb.BoolValue:
 		return types.Bool(m.GetValue()), 1
@@ -1480,10 +1530,22 @@ var wellKnown = func() map[reflect.Type]bool {
 	return known
 }()
 
+// nilNull are the well-known messages whose nil one CEL reads as null, as a nil pointer is read: a
+// Value, and a wrapper, which holds a scalar or none.
+var nilNull = map[reflect.Type]bool{
+	reflect.TypeFor[*structpb.Value](): true, reflect.TypeFor[*wrapperspb.BoolValue](): true,
+	reflect.TypeFor[*wrapperspb.BytesValue](): true, reflect.TypeFor[*wrapperspb.DoubleValue](): true,
+	reflect.TypeFor[*wrapperspb.FloatValue](): true, reflect.TypeFor[*wrapperspb.Int32Value](): true,
+	reflect.TypeFor[*wrapperspb.Int64Value](): true, reflect.TypeFor[*wrapperspb.StringValue](): true,
+	reflect.TypeFor[*wrapperspb.UInt32Value](): true, reflect.TypeFor[*wrapperspb.UInt64Value](): true,
+}
+
 // The types an attribute can be declared as, with the Go value a host passes for each, or any
 // other converted to that type (Attributes), such as a pointer to a string, number or bool, a
 // protobuf timestamp or duration, or a []any or map[string]any of strings. A nil pointer is null,
-// which is none.
+// which is none, and a nil Struct, ListValue, Timestamp, Duration or Any can't be read
+// (Attributes): CEL reads all but an Any as a value of its type, so read as CEL reads it, a
+// declared timestamp passed as one met a grant's condition.
 const (
 	AttrString    AttributeType = "string"              // string
 	AttrInt       AttributeType = "int"                 // int or int64
@@ -1649,25 +1711,29 @@ func typing(attrs Attributes) (*cel.Env, error) {
 // own, a protobuf message among them copied field by field, as cloning it would, but for one of a
 // host's type that makes messages of another, copied as any other pointer (itself), and a value
 // reached twice copied once, a message too, so a cycle ends. A slice is copied once for where it
-// starts and its capacity, however many lengths it is reached with, each a slice of the one copy,
-// as each is of the host's, but for one reached while its elements are copied, before a longer
-// length outgrew that copy, which is a slice of a copy of its own: copied for each length, the
-// prefixes of one slice of 3,000 maps took half a second. A value holding no map, slice or pointer,
-// as an array of bytes, is copied whole, and shared where an interface holds it, as nothing writes
-// through one: copied element by element for each interface holding it, a hundred holding one array
-// of 100 KB took 170 ms. So is a time, whose fields are unexported. A struct's fields an unexported
-// struct it embeds promotes are its own too, and its other unexported fields are copied whole, as
-// setting it copies them, so it copies none holding more than that copies, as a pointer, a slice or
-// another package's state, which reflection can't set, nor a value holding a lock or an unsafe
-// pointer in place (copyable), and a message's reflection only as that of a copy of the message
-// (pointer). A map's keys are set as they are, of a type it can copy in place, and what a pointer
-// among them reaches is shared: a copied key would be another key, so the copy would find nothing
-// under the one the host passed. It copies at most what a check converts (maxConverted), counted as
-// converting counts it, whatever it shares or copies whole (mapCost), and no value nesting past
-// maxCopied deep, nor one holding itself that reaches as many values holding others
-// (copier.around), past which, or where v holds what it can't copy, it reports false, and the copy
-// is v's zero value: copying recurses as far as v reaches, as a check's converting does, which stops
-// there.
+// starts, however many lengths and capacities it is reached with, each a slice of the one copy, as
+// each is of the host's, but for one reached while its elements are copied, before a longer length
+// outgrew that copy, which is a slice of a copy of its own: copied for each length, the prefixes of
+// one slice of 3,000 maps took half a second. A value holding no map, slice or pointer, as an array
+// of bytes, is copied whole, and shared where an interface holds it, as nothing writes through one:
+// copied element by element for each interface holding it, a hundred holding one array of 100 KB
+// took 170 ms. So is a time, whose fields are unexported, but in a zone of the copy's own where the
+// host's is its own (zone), wherever it lies, a map's key too, set anew (ownKey). A struct's fields
+// an unexported struct it embeds promotes are its own too, and its other unexported fields are
+// copied whole, as setting it copies them, so it copies none holding more than that copies, as a
+// pointer, a slice or another package's state, which reflection can't set, nor a value holding an
+// unsafe pointer in place, nor a lock, a channel or a func wherever it lies, as it would copy a
+// lock and share the others (copyable), and a message's reflection only as that of a copy of the
+// message (pointer), and none whose copying panics, as the host's own reflection can, or makes
+// another type (reflected). A map's keys are set as they are, but for a time's zone (ownKey), as a
+// copied key would be another key, under which the copy would find nothing the host passed, so it
+// copies no map keyed by what it wouldn't share, as a pointer, a struct holding one, or an
+// interface holding one, however deep in the key (sharedKey). It copies at most what a check
+// converts (maxConverted), counted as converting counts it, whatever it shares or copies whole
+// (mapCost), and no value nesting past maxCopied deep, nor one holding itself that reaches as many
+// values holding others (copier.around), past which, or where v holds what it can't copy, it
+// reports false, and the copy is v's zero value: copying recurses as far as v reaches, as a check's
+// converting does, which stops there.
 func deepCopy[T any](v T) (T, bool) {
 	copying()
 	c := copier{left: maxConverted}
@@ -1702,8 +1768,8 @@ const maxCopied = 2 * maxNested
 
 // copier copies values for deepCopy, keeping each map and pointer it copied by where it points and
 // its type, and apart, with a length of -1, a message of a host's type it copied as the message that
-// type makes (message), and each slice by where it starts, its capacity and its type (sliceKey); and
-// what it may still copy (left), past which it is over.
+// type makes (message), and each slice by where it starts and its type (sliceKey); and what it may
+// still copy (left), past which it is over.
 type copier struct {
 	done map[copiedKey]kept
 	// slices are the copies of each slice's elements, each changed where it is kept as its elements
@@ -1723,6 +1789,8 @@ type copier struct {
 	// reached one it was still copying (around).
 	holders int
 	cycled  bool
+	// zones are the copy's own of each time zone of the host's own it reached (zone).
+	zones map[*time.Location]*time.Location
 }
 
 // kept is the copy of a map, pointer or message, and once it is copied whole, how much deeper than
@@ -1752,24 +1820,19 @@ type copied struct {
 type rise struct{ at, height int }
 
 type copiedKey struct {
-	t        reflect.Type
-	at       uintptr
-	len, cap int
+	t   reflect.Type
+	at  uintptr
+	len int
 }
 
 // copiedKeyOf is how copier and converter know v: a map, pointer, slice or string by where it
-// points, its length, a slice's capacity and its type. One held by value, which points nowhere, has
-// no key. Two slices of one array, one with room to grow, are two values, which a copy copies apart
-// (sliceKey), as appending to one writes to the array and appending to the other doesn't: known by
-// their length alone, converting counted them once, so lists of them a check converted were past
-// what a hook's copy holds.
+// points, its length and its type, and not a slice by its capacity, as none reads past its length
+// (sliceKey). One held by value, which points nowhere, has no key.
 func copiedKeyOf(v reflect.Value) (copiedKey, bool) {
 	switch v.Kind() {
 	case reflect.Map, reflect.Pointer:
 		return copiedKey{t: v.Type(), at: v.Pointer()}, true
-	case reflect.Slice:
-		return copiedKey{t: v.Type(), at: v.Pointer(), len: v.Len(), cap: v.Cap()}, true
-	case reflect.String:
+	case reflect.Slice, reflect.String:
 		return copiedKey{t: v.Type(), at: v.Pointer(), len: v.Len()}, true
 	default:
 		return copiedKey{}, false
@@ -1818,9 +1881,12 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 		}
 	}
 	if shared(v.Type()) {
-		// Set whole where the copy holds it.
+		// Set whole where the copy holds it, a time in a zone of the copy's own.
 		if !c.payWhole(v) {
 			return reflect.Value{}
+		}
+		if zoned(v.Type()) {
+			return c.moved(v)
 		}
 		return v
 	}
@@ -1837,13 +1903,9 @@ func (c *copier) copy(v reflect.Value, depth int) reflect.Value {
 			}
 			return v
 		}
-		held := c.copy(v.Elem(), depth)
-		if c.over {
-			return reflect.Value{}
-		}
-		out := reflect.New(v.Type()).Elem()
-		out.Set(held)
-		return out
+		// Its copy is set where v lay, which holds it in an interface of v's type: made one here, a
+		// time a copy moved to a zone of its own cost a third allocation in a list of them.
+		return c.copy(v.Elem(), depth)
 	case reflect.Map:
 		if v.IsNil() {
 			return v
@@ -1899,9 +1961,10 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 		c.reachedAgain(done, at)
 		return done.out
 	}
-	// Its keys are set as they are, so one of a type no copy can hold in place (copyable) refuses
-	// it, as its values do once copy reaches them.
-	if !copyable(v.Type().Key()) {
+	// Its keys are set as they are, so one of a type a copy wouldn't share (sharedKey) refuses it,
+	// and so does one an interface in a key holds (payHashed): set so, a pointer, or a channel an
+	// interface in a struct held, was the host's.
+	if !sharedKey(v.Type().Key()) {
 		c.overflow()
 		return reflect.Value{}
 	}
@@ -1923,6 +1986,7 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 	// each struct it held only to drop it.
 	kt := v.Type().Key()
 	moved, hashed := (keyTenths(kt)+inlineTenths(v.Type().Elem()))/10, kt.Kind() != reflect.String && hashesHeld(kt)
+	zonedKeys := zonesHeld(kt)
 	for it := v.MapRange(); it.Next() && c.pay(moved); {
 		key := it.Key()
 		// What the entries before it held can leave less than its value holds in place, as one of two
@@ -1931,6 +1995,9 @@ func (c *copier) dict(v reflect.Value, at, depth int) reflect.Value {
 			break
 		}
 		if held := c.copy(it.Value(), depth); !c.over {
+			if zonedKeys {
+				key = c.ownKey(key)
+			}
 			out.SetMapIndex(key, held)
 		}
 	}
@@ -1952,28 +2019,19 @@ func (c *copier) pointer(v reflect.Value, at, depth int) reflect.Value {
 	switch m := v.Interface().(type) {
 	case proto.Message:
 		if itself(m) {
-			c.hold()
-			copied := c.message(m.ProtoReflect(), depth)
-			if c.over {
-				return reflect.Value{}
-			}
-			return reflect.ValueOf(copied.Interface())
+			return c.reflected(v, func() any {
+				if copied := c.message(m.ProtoReflect(), depth); copied != nil {
+					return copied.Interface()
+				}
+				return nil
+			})
 		}
 	case protoreflect.Message:
 		// A message's reflection, as a host's type that is its own reflection by a generated message's
 		// embeds, is protobuf's own state, which its methods find the message by where it lies: copied
 		// as any other pointer, a copy of that state alone read past where it lay. It is copied as the
 		// reflection of a copy of the message it reflects, and refused where that isn't of its type.
-		c.hold()
-		copied := c.message(m, depth)
-		if c.over {
-			return reflect.Value{}
-		}
-		if reflect.TypeOf(copied) != v.Type() {
-			c.overflow()
-			return reflect.Value{}
-		}
-		return reflect.ValueOf(copied)
+		return c.reflected(v, func() any { return c.message(m, depth) })
 	}
 	// What it points to costs at least what it holds in place (leastCopied), so no room is made for
 	// it where that is more than is left: a pointer to an array of 128 MiB allocated 268 MB before
@@ -1988,6 +2046,32 @@ func (c *copier) pointer(v reflect.Value, at, depth int) reflect.Value {
 		out.Elem().Set(held)
 	}
 	c.ascendFrom(k, at, outer)
+	return out
+}
+
+// reflected is copied, the copy of v, a pointer to a message or to a message's reflection, which
+// copying it by its reflection makes (message), or none where that panics or isn't of v's type.
+// Copying it calls methods of v's type, which are the host's own where the type is: a struct of the
+// host's embedding a nil reflection panicked on the first, a dynamic message made without its type
+// on its descriptor, and a copy of a type saying it makes its own (itself) and making another
+// panicked where it was set in place of v, each panicking every call asking a hook about it. Each
+// is refused as what can't be copied, as converting refuses it unread.
+func (c *copier) reflected(v reflect.Value, copied func() any) (out reflect.Value) {
+	defer func() {
+		if recover() != nil {
+			c.overflow()
+			out = reflect.Value{}
+		}
+	}()
+	c.hold()
+	out = reflect.ValueOf(copied())
+	if c.over {
+		return reflect.Value{}
+	}
+	if !out.IsValid() || out.Type() != v.Type() {
+		c.overflow()
+		return reflect.Value{}
+	}
 	return out
 }
 
@@ -2075,19 +2159,29 @@ func (c *copier) set(s *copied, k copiedKey, i int, v reflect.Value) {
 	}
 }
 
-// sliceKey is how copier knows a slice: by where it starts, its capacity and its type, which every
-// length of it shares.
+// sliceKey is how copier knows a slice: by where it starts and its type, which every length and
+// capacity of it shares. A slice is what a hook or a condition reads of it, its elements from where
+// it starts, as many as its length, so neither copying nor converting knows one by its capacity:
+// converting converts each length of it once, a list of its own (copiedKeyOf), and a copy copies
+// its elements once, as many as the longest length it is reached with, each length a slice of that
+// copy. So a copy costs no more than converting the same does, each slice holds in the copy what
+// it holds in the host, and one reached again while it is copied, as a slice holding itself, is a
+// slice of the copy, so copying it ends, as converting it does (once). Slices of one array that
+// start apart are copied apart, each as converting converts it. Known by its capacity, as a copy
+// knew one, one array's 2,000 strings reached at one length with 100 capacities were copied, and
+// charged, 100 times, past what a copy holds; and known so by converting too, which counted the
+// same once, a list of them a check read before was past what it converts.
 func sliceKey(v reflect.Value) copiedKey {
 	if v.Kind() != reflect.Slice {
 		return copiedKey{}
 	}
-	return copiedKey{t: v.Type(), at: v.Pointer(), cap: v.Cap()}
+	return copiedKey{t: v.Type(), at: v.Pointer()}
 }
 
 // slice is a copy of v, a slice that isn't nil, which is depth deep: a slice of the copy of its
-// elements from where it starts, made as long as the longest length it is reached with, and no
-// longer than it may grow to, so each element is copied once. Each copy is as long as its capacity,
-// so appending to one writes to none of the others.
+// elements from where it starts (sliceKey), made as long as the longest length it is reached with,
+// so each element is copied once. Each copy is as long as its capacity, so appending to one writes
+// to none of the others.
 func (c *copier) slice(v reflect.Value, depth int) reflect.Value {
 	n, k, at := v.Len(), sliceKey(v), depth-1
 	s := c.slices[k]
@@ -2203,7 +2297,11 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 		}
 		c.slices[k] = s
 	case n > s.out.Cap():
-		grown := reflect.MakeSlice(v.Type(), n, min(max(n, 2*s.out.Cap()), v.Cap()))
+		// At least twice as long, whatever room past its length v has: grown no further than v's,
+		// 40,000 slices of one array of strings, each one longer than the one before it and with no
+		// room past it, as three-index slices can be, were each copied anew, with all the copies
+		// they outgrew, taking 3.7 s and 12 GB, charged 80,016.
+		grown := reflect.MakeSlice(v.Type(), n, max(n, 2*s.out.Cap()))
 		reflect.Copy(grown, s.out)
 		if c.outgrown == nil {
 			c.outgrown = map[copiedKey][]reflect.Value{}
@@ -2213,13 +2311,17 @@ func (c *copier) lengthen(v reflect.Value, k copiedKey, s *copied) *copied {
 	default:
 		s.out = s.out.Slice(0, n)
 	}
-	// Each hook is given its own, so elements no write could reach through are copied at once.
+	// Each hook is given its own, so elements no write could reach through are copied at once, a
+	// time in a zone of the copy's own (zone).
 	if s.filled == 0 {
 		reflect.Copy(s.out, v)
 	} else {
 		reflect.Copy(s.out.Slice(s.filled, n), v.Slice(s.filled, n))
 	}
 	if shared(elem) {
+		for i := s.filled; i < n && zoned(elem); i++ {
+			c.rezone(s.out.Index(i))
+		}
 		s.filled, s.measured = n, n
 	}
 	return s
@@ -2433,6 +2535,9 @@ func (c *copier) fields(out, v reflect.Value, depth int) {
 			if held := c.copy(v.Field(i), depth); !c.over {
 				f.Set(held)
 			}
+		case zoned(f.Type()):
+			// Set whole, in the host's zone, which the type's methods could write through.
+			c.rezone(f)
 		case v.Type().Field(i).Anonymous && f.Kind() == reflect.Struct:
 			c.fields(f, v.Field(i), depth)
 		}
@@ -2448,10 +2553,165 @@ func unreachable(v reflect.Value) bool {
 	}
 	switch e := v.Elem(); e.Kind() {
 	case reflect.Map, reflect.Pointer, reflect.Slice:
-		return e.IsNil()
+		// A nil one of a type no copy holds, a lock of the host's own, is refused as it is held
+		// directly: shared, an interface holding a nil lock was copied where an array of it wasn't.
+		return e.IsNil() && copyable(e.Type())
 	default:
-		return shared(e.Type())
+		// A time in a zone of the host's own is given in one of the copy's (zone).
+		return shared(e.Type()) && (!zoned(e.Type()) || global(zoneOf(e)))
 	}
+}
+
+// zoned reports whether a value of type t is a time, which a copy holds in a zone of its own
+// (zone): a time.Time, or one of CEL's timestamps.
+func zoned(t reflect.Type) bool { return t == timeType || t == celTimestampType }
+
+// global reports whether at is UTC or the local zone, which any code can reach, and a time in
+// which a copy holds as it is.
+func global(at *time.Location) bool { return at == time.UTC || at == time.Local }
+
+// zoneOf is the zone of v, a time (zoned).
+func zoneOf(v reflect.Value) *time.Location { return timeOf(v).Location() }
+
+// timeOf is v, a time (zoned), as the time it is, read in place where v is addressable, as reading
+// it otherwise copies it.
+func timeOf(v reflect.Value) time.Time {
+	if v.Type() == celTimestampType {
+		v = v.Field(0)
+	}
+	if v.CanAddr() {
+		at, _ := reflect.NewAt(timeType, v.Addr().UnsafePointer()).Interface().(*time.Time)
+		return *at
+	}
+	at, _ := v.Interface().(time.Time)
+	return at
+}
+
+// moved is v, a time (zoned) a copy sets whole, in a zone of the copy's own (zone), or v where its
+// zone is the process's.
+func (c *copier) moved(v reflect.Value) reflect.Value {
+	at := timeOf(v)
+	if global(at.Location()) {
+		return v
+	}
+	if v.Type() == celTimestampType {
+		return reflect.ValueOf(types.Timestamp{Time: c.zone(at)})
+	}
+	return reflect.ValueOf(c.zone(at))
+}
+
+// zone is t, a time of the host's, in a zone of the copy's own, one for each zone of the host's own
+// a copy reaches, so its times compare with one another as the host's do. A zone's methods write
+// none of it, but assigning through t.Location() writes it whole, so a constraint writing
+// `*t.Location() = *time.UTC` to its copy wrote the host's zone, and every time in it, the host's
+// and other hooks' alike. UTC and the local zone are the process's, which any code can write
+// anyway, and a time in them, which can hold a monotonic reading moving it drops, is kept as it is.
+func (c *copier) zone(t time.Time) time.Time {
+	at := t.Location()
+	if global(at) {
+		return t
+	}
+	own, ok := c.zones[at]
+	if !ok {
+		// Its name loads the local zone where at is it, which reading it whole doesn't.
+		_ = at.String()
+		copied := *at
+		own = &copied
+		if c.zones == nil {
+			c.zones = map[*time.Location]*time.Location{}
+		}
+		c.zones[at] = own
+	}
+	return t.In(own)
+}
+
+// zonedApart is t, a time a hook is given apart from any copy, as ValidateGrant is given a grant's
+// expiry, in a zone of its own where its zone is the host's own (zone): given as the host passed
+// it, ValidateGrant writing through its Location wrote the host's zone.
+func zonedApart(t time.Time) time.Time {
+	var c copier
+	return c.zone(t)
+}
+
+// rezone moves v, an addressable time (zoned) of the copy's, set as the host's was, to a zone of
+// the copy's own (zone): in place, as v can be an unexported field of a struct of the copy's, which
+// a hook reaches through the type's methods and reflection can't set.
+func (c *copier) rezone(v reflect.Value) {
+	if v.Type() == celTimestampType {
+		v = v.Field(0)
+	}
+	if at, ok := reflect.NewAt(timeType, v.Addr().UnsafePointer()).Interface().(*time.Time); ok {
+		*at = c.zone(*at)
+	}
+}
+
+// ownKey is key, a map's key whose type holds a time in place or an interface (zonesHeld), with
+// each time it holds in a zone of the copy's own (zone): a key is set as it is, so this one is set
+// anew. The copy's zones are one for each of the host's, so keys the host holds apart are apart in
+// the copy, and so are none it holds as one.
+func (c *copier) ownKey(key reflect.Value) reflect.Value {
+	if key.Kind() == reflect.Interface && (key.IsNil() || !zonesHeld(key.Elem().Type())) {
+		return key
+	}
+	out := reflect.New(key.Type()).Elem()
+	if key.Kind() == reflect.Interface {
+		out.Set(c.ownKey(key.Elem()))
+		return out
+	}
+	out.Set(key)
+	c.rezoneIn(out)
+	return out
+}
+
+// rezoneIn moves each time v, an addressable value of a key's type a copy sets anew (ownKey), holds
+// in place or in an interface to a zone of the copy's own.
+func (c *copier) rezoneIn(v reflect.Value) {
+	switch {
+	case zoned(v.Type()):
+		c.rezone(v)
+	case v.Kind() == reflect.Interface:
+		if !v.IsNil() && zonesHeld(v.Elem().Type()) {
+			reflect.NewAt(v.Type(), v.Addr().UnsafePointer()).Elem().Set(c.ownKey(v.Elem()))
+		}
+	case v.Kind() == reflect.Array:
+		for i := 0; i < v.Len() && zonesHeld(v.Type().Elem()); i++ {
+			c.rezoneIn(v.Index(i))
+		}
+	case v.Kind() == reflect.Struct:
+		for i := range v.NumField() {
+			if zonesHeld(v.Type().Field(i).Type) {
+				c.rezoneIn(v.Field(i))
+			}
+		}
+	default:
+	}
+}
+
+// zonesHeld reports whether a value of type t, a map's key, can hold a time (zoned), in place or in
+// an interface, which ownKey sets anew. An array's or a struct's is found once for each type
+// (typeFact).
+func zonesHeld(t reflect.Type) bool {
+	switch {
+	case zoned(t), t.Kind() == reflect.Interface:
+		return true
+	case t.Kind() == reflect.Array && t.Len() > 0, t.Kind() == reflect.Struct:
+		return typeFact(&zoneTypes, t, zonesWithin)
+	default:
+		return false
+	}
+}
+
+// zonesWithin is zonesHeld of t, an array or a struct, by what it holds in place.
+func zonesWithin(t reflect.Type) bool {
+	if t.Kind() == reflect.Array {
+		return zonesHeld(t.Elem())
+	}
+	for i := range t.NumField() {
+		if zonesHeld(t.Field(i).Type) {
+			return true
+		}
+	}
+	return false
 }
 
 // payHeld pays for v, an interface no write could reach through (unreachable), as converting what
@@ -2471,7 +2731,7 @@ func (c *copier) payWhole(v reflect.Value) bool {
 	switch {
 	case t.Kind() == reflect.String:
 		return c.pay(length(v.Len()) / 10)
-	case t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8:
+	case t.Kind() == reflect.Array && byteKind(t.Elem()):
 		return c.pay(length(v.Len()) / 10)
 	case t.Kind() == reflect.Array:
 		if !c.pay(listCost - 1 + length(v.Len())) {
@@ -2515,27 +2775,54 @@ func textOf(v reflect.Value) int {
 
 // tenths is what copying a value of t whole costs, in tenths: a tenth of each of its bytes, as
 // converting counts bytes, a struct's padding too, but for a string's, which is one value, as
-// converting counts it, though moving it moves 16 bytes. So copying a value costs at least a
-// sixteenth of each byte it holds in place, more than leastCopied reserves: uncounted, the padding
-// of an array of 60,000 structs of a bool, each padded to 16 bytes, was charged 6,000, where 40,000
-// were reserved for a pointer to it, so a copy reaching it after a string past 30,000 was refused,
-// and one reaching it first wasn't.
+// converting counts it, though moving it moves 16 bytes, and of each of a struct's fields at least
+// one, as finding this walks each. So copying a value costs at least a sixteenth of each byte it
+// holds in place, more than leastCopied reserves: uncounted, the padding of an array of 60,000
+// structs of a bool, each padded to 16 bytes, was charged 6,000, where 40,000 were reserved for a
+// pointer to it, so a copy reaching it after a string past 30,000 was refused, and one reaching it
+// first wasn't. And a field holding nothing in place cost nothing, so a struct of 4,000 empty
+// fields was charged one, though walking its type for each value took 226 µs. An array's or a
+// struct's is found once for each type (typeFact), so only a type's first value walks it, at about
+// 160 ns a field, past what a tenth covers, though a fifth to a half of what making the type by
+// reflection took; none of an empty array's element is found, which it holds none of; and it counts
+// no more than mostTenths, as fields of no size, nesting, count each path through them.
 func tenths(t reflect.Type) uint64 {
 	switch t.Kind() {
 	case reflect.String:
 		return 10
-	case reflect.Array:
-		return length(t.Len()) * tenths(t.Elem())
-	case reflect.Struct:
-		var n, fields uint64
-		for i := range t.NumField() {
-			n += tenths(t.Field(i).Type)
-			fields += uint64(t.Field(i).Type.Size())
-		}
-		return n + uint64(t.Size()) - fields
+	case reflect.Array, reflect.Struct:
+		return typeFact(&tenthsTypes, t, tenthsWithin)
 	default:
 		return uint64(t.Size())
 	}
+}
+
+// tenthsWithin is tenths of t, an array or a struct, by what it holds in place.
+func tenthsWithin(t reflect.Type) uint64 {
+	if t.Kind() == reflect.Array {
+		if t.Len() == 0 {
+			return 0
+		}
+		return times(length(t.Len()), tenths(t.Elem()))
+	}
+	var n, fields uint64
+	for i := range t.NumField() {
+		f := t.Field(i).Type
+		n += max(1, tenths(f))
+		fields += uint64(f.Size())
+	}
+	return min(mostTenths, n+uint64(t.Size())-fields)
+}
+
+// mostTenths is more tenths than any copy may spend (maxConverted), past which tenths counts none.
+const mostTenths = 10 * (maxConverted + 1)
+
+// times is n of what costs each, in tenths, or mostTenths where that is more.
+func times(n, each uint64) uint64 {
+	if each > 0 && n > mostTenths/each {
+		return mostTenths
+	}
+	return n * each
 }
 
 // inlineTenths is what moving the structs a value of t holds in place whole costs, in tenths
@@ -2545,8 +2832,8 @@ func inlineTenths(t reflect.Type) uint64 {
 	switch {
 	case t.Kind() == reflect.Struct && t != timeType && t != celTimestampType && t != celDurationType:
 		return tenths(t)
-	case t.Kind() == reflect.Array:
-		return length(t.Len()) * inlineTenths(t.Elem())
+	case t.Kind() == reflect.Array && t.Len() > 0:
+		return times(length(t.Len()), inlineTenths(t.Elem()))
 	default:
 		return 0
 	}
@@ -2575,7 +2862,8 @@ func keyTenths(t reflect.Type) uint64 {
 // of, a tenth of its bytes in place (keyTenths), and the strings an array or a struct key holds, and
 // what the interfaces it holds hold, a tenth of their bytes (payHashing), as Go hashes a key whole.
 // Charged an array's or a struct's bytes in place alone, a copy of 50 entries keyed by structs each
-// holding a string of 1 MiB took 1.4 ms, charged 167.
+// holding a string of 1 MiB took 1.4 ms, charged 167. As hashing reads each interface the key
+// holds, it refuses one holding what a copy can't set as it is (heldKey).
 func (c *copier) payHashed(key reflect.Value) bool {
 	if key.Kind() != reflect.Interface {
 		return c.payHashing(key)
@@ -2584,7 +2872,8 @@ func (c *copier) payHashed(key reflect.Value) bool {
 		return true
 	}
 	key = key.Elem()
-	return c.pay(keyTenths(key.Type())/10) && (key.Kind() == reflect.String || !hashesHeld(key.Type()) || c.payHashing(key))
+	return c.heldKey(key) && c.pay(keyTenths(key.Type())/10) &&
+		(key.Kind() == reflect.String || !hashesHeld(key.Type()) || c.payHashing(key))
 }
 
 // payHashing pays a tenth of the bytes of each string v holds in place, and of what each interface it
@@ -2598,7 +2887,7 @@ func (c *copier) payHashing(v reflect.Value) bool {
 			return true
 		}
 		e := v.Elem()
-		return c.pay(tenths(e.Type())/10) && (!hashesHeld(e.Type()) || c.payHashing(e))
+		return c.heldKey(e) && c.pay(tenths(e.Type())/10) && (!hashesHeld(e.Type()) || c.payHashing(e))
 	case reflect.Array:
 		for i := range v.Len() {
 			if !c.payHashing(v.Index(i)) {
@@ -2617,112 +2906,206 @@ func (c *copier) payHashing(v reflect.Value) bool {
 }
 
 // hashesHeld reports whether hashing a value of type t reads more than it holds in place: a string's
-// bytes, or what an interface holds, or an array or struct holding either.
+// bytes, or what an interface holds, or an array or struct holding either, which one of no size, as
+// an empty array, doesn't. An array's or a struct's is found once for each type (typeFact).
 func hashesHeld(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.String, reflect.Interface:
 		return true
-	case reflect.Array:
-		return t.Len() > 0 && hashesHeld(t.Elem())
-	case reflect.Struct:
-		for i := range t.NumField() {
-			if hashesHeld(t.Field(i).Type) {
-				return true
-			}
-		}
+	case reflect.Array, reflect.Struct:
+		return t.Size() > 0 && typeFact(&hashingTypes, t, hashesWithin)
 	default:
+		return false
+	}
+}
+
+// hashesWithin is hashesHeld of t, an array or a struct of some size, by what it holds in place.
+func hashesWithin(t reflect.Type) bool {
+	if t.Kind() == reflect.Array {
+		return hashesHeld(t.Elem())
+	}
+	for i := range t.NumField() {
+		if hashesHeld(t.Field(i).Type) {
+			return true
+		}
 	}
 	return false
 }
 
-// shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
-// one holding no map, slice, pointer or interface a copy would share (flat), nor what no copy can
-// hold (copyable), and a time, whose fields are unexported, which no hook can write to but by
-// replacing it whole.
-func shared(t reflect.Type) bool {
-	return t == timeType || t == celTimestampType || flat(t) && copyable(t)
+// heldKey reports whether a copy can set as it is e, what an interface in a map's key holds
+// (sharedKey), and is over where it can't.
+func (c *copier) heldKey(e reflect.Value) bool {
+	if !sharedKey(e.Type()) {
+		c.overflow()
+		return false
+	}
+	return true
 }
 
-// copyable reports whether a copy can hold a value of type t, which it copies in place, as setting
-// it whole does, before copying each field it can set: none holding there an unsafe pointer, as a
-// reflect.Value does, or a lock, a value of a type whose pointer locks and unlocks, as a mutex, a
-// WaitGroup or an atomic value is, nor a struct holding an empty array of one, by which protobuf's
-// own state marks itself never to be copied, nor a field a copy can't set holding more than setting
-// it whole copies (shared), but a struct it embeds, whose fields are copied in turn. A copy of
-// another package's state, which its methods find by where it lay, or which held the host's, was
-// read past where it lay, or wrote to the host's. An empty array holds none of these, as conditions
-// read it, and what a pointer, a slice, a map or an interface holds is told where copy reaches it.
-func copyable(t reflect.Type) bool {
+// sharedKey reports whether a copy can set a map's key of type t as it is, as it sets each: a copied
+// key would be another key, under which the copy would find nothing the host passed. So t holds in
+// place only what a copy shares (shared), but for interfaces, each told by what it holds as the key
+// is hashed (payHashed): a key holding a pointer gave a hook what it reaches of the host's, and one
+// whose interface held a pointer or a channel, in a struct or an array, did too. No condition reads
+// a map keyed by any of them (keyType). An array's or a struct's is found once for each type
+// (typeFact).
+func sharedKey(t reflect.Type) bool {
 	switch t.Kind() {
-	case reflect.UnsafePointer:
-		return false
-	case reflect.Array:
-		if k := t.Elem().Kind(); k != reflect.Struct && k != reflect.Array && k != reflect.UnsafePointer {
-			return true
-		}
-	case reflect.Struct:
-		if t == timeType || t == celTimestampType {
-			return true
-		}
-	default:
+	case reflect.Interface:
 		return true
+	case reflect.Array, reflect.Struct:
+		return shared(t) || copyable(t) && typeFact(&keyTypes, t, sharedKeyWithin)
+	default:
+		return shared(t)
 	}
-	if known, ok := copyableTypes.Load(t); ok {
-		can, _ := known.(bool)
-		return can
-	}
-	can := copiedInPlace(t)
-	copyableTypes.Store(t, can)
-	return can
 }
 
-// copyableTypes are what copyable found of each array and struct type it was asked about.
-var copyableTypes sync.Map
-
-var lockerType = reflect.TypeFor[sync.Locker]()
-
-// copiedInPlace is copyable of t, an array's or a struct's, or a type one holds in place.
-func copiedInPlace(t reflect.Type) bool {
-	switch {
-	case t == timeType || t == celTimestampType:
-		return true
-	case t.Kind() == reflect.UnsafePointer, reflect.PointerTo(t).Implements(lockerType) && !t.Implements(lockerType):
-		return false
-	case t.Kind() == reflect.Array:
-		return t.Len() == 0 || copiedInPlace(t.Elem())
-	case t.Kind() != reflect.Struct:
-		return true
+// sharedKeyWithin is sharedKey of t, an array or a struct a copy doesn't share whole, by what it
+// holds in place.
+func sharedKeyWithin(t reflect.Type) bool {
+	if t.Kind() == reflect.Array {
+		return sharedKey(t.Elem())
 	}
 	for i := range t.NumField() {
-		f := t.Field(i)
-		// An empty array holds nothing, which conditions read, but one of what can't be copied marks
-		// the struct holding it never to be copied, as protobuf's own state is marked.
-		marked := f.Type.Kind() == reflect.Array && f.Type.Len() == 0 && !copiedInPlace(f.Type.Elem())
-		if marked || !copiedInPlace(f.Type) || !f.IsExported() && (!f.Anonymous || f.Type.Kind() != reflect.Struct) && !shared(f.Type) {
+		if !sharedKey(t.Field(i).Type) {
 			return false
 		}
 	}
 	return true
 }
 
+// shared reports whether a copy shares a value of type t, setting it whole where the copy holds it:
+// one holding no map, slice, pointer or interface a copy would share (flat), nor what no copy can
+// hold (copyable), and a time, whose fields are unexported, which no hook can write to but by
+// replacing it whole, or through its zone, which a copy holds a copy of where it is the host's own
+// (zone).
+func shared(t reflect.Type) bool {
+	return t == timeType || t == celTimestampType || flat(t) && copyable(t)
+}
+
+// copyable reports whether a copy can hold a value of type t, which it copies in place, as setting
+// it whole does, before copying each field it can set: none holding there an unsafe pointer, as a
+// reflect.Value does, a channel or a func, which a copy would share with the host, as a hook
+// sending on it or calling it would reach the host's, or a lock, a value of a type whose pointer
+// locks and unlocks, as a mutex's does and as a WaitGroup or an atomic value holds one, or a lock
+// of the host's own, as an integer a pointer to which spins, nor a struct holding an empty array of
+// a lock itself or of an unsafe pointer (marks), by which protobuf's own state marks itself never
+// to be copied, though not one of a type holding a lock, as a WaitGroup, a shape no such mark
+// takes, nor a field a copy can't set holding more than setting it whole copies (shared), but a
+// struct it embeds, whose fields are copied in turn. A copy of another package's state, which its
+// methods find by where it lay, or which held the host's, was read past where it lay, or wrote to
+// the host's. An empty array holds none of these, as conditions read it, and what a pointer, a
+// slice, a map or an interface holds is told where copy reaches it. A lock is refused however deep
+// it lies, as conditions refuse it (hostLock): a spin lock of the host's was copied alone and in an
+// array, and refused in an array of arrays.
+func copyable(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.UnsafePointer, reflect.Chan, reflect.Func:
+		return false
+	case reflect.Array, reflect.Struct:
+		if t == timeType || t == celTimestampType {
+			return true
+		}
+	default:
+		// Only a type of the host's own has methods, and so can be a lock.
+		if t.PkgPath() == "" {
+			return true
+		}
+	}
+	return typeFact(&copyableTypes, t, copiedInPlace)
+}
+
+// copyableTypes are what copyable found of each array, struct and type of the host's own it was
+// asked about.
+var copyableTypes sync.Map
+
+var lockerType = reflect.TypeFor[sync.Locker]()
+
+// lockType reports whether t is a lock: a type whose pointer locks and unlocks, as a mutex's does,
+// though it doesn't itself, as a type holding the pointer to one would.
+func lockType(t reflect.Type) bool {
+	return reflect.PointerTo(t).Implements(lockerType) && !t.Implements(lockerType)
+}
+
+// copiedInPlace is copyable of t, an array's, a struct's or a type of the host's own, by what it
+// holds in place, each type it holds as copyable finds it.
+func copiedInPlace(t reflect.Type) bool {
+	switch {
+	case t == timeType || t == celTimestampType:
+		return true
+	case t.Kind() == reflect.UnsafePointer, lockType(t):
+		return false
+	case t.Kind() == reflect.Array:
+		return t.Len() == 0 || copyable(t.Elem())
+	case t.Kind() != reflect.Struct:
+		return true
+	}
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if marks(f.Type) || !copyable(f.Type) || !f.IsExported() && (!f.Anonymous || f.Type.Kind() != reflect.Struct) && !shared(f.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// marks reports whether a struct holding a value of type t is marked never to be copied: t is an
+// empty array of a lock, as protobuf's own state is marked by one of a mutex, or of an unsafe
+// pointer. Its element is told by its type alone: the struct holds none of what the element holds,
+// which finding whether the element could be copied walked uncharged, along each path through
+// empty arrays, so a type nesting two of the type before it 20 deep took 640 ms to copy first.
+func marks(t reflect.Type) bool {
+	return t.Kind() == reflect.Array && t.Len() == 0 && (t.Elem().Kind() == reflect.UnsafePointer || lockType(t.Elem()))
+}
+
 // flat reports whether a value of type t holds no map, slice, pointer or interface a copy would
-// share: a scalar, a string, or an array or struct of them, which setting it copies whole.
+// share: a scalar, a string, or an array or struct of them, which setting it copies whole, and an
+// empty array, which holds none. An array's or a struct's is found once for each type (typeFact).
 func flat(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
 		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String:
 		return true
-	case reflect.Array:
-		return flat(t.Elem())
-	case reflect.Struct:
-		for i := range t.NumField() {
-			if !flat(t.Field(i).Type) {
-				return false
-			}
-		}
-		return true
+	case reflect.Array, reflect.Struct:
+		return typeFact(&flatTypes, t, flatWithin)
 	default:
 		return false
 	}
 }
+
+// flatWithin is flat of t, an array or a struct, by what it holds in place.
+func flatWithin(t reflect.Type) bool {
+	if t.Kind() == reflect.Array {
+		return t.Len() == 0 || flat(t.Elem())
+	}
+	for i := range t.NumField() {
+		if !flat(t.Field(i).Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// What flat, tenths, hashesHeld, sharedKey and zonesHeld found of each array and struct type they
+// were asked about.
+var flatTypes, tenthsTypes, hashingTypes, keyTypes, zoneTypes sync.Map
+
+// typeFact is what find finds of t, kept in known, so it is found once for each type: finding it
+// walks each type t holds in place, and copying asks it of each value it copies. Walked for each, a
+// slice of 10,000 structs of 4,000 empty fields took 2.3 s to copy, charged 10,013, and 100 of a
+// type nesting two empty arrays of the type before it 20 deep, walked along each path through them,
+// 19.6 s, charged 113.
+func typeFact[F any](known *sync.Map, t reflect.Type, find func(reflect.Type) F) F {
+	if found, ok := known.Load(t); ok {
+		fact, _ := found.(F)
+		return fact
+	}
+	walkingType()
+	fact := find(t)
+	known.Store(t, fact)
+	return fact
+}
+
+// walkingType runs as typeFact finds what it finds of a type, as a test's counter.
+var walkingType = func() {}

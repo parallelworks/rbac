@@ -107,7 +107,10 @@ where that is past the database's clock, where a check is refused (Expiry), and 
 column keeps no row once that is as late as the first time after `Filter` read the holding that the
 subject's membership, or its last path to one of its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
-which their indexes still serve. The subject's grants are matched through the path's index, whose
+which their indexes still serve. For a row whose tenant or label column is NULL, the condition can
+be NULL rather than false, as SQL compares NULL: a `WHERE` clause leaves the row out all the same,
+but a query that selects the condition as a column reads it through `coalesce(..., false)` or
+`IS TRUE`. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
 past 128 on containers and the tenant, as one holding a grant on everything it created does, each of
 a row's keys is looked up among them instead, so a row costs a few lookups however many it holds; no
@@ -283,10 +286,13 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
   named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
   of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
-  reads, below; maps of these keyed by a bool, a
+  reads, or to a `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any`, below; maps of these keyed
+  by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
-  `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
+  `Timestamp` and `Duration`, and an `Any` packing one of them, a `Value` holding a nil `Struct`
+  or `ListValue` read as an empty one, as CEL reads it and protobuf writes it; and CEL's own scalar
+  values.
   A kind's attributes, the subject's, the resource's or the request's, holding anything else,
   however deep, can't be read as a whole, as a policy engine fails input it can't read: every
   condition reading any of them fails, `has()` and `in` included, and so does one keying a map by
@@ -304,14 +310,20 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
   lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
-  struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
-  array, and a slice, a pointer or a map of any of these, or an array holding one, holding none
-  too, as an empty slice of structs or a nil pointer to one, read as `[]` or `null`, left a kind
+  struct, a channel, a func, a lock of the host's own, as an integer a pointer to which locks and
+  unlocks, which no hook can be given either, below, any other message, a map keyed by anything
+  else, as a double, an array or a lock, and a slice, a pointer or a map of any of these, or an
+  array holding one, holding none too, as an empty slice of structs or a nil pointer to one, read as
+  `[]` or `null`, left a kind
   readable until it held one, a map holding two keys read as the same value, as `1`
   and `1u`, and so JSON text naming a member of an object twice, once unescaped, or an `Any`
   packing a message that sets a field twice, as a `Struct` with two entries of `role`: each is read
   as the last, where a host reading the first reads another. A `Struct` the host passes holds each
-  key once, as a Go map does. So do invalid
+  key once, as a Go map does. So do those holding a nil `Struct`, `ListValue`, `Timestamp`,
+  `Duration` or `Any`, which CEL reads as `{}`, `[]`, the epoch or zero, or fails on, where a nil
+  pointer is null: read as null, a grant's `request.attributes.v == null` held where CEL found it
+  false, and read as CEL reads it, a declared timestamp passed as one met a grant's condition. A nil
+  `Value` or wrapper is null, as CEL reads it. So do invalid
   JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which `encoding/json` reads as
   U+FFFD, a `json.Number` that isn't a number as JSON writes one, as `0x1p4` or `Inf`, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
@@ -470,11 +482,21 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `null` where one holding such a value couldn't be read; and a map's values no condition reads,
   as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
   for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
-  converts. Attributes
+  converts. Attributes holding a lock of the host's own that isn't a struct, as an integer a pointer
+  to which locks and unlocks, were read by its kind, or as bytes in an array or a slice of ones that
+  are bytes, and now can't be, failing every condition reading their kind, as no hook can be given
+  them either, below, nor can ones holding an empty slice or map of them, or a nil pointer to one,
+  read as `[]`, `{}` or `null`, while an empty array of ones that are bytes, read as empty bytes,
+  is now read as `[]`, as an empty array of any other lock is; and a `Value`
+  holding a nil `Struct` or `ListValue`, read as null, is now read as an empty map or list, as CEL
+  reads it, so a condition comparing it with `null`, as a grant's `request.attributes.v == null`,
+  no longer holds, and one reading its size does; but attributes holding a nil `Struct`,
+  `ListValue`, `Timestamp`, `Duration` or `Any` the host passes, read as null, now can't be read,
+  failing every condition reading their kind, a declared one's too, which failed only those reading
+  it. Attributes
   holding maps, lists, pointers, messages, slices of bytes or JSON text are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are, or lists and JSON texts that
-  are slices of one array, one with room to grow, now each converted, as a hook's copy copies each,
+  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are,
   failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
@@ -489,8 +511,29 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   arrays and messages, counting each time one is reached, however shallow, which were copied
   whole, and ones holding a lock, an unsafe pointer or a struct's unexported field holding a
   pointer, a slice, a map or an interface, which a hook was given copied whole, sharing what the
-  field held with the host; and a condition building a list or a map holding attributes no condition can
-  read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
+  field held with the host, and ones holding a channel or a func, which a hook was given shared
+  with the host, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
+  which a hook was given alone, in an array, or in a slice or a map of arrays, and not in an array
+  of arrays, and ones holding a map keyed by a pointer, or by a value holding one, in place or in an
+  interface, or by a struct or an array whose interface held a channel or a lock, which a hook was
+  given holding the host's pointer or channel, or the lock, and ones holding a message, or a
+  message's reflection, whose copying panics, as that of a struct of the host's embedding a nil
+  reflection or of a dynamic message made without its type does, which panicked every call asking a
+  hook about them, or makes a message of another type, which a hook was given as that type, or
+  which panicked such a call in a list of its own; and ones holding structs whose fields
+  hold nothing in place, as empty structs or empty arrays, which a copy charged nothing for them and
+  now charges a tenth for each, can be past what a hook's copy holds, as 1,000 structs of 4,000
+  empty fields are, while a struct holding an empty array of funcs, which marks it only never to be
+  compared, or of a struct holding a lock that isn't itself one, was refused and is now copied, as
+  are ones holding a slice reached at one length with several capacities, as three-index slices of
+  one array are, which a copy charged for each, past what converting them costs; and a hook's copy
+  of a time in a zone of the host's own, as `time.FixedZone` and `time.LoadLocation` make, which
+  shared that zone with the host, so a constraint writing through `Location()` wrote the host's, is
+  now in a copy of the zone, which `==` tells from the host's, though `Equal` doesn't, and so is the
+  expiry of a grant `ValidateGrant` is asked about, which was in the host's; and
+  a condition building a list or a map
+  holding attributes no condition can read, or reading the `subject`, the `resource` or the
+  `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
   `has({"k": 0.0 / 0.0}.k)`, or a map naming a key twice, which keys a condition computes can do
@@ -547,26 +590,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `Permissions` does for each permission and a check of a labeled resource for each value its label
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
-  `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
-  more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
-  condition reads, along any path, wherever a value reached twice is reached first, nor a value
-  holding itself, as a graph of objects with links back can, that reaches 20,000 maps, lists,
-  pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
-  deep a path around the cycle nests turns on where the copy enters it, which the order a map's
-  entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
-  of them, were copied on one call and refused on the next. Nor does it hold what can't be copied
-  as a value: a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
-  value holds, an unsafe pointer, as a `reflect.Value` holds, or a struct's unexported field, which
-  a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
-  keep their state in; a host's type that is its own reflection by a generated message's it embeds
-  is given holding the reflection of a copy of the message. Where the attributes hold more, nest
-  deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be
-  given part of them,
-  and the call is refused as any other, a `DeniedError` of the permission on the resource
-  asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
-  users can write what takes attributes past it, as a resource's tags, and the message named the
-  constraint. What one removes from an actor the actor can't hand on, but for a
-  role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
+  `ValidateGrant` is given its copy of the actor's attributes once for a call too, and the grant's
+  expiry in a copy of its zone, as a copy holds a time, and neither is given what a copy can't
+  hold (see What a hook's copy holds). `OnChange` is told what a change wrote, not given copies:
+  its event's times are as PostgreSQL returns them, in none of the host's zones. What one removes
+  from an actor the actor can't hand on, but for a role a role it holds lists in `GrantableRoles`,
+  which it grants without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
   revoking there, and so it stops any change taking access away there, whatever the actor's grants,
@@ -606,6 +635,47 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   member's own membership takes that member's lock alone, so one committing after the change reads
   them again isn't seen: a host whose policy rests on a group's members checks the group's grants
   when it changes a membership, as `SetMemberships` says.
+- **What a hook's copy holds:** what the host passed, its maps, lists, pointers and messages its
+  own, a host's type that is its own reflection by a generated message's it embeds holding the
+  reflection of a copy of the message, a time in a zone of the host's own, as `time.FixedZone` and
+  `time.LoadLocation` make, in a copy of the zone, one for each copy, wherever it lies, an
+  unexported field or a map's key too, and none of what follows. A zone's methods write none of it,
+  but assigning through `Location()` writes it whole: shared, a constraint writing
+  `*t.Location() = *time.UTC` wrote the host's zone, and every time in it. A time in UTC or the
+  local zone, which any code can reach, is as the host passed it. `ValidateGrant` is given a grant's
+  expiry so too, apart from any copy: in the host's zone, a hook writing through it wrote the
+  host's. Where what a hook would be given
+  holds any of it, the hook can't be asked, rather than be given part of it, and the call is
+  refused as any other, a `DeniedError` of the permission on the resource asked about, or the
+  tenant, whose `Reason` names the hook and whose message doesn't: a tenant's users can write what
+  takes attributes past it, as a resource's tags, and the message named the constraint.
+  - **Size:** more than a check converts, counted alike.
+  - **Depth:** what nests past 20,000 deep, twice what a condition reads, along any path, wherever
+    a value reached twice is reached first.
+  - **Cycles:** a value holding itself, as a graph of objects with links back can, that reaches
+    20,000 maps, lists, pointers, structs, arrays and messages, counting each time it reaches one,
+    however shallow: how deep a path around the cycle nests turns on where the copy enters it,
+    which the order a map's entries come in picks, so two links each holding the other, beside a
+    chain of 9,998 links to one of them, were copied on one call and refused on the next.
+  - **Locks:** a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
+    value holds, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
+    wherever it lies, alone or in an array, a slice, a map or a struct, which can't be copied as a
+    value, and which no condition reads either.
+  - **Unsafe pointers:** as a `reflect.Value` holds, which can't be copied as a value either.
+  - **Another package's state:** a struct's unexported field, which a copy can't set, holding a
+    pointer, a slice, a map or an interface, as another package's types keep their state in.
+  - **Channels and funcs:** wherever they lie, which a copy could only share with the host: a
+    constraint sending on its copy's channel sent on the host's, and calling its copy's func ran
+    the host's closure.
+  - **Maps keyed by pointers:** a map keyed by a pointer, or by a value holding one, in place or in
+    an interface, however deep in the key: a copy gives a key as it is, as it finds an entry only by
+    the host's own key, so a constraint writing through a pointer key wrote to the host's, and an
+    interface in a struct or an array key gave it the host's channel, or a lock. No condition reads
+    such a map either, as CEL keys are bools, ints, uints and strings.
+  - **Reflections that fail:** a message, or a message's reflection, whose copying panics, as that
+    of a struct of the host's embedding a nil reflection, or of a dynamic message made without its
+    type, does, which panicked every call asking a hook about it, or makes a message of another
+    type than the host passed, which a hook was given as that type.
 
 ## Principals
 
@@ -856,18 +926,22 @@ still running the rest of its commit; one waiting for synchronous replication, a
 set to `remote_apply` to wait for a standby to replay it; or one prepared for two-phase commit,
 whose deferred triggers fire, and whose commit is recorded, as it is prepared, not committed. The
 rest of a commit is the host's own deferred triggers and constraints of statements after its last
-change to the package's tables, and what they wait for, as a deferred foreign key's check waits for
-a row another session has locked; the session's temporary tables made `ON COMMIT DROP` or `ON COMMIT
-DELETE ROWS`, which it drops or empties, about half a millisecond each at the default `temp_buffers`,
-so a session with thousands holds its commit back for a second or so; and no lock it waits for longer
-than 100 ms, where the session's `lock_timeout` is longer, as another session that holds one of those
-temporary tables would have it wait, or past which it fails with SQLSTATE 55P03. Emptying an `ON
-COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large `temp_buffers` it
-costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s past its commit
-record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that sets a large
-`temp_buffers` and makes many such tables holds its own commit back accordingly; set `temp_buffers`
-no larger than the session's temporary data needs. The rest of a commit also writes the
-notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQL's notification
+change to the package's tables, which fire after the commit record is written but before its own
+event, and what they wait for, as a deferred foreign key's check waits for a row another session
+has locked, for as long as the session's `lock_timeout` lets them, without end by default; the
+session's temporary tables made `ON COMMIT DROP` or `ON COMMIT DELETE ROWS`, which it drops or
+empties, about half a millisecond each at the default `temp_buffers`, so a session with thousands
+holds its commit back for a second or so; and, from the commit record's own event on, no lock it
+waits for longer than 100 ms, where the session's `lock_timeout` is longer, as another session that
+holds one of those temporary tables would have it wait, or past which it fails with SQLSTATE 55P03.
+A host that wants its own deferred triggers and constraints bounded too sets `lock_timeout`: for
+its whole transaction, or with `SET LOCAL lock_timeout` just before `COMMIT`, for the commit alone.
+Emptying an `ON COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large
+`temp_buffers` it costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s
+past its commit record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that
+sets a large `temp_buffers` and makes many such tables holds its own commit back accordingly; set
+`temp_buffers` no larger than the session's temporary data needs. The rest of a commit also writes
+the notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQL's notification
 queue, which no SQL can see beforehand: about 1.6 ms a MB on a test server, 260 ms for 160 MB, and
 some 13 s at the default queue of 8 GB, which `lock_timeout` doesn't bound either. Any role may
 `NOTIFY`, which takes no privilege, so revoking `EXECUTE` on `pg_notify` from `PUBLIC` bounds
@@ -938,9 +1012,11 @@ reads in a transaction, or under `WithTx` a savepoint of the host's, that it mak
 nothing in its read writes, a hook's or the host's query either, but to a session's own temporary
 table, and rolls back, which leaves a host's transaction as it was, writable where it was. It reads
 history through views that migrating makes (`0028_as_of_views`), in a schema beside the package's
-named as it with `_as_of` after, each named as the table it stands in for, which it names first on
-its transaction's search_path: a statement there, the package's, a hook's through the `DB` it is
-given or the host's on that transaction, reads a table by its name as it was then,
+named as it with `_as_of` after (so name the package's schema in at most 57 bytes: PostgreSQL cuts
+a name to 63, and migrating refuses a longer one as it would make the views, with SQLSTATE 42622),
+each named as the table it stands in for, which it names first on its transaction's search_path: a
+statement there, the package's, a hook's through the `DB` it is given or the host's on that
+transaction, reads a table by its name as it was then,
 `rbac_group_members` too, and `current_schema()` there is the views' schema. So it makes no object
 and takes no transaction id: it needs no `TEMPORARY`, and while its read runs it holds no `History`
 or `Export` back, though under `WithTx` a host's transaction that has taken one holds them back, as
@@ -1079,10 +1155,11 @@ have the server load a library or run a program of its choosing; and:
    role. Where that role owns the schema of `AsOf`'s views, below, a first `Migrate` as any other
    role, a superuser too, is refused as `rbac.ErrInvalid` naming it, having made nothing. A later
    migration can change history too, so the administrator's role keeps both owners' rights. It
-   owns the schema of `AsOf`'s views too, named
-   as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
-   database, which a role that doesn't own it hasn't by default, so a superuser makes it first,
-   empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
+   owns the schema of `AsOf`'s views too, named as the package's with `_as_of` after, so name the
+   package's in at most 57 bytes, as no name is longer than 63. `0028_as_of_views` makes the
+   views' schema: that takes `CREATE` on the database, which a role that doesn't own it hasn't by
+   default, so a superuser makes it first, empty,
+   `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
    only where it may `SET ROLE` to the administrator's), and grants no other role `CREATE` there,
    nor do the administrator's default privileges, which a schema made for it takes. `AsOf` names it
    first on its search_path, so migrating, and `AsOf` itself, refuse one that holds more than the
@@ -1382,15 +1459,18 @@ the package's uses foreign data, so none of the roles needs any.
   its session has an enabled deferrable trigger on a temporary table: declare the cursor in a
   transaction of its own, or without `HOLD`, and drop or disable the trigger, make it `NOT
   DEFERRABLE`, or change the package's tables on another connection. The rest of its commit, from
-  its commit record on, waits for a lock at most 100 ms where its `lock_timeout` is longer, and
-  fails past it with SQLSTATE 55P03, as where another session holds one of its session's temporary
-  tables, or a transaction with `NOTIFY` waits behind many others committing theirs: retry it. It
-  fails with SQLSTATE 42501 where its session set `rbac.cluster`, the setting history stamps each
-  record's cluster from, to another than the server's: reset it. A host transaction may set its
-  constraints immediate, by name or `ALL`, before or after its changes:
-  `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
-  the host transaction's own changes, which haven't committed, where earlier code counted those
-  dated by its time: read them after the transaction commits.
+  its commit record's own event on, waits for a lock at most 100 ms where its `lock_timeout` is
+  longer, and fails past it with SQLSTATE 55P03, as where another session holds one of its
+  session's temporary tables, or a transaction with `NOTIFY` waits behind many others committing
+  theirs: retry it. The host's own deferred triggers and constraints of its statements after its
+  last change to the tables fire after the commit record but before that event, and wait for a lock
+  as long as its `lock_timeout` lets them: set one to bound them (see History). It fails with
+  SQLSTATE 42501 where its session set `rbac.cluster`, the setting history stamps each record's
+  cluster from, to another than the server's: reset it. A host transaction may set its constraints
+  immediate, by name or `ALL`, before or after its changes: `rbac_history_committed` is deferred
+  again as it fires. And `AsOf` under `WithTx` no longer counts the host transaction's own changes,
+  which haven't committed, where earlier code counted those dated by its time: read them after the
+  transaction commits.
   `0028_as_of_views` makes the views `AsOf` reads history through, one of each of the package's
   tables, in a schema beside the package's named as it with `_as_of` after, and the function
   `rbac_as_of_views`, which makes them again for a later migration that changes a table. Making the
@@ -1398,23 +1478,27 @@ the package's uses foreign data, so none of the roles needs any.
   with SQLSTATE 42501, recording nothing, until a superuser makes the schema for that role, empty,
   as the roles above say, and one that holds anything, is another role's or in which another may
   create, as the role's default privileges can have it, fails it with SQLSTATE 42P15, as does one
-  that has come to be so when a later migration makes the views again. It gives the views and their
-  schema to each role that may read history and use the package's schema then, as the application's
-  role above, so that role needs no new grant, and `rbac_as_of_views` does again to each that may
-  when it runs. It takes no lock a check, a change or a read of history waits for. Code from before
-  it makes temporary views for `AsOf`, as it still may beside it, and code from it on reads these,
-  refusing as `rbac.ErrInvalid` to read as of a time where they aren't made: migrate before running
-  it. From it on `AsOf` needs no `TEMPORARY`, so once no replica runs code from before it, revoke it
-  from `PUBLIC` with no exception; and it takes no transaction id, so its read holds no `History` or
-  `Export` back. Hooks and a host's queries on its transaction read the package's tables by name as
-  of the time, as before, but its read runs READ ONLY, with the views' schema first on the
-  search_path: `current_schema()` there names the views' schema, a write there but to a temporary
-  table fails with SQLSTATE 25006 rather than roll back with the read, and one that leaves the
-  search_path, the role, `rbac.as_of`, `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise
-  fails `AsOf` as `rbac.ErrInvalid` once its read returns, as does the views' schema holding more
-  than the views, or another role being able to create there, when the read begins or as it ends, or
-  one of the views dropped as it ran. Drop the views' schema with the package's: dropping the
-  package's drops the views, which read its history, but not their schema.
+  that has come to be so when a later migration makes the views again. Where the package's schema
+  is named in more than 57 bytes, the views' schema's name would be cut to 63, so the migration
+  fails with SQLSTATE 42622, having made nothing, as does `rbac_as_of_views` wherever it would name
+  that schema: rename the package's schema to a name of at most 57 bytes (Renaming the schema), and
+  migrate again. It gives the views and their schema to each role that may read history and use
+  the package's schema then, as the application's role above, so that role needs no new grant, and
+  `rbac_as_of_views` does again to each that may when it runs. It takes no lock a check, a change
+  or a read of history waits for. Code from before it makes temporary views for `AsOf`, as it still
+  may beside it, and code from it on reads these, refusing as `rbac.ErrInvalid` to read as of a
+  time where they aren't made: migrate before running it. From it on `AsOf` needs no `TEMPORARY`,
+  so once no replica runs code from before it, revoke it from `PUBLIC` with no exception; and it
+  takes no transaction id, so its read holds no `History` or `Export` back. Hooks and a host's
+  queries on its transaction read the package's tables by name as of the time, as before, but its
+  read runs READ ONLY, with the views' schema first on the search_path: `current_schema()` there
+  names the views' schema, a write there but to a temporary table fails with SQLSTATE 25006 rather
+  than roll back with the read, and one that leaves the search_path, the role, `rbac.as_of`,
+  `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise fails `AsOf` as `rbac.ErrInvalid` once
+  its read returns, as does the views' schema holding more than the views, or another role being
+  able to create there, when the read begins or as it ends, or one of the views dropped as it ran.
+  Drop the views' schema with the package's: dropping the package's drops the views, which read its
+  history, but not their schema.
   `0029_commit_trigger` has `rbac_history_committed` run a function of its own,
   `rbac_history_commit`, in place of `rbac_record`. The trigger fires as a transaction commits once
   for each record the transaction wrote, which ran with `rbac_record`'s settings and start and read
@@ -1513,7 +1597,8 @@ the package's uses foreign data, so none of the roles needs any.
   refused. Never move one of the package's tables to another schema: its changes would be recorded
   in that schema's history, or with none there, in a session's own table of its name. `AsOf` finds
   its views by the history they read, whatever either schema is named, so renaming either keeps it
-  reading.
+  reading; but where they are gone, they are made again only beside a schema named in at most 57
+  bytes, in one named as it with `_as_of` after.
 - **Goroutines:** an Authorizer `New` returns on a pool is safe for concurrent use. One bound to a
   transaction or a connection, as `WithTx` and `AsOf`'s read give and `New` returns on a `pgx.Tx`
   or a `*pgx.Conn`, runs every call on that one connection, so it is for one goroutine at a time,
@@ -1548,8 +1633,10 @@ the package's uses foreign data, so none of the roles needs any.
   deferrable trigger on a temporary table of its session: history refuses each as the transaction
   commits, with SQLSTATE 0A000, as it would have its changes counted before they commit (see
   History), or where constraints were set immediate, as the statement that did, or the first change
-  after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
-  where its `lock_timeout` is longer.
+  after it. And the rest of its commit, from its commit record's own event on, waits for no lock
+  past 100 ms, failing with SQLSTATE 55P03, where its `lock_timeout` is longer; its own deferred
+  triggers and constraints of statements after its last change to the tables fire before that
+  event, and wait for a lock as long as its `lock_timeout` lets them: set one to bound them.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only
   conditions, compiled or found not to compile, are cached. Read a resource's ancestors and
   attributes from where they are stored, never from request input, no earlier than the content

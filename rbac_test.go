@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/token"
 	"io/fs"
 	"maps"
 	"math"
+	"math/big"
 	mathrand "math/rand/v2"
+	"net/url"
 	"os"
 	"os/exec"
 	"reflect"
@@ -34,8 +37,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/gofeaturespb"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -681,6 +687,51 @@ func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 		}
 		agree(t)
 	})
+}
+
+// Filter's condition is NULL rather than false for a row whose tenant or label column is NULL that
+// it would otherwise keep, as its docs say: a WHERE clause leaves the row out all the same, and a
+// host selecting the condition as a column reads it as false through coalesce or IS TRUE.
+func TestFilterIsNullForARowWhoseTenantOrLabelIsNull(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE clusters (id text NOT NULL, tenant text, path text[] NOT NULL, labels text[])`); err != nil {
+		t.Fatal(err)
+	}
+	for id, row := range map[string]struct {
+		tenant any
+		labels []string
+	}{"c1": {"t1", []string{}}, "c2": {nil, []string{}}, "c3": {"t1", nil}} {
+		path := h.path(t, rbac.Resource{Tenant: "t1", Type: "cluster", ID: id})
+		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3, $4)`, id, row.tenant, path, row.labels); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT id || ': ' || coalesce((`+pred.SQL+`)::text, 'null') || ', ' || coalesce(`+pred.SQL+`, false)
+		|| ', ' || ((`+pred.SQL+`) IS TRUE) FROM clusters ORDER BY id`, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"c1: true, true, true", "c2: null, false, false", "c3: null, false, false"}; !slices.Equal(got, want) {
+		t.Errorf("Filter's condition, coalesced and IS TRUE, of a row, of one of a NULL tenant and of one of NULL labels: %q, want %q", got, want)
+	}
+	var kept []string
+	if err := h.pool.QueryRow(ctx, `SELECT array_agg(id ORDER BY id) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(kept, []string{"c1"}) {
+		t.Errorf("Filter keeps %v", kept)
+	}
 }
 
 // A table holding several types is listed through its path's index as one of a type is: each row's
@@ -2537,6 +2588,33 @@ func TestCopyingPrefixesOfOneSliceCopiesItOnce(t *testing.T) {
 	}
 }
 
+// A slice reached at one length with several capacities, as three-index slices of one array are, is
+// copied once, and charged as converting it is, once: copied for each capacity, 100 such slices of
+// an array of 2,000 strings were charged 100 times what converting them was, past what a hook's copy
+// holds, so every constrained call was refused for attributes a check reads; and converted for each
+// capacity, to count as that copy did, they were past what a check converts. Each is the hook's
+// own, as long as its capacity.
+func TestCopyingASliceAtSeveralCapacitiesCostsWhatConvertingItDoes(t *testing.T) {
+	base := make([]string, 2000, 2100)
+	for i := range base {
+		base[i] = "x"
+	}
+	attributes := map[string]any{}
+	for i := range 100 {
+		attributes[fmt.Sprint("s", i)] = base[: len(base) : len(base)+i]
+	}
+	converted, read := rbac.ConvertingCharge(attributes)
+	if copied, ok := rbac.CopyingCharge(attributes); !read || !ok || copied > converted {
+		t.Errorf("read %t, charged %d; copied %t, charged %d", read, converted, ok, copied)
+	}
+	copied := rbac.DeepCopy(attributes)
+	for name := range attributes {
+		if s, _ := copied[name].([]string); len(s) != len(base) || cap(s) != len(s) || &s[0] == &base[0] {
+			t.Fatalf("%s was copied as %d of %d, the host's %t", name, len(s), cap(s), len(s) > 0 && &s[0] == &base[0])
+		}
+	}
+}
+
 // A slice reached again while its elements are copied, shorter and then longer, as by an element
 // holding both, is copied whole wherever it is reached: the shorter copy, given out before the
 // longer replaced it, kept the host's elements, so a hook writing to one wrote to the host's map.
@@ -2688,8 +2766,10 @@ func TestACallGivesAHookTheCopyOfNoValueFreedSince(t *testing.T) {
 // as of a resource holding nearly 40,000 timestamps, which a check converts. Converting counts what JSON
 // text and a packed message decode to as well, which a copy holds as bytes. An array of interfaces
 // costs what it holds, as a slice does: uncounted, a copy of one holding more values than a check
-// converts cost one. And converting counts two slices of one array, one with room to grow, apart,
-// as a copy copies them apart: counted once, lists of them a check converted couldn't be copied.
+// converts cost one. And two slices of one array at one length, one with room to grow, are one list
+// to converting and to a copy, which knows neither by its capacity, and bytes of them a copy copies
+// once, where converting reads each where it lies: copied apart, lists of them a check converted
+// couldn't be copied.
 func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 	type level int
 	type named string
@@ -2763,10 +2843,9 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 		"a pointer":                      func(i int) any { return &i },
 		"a pointer to a pointer":         func(i int) any { p := &i; return &p },
 		"a pointer to a map":             func(i int) any { m := map[string]any{long: i}; return &m },
-		// Two slices of one array, one with room to grow, which a copy copies apart, as appending to
-		// it writes to the array and appending to the other doesn't.
+		// Two slices of one array at one length, one with room to grow, which converting converts
+		// once and a copy copies once.
 		"lists of one array": func(i int) any { l := []any{i, long, nil}; return [2]any{l[:2:2], l[:2]} },
-		"bytes of one array": func(int) any { b := make([]byte, 33, 40); return [2]any{b[:33:33], b} },
 	}
 	for name, made := range messages {
 		values[name] = func(i int) any { return made(i) }
@@ -2824,6 +2903,19 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 			t.Errorf("%s: converting it costs %d, read %t, and copying it %d", name, converted.Charged, converted.Done, copied.Charged)
 		}
 	}
+	// Two slices of bytes of one array, one with room to grow, which a copy copies once, and
+	// converting reads each of where it lies: as many as a check converts are copied, for less.
+	b := make([]byte, 33, 40)
+	ofOneArray := func(int) any { return [2]any{b[:33:33], b} }
+	one := rbac.ConvertingWork(listed(ofOneArray, 1)).Charged
+	each := rbac.ConvertingWork(listed(ofOneArray, 2)).Charged - one
+	for _, n := range []int{1, int((rbac.MaxConverted-one)/each) + 1} {
+		converted, copied := rbac.ConvertingWork(listed(ofOneArray, n)), rbac.CopyingWork(listed(ofOneArray, n))
+		if !converted.Done || !copied.Done || copied.Charged >= converted.Charged {
+			t.Errorf("%d pairs of bytes of one array: converting them costs %d, read %t, and copying them %d, copied %t", n,
+				converted.Charged, converted.Done, copied.Charged, copied.Done)
+		}
+	}
 	var half [rbac.MaxConverted/2 + 1]any
 	if rbac.Copies(map[string]any{"a": half, "b": half}) {
 		t.Error("arrays holding more values than a check converts were copied")
@@ -2857,7 +2949,7 @@ func TestACopyForAHookCountsWhatItHoldsAsConvertingDoes(t *testing.T) {
 // what converting them costs, and no more where they hold JSON text or packed messages, which
 // converting decodes and a copy holds as bytes, a value reached twice, which a copy copies once
 // where converting may count it again, or slices of one array, which a copy copies once for where
-// each starts and its capacity, and converting once for each length too.
+// each starts, whatever its capacity, and converting once for each length, and bytes each time.
 func TestACopyOfAnyShapeCostsWhatConvertingItDoes(t *testing.T) {
 	for _, mode := range []struct {
 		name                      string
@@ -2990,7 +3082,7 @@ func (d *copyDraw) protoValue(depth int) *structpb.Value {
 	case k == 5 && depth > 0:
 		return structpb.NewListValue(d.protoList(depth - 1))
 	case k == 6:
-		return &structpb.Value{Kind: &structpb.Value_StructValue{}}
+		return []*structpb.Value{{Kind: &structpb.Value_StructValue{}}, {Kind: &structpb.Value_ListValue{}}}[d.rng.IntN(2)]
 	default:
 		return &structpb.Value{}
 	}
@@ -3085,7 +3177,7 @@ func (d *copyDraw) value(depth int) any {
 	case 6:
 		v = []any{d.bytes(), []byte(nil), [33]byte{}}[d.rng.IntN(3)]
 	case 7:
-		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Struct)(nil), (*timestamppb.Timestamp)(nil)}[d.rng.IntN(5)]
+		v = []any{(*int)(nil), map[string]any(nil), []any(nil), (*structpb.Value)(nil), (*wrapperspb.StringValue)(nil)}[d.rng.IntN(5)]
 	case 8, 9:
 		v = d.message(1)
 	case 10:
@@ -3104,7 +3196,7 @@ func (d *copyDraw) value(depth int) any {
 	case 16:
 		v = map[string]*structpb.Value{d.text(): d.protoValue(1)}
 	case 17:
-		v = []*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0)), nil}
+		v = []any{[]*timestamppb.Timestamp{timestamppb.New(time.Unix(1, 0))}, []*wrapperspb.Int64Value{wrapperspb.Int64(1), nil}}[d.rng.IntN(2)]
 	case 18:
 		v = []any{map[string]time.Time{d.text(): time.Unix(1, 0)}, map[string][64]int64{d.text(): {}}, map[string][64]int64{}}[d.rng.IntN(3)]
 	case 19:
@@ -3456,6 +3548,16 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		A int
 		_ [0]sync.Mutex
 	}
+	// An empty array of an unsafe pointer, or of a struct embedding a mutex, which is a lock itself,
+	// marks one too.
+	type unsafeMarked struct {
+		A int
+		_ [0]unsafe.Pointer
+	}
+	type embeddingMarked struct {
+		A int
+		_ [0]struct{ sync.Mutex }
+	}
 	type keyed struct {
 		Mu sync.Mutex
 		K  string
@@ -3464,7 +3566,10 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		"a struct holding a mutex beside a map": locked{}, "a pointer to a mutex": &sync.Mutex{}, "a mutex": sync.Mutex{},
 		"a slice of mutexes": []sync.Mutex{{}}, "an array of a struct holding a WaitGroup": [1]struct{ W sync.WaitGroup }{},
 		"an atomic int": &atomic.Int64{}, "a struct marked never to be copied": marked{A: 1},
+		"one marked by an empty array of unsafe pointers": unsafeMarked{A: 1}, "one marked by one of locks it embeds": embeddingMarked{A: 1},
 		"a map keyed by a struct holding a mutex": map[keyed]int{{K: "a"}: 1}, "a message held by value": []structpb.Value{{}},
+		"a map keyed by a struct marked never to be copied": map[marked]int{{A: 1}: 1}, "one an interface key holds": map[any]int{marked{A: 1}: 1},
+		"a map keyed by a struct whose interface it can't set holds a string": map[struct{ a any }]int{{"a"}: 1},
 		"a reflect.Value": reflect.ValueOf(1), "an unsafe pointer": unsafe.Pointer(&x),
 		"a map keyed by a struct holding an unsafe pointer": map[struct{ P unsafe.Pointer }]int{{unsafe.Pointer(&x)}: 1},
 		"a struct holding a slice it can't set":             struct{ tags []string }{[]string{"a"}},
@@ -3491,9 +3596,1187 @@ func TestAHookCopyRefusesWhatItCantCopyInPlace(t *testing.T) {
 		"a time":                                         time.Unix(1, 0),
 		"a lock's interface holding none":                struct{ L sync.Locker }{},
 		"empty arrays of mutexes, which conditions read": [][0]sync.Mutex{{}}, "an array of empty arrays of mutexes": [2][0]sync.Mutex{},
+		// An empty array of funcs, which holds none, marks a struct only never to be compared.
+		"a struct marked never to be compared": struct {
+			A int
+			_ [0]func()
+		}{A: 1},
 	} {
 		if !rbac.Copies(map[string]any{"v": v}) {
 			t.Errorf("%s wasn't copied", name)
+		}
+	}
+}
+
+// A copy finds what copying a struct or an array costs, whether it shares one, whether it can hold
+// one and whether hashing one reads more than it holds in place by walking its type, once for each
+// type, and none of the types an empty array would hold, as it holds none: each found for each value,
+// and along each path through such arrays, copying 100 values of a type nesting two empty arrays of
+// the type before it 20 deep took 19.6 s, and walking the type alone 640 ms. Copying values of a
+// type nesting an empty array of the one before it 32 deep, in a slice, a map and a map's key, and
+// a map of empty arrays of a type nesting arrays of one 32 deep, walks a few types, of those holding
+// them, not the 32 the arrays would hold.
+func TestACopyWalksNoTypeAnEmptyArrayWouldHold(t *testing.T) {
+	n := freshTypes.Add(1)
+	nested, deep := reflect.StructOf([]reflect.StructField{{Name: fmt.Sprint("A", n), Type: reflect.TypeFor[int]()}}), reflect.TypeFor[int]()
+	var empty reflect.Type
+	for range 32 {
+		empty = reflect.ArrayOf(0, nested)
+		nested = reflect.StructOf([]reflect.StructField{{Name: fmt.Sprint("A", n), Type: empty}, {Name: "B", Type: reflect.TypeFor[int]()}})
+		deep = reflect.StructOf([]reflect.StructField{{Name: fmt.Sprint("A", n), Type: reflect.ArrayOf(1, deep)}})
+	}
+	key := reflect.StructOf([]reflect.StructField{{Name: "K", Type: reflect.TypeFor[int]()}, {Name: "E", Type: empty}})
+	keyed := reflect.MakeMap(reflect.MapOf(key, reflect.TypeFor[int]()))
+	keyed.SetMapIndex(reflect.New(key).Elem(), reflect.ValueOf(1))
+	attributes := map[string]any{"l": reflect.MakeSlice(reflect.SliceOf(nested), 2, 2).Interface(), "k": keyed.Interface()}
+	for name, of := range map[string]reflect.Type{"m": empty, "d": reflect.ArrayOf(0, deep)} {
+		m := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), of))
+		m.SetMapIndex(reflect.ValueOf("a"), reflect.New(of).Elem())
+		attributes[name] = m.Interface()
+	}
+	walked := rbac.CountTypesWalked(t)
+	if copied := rbac.Copies(attributes); !copied || *walked > 16 {
+		t.Errorf("copied %t, walking %d types", copied, *walked)
+	}
+}
+
+// freshTypes numbers the types a test makes that no copy has walked, each run.
+var freshTypes atomic.Int64
+
+// spinLock is a lock of the host's own: a pointer to it locks and unlocks, as one to a mutex does.
+type spinLock uint32
+
+func (*spinLock) Lock()   {}
+func (*spinLock) Unlock() {}
+
+// spinLocks is a lock of the host's own that is a slice, so it can be nil.
+type spinLocks []uint32
+
+func (*spinLocks) Lock()   {}
+func (*spinLocks) Unlock() {}
+
+// byteLock is a lock of the host's own that is a byte, which an array or a slice of holds as bytes.
+type byteLock uint8
+
+func (*byteLock) Lock()   {}
+func (*byteLock) Unlock() {}
+
+// A hook's copy shared a channel or a func with the host where it held one but in a struct's
+// unexported field: a constraint sending on its copy's channel sent on the host's, and calling its
+// func ran the host's closure. And a lock of the host's own, as an integer a pointer to which spins,
+// was copied alone, in an array, a slice of arrays or a map of arrays, and refused in an array of
+// arrays, so every constrained call was refused, though conditions read it wherever it lay. Each,
+// and an unsafe pointer, is refused wherever it lies, nil too, alone, in an array, a slice, a map's
+// value or key, a struct's field, or what a pointer or an interface holds, and conditions read none
+// of them, as no hook can be given them: an interface holding a nil lock that is a slice gave a
+// hook the lock, where an array of it was refused, and a lock that is a byte, in an array or a
+// slice, was read as bytes. An empty array holds none of them, and is read and copied, and so is
+// the host's own integer that isn't a lock, wherever it lies, but where no condition reads what
+// holds it.
+func TestConvertingAndCopyingRefuseAChannelAFuncOrALockWhereverItLies(t *testing.T) {
+	ch, x := make(chan int, 1), 1
+	type count uint32
+	// held are values holding v, each as what it is held by.
+	held := func(v any) map[string]any {
+		e := reflect.ValueOf(v)
+		of := func(t reflect.Type) reflect.Value { return reflect.New(t).Elem() }
+		array, arrays := of(reflect.ArrayOf(2, e.Type())), of(reflect.ArrayOf(2, reflect.ArrayOf(2, e.Type())))
+		array.Index(1).Set(e)
+		arrays.Index(1).Set(array)
+		pointer, field := reflect.New(e.Type()), of(reflect.StructOf([]reflect.StructField{{Name: "V", Type: e.Type()}}))
+		pointer.Elem().Set(e)
+		field.Field(0).Set(e)
+		slice := reflect.Append(of(reflect.SliceOf(e.Type())), e)
+		valued := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), e.Type()))
+		valued.SetMapIndex(reflect.ValueOf("a"), e)
+		arrayed := reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), array.Type()))
+		arrayed.SetMapIndex(reflect.ValueOf("a"), array)
+		holders := map[string]any{
+			"alone": v, "in an array": array.Interface(), "in an array of arrays": arrays.Interface(), "in a slice": slice.Interface(),
+			"in a map": valued.Interface(), "in a map of arrays": arrayed.Interface(), "behind a pointer": pointer.Interface(),
+			"in a struct": field.Interface(), "in an interface in a list": []any{v},
+		}
+		if e.Type().Comparable() {
+			for by, key := range map[string]reflect.Value{"as a map's key": e, "in an array as a map's key": array, "in a struct as a map's key": field} {
+				keyed := reflect.MakeMap(reflect.MapOf(key.Type(), reflect.TypeFor[int]()))
+				keyed.SetMapIndex(key, reflect.ValueOf(1))
+				holders[by] = keyed.Interface()
+			}
+			holders["as a key an interface holds"] = map[any]int{v: 1}
+		}
+		return holders
+	}
+	for name, v := range map[string]any{
+		"a channel": ch, "a nil channel": (chan int)(nil), "a func": func() { x++ }, "a nil func": (func())(nil),
+		"a lock of the host's own": spinLock(1), "a nil lock of the host's own that is a slice": spinLocks(nil),
+		"a lock of the host's own that is a byte": byteLock(1), "an unsafe pointer": unsafe.Pointer(&x),
+	} {
+		for by, attribute := range held(v) {
+			attributes := map[string]any{"v": attribute, "ok": true}
+			if _, evaluated := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); evaluated {
+				t.Errorf("%s %s: a condition read its kind", name, by)
+			}
+			if rbac.Copies(attributes) {
+				t.Errorf("%s %s: a hook was given a copy", name, by)
+			}
+		}
+		empty := reflect.New(reflect.ArrayOf(0, reflect.TypeOf(v))).Elem().Interface()
+		attributes := map[string]any{"v": empty, "ok": true}
+		if held, _ := rbac.EvaluateConditionOf(t, `request.attributes.v == [] && request.attributes.ok`, nil, nil, attributes); !held || !rbac.Copies(attributes) {
+			t.Errorf("an empty array of %s: read %t, copied %t", name, held, rbac.Copies(attributes))
+		}
+	}
+	// No condition reads a struct, nor a map keyed by an array or a struct, whatever they hold.
+	unread := map[string]bool{"in a struct": true, "in an array as a map's key": true, "in a struct as a map's key": true}
+	for by, attribute := range held(count(1)) {
+		attributes := map[string]any{"v": attribute, "ok": true}
+		if held, _ := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); !held && !unread[by] {
+			t.Errorf("the host's own integer %s: a condition couldn't read its kind", by)
+		}
+		if !rbac.Copies(attributes) {
+			t.Errorf("the host's own integer %s: no hook was given a copy", by)
+		}
+	}
+}
+
+// A hook's copy sets a map's keys as they are, as a copied key would be another key, under which the
+// hook would find nothing the host passed: so a key that is a pointer, or holds one, gave the hook
+// the host's value, and a constraint writing through it wrote to the host's, and a key whose
+// interface held a pointer or a channel, in a struct or an array, gave it the host's too. No
+// condition reads a map keyed by any of them, as CEL keys are bools, ints, uints and strings, and
+// no hook is given one, empty too where its key's type holds a pointer in place. A key holding a
+// string, a time in UTC or the local zone, or an interface holding one, reaches nothing a hook
+// could write to, and is copied as it is.
+func TestAHookIsGivenNoMapKeyedByWhatReachesTheHost(t *testing.T) {
+	x, ch := 1, make(chan int)
+	type pointing struct{ P *int }
+	type holding struct{ A any }
+	type embedding struct{ holding }
+	for name, m := range map[string]any{
+		"a pointer": map[*int]int{&x: 1}, "pointers, holding none": map[*int]int{}, "a message": map[*structpb.Struct]int{{}: 1},
+		"a struct holding a pointer": map[pointing]int{{&x}: 1}, "an array of pointers": map[[1]*int]int{{&x}: 1},
+		"an interface holding a pointer": map[any]int{"a": 1, &x: 2}, "a struct's interface holding a pointer": map[holding]int{{&x}: 1},
+		"an interface holding such a struct": map[any]int{holding{&x}: 1}, "a struct's interface holding a lock": map[holding]int{{spinLock(1)}: 1},
+		"an array's interface holding a channel": map[[1]any]int{{ch}: 1}, "a struct's interface holding a channel": map[holding]int{{ch}: 1},
+		"an interface holding an array's interface holding a pointer": map[any]int{[1]any{&x}: 1}, "a struct embedding such a struct": map[embedding]int{{holding{&x}}: 1},
+	} {
+		attributes := map[string]any{"m": m, "ok": true}
+		if _, evaluated := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); evaluated {
+			t.Errorf("a map keyed by %s: a condition read its kind", name)
+		}
+		if rbac.Copies(attributes) {
+			t.Errorf("a map keyed by %s: a hook was given a copy", name)
+		}
+	}
+	for name, m := range map[string]any{
+		"a struct whose interface holds a string": map[holding]int{{"a"}: 1, {}: 2}, "an interface holding a time": map[any]int{time.Unix(1, 0): 1},
+		"a struct holding a time": map[struct{ T time.Time }]int{{time.Unix(1, 0)}: 1}, "an array of strings": map[[1]string]int{{"a"}: 1},
+	} {
+		attributes := map[string]any{"m": m}
+		if copied := rbac.DeepCopy(attributes); !reflect.DeepEqual(copied, attributes) {
+			t.Errorf("a map keyed by %s: a hook was given %#v", name, copied)
+		}
+	}
+}
+
+// zonesOf calls each with the zone of each time v reaches, as Location gives it, but nil for UTC.
+func zonesOf(v reflect.Value, each func(*time.Location)) {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			zonesOf(v.Elem(), each)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := range v.Len() {
+			zonesOf(v.Index(i), each)
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			zonesOf(it.Key(), each)
+			zonesOf(it.Value(), each)
+		}
+	case reflect.Struct:
+		if v.Type() == reflect.TypeFor[time.Time]() {
+			each((*time.Location)(v.FieldByName("loc").UnsafePointer()))
+			return
+		}
+		for i := range v.NumField() {
+			zonesOf(v.Field(i), each)
+		}
+	default:
+	}
+}
+
+// A hook's copy of a time held the time's zone, which the zone's methods never write, but which
+// assigning through Location writes whole: a constraint writing `*t.Location() = *time.UTC` to its
+// copy wrote the zone of the host's time, and so of every time in it, the host's and those in other
+// hooks' copies. A time in a zone of the host's own is given in a copy of the zone, wherever it
+// lies, an unexported field and a map's key too, each copy's its own, and its times keep the
+// instant and the zone the host passed.
+func TestAHookWritingTheZoneOfItsTimeWritesNoneOfTheHosts(t *testing.T) {
+	type unexported struct{ at time.Time }
+	type embedding struct{ unexported }
+	for name, holding := range map[string]func(time.Time) any{
+		"alone":                     func(at time.Time) any { return at },
+		"in a list":                 func(at time.Time) any { return []time.Time{at} },
+		"behind a pointer":          func(at time.Time) any { return &at },
+		"in an interface in a list": func(at time.Time) any { return []any{at} },
+		"in a map":                  func(at time.Time) any { return map[string]time.Time{"a": at} },
+		"in a struct":               func(at time.Time) any { return struct{ T time.Time }{at} },
+		"in an unexported field":    func(at time.Time) any { return unexported{at} },
+		"in one of an unexported struct a struct embeds": func(at time.Time) any { return embedding{unexported{at}} },
+		"beside unexported fields of other types":        func(at time.Time) any { return apart{n: 1, s: "a", at: at} },
+		"in one of an exported struct a struct embeds":   func(at time.Time) any { return embeddingInner{Inner: Inner{at: at}} },
+		"as a map's key":                      func(at time.Time) any { return map[time.Time]int{at: 1} },
+		"in a struct as a map's key":          func(at time.Time) any { return map[unexported]int{{at}: 1} },
+		"as a key an interface holds":         func(at time.Time) any { return map[any]int{at: 1} },
+		"in an array a key's interface holds": func(at time.Time) any { return map[any]int{[1]any{at}: 1} },
+		"a CEL timestamp":                     func(at time.Time) any { return types.Timestamp{Time: at} },
+		"CEL timestamps in a list":            func(at time.Time) any { return []types.Timestamp{{Time: at}, {Time: at}} },
+	} {
+		zone := time.FixedZone("host", 3600)
+		at := time.Date(2026, 1, 2, 3, 4, 5, 0, zone)
+		attributes := map[string]any{"v": holding(at)}
+		one, other := rbac.DeepCopy(attributes), rbac.DeepCopy(attributes)
+		if one == nil {
+			t.Errorf("%s wasn't copied", name)
+			continue
+		}
+		var held []*time.Location
+		zonesOf(reflect.ValueOf(one), func(z *time.Location) { held = append(held, z) })
+		for _, z := range held {
+			if z != held[0] || z.String() != "host" {
+				t.Errorf("%s: a copy's times are in %d zones, as %q", name, len(slices.Compact(slices.Clone(held))), z)
+			}
+		}
+		if len(held) == 0 {
+			t.Fatalf("%s: a copy holds no time", name)
+		}
+		*held[0] = *time.UTC
+		zonesOf(reflect.ValueOf(other), func(z *time.Location) {
+			if z.String() != "host" {
+				t.Errorf("%s: writing a copy's zone wrote another copy's", name)
+			}
+		})
+		if zone.String() != "host" || at.Format(time.RFC3339) != "2026-01-02T03:04:05+01:00" {
+			t.Errorf("%s: writing a copy's zone wrote the host's, so its time reads %s", name, at.Format(time.RFC3339))
+		}
+	}
+	// A time in UTC or the local zone is as the host passed it, monotonic reading and all.
+	now := time.Now()
+	for _, v := range []time.Time{now, now.UTC()} {
+		if copied, _ := rbac.DeepCopy(map[string]any{"v": v})["v"].(time.Time); copied != v {
+			t.Errorf("a time in %s was copied as %#v", v.Location(), copied)
+		}
+	}
+}
+
+// ValidateGrant is given a grant's expiry in a copy of its zone, as a constraint is given a time in
+// its copy, whether the host passed it, as Apply's grant, or its clock read it, as an activation's:
+// given as the host passed it, a hook writing `*t.Location() = *time.UTC` wrote the host's zone, so
+// the host's time, and every other in that zone, read an hour off. One in UTC is as the host passed
+// it.
+func TestValidateGrantWritingTheZoneOfAnExpiryWritesNoneOfTheHosts(t *testing.T) {
+	zone := time.FixedZone("host", 3600)
+	at := time.Date(2027, 1, 2, 3, 4, 5, 0, zone)
+	// given are the expiries ValidateGrant was given, as they read when it was asked, and their zones.
+	var given []string
+	var zones []*time.Location
+	h := setup(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			given, zones = append(given, in.Binding.ExpiresAt.Format(time.RFC3339)), append(zones, in.Binding.ExpiresAt.Location())
+			if z := in.Binding.ExpiresAt.Location(); z != time.UTC && z != time.Local {
+				*z = *time.UTC
+			}
+			return validate(ctx, q, in)
+		}
+		c.Now = func() time.Time { return time.Date(2026, 1, 1, 13, 0, 0, 0, zone) }
+	})
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	// Each in the order they run, as an activation needs the eligibility.
+	for _, c := range []struct {
+		name, want string
+		change     func() error
+	}{
+		{"a grant", "2027-01-02T03:04:05+01:00", func() error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("u"), ExpiresAt: at}}})
+		}},
+		{"an eligibility", "2027-01-02T03:04:05+01:00", func() error {
+			return h.authz.SetEligibility(ctx, owner, cluster, rbac.Eligibility{Role: "cluster.sudo", Principal: identity("v"), MaxDuration: time.Hour, ExpiresAt: at})
+		}},
+		{"an activation", "2026-01-01T14:00:00+01:00", func() error {
+			_, err := h.authz.Activate(ctx, h.as(t, "v"), cluster, rbac.Activation{Role: "cluster.sudo", Duration: time.Hour, Justification: "on call"})
+			return err
+		}},
+	} {
+		given, zones = nil, nil
+		if err := c.change(); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if len(given) == 0 || given[0] != c.want || zones[0] == zone {
+			t.Errorf("%s: ValidateGrant was given %v, the host's zone %t", c.name, given, len(zones) > 0 && zones[0] == zone)
+		}
+		if zone.String() != "host" || at.Format(time.RFC3339) != "2027-01-02T03:04:05+01:00" {
+			t.Fatalf("%s: writing the zone of ValidateGrant's expiry wrote the host's, so its time reads %s", c.name, at.Format(time.RFC3339))
+		}
+	}
+	given, zones = nil, nil
+	if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("w"), ExpiresAt: at.UTC()}}}); err != nil ||
+		len(zones) != 1 || zones[0] != time.UTC {
+		t.Errorf("an expiry in UTC was given as %v: %v", given, err)
+	}
+}
+
+// A time in the local zone the process started in, where the host has since set time.Local to
+// another, is in a zone of the host's own, which a copy copies, loading it first: copied as it lay,
+// before anything had loaded it, it read as UTC where the host's read as the zone the process
+// started in. It runs in a child process, in which nothing has loaded the zone yet.
+func TestACopyOfATimeInTheLocalZoneTheHostSetAsideReadsAsTheHostsDoes(t *testing.T) {
+	if os.Getenv("RBAC_COPY_LOCAL_ZONE") != "" {
+		at := time.Unix(1, 0)
+		time.Local = time.FixedZone("elsewhere", 7200)
+		copied, _ := rbac.DeepCopy(map[string]any{"v": at})["v"].(time.Time)
+		if copied.Format(time.RFC3339) != at.Format(time.RFC3339) {
+			t.Errorf("a time the host reads as %s was copied as %s", at.Format(time.RFC3339), copied.Format(time.RFC3339))
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestACopyOfATimeInTheLocalZoneTheHostSetAsideReadsAsTheHostsDoes$")
+	cmd.Env = append(os.Environ(), "RBAC_COPY_LOCAL_ZONE=1", "TZ=Asia/Tokyo")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("%v\n%.2000s", err, out)
+	}
+}
+
+// Types of the host's own a draw holds: a lock that is a map, structs marked never to be copied, by
+// an empty array of a mutex, or never to be compared, by one of funcs, one holding an empty array
+// of what holds a lock, one embedding a mutex, one that is a message by the Struct it embeds, one
+// holding unexported fields a copy sets whole, a time among them, beside exported ones it copies,
+// one embedding it unexported, which promotes its exported fields, and one embedding an exported
+// struct holding an unexported time.
+type (
+	spinLockMap  map[string]int
+	markedStruct struct {
+		_ [0]sync.Mutex
+		A int
+	}
+	uncomparedStruct struct {
+		_ [0]func()
+		A int
+	}
+	waitMarkedStruct struct {
+		_ [0]sync.WaitGroup
+		A int
+	}
+	lockingStruct struct {
+		sync.Mutex
+		A int
+	}
+	embeddedMessage struct {
+		*structpb.Struct
+		C chan int
+	}
+	apart struct {
+		n  int
+		s  string
+		at time.Time
+		P  *int
+		M  map[string]int
+		S  []string
+	}
+	embeddingApart struct {
+		apart
+		B int
+	}
+	Inner struct {
+		P  *int
+		at time.Time
+	}
+	embeddingInner struct {
+		Inner
+		C []byte
+	}
+)
+
+func (*spinLockMap) Lock()   {}
+func (*spinLockMap) Unlock() {}
+
+// shapeDraw draws a type a host may pass, and values of it, from drawnLeaves, held alone, in arrays
+// of none, one or two, arrays of arrays, slices, some with room past their length, pointers, maps
+// keyed by each of drawnKeys, pointers, times and structs or arrays holding a pointer, a time or an
+// interface among them, structs, by a field or embedding it, and interfaces holding any of them;
+// times in UTC, the local zone, a zone many share or one of their own; and messages holding bytes,
+// lists, maps, oneofs, extensions and unknown fields of each.
+type shapeDraw struct{ rng *mathrand.Rand }
+
+var drawnLeaves = []reflect.Type{
+	reflect.TypeFor[int](), reflect.TypeFor[string](), reflect.TypeFor[bool](), reflect.TypeFor[float64](), reflect.TypeFor[uint8](),
+	reflect.TypeFor[complex128](), reflect.TypeFor[uintptr](), reflect.TypeFor[[]byte](), reflect.TypeFor[[2]byte](),
+	reflect.TypeFor[time.Time](), reflect.TypeFor[any](), reflect.TypeFor[chan int](), reflect.TypeFor[func()](),
+	reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[sync.Mutex](), reflect.TypeFor[atomic.Int64](), reflect.TypeFor[struct{ A int }](),
+	reflect.TypeFor[struct{ L sync.Locker }](), reflect.TypeFor[spinLock](), reflect.TypeFor[spinLocks](), reflect.TypeFor[spinLockMap](),
+	reflect.TypeFor[byteLock](),
+	reflect.TypeFor[markedStruct](), reflect.TypeFor[uncomparedStruct](), reflect.TypeFor[waitMarkedStruct](),
+	reflect.TypeFor[lockingStruct](), reflect.TypeFor[*embeddedMessage](), reflect.TypeFor[*structpb.Struct](),
+	reflect.TypeFor[*structpb.ListValue](), reflect.TypeFor[*structpb.Value](), reflect.TypeFor[*timestamppb.Timestamp](),
+	reflect.TypeFor[*durationpb.Duration](), reflect.TypeFor[*wrapperspb.StringValue](), reflect.TypeFor[*anypb.Any](),
+	reflect.TypeFor[*dynamicpb.Message](), reflect.TypeFor[*wrapperspb.BytesValue](), reflect.TypeFor[*descriptorpb.FeatureSet](),
+	reflect.TypeFor[apart](), reflect.TypeFor[embeddingApart](), reflect.TypeFor[embeddingInner](), reflect.TypeFor[types.Timestamp](),
+	reflect.TypeFor[json.RawMessage](), reflect.TypeFor[*reflectionOf](), reflect.TypeFor[*big.Int](), reflect.TypeFor[*url.URL](),
+}
+
+var drawnKeys = []reflect.Type{
+	reflect.TypeFor[string](), reflect.TypeFor[int](), reflect.TypeFor[bool](), reflect.TypeFor[float64](), reflect.TypeFor[any](),
+	reflect.TypeFor[spinLock](), reflect.TypeFor[[1]int](), reflect.TypeFor[[1]spinLock](), reflect.TypeFor[struct{ A int }](),
+	reflect.TypeFor[chan int](), reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[byteLock](), reflect.TypeFor[*int](),
+	reflect.TypeFor[struct{ P *int }](), reflect.TypeFor[[1]*int](), reflect.TypeFor[struct{ A any }](), reflect.TypeFor[[1]any](),
+	reflect.TypeFor[struct{ T time.Time }](), reflect.TypeFor[time.Time](), reflect.TypeFor[struct{ t time.Time }](),
+	reflect.TypeFor[types.Timestamp](),
+}
+
+func (d *shapeDraw) typ(depth int) reflect.Type {
+	if depth == 0 || d.rng.IntN(4) == 0 {
+		return drawnLeaves[d.rng.IntN(len(drawnLeaves))]
+	}
+	held := d.typ(depth - 1)
+	switch d.rng.IntN(7) {
+	case 0:
+		return reflect.ArrayOf(d.rng.IntN(3), held)
+	case 1:
+		return reflect.ArrayOf(d.rng.IntN(2)+1, reflect.ArrayOf(d.rng.IntN(3), held))
+	case 2:
+		return reflect.SliceOf(held)
+	case 3:
+		return reflect.PointerTo(held)
+	case 4:
+		return reflect.MapOf(reflect.TypeFor[string](), held)
+	case 5:
+		return reflect.MapOf(drawnKeys[d.rng.IntN(len(drawnKeys))], held)
+	default:
+		return d.structOf(held)
+	}
+}
+
+// structOf is a struct holding a value of type held, embedded at times where held is named and
+// exported, or a pointer to such, as StructOf embeds one, so the struct has its methods.
+func (d *shapeDraw) structOf(held reflect.Type) (t reflect.Type) {
+	named, field := held, reflect.StructField{Name: "F", Type: held}
+	if named.Kind() == reflect.Pointer {
+		named = named.Elem()
+	}
+	if d.rng.IntN(2) == 0 || !token.IsExported(named.Name()) {
+		return reflect.StructOf([]reflect.StructField{field})
+	}
+	defer func() {
+		if recover() != nil {
+			t = reflect.StructOf([]reflect.StructField{field})
+		}
+	}()
+	return reflect.StructOf([]reflect.StructField{{Name: named.Name(), Type: held, Anonymous: true}})
+}
+
+// value is a value of t, its zero value at times, as nil slices, maps, pointers and interfaces.
+func (d *shapeDraw) value(t reflect.Type, depth int) reflect.Value {
+	v := reflect.New(t).Elem()
+	if d.rng.IntN(5) == 0 {
+		return v
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int64:
+		v.SetInt(int64(d.rng.IntN(3)))
+	case reflect.Uint8, reflect.Uint32, reflect.Uintptr:
+		v.SetUint(uint64(d.rng.IntN(3)))
+	case reflect.String:
+		v.SetString([]string{"a", "b", ""}[d.rng.IntN(3)])
+	case reflect.Bool:
+		v.SetBool(true)
+	case reflect.Float64:
+		v.SetFloat(0.5)
+	case reflect.Complex128:
+		v.SetComplex(1i)
+	case reflect.Chan:
+		v.Set(reflect.MakeChan(t, 1))
+	case reflect.Func:
+		v.Set(reflect.MakeFunc(t, func([]reflect.Value) []reflect.Value { return nil }))
+	case reflect.UnsafePointer:
+		v.SetPointer(unsafe.Pointer(new(int)))
+	case reflect.Interface:
+		held := append(drawnLeaves[:len(drawnLeaves):len(drawnLeaves)], drawnKeys...)[d.rng.IntN(len(drawnLeaves)+len(drawnKeys))]
+		if held.Kind() != reflect.Interface && held.AssignableTo(t) && depth > 0 {
+			v.Set(d.value(held, depth-1))
+		}
+	case reflect.Array:
+		for i := range t.Len() {
+			v.Index(i).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Slice:
+		// Room past its length holds values too, which a copy's elements are none of.
+		n, room := d.rng.IntN(3), d.rng.IntN(2)
+		v.Set(reflect.MakeSlice(t, n, n+room))
+		for i, all := 0, v.Slice3(0, n+room, n+room); i < all.Len(); i++ {
+			all.Index(i).Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Map:
+		v.Set(reflect.MakeMap(t))
+		for range d.rng.IntN(3) {
+			if k := d.value(t.Key(), depth-1); k.Comparable() {
+				v.SetMapIndex(k, d.value(t.Elem(), depth-1))
+			}
+		}
+	case reflect.Pointer:
+		if m := d.message(t); m != nil {
+			v.Set(reflect.ValueOf(m))
+		} else {
+			v.Set(reflect.New(t.Elem()))
+			v.Elem().Set(d.value(t.Elem(), depth-1))
+		}
+	case reflect.Struct:
+		switch t {
+		case reflect.TypeFor[time.Time]():
+			v.Set(reflect.ValueOf(d.time()))
+			return v
+		case reflect.TypeFor[types.Timestamp]():
+			v.Set(reflect.ValueOf(types.Timestamp{Time: d.time()}))
+			return v
+		}
+		// An unexported field is set as the host's own code sets it.
+		for i := range t.NumField() {
+			f := v.Field(i)
+			if !f.CanSet() {
+				f = reflect.NewAt(f.Type(), f.Addr().UnsafePointer()).Elem()
+			}
+			f.Set(d.value(t.Field(i).Type, depth-1))
+		}
+	default:
+	}
+	return v
+}
+
+// message is a message of type t, a Struct, at times holding fields it doesn't know, and a ListValue
+// holding a nil Value, a Value of each kind but a number, and one of a nil Struct or ListValue, a
+// dynamic holder, a dynamic message made without its type, bytes, and generated features holding
+// an extension, or nil where t isn't a message's type.
+func (d *shapeDraw) message(t reflect.Type) proto.Message {
+	switch t {
+	case reflect.TypeFor[*structpb.Struct]():
+		s := &structpb.Struct{Fields: map[string]*structpb.Value{"a": nil}}
+		if d.rng.IntN(2) == 0 {
+			s.ProtoReflect().SetUnknown(protowire.AppendBytes(protowire.AppendTag(nil, 300, protowire.BytesType), []byte{1, 2}))
+		}
+		return s
+	case reflect.TypeFor[*structpb.ListValue]():
+		return &structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("a"), nil}}
+	case reflect.TypeFor[*structpb.Value]():
+		return []*structpb.Value{
+			structpb.NewNullValue(), {Kind: &structpb.Value_StructValue{}}, {Kind: &structpb.Value_ListValue{}}, structpb.NewBoolValue(true),
+		}[d.rng.IntN(4)]
+	case reflect.TypeFor[*timestamppb.Timestamp]():
+		return timestamppb.New(time.Unix(5, 0))
+	case reflect.TypeFor[*durationpb.Duration]():
+		return durationpb.New(time.Second)
+	case reflect.TypeFor[*wrapperspb.StringValue]():
+		return wrapperspb.String("a")
+	case reflect.TypeFor[*anypb.Any]():
+		packed, err := anypb.New(structpb.NewStringValue("a"))
+		if err != nil {
+			panic(err)
+		}
+		return packed
+	case reflect.TypeFor[*embeddedMessage]():
+		return &embeddedMessage{Struct: &structpb.Struct{}}
+	case reflect.TypeFor[*dynamicpb.Message]():
+		switch d.rng.IntN(4) {
+		case 0:
+			return &dynamicpb.Message{}
+		case 1, 2:
+			return d.holder(d.rng.IntN(3))
+		}
+		return dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())
+	case reflect.TypeFor[*wrapperspb.BytesValue]():
+		return wrapperspb.Bytes([]byte{1, byte(d.rng.IntN(256))})
+	case reflect.TypeFor[*descriptorpb.FeatureSet]():
+		features := &descriptorpb.FeatureSet{FieldPresence: descriptorpb.FeatureSet_EXPLICIT.Enum()}
+		proto.SetExtension(features, gofeaturespb.E_Go, &gofeaturespb.GoFeatures{LegacyUnmarshalJsonEnum: proto.Bool(true)})
+		features.ProtoReflect().SetUnknown(protowire.AppendVarint(protowire.AppendTag(nil, 9999, protowire.VarintType), 7))
+		return features
+	}
+	return nil
+}
+
+// time is a time in UTC, in the local zone, in a zone many times share, or in one of its own.
+func (d *shapeDraw) time() time.Time {
+	at := time.Unix(int64(d.rng.IntN(100)), 0)
+	switch d.rng.IntN(4) {
+	case 0:
+		return at.UTC()
+	case 1:
+		return at
+	case 2:
+		return at.In(drawnZone)
+	default:
+		return at.In(time.FixedZone("own", 3600))
+	}
+}
+
+// drawnZone is the zone times a draw holds share.
+var drawnZone = time.FixedZone("shared", 2*3600)
+
+// holder is a dynamic message of holderType, holding bytes alone, in a list, in a map and in a
+// oneof, and as extensions, and messages of its own type, alone, in a list, in a map, in the oneof
+// and as an extension, depth deep, and unknown fields.
+func (d *shapeDraw) holder(depth int) *dynamicpb.Message {
+	m := dynamicpb.NewMessage(holderType)
+	fields, key := holderType.Fields(), protoreflect.ValueOfString("k").MapKey()
+	some := func() protoreflect.Value { return protoreflect.ValueOfBytes([]byte{byte(d.rng.IntN(256)), 1}) }
+	m.Set(fields.ByName("b"), some())
+	m.Mutable(fields.ByName("rb")).List().Append(some())
+	m.Mutable(fields.ByName("mb")).Map().Set(key, some())
+	m.Set(holderExtensions[0].TypeDescriptor(), some())
+	m.Mutable(holderExtensions[2].TypeDescriptor()).List().Append(some())
+	if depth > 0 {
+		m.Set(fields.ByName("m"), protoreflect.ValueOfMessage(d.holder(depth-1)))
+		m.Mutable(fields.ByName("rm")).List().Append(protoreflect.ValueOfMessage(d.holder(depth - 1)))
+		m.Mutable(fields.ByName("mm")).Map().Set(key, protoreflect.ValueOfMessage(d.holder(depth-1)))
+		m.Set(holderExtensions[1].TypeDescriptor(), protoreflect.ValueOfMessage(d.holder(depth-1)))
+	}
+	if depth > 0 && d.rng.IntN(2) == 0 {
+		m.Set(fields.ByName("om"), protoreflect.ValueOfMessage(d.holder(depth-1)))
+	} else {
+		m.Set(fields.ByName("ob"), some())
+	}
+	m.SetUnknown(protowire.AppendBytes(protowire.AppendTag(nil, 300, protowire.BytesType), []byte{byte(d.rng.IntN(256))}))
+	return m
+}
+
+// holderType is a message holding bytes and messages of its own type in each place a message can
+// hold a field, and holderExtensions its extensions: bytes, one of its own type, and a list of
+// bytes.
+var holderType, holderExtensions = func() (protoreflect.MessageDescriptor, []protoreflect.ExtensionType) {
+	optional, repeated := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(), descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+	bytes, message, text := descriptorpb.FieldDescriptorProto_TYPE_BYTES.Enum(), descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(),
+		descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum()
+	field := func(name string, n int32, label *descriptorpb.FieldDescriptorProto_Label, typ *descriptorpb.FieldDescriptorProto_Type, of string) *descriptorpb.FieldDescriptorProto {
+		f := &descriptorpb.FieldDescriptorProto{Name: proto.String(name), Number: proto.Int32(n), Label: label, Type: typ}
+		if of != "" {
+			f.TypeName = proto.String(of)
+		}
+		return f
+	}
+	entry := func(name string, typ *descriptorpb.FieldDescriptorProto_Type, of string) *descriptorpb.DescriptorProto {
+		return &descriptorpb.DescriptorProto{
+			Name:    proto.String(name),
+			Field:   []*descriptorpb.FieldDescriptorProto{field("key", 1, optional, text, ""), field("value", 2, optional, typ, of)},
+			Options: &descriptorpb.MessageOptions{MapEntry: proto.Bool(true)},
+		}
+	}
+	const holder = ".rbactest.Holder"
+	ob, om := field("ob", 3, optional, bytes, ""), field("om", 4, optional, message, holder)
+	ob.OneofIndex, om.OneofIndex = proto.Int32(0), proto.Int32(0)
+	extensions := []*descriptorpb.FieldDescriptorProto{
+		field("xb", 100, optional, bytes, ""), field("xm", 101, optional, message, holder), field("xr", 102, repeated, bytes, ""),
+	}
+	for _, x := range extensions {
+		x.Extendee = proto.String(holder)
+	}
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name: proto.String("rbactest/holder.proto"), Package: proto.String("rbactest"), Syntax: proto.String("proto2"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Holder"),
+			Field: []*descriptorpb.FieldDescriptorProto{
+				field("mb", 1, repeated, message, holder+".MbEntry"), field("rb", 2, repeated, bytes, ""), ob, om,
+				field("b", 5, optional, bytes, ""), field("m", 6, optional, message, holder),
+				field("rm", 7, repeated, message, holder), field("mm", 8, repeated, message, holder+".MmEntry"),
+			},
+			NestedType:     []*descriptorpb.DescriptorProto{entry("MbEntry", bytes, ""), entry("MmEntry", message, holder)},
+			OneofDecl:      []*descriptorpb.OneofDescriptorProto{{Name: proto.String("o")}},
+			ExtensionRange: []*descriptorpb.DescriptorProto_ExtensionRange{{Start: proto.Int32(100), End: proto.Int32(200)}},
+		}},
+		Extension: extensions,
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+	var made []protoreflect.ExtensionType
+	for i := range file.Extensions().Len() {
+		made = append(made, dynamicpb.NewExtensionType(file.Extensions().Get(i)))
+	}
+	return file.Messages().Get(0), made
+}()
+
+// nilUnread reports whether the zero value of t is, or holds in place, a nil message no condition
+// reads, as CEL reads it as another value than null.
+func nilUnread(t reflect.Type) bool {
+	switch t {
+	case reflect.TypeFor[*structpb.Struct](), reflect.TypeFor[*structpb.ListValue](), reflect.TypeFor[*timestamppb.Timestamp](),
+		reflect.TypeFor[*durationpb.Duration](), reflect.TypeFor[*anypb.Any]():
+		return true
+	}
+	return t.Kind() == reflect.Array && t.Len() > 0 && nilUnread(t.Elem())
+}
+
+// generated reports whether t is the type of a message protobuf makes, whose state is protobuf's.
+func generated(t reflect.Type) bool {
+	return t.Kind() == reflect.Pointer && t.Implements(reflect.TypeFor[proto.Message]()) && t != reflect.TypeFor[*embeddedMessage]()
+}
+
+// holdsAny reports whether v holds an Any, which a copy holds as bytes, so charged less.
+func holdsAny(v reflect.Value) bool {
+	if !v.IsValid() {
+		return false
+	}
+	if generated(v.Type()) {
+		return v.Type() == reflect.TypeFor[*anypb.Any]()
+	}
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		return !v.IsNil() && holdsAny(v.Elem())
+	case reflect.Array, reflect.Slice:
+		for i := range v.Len() {
+			if holdsAny(v.Index(i)) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if holdsAny(it.Value()) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if holdsAny(v.Field(i)) {
+				return true
+			}
+		}
+	default:
+	}
+	return false
+}
+
+// startsShared reports whether v holds two slices of one type starting at one place at two lengths,
+// or two of bytes at any, which a copy copies once, at the longer, and converting at each length,
+// and bytes each time, as slices of values of no size, and empty ones, all start at one place.
+func startsShared(v reflect.Value, lengths map[[2]any]int) bool {
+	if !v.IsValid() {
+		return false
+	}
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		return !v.IsNil() && startsShared(v.Elem(), lengths)
+	case reflect.Slice:
+		at := [2]any{v.Type(), v.Pointer()}
+		if n, ok := lengths[at]; v.IsNil() || ok && (n != v.Len() || v.Type().Elem().Kind() == reflect.Uint8) {
+			return !v.IsNil()
+		}
+		lengths[at] = v.Len()
+		fallthrough
+	case reflect.Array:
+		for i := range v.Len() {
+			if startsShared(v.Index(i), lengths) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if startsShared(it.Value(), lengths) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if startsShared(v.Field(i), lengths) {
+				return true
+			}
+		}
+	default:
+	}
+	return false
+}
+
+// unshared is the channel, func, unsafe pointer or lock v, a hook's copy, holds, or a pointer a
+// map's key holds, which is the host's, as a key is given as it is, or empty for none: a message's
+// own state is protobuf's, and a time's zone, which writing tells apart (written), is the copy's or
+// the process's.
+func unshared(v reflect.Value, key bool, seen map[uintptr]bool) string {
+	if !v.IsValid() || v.Type() == reflect.TypeFor[time.Time]() {
+		return ""
+	}
+	t, locker := v.Type(), reflect.TypeFor[sync.Locker]()
+	switch {
+	case t.Kind() == reflect.Chan || t.Kind() == reflect.Func || t.Kind() == reflect.UnsafePointer:
+		return t.String()
+	case reflect.PointerTo(t).Implements(locker) && !t.Implements(locker):
+		return "a lock, " + t.String()
+	case t.Kind() == reflect.Pointer && key && !v.IsNil():
+		return "a pointer in a map's key, " + t.String()
+	case t.Kind() == reflect.Pointer && (v.IsNil() || seen[v.Pointer()] || generated(t)):
+		return ""
+	}
+	switch v.Kind() {
+	case reflect.Pointer:
+		seen[v.Pointer()] = true
+		return unshared(v.Elem(), key, seen)
+	case reflect.Interface:
+		if v.IsNil() {
+			return ""
+		}
+		return unshared(v.Elem(), key, seen)
+	case reflect.Array, reflect.Slice:
+		for i := range v.Len() {
+			if held := unshared(v.Index(i), key, seen); held != "" {
+				return held
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if held := cmp.Or(unshared(it.Key(), true, seen), unshared(it.Value(), key, seen)); held != "" {
+				return held
+			}
+		}
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if held := unshared(v.Field(i), key, seen); held != "" {
+				return held
+			}
+		}
+	default:
+	}
+	return ""
+}
+
+// fingerprint is all v reaches, in order, unexported fields and the room past a slice's length too,
+// and a message as protobuf encodes it, so writing anything v reaches changes it.
+func fingerprint(b *strings.Builder, v reflect.Value) {
+	if !v.IsValid() {
+		b.WriteString("none")
+		return
+	}
+	t := v.Type()
+	if generated(t) && t.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			b.WriteString("nil")
+			return
+		}
+		m, _ := reflect.NewAt(t.Elem(), v.UnsafePointer()).Interface().(proto.Message)
+		fmt.Fprintf(b, "%s(%s)", t, encoded(m))
+		return
+	}
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			b.WriteString("nil")
+			return
+		}
+		fmt.Fprintf(b, "%s(", v.Elem().Type())
+		fingerprint(b, v.Elem())
+		b.WriteString(")")
+	case reflect.Slice, reflect.Array:
+		if t.Kind() == reflect.Slice {
+			if v.IsNil() {
+				b.WriteString("nil")
+				return
+			}
+			fmt.Fprintf(b, "%d of ", v.Len())
+			v = v.Slice3(0, v.Cap(), v.Cap())
+		}
+		b.WriteString("[")
+		for i := range v.Len() {
+			fingerprint(b, v.Index(i))
+			b.WriteString(" ")
+		}
+		b.WriteString("]")
+	case reflect.Map:
+		if v.IsNil() {
+			b.WriteString("nil")
+			return
+		}
+		var entries []string
+		for it := v.MapRange(); it.Next(); {
+			var entry strings.Builder
+			fingerprint(&entry, it.Key())
+			entry.WriteString(": ")
+			fingerprint(&entry, it.Value())
+			entries = append(entries, entry.String())
+		}
+		slices.Sort(entries)
+		fmt.Fprintf(b, "{%s}", strings.Join(entries, ", "))
+	case reflect.Struct:
+		b.WriteString("{")
+		for i := range v.NumField() {
+			fingerprint(b, v.Field(i))
+			b.WriteString(" ")
+		}
+		b.WriteString("}")
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		fmt.Fprintf(b, "%#x", v.Pointer())
+	case reflect.String:
+		fmt.Fprintf(b, "%q", v.String())
+	case reflect.Bool:
+		fmt.Fprint(b, v.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fmt.Fprint(b, v.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		fmt.Fprint(b, v.Uint())
+	case reflect.Float32, reflect.Float64:
+		fmt.Fprint(b, v.Float())
+	case reflect.Complex64, reflect.Complex128:
+		fmt.Fprint(b, v.Complex())
+	default:
+		b.WriteString(t.String())
+	}
+}
+
+// encoded is m as protobuf encodes it, or why it can't, as a dynamic message made without its type
+// panics.
+func encoded(m proto.Message) (text string) {
+	defer func() {
+		if r := recover(); r != nil {
+			text = fmt.Sprint("panicked: ", r)
+		}
+	}()
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	return fmt.Sprintf("%x %v", b, err)
+}
+
+// fingerprintOf is fingerprint of v.
+func fingerprintOf(v any) string {
+	var b strings.Builder
+	fingerprint(&b, reflect.ValueOf(&v).Elem())
+	return b.String()
+}
+
+// written writes all a hook could write through v, its copy: each value it can set, by
+// reflection or by the methods of a type of the host's own, which set unexported fields too; what
+// each pointer, slice, map, interface and message reaches, the room past a slice's length, a map's
+// new entries and a message's bytes in place among them; and each time's zone, as assigning through
+// Location does, but UTC's and the local zone, which are the process's.
+func written(v reflect.Value) {
+	if !v.IsValid() {
+		return
+	}
+	t := v.Type()
+	if generated(t) && t.Kind() == reflect.Pointer {
+		if !v.IsNil() {
+			m, _ := reflect.NewAt(t.Elem(), v.UnsafePointer()).Interface().(proto.Message)
+			writtenMessage(m.ProtoReflect())
+		}
+		return
+	}
+	// Where v lies in memory, as a method of the host's type writing an unexported field writes it.
+	w, settable := v, v.CanSet()
+	if !settable && v.CanAddr() {
+		w, settable = reflect.NewAt(t, v.Addr().UnsafePointer()).Elem(), true
+	}
+	switch t.Kind() {
+	case reflect.Bool:
+		if settable {
+			w.SetBool(!w.Bool())
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if settable {
+			w.SetInt(w.Int() ^ 1)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if settable {
+			w.SetUint(w.Uint() ^ 1)
+		}
+	case reflect.Float32, reflect.Float64:
+		if settable {
+			w.SetFloat(w.Float() + 1)
+		}
+	case reflect.Complex64, reflect.Complex128:
+		if settable {
+			w.SetComplex(w.Complex() + 1)
+		}
+	case reflect.String:
+		if settable {
+			w.SetString(w.String() + " written")
+		}
+	case reflect.Pointer:
+		if !v.IsNil() {
+			written(reflect.NewAt(t.Elem(), v.UnsafePointer()).Elem())
+		}
+	case reflect.Interface:
+		if !v.IsNil() {
+			written(v.Elem())
+		}
+	case reflect.Slice:
+		if !v.IsNil() {
+			for i, all := 0, v.Slice3(0, v.Cap(), v.Cap()); i < all.Len(); i++ {
+				written(all.Index(i))
+			}
+		}
+	case reflect.Array:
+		for i := range v.Len() {
+			written(w.Index(i))
+		}
+	case reflect.Map:
+		if v.IsNil() {
+			return
+		}
+		at := v.UnsafePointer()
+		m := reflect.NewAt(t, unsafe.Pointer(&at)).Elem()
+		for _, k := range slices.Collect(m.Seq()) {
+			written(k)
+			e := reflect.New(t.Elem()).Elem()
+			e.Set(m.MapIndex(k))
+			written(e)
+			m.SetMapIndex(k, e)
+		}
+		if k := reflect.New(t.Key()).Elem(); !m.MapIndex(k).IsValid() {
+			m.SetMapIndex(k, reflect.New(t.Elem()).Elem())
+		}
+	case reflect.Struct:
+		if t == reflect.TypeFor[time.Time]() {
+			if zone := (*time.Location)(v.FieldByName("loc").UnsafePointer()); zone != nil && zone != time.UTC && zone != time.Local {
+				*zone = *time.FixedZone("written", 7*3600)
+			}
+			if settable {
+				w.Set(reflect.ValueOf(time.Unix(12345, 0)))
+			}
+			return
+		}
+		own := t.PkgPath() == "" || t.PkgPath() == reflect.TypeFor[apart]().PkgPath()
+		for i := range v.NumField() {
+			if t.Field(i).IsExported() || own {
+				written(w.Field(i))
+			}
+		}
+		// Another package's struct is written whole, as assigning to it does.
+		if settable && !own {
+			w.Set(reflect.New(t).Elem())
+		}
+	default:
+	}
+}
+
+// writtenMessage writes all a hook could write through m, a message of its copy, by its reflection:
+// each field, each element and entry, in place too where it is bytes, new ones, and the fields it
+// doesn't know, in place too.
+func writtenMessage(m protoreflect.Message) {
+	if !m.IsValid() {
+		return
+	}
+	type field struct {
+		fd protoreflect.FieldDescriptor
+		v  protoreflect.Value
+	}
+	var fields []field
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		fields = append(fields, field{fd, v})
+		return true
+	})
+	other := func(fd protoreflect.FieldDescriptor, v protoreflect.Value) protoreflect.Value {
+		switch fd.Kind() {
+		case protoreflect.BytesKind:
+			if b := v.Bytes(); len(b) > 0 {
+				b[0] ^= 0xff
+			}
+			return protoreflect.ValueOfBytes([]byte("written"))
+		case protoreflect.StringKind:
+			return protoreflect.ValueOfString(v.String() + " written")
+		case protoreflect.BoolKind:
+			return protoreflect.ValueOfBool(!v.Bool())
+		case protoreflect.EnumKind:
+			return protoreflect.ValueOfEnum(v.Enum() + 1)
+		default:
+			return fd.Default()
+		}
+	}
+	held := func(fd protoreflect.FieldDescriptor) bool {
+		return fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind
+	}
+	for _, f := range fields {
+		switch {
+		case f.fd.IsList():
+			l := m.Mutable(f.fd).List()
+			for i := range l.Len() {
+				if held(f.fd) {
+					writtenMessage(l.Get(i).Message())
+				} else {
+					l.Set(i, other(f.fd, l.Get(i)))
+				}
+			}
+			l.Append(l.NewElement())
+		case f.fd.IsMap():
+			entries := m.Mutable(f.fd).Map()
+			var keys []protoreflect.MapKey
+			entries.Range(func(k protoreflect.MapKey, _ protoreflect.Value) bool {
+				keys = append(keys, k)
+				return true
+			})
+			for _, k := range keys {
+				if held(f.fd.MapValue()) {
+					writtenMessage(entries.Mutable(k).Message())
+				} else {
+					entries.Set(k, other(f.fd.MapValue(), entries.Get(k)))
+				}
+			}
+			entries.Set(protoreflect.ValueOfString("written").MapKey(), entries.NewValue())
+		case held(f.fd):
+			writtenMessage(m.Mutable(f.fd).Message())
+		default:
+			m.Set(f.fd, other(f.fd, f.v))
+		}
+	}
+	if unknown := m.GetUnknown(); len(unknown) > 0 {
+		unknown[0] ^= 0xff
+		m.SetUnknown(protowire.AppendVarint(protowire.AppendTag(slices.Clip(unknown), 9998, protowire.VarintType), 1))
+	}
+}
+
+// Converting and copying agree on every type a host may pass, a channel, a func, a lock, a mark
+// never to copy or compare and a nil message among them, wherever it lies: no condition reads a
+// value of a type a check refuses by its type, empty or nil too, and a condition reads the zero
+// value of any other, but where it is or holds in place a nil message CEL reads as another value;
+// a hook is given a copy of every value a condition reads, charged as converting it is, or less
+// where it holds an Any, whose packed bytes it holds, or a slice at two lengths, or two slices of
+// bytes starting at one place, which it copies once; no copy holds a channel, a func, an unsafe pointer or a lock, nor a map whose key holds a
+// pointer, in place or in an interface; and a hook writing all its copy reaches, as reflection and
+// the methods of the host's types can, writes nothing of the host's, nor of another hook's copy. An
+// interface holding a nil lock of the host's own that is a slice gave a hook the lock, where one
+// held directly was refused, a map keyed by a pointer, or by a struct or an array whose interface
+// held a pointer or a channel, gave a hook the host's, a time gave it the host's zone, a slice
+// reached at one length with two capacities was charged twice, and copying a dynamic message made
+// without its type panicked.
+func TestConvertingAndCopyingAgreeOnEveryShape(t *testing.T) {
+	for seed := range uint64(4000) {
+		d := &shapeDraw{rng: mathrand.New(mathrand.NewPCG(seed, 138))}
+		typ := d.typ(3)
+		_, zeroRead := rbac.ConvertingCharge(map[string]any{"v": reflect.New(typ).Elem().Interface()})
+		if refused := typ.Kind() != reflect.Interface && (rbac.RefusedWhole(typ) || nilUnread(typ)); refused == zeroRead {
+			t.Errorf("seed %d, %v: refused by its type %t, its zero value read %t", seed, typ, refused, zeroRead)
+		}
+		for range 4 {
+			v := d.value(typ, 4)
+			attributes := map[string]any{"v": v.Interface()}
+			converted, read := rbac.ConvertingCharge(attributes)
+			copied, ok := rbac.CopyingCharge(attributes)
+			switch {
+			case read && typ.Kind() != reflect.Interface && rbac.RefusedWhole(typ):
+				t.Errorf("seed %d, %v: refused by its type, %#v was read", seed, typ, v.Interface())
+			case read && !ok:
+				t.Errorf("seed %d, %v: %#v was read, and no hook could be given a copy", seed, typ, v.Interface())
+			case read && (copied > converted || copied < converted && !holdsAny(v) && !startsShared(v, map[[2]any]int{})):
+				t.Errorf("seed %d, %v: converting %#v charged %d, and copying it %d", seed, typ, v.Interface(), converted, copied)
+			}
+			if held := unshared(reflect.ValueOf(rbac.DeepCopy(attributes)["v"]), false, map[uintptr]bool{}); ok && held != "" {
+				t.Errorf("seed %d, %v: a hook's copy of %#v holds %s", seed, typ, v.Interface(), held)
+			}
+			if !ok {
+				continue
+			}
+			host, one, other := fingerprintOf(attributes), rbac.DeepCopy(attributes), rbac.DeepCopy(attributes)
+			before := fingerprintOf(other)
+			written(reflect.ValueOf(one))
+			if after := fingerprintOf(attributes); after != host {
+				t.Errorf("seed %d, %v: a hook writing its copy wrote the host's\n%.1000s\n%.1000s", seed, typ, host, after)
+			}
+			if after := fingerprintOf(other); after != before {
+				t.Errorf("seed %d, %v: a hook writing its copy wrote another's\n%.1000s\n%.1000s", seed, typ, before, after)
+			}
 		}
 	}
 }
@@ -3564,6 +4847,62 @@ func TestAConstraintIsGivenAMessageThatIsItsOwnReflectionAsTheHostsType(t *testi
 				t.Errorf("a constraint freezing a subject holding such a message %s didn't deny", name)
 			}
 		}()
+	}
+}
+
+// A hook's copy of a message's reflection, or of a message as itself, calls the reflection's
+// methods, which are the host's own where its type is: a struct embedding a nil reflection panicked
+// on the first, and so did a dynamic message made without its type, and a copy of a type saying it
+// makes its own and making another panicked set in a list of the host's type, each panicking every
+// call asking a hook about it. No condition reads any of them, and no hook is given a copy of one,
+// so the call is refused.
+func TestAHookIsGivenNoCopyOfAMessageWhoseReflectionPanics(t *testing.T) {
+	another := &mistyped{dynamicpb.NewMessage((&structpb.Struct{}).ProtoReflect().Descriptor())}
+	values := map[string]any{
+		"a struct embedding a nil reflection": &reflectionOf{}, "such a struct in a list": []any{&reflectionOf{}},
+		"a dynamic message made without its type": &dynamicpb.Message{},
+		"a message of a type making another":      another, "such a message in a list of its type": []*mistyped{another},
+	}
+	refused := func(name string, call func()) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("%s: panicked: %v", name, r)
+			}
+		}()
+		call()
+	}
+	for name, v := range values {
+		attributes := map[string]any{"v": v, "ok": true}
+		if _, evaluated := rbac.EvaluateConditionOf(t, `request.attributes.ok == true`, nil, nil, attributes); evaluated {
+			t.Errorf("%s: a condition read its kind", name)
+		}
+		refused(name, func() {
+			if rbac.Copies(attributes) {
+				t.Errorf("%s: a hook was given a copy", name)
+			}
+		})
+	}
+	asked := false
+	h := setup(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "asked", Deny: func(context.Context, rbac.DB, rbac.ConstraintInput) (bool, error) {
+			asked = true
+			return false, nil
+		}}}
+	})
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "alice"))
+	alice := h.as(t, "alice")
+	for name, v := range values {
+		r := cluster
+		r.Attributes = map[string]any{"v": v}
+		refused(name, func() {
+			if allowed(t, h, alice, login, r) {
+				t.Errorf("%s: a check its constraint can't be asked about was allowed", name)
+			}
+		})
+	}
+	if asked {
+		t.Error("a constraint was asked about a copy")
 	}
 }
 
