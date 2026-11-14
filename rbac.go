@@ -914,7 +914,8 @@ const (
 	// in all, each member's counted apart, as the host is asked about each, but no more than one
 	// place alone gains, whatever its group and those it is in hold, and not the host's own
 	// ImportMembers: a member is its principal, however many groups, or places in one, the change
-	// gives it, and what they reach counts once for each end its places give it; and
+	// gives it, and each grant or eligibility they reach counts once for each end the member gains
+	// it until, the sooner of its own end and a place's; and
 	// MaxGrantsPerRole how many grants in force of one role a principal holds on one scope,
 	// differing by source, expiry or condition, as cloud IAM bounds bindings of one role: those
 	// from each source the host owns (Config.Sources) counted apart.

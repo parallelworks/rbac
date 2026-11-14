@@ -1613,7 +1613,8 @@ func (a *Authorizer) placesBounded(ctx context.Context, tx pgx.Tx, tenant string
 // counted apart, as the host is asked about each, but no more than one place alone gains, which
 // gains whatever its group and those it is in hold: a member is its principal, whatever it gains
 // through all the groups, and places in one, the change gives it, each grant or eligibility counted
-// once for each end its places give it, as the host is asked about it once. Whether the actor may
+// once for each end it gains it until, the sooner of its own end and a place's, as the host is
+// asked about it once. Whether the actor may
 // make one is decided once for each end, however many members gain it. The rest of what a change
 // checks is its groups', read once however many of their members change, and what a group many of
 // them are in reaches, once for all of them, so it grows with what the groups hold, approve and are
