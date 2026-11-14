@@ -354,7 +354,9 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   between it and 1 and for its digits, up to 1,070, as does a string `double()` converts in a
   condition, which parsing one digit by digit takes, reading an underscore between digits as
   strconv does: charged 3, 40,000 of `8.9884656743115790396e307` took a check 1.2 s to convert, and
-  so charged, a unit of parsing takes no more than about 110 ns on Go 1.26 or 1.27. A condition's
+  so charged, a unit of parsing takes no more than about 110 ns on Go 1.27. Built with Go 1.26, a
+  number of 15 to 19 digits that 1.26 can't round at once takes up to about 840 ns, charged 3 or 4,
+  about 280 ns a unit, so a check's budget of them about 34 ms. A condition's
   bound counts what parsing a literal string `double()` converts costs, and up to 1,070 for any
   other string of 5 bytes or more. Past that
   every condition reading an attribute fails, as it does where

@@ -1249,7 +1249,8 @@ func (c *converter) number(n string) ref.Val {
 // took no more than about 110 ns to parse on either version, whatever its digits and exponent. Any
 // other number of 19 significant digits or fewer, which strconv rounds at once, as one exactly
 // halfway between two doubles, costs nothing more, as does a hexadecimal one, which it reads 16
-// digits of, and inf or nan.
+// digits of, and inf or nan; but for one of 15 to 19 digits, a power of ten from -5 to 23, that
+// Go 1.26's fast path can't round, which its fallback took up to 840 ns to, about 280 ns a unit.
 func parseCost[T string | []byte](n T) uint64 {
 	i := 0
 	if i < len(n) && (n[i] == '-' || n[i] == '+') {

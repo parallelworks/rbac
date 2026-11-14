@@ -713,7 +713,11 @@ sequenceDiagram
   however short (5e-324 took 14 µs, 4e308 30), and `parseCost` skips an underscore between digits
   and in the exponent, as strconv does, where 8.988_4656743115790396e307 took 29 µs charged 4. So
   charged, parsing took no more than about 110 ns a unit on either version over about 9,000
-  random inputs to each. A condition's bound counts what parsing a literal `double()` converts
+  random inputs to each, and 92 over 60,000 on Go 1.27. Built with Go 1.26, a number of 15 to 19
+  digits with a power of ten from -5 to 23 that its fast path can't round, as 2877421929889792e18,
+  falls back to a slower one and took up to 840 ns, charged 3 or 4: about 280 ns a unit, which is
+  left documented, as charging such numbers more would charge every float of 17 digits more on
+  either version. A condition's bound counts what parsing a literal `double()` converts
   costs (`literalString`), and for any other string of 5 bytes or more, the shortest that can be
   out of range, as `1e308`, up to 1,070 (`parseBound`). So weighed, a unit
   took 20 to 145 ns to convert (160 to 230 for lists or JSON arrays 3,000 to 9,999 deep, each
