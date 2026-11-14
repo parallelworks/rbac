@@ -2314,45 +2314,14 @@ func (r reach) activatedBy(leaving []Member) []Scope {
 // where stillReached refuses a group holding more than was read, or what it holds ending otherwise.
 func (r reach) gainsWithin(add []Member) error {
 	places := r.gaining(add)
-	type reaching struct {
-		p   Principal
-		key string
-	}
-	gainers, until := map[Principal]bool{}, map[reaching]map[int64]bool{}
-	for _, m := range places {
-		for key := range r.up[m.Group] {
-			if len(r.heldOf[key]) == 0 {
-				continue
-			}
-			x := reaching{m.Principal, key}
-			if until[x] == nil {
-				until[x] = map[int64]bool{}
-			}
-			until[x][endOf(m.ExpiresAt)], gainers[m.Principal] = true, true
+	// What a group holds is counted by the places gaining it, each held one's end found once however
+	// many places reach it: many groups in one holding many are refused for about as little as one.
+	gainers, ends, n := map[Principal]bool{}, map[string]heldUntil{}, 0
+	for i, keys := range r.reached(places) {
+		for _, k := range keys {
+			n += len(r.until(ends, k, places[i]))
+			gainers[places[i].Principal] = true
 		}
-	}
-	// What a group holds is counted by the ends of its places reaching it, each held one's end found
-	// once however many places reach it: many groups in one holding many are refused for about as
-	// little as one.
-	ends := map[string][]int64{}
-	n := 0
-	for x, at := range until {
-		es, ok := ends[x.key]
-		if !ok {
-			for _, i := range r.heldOf[x.key] {
-				es = append(es, endOf(r.held[i].binding.ExpiresAt))
-			}
-			slices.Sort(es)
-			ends[x.key] = es
-		}
-		// One ending after a place is gained until that place's end, a different end for each; the
-		// rest, ending no later than the last of them, are gained until their own.
-		last := int64(math.MinInt64)
-		for p := range at {
-			n += len(es) - after(es, p)
-			last = max(last, p)
-		}
-		n += after(es, last)
 	}
 	alone := 0
 	for _, m := range places {
@@ -2377,56 +2346,104 @@ func endOf(t time.Time) int64 {
 	return t.UnixMicro()
 }
 
-// after is where in es, sorted, the first end later than p is.
-func after(es []int64, p int64) int {
-	i, _ := slices.BinarySearchFunc(es, p, func(e, p int64) int {
+// heldUntil is where in held what one group holds is, by end, with those ends, none last.
+type heldUntil struct {
+	at   []int
+	ends []int64
+}
+
+// until is where in held what place m gains through k is, as reached gives k: all that k's group
+// holds, or only what ends after m does, each of what the group holds sorted by its end once for
+// all the places reaching it, in ends.
+func (r reach) until(ends map[string]heldUntil, k reachedKey, m Member) []int {
+	if k.all {
+		return r.heldOf[k.key]
+	}
+	h, ok := ends[k.key]
+	if !ok {
+		h.at = slices.Clone(r.heldOf[k.key])
+		slices.SortFunc(h.at, func(i, j int) int {
+			return cmp.Compare(endOf(r.held[i].binding.ExpiresAt), endOf(r.held[j].binding.ExpiresAt))
+		})
+		for _, i := range h.at {
+			h.ends = append(h.ends, endOf(r.held[i].binding.ExpiresAt))
+		}
+		ends[k.key] = h
+	}
+	p := endOf(m.ExpiresAt)
+	i, _ := slices.BinarySearchFunc(h.ends, p, func(e, p int64) int {
 		if e <= p {
 			return -1
 		}
 		return 1
 	})
-	return i
+	return h.at[i:]
+}
+
+// reachedKey is the key of a group a place reaches that holds anything, and whether the place gains
+// all it holds, or only what ends after the place does.
+type reachedKey struct {
+	key string
+	all bool
 }
 
 // reached is, for each of places, members a change adds that gain a place (placed.gaining), the
-// keys of the groups it reaches that hold anything, but those reached by a place before it of its
-// principal that ends when it does: so what a principal gains through several groups, or places in
-// one, is found once for each end its places give it, however many of them reach it.
-func (r reach) reached(places []Member) [][]string {
+// keys of the groups it reaches that hold anything, each once for each principal and end: by the
+// first of its places reaching it until that end. A member gains what a group holds until the
+// sooner of each held one's end and its place's, so what ends after a place is gained until that
+// place's end, a different end for each, and what ends no later than the last of them until its
+// own, the same whichever place reaches it: the last place gains all, the others only what ends
+// after them. So what a principal gains through several groups, or places in one, is found once
+// for each end it gains it until, however many of them reach it.
+func (r reach) reached(places []Member) [][]reachedKey {
 	type reaching struct {
-		p     Principal
-		key   string
-		until int64
+		p   Principal
+		key string
 	}
-	seen := map[reaching]bool{}
-	keys := make([][]string, len(places))
+	first, last := map[reaching]map[int64]int{}, map[reaching]int64{}
 	for i, m := range places {
 		for key := range r.up[m.Group] {
-			x := reaching{m.Principal, key, m.ExpiresAt.UnixMicro()}
-			if len(r.heldOf[key]) > 0 && !seen[x] {
-				seen[x] = true
-				keys[i] = append(keys[i], key)
+			if len(r.heldOf[key]) == 0 {
+				continue
 			}
+			x, e := reaching{m.Principal, key}, endOf(m.ExpiresAt)
+			if first[x] == nil {
+				first[x], last[x] = map[int64]int{}, e
+			}
+			if _, ok := first[x][e]; !ok {
+				first[x][e] = i
+			}
+			last[x] = max(last[x], e)
+		}
+	}
+	keys := make([][]reachedKey, len(places))
+	for x, at := range first {
+		for e, i := range at {
+			keys[i] = append(keys[i], reachedKey{x.key, e == last[x]})
 		}
 	}
 	return keys
 }
 
 // gained is, for each of places, as for reached, where in held what it gains is, in order: each
-// grant and eligibility once for each principal and end of its places, which askMemberships asks
-// about once for each end it is gained until, as gainsWithin counts them, so what one change builds
-// and asks the host about grows with that, not with how many of a principal's groups, or places in
-// one, reach it.
+// grant and eligibility once for each principal and end it is gained until, as askMemberships asks
+// about them and gainsWithin counts them, so what one change builds and asks the host about grows
+// with that, not with how many of a principal's groups, or places in one, reach it.
 func (r reach) gained(places []Member) [][]int {
-	held := make([][]int, len(places))
+	held, ends, n := make([][]int, len(places)), map[string]heldUntil{}, 0
 	for i, keys := range r.reached(places) {
-		for _, key := range keys {
-			held[i] = append(held[i], r.heldOf[key]...)
+		for _, k := range keys {
+			held[i] = append(held[i], r.until(ends, k, places[i])...)
 		}
 		slices.Sort(held[i])
+		n += len(held[i])
 	}
+	findingGains(n)
 	return held
 }
+
+// findingGains runs as gained finds n grants and eligibilities places gain, as a test counts them.
+var findingGains = func(int) {}
 
 // locks are the principal locks of every group the change reaches: a grant, an eligibility or a
 // deny naming one takes its lock, and so does nesting it in another group.

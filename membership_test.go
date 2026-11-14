@@ -6603,10 +6603,12 @@ func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
 
 // A member gains what its groups hold until the sooner of each grant's end and its place's, and
 // the host is asked about each grant once for each end it is gained until, so that is what a
-// change is counted as gaining: two places ending after the grants their groups hold count each
-// once, as it is asked about once, but two ending before them count, and are asked about, twice.
+// change is counted as gaining, and builds: two places ending after the grants their groups hold
+// count, and find, each once, as it is asked about once, but two ending before them count, and are
+// asked about, twice.
 func TestAMemberGainsAGrantOnceForEachEndItIsGainedUntil(t *testing.T) {
-	var validated int
+	var validated, found int
+	rbac.SetFindingGains(t, func(n int) { found = max(found, n) })
 	h := grouped(t, func(c *rbac.Config) {
 		validate := c.ValidateGrant
 		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
@@ -6632,9 +6634,9 @@ func TestAMemberGainsAGrantOnceForEachEndItIsGainedUntil(t *testing.T) {
 	h.join(t, "ann", "bob")
 	manager := h.as(t, "manager")
 	later := []rbac.Member{{Group: "g1", Principal: identity("ann"), ExpiresAt: end.Add(time.Hour)}, {Group: "top", Principal: identity("ann"), ExpiresAt: end.Add(2 * time.Hour)}}
-	if err := h.authz.ChangeMembers(ctx, manager, "t1", later, nil); err != nil || validated != grants {
-		t.Fatalf("one member added to a group and the one it is in until two ends after the %d grants it gains: %v, Config.ValidateGrant asked %d times",
-			grants, err, validated)
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", later, nil); err != nil || validated != grants || found != grants {
+		t.Fatalf("one member added to a group and the one it is in until two ends after the %d grants it gains: %v, Config.ValidateGrant asked %d times, %d found",
+			grants, err, validated, found)
 	}
 	validated = 0
 	sooner := []rbac.Member{{Group: "g1", Principal: identity("bob"), ExpiresAt: end.Add(-2 * time.Hour)}, {Group: "top", Principal: identity("bob"), ExpiresAt: end.Add(-time.Hour)}}
