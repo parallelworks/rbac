@@ -471,6 +471,16 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		if _, err := tx.Exec(ctx, sql, args...); err != nil {
 			return fmt.Errorf("%w: %w", errReplica, err)
 		}
+		// The session reads the catalog changes the replica it waited for committed, as it reads any,
+		// only once it takes a lock that isn't a relation's it already holds, which the advisory lock
+		// isn't, and every catalog asOwner reads it locked before the wait: its cached schema would
+		// still be the one from before, as where that replica gave the schema and the tables to another
+		// role, which the cache then reads as having no USAGE on it, so a superuser's replica, setting
+		// its role to that one, would find no current schema, and refuse it. Locking the schema as an
+		// object, as CREATE in it does, reads them first, and keeps it from being dropped meanwhile.
+		if _, err := tx.Exec(ctx, `SELECT FROM pg_catalog.pg_get_object_address('schema', ARRAY[$1::pg_catalog.text], '{}')`, *schema); err != nil {
+			return err
+		}
 		restore, err := asOwner(ctx, tx, *schema, true)
 		if err != nil {
 			return err

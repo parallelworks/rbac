@@ -418,9 +418,15 @@ func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	if err := rbac.Migrate(ctx, r.adminPool); sqlState(err) != "42501" ||
-		!strings.Contains(err.Error(), "trigger planted runs planted(), which "+r.app+" owns") {
+	// Migrate refuses the function in the schema before it applies anything; 0032, applied as a
+	// host's own tool does, refuses the trigger itself.
+	if err := rbac.Migrate(ctx, r.adminPool); !errors.Is(err, rbac.ErrInvalid) ||
+		!strings.Contains(err.Error(), "schema "+r.schema+" holds function planted(), "+r.app+"'s") {
 		t.Fatalf("migrating with a trigger on rbac_expired running the application's role's function: %v", err)
+	}
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "0032", "0033"); sqlState(err) != "42501" ||
+		!strings.Contains(err.Error(), "trigger planted runs planted(), which "+r.app+" owns") {
+		t.Fatalf("applying 0032 with a trigger on rbac_expired running the application's role's function: %v", err)
 	}
 	var applied int
 	var through bool
@@ -430,6 +436,7 @@ func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing
 	}
 	for _, sql := range []string{
 		`DROP TRIGGER planted ON ` + r.schema + `.rbac_expired`,
+		`DROP FUNCTION ` + r.schema + `.planted()`,
 		`CREATE FUNCTION ` + r.schema + `.owners() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
 		`ALTER FUNCTION ` + r.schema + `.owners() OWNER TO ` + r.admin,
 		`CREATE TRIGGER owners BEFORE INSERT ON ` + r.schema + `.rbac_expired FOR EACH ROW EXECUTE FUNCTION ` + r.schema + `.owners()`,
