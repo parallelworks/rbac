@@ -1660,7 +1660,10 @@ func CopyingCharge(attributes map[string]any) (uint64, bool) {
 }
 
 // ParseJSON is JSON text as converting reads it, and whether a condition can read it.
-func ParseJSON(text []byte) (any, bool) { return parseJSON(text) }
+func ParseJSON(text []byte) (any, bool) {
+	v, ok, _ := parseJSON(text, maxConverted)
+	return v, ok
+}
 
 // Converting is what converting attributes as a check does allocates, and whether they were more
 // than a check converts.
