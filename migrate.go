@@ -343,8 +343,14 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 // schema that none of those owns, which a statement whose arguments it matches better than
 // pg_catalog's would call, as format(text, name) does format(..., current_schema()), and a trigger
 // on any of the tables calling a function none of those owns: its maker needs only TRIGGER on the
-// table, and it fires on the migration's writes. Rules and policies only a table's owner makes. The
-// tables' owner is the role that will make them, the current one, where they aren't made.
+// table, and it fires on the migration's writes. So too is any other object in the schema that names
+// can find, but tables, views and indexes not named rbac_, which a migration names only so: a type
+// or domain, a composite type, collation, conversion, text search configuration or dictionary,
+// statistics object, foreign table, or a sequence no column owns, which a name a migration gives
+// could resolve to, or which a migration's CREATE would meet, now or once a later one names it. Rules
+// and policies only a table's owner makes, and operator classes and families, text search parsers
+// and templates only a superuser. The tables' owner is the role that will make them, the current
+// one, where they aren't made.
 func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) {
 	var planted *string
 	err := tx.QueryRow(ctx, `WITH s AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1),
@@ -362,7 +368,7 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		    FROM pg_catalog.pg_class c JOIN ns ON c.relnamespace = ns.oid WHERE pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_')
 		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, false, 1
 		    FROM pg_catalog.pg_type y JOIN ns ON y.typnamespace = ns.oid
-		    WHERE y.typrelid = 0 AND pg_catalog.starts_with(y.typname::pg_catalog.text, 'rbac_')
+		    WHERE y.typrelid = 0 AND pg_catalog.starts_with(y.typname::pg_catalog.text, 'rbac_') AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
 		    UNION ALL SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid, p.proowner, false, 1
 		    FROM pg_catalog.pg_proc p JOIN ns ON p.pronamespace = ns.oid WHERE pg_catalog.starts_with(p.proname::pg_catalog.text, 'rbac_')),
 		  planted AS (SELECT n.class, n.oid, n.owner, n.rank FROM named n
@@ -373,7 +379,23 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		    WHERE o.oprowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, p.proowner, 1 FROM pg_catalog.pg_trigger g
 		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid JOIN pg_catalog.pg_proc p ON p.oid = g.tgfoid
-		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND p.proowner NOT IN (SELECT t.oid FROM trusted t))
+		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND p.proowner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, 1 FROM pg_catalog.pg_type y JOIN s ON y.typnamespace = s.oid
+		    WHERE y.typrelid = 0 AND y.typowner NOT IN (SELECT t.oid FROM trusted t) AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
+		    UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, c.relowner, 1 FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
+		    WHERE c.relkind IN ('S', 'c', 'f') AND c.relowner NOT IN (SELECT t.oid FROM trusted t)
+		      AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+		        AND d.objid = c.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjsubid <> 0 AND d.deptype IN ('a', 'i'))
+		    UNION ALL SELECT 'pg_catalog.pg_collation'::pg_catalog.regclass, l.oid, l.collowner, 1 FROM pg_catalog.pg_collation l JOIN s ON l.collnamespace = s.oid
+		    WHERE l.collowner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_conversion'::pg_catalog.regclass, v.oid, v.conowner, 1 FROM pg_catalog.pg_conversion v JOIN s ON v.connamespace = s.oid
+		    WHERE v.conowner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_ts_config'::pg_catalog.regclass, f.oid, f.cfgowner, 1 FROM pg_catalog.pg_ts_config f JOIN s ON f.cfgnamespace = s.oid
+		    WHERE f.cfgowner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_ts_dict'::pg_catalog.regclass, d.oid, d.dictowner, 1 FROM pg_catalog.pg_ts_dict d JOIN s ON d.dictnamespace = s.oid
+		    WHERE d.dictowner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass, x.oid, x.stxowner, 1 FROM pg_catalog.pg_statistic_ext x JOIN s ON x.stxnamespace = s.oid
+		    WHERE x.stxowner NOT IN (SELECT t.oid FROM trusted t))
 		SELECT pg_catalog.pg_describe_object(p.class, p.oid, 0) || ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s'
 		FROM planted p ORDER BY p.rank, 1 LIMIT 1`, schema).Scan(&planted)
 	if errors.Is(err, pgx.ErrNoRows) {

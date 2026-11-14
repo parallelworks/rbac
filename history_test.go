@@ -1598,8 +1598,9 @@ func plantedRefused(t *testing.T, err error, named string) {
 // another role made what a migration would find: rbac_migrations, which CREATE TABLE IF NOT EXISTS
 // kept, so its trigger ran as the administrator's role on each version recorded, or versions it
 // held skipped the migrations; any relation, type or function named rbac_, in the schema or the
-// views'; or a function or operator in the schema, which a migration's statement can call over
-// pg_catalog's. Once the planting role drops them, the administrator's role migrates. The
+// views'; a function or operator in the schema, which a migration's statement can call over
+// pg_catalog's; or another object a name there can find, as a domain, collation, text search
+// configuration or sequence. Once the planting role drops them, the administrator's role migrates. The
 // application's role may create in the schema, as #139's tests of a planted view let it.
 func TestARoleIsRefusedTheTablesWhereAnotherMadeWhatTheMigrationsFind(t *testing.T) {
 	for _, c := range []struct {
@@ -1624,6 +1625,10 @@ func TestARoleIsRefusedTheTablesWhereAnotherMadeWhatTheMigrationsFind(t *testing
 		{"a function matching a call better than pg_catalog's", "function format(text,name)", []string{
 			`CREATE FUNCTION format(f text, n name) RETURNS text LANGUAGE sql AS $$ SELECT {own}.rbac_planted_seen(); SELECT pg_catalog.format(f, n) $$`,
 		}},
+		{"a domain not named as the package's", "type planted_text", []string{`CREATE DOMAIN planted_text AS text`}},
+		{"a collation", "collation planted_c", []string{`CREATE COLLATION planted_c FROM "C"`}},
+		{"a text search configuration", "text search configuration planted", []string{`CREATE TEXT SEARCH CONFIGURATION planted (COPY = pg_catalog.simple)`}},
+		{"a sequence", "sequence planted_seq", []string{`CREATE SEQUENCE planted_seq`}},
 		{"an operator", "operator ||(text,name)", []string{
 			`CREATE FUNCTION {own}.cat(a text, b name) RETURNS text LANGUAGE sql AS $$ SELECT {own}.rbac_planted_seen(); SELECT a OPERATOR(pg_catalog.||) b::text $$`,
 			`CREATE OPERATOR || (LEFTARG = text, RIGHTARG = name, FUNCTION = {own}.cat)`,
