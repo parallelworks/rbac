@@ -5562,7 +5562,10 @@ func TestFilterCountsAFewOfItsSubjectsGrantsOfBuiltInRoles(t *testing.T) {
 
 // Revoking a grant on a scope many hold grants on reads only the revoked principal's, under its
 // lock, by Apply and by DeleteGrants, by source and by an ID written otherwise than as stored, under
-// a generic plan too: matched to the scope's grants, a revoke reads each of them.
+// a generic plan too: matched to the scope's grants, a revoke reads each of them. Each is counted on
+// one connection once it has run there: the first run after ANALYZE plans its statements again,
+// reading pages of every index on the table, and a run by ID and one by source share them, so
+// whichever ran first, in the map's order, read twice the pages.
 func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 	for _, plan := range []string{"custom", "generic"} {
 		t.Run(plan, func(t *testing.T) {
@@ -5584,6 +5587,11 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 			}
 			read := func() map[string]int64 {
 				t.Helper()
+				conn, err := h.pool.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Release()
 				pages := map[string]int64{}
 				for what, f := range map[string]func(a *rbac.Authorizer) error{
 					"Apply": func(a *rbac.Authorizer) error {
@@ -5599,8 +5607,8 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 						return a.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: rbac.TenantRoot("t1"), Binding: byID}})
 					},
 				} {
-					pages[what] = func() int64 {
-						tx, err := h.pool.Begin(ctx)
+					run := func() int64 {
+						tx, err := conn.Begin(ctx)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -5614,7 +5622,9 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 							t.Fatalf("%s left ann's grant: %v", what, err)
 						}
 						return pagesRead(ctx, t, tx, "rbac_grants") - start
-					}()
+					}
+					run()
+					pages[what] = run()
 				}
 				return pages
 			}
