@@ -1269,8 +1269,9 @@ func TestASuperuserByARoleMigratesAsTheOwnerWhereItsLoginMay(t *testing.T) {
 // refused. Where another role owns the schema of AsOf's views, as the README's administrator's role
 // does, which 0028_as_of_views would fail on, it is refused, as ErrInvalid naming that role, before
 // it makes anything, on transactions of its own or a host's, which runs as it did after, and that
-// role then migrates. Making them as the schema's owner, or the database's, it made them the
-// application's role's.
+// role then migrates. A view the application's role made named as rbac_grants doesn't make it the
+// tables' owner, which the superuser would migrate as. Making them as the schema's owner, or the
+// database's, it made them the application's role's.
 func TestASuperuserMakesTheTablesAsItself(t *testing.T) {
 	refused := func(t *testing.T, err error, owner string) {
 		t.Helper()
