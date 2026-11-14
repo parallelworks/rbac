@@ -5485,8 +5485,10 @@ func TestSearchesSeekFewGrantsOnceWhateverTheRolesGivingThePermission(t *testing
 				t.Helper()
 				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan), func(c *rbac.Config) {
 					for i := range roles {
-						c.Catalog = append(c.Catalog, rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.operator", i)),
-							Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"}})
+						c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+							ID:          rbac.Role(fmt.Sprint("cluster.operator", i)),
+							Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"},
+						})
 					}
 				})
 				ctx := t.Context()
