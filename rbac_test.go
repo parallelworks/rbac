@@ -689,6 +689,51 @@ func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 	})
 }
 
+// Filter's condition is NULL rather than false for a row whose tenant or label column is NULL that
+// it would otherwise keep, as its docs say: a WHERE clause leaves the row out all the same, and a
+// host selecting the condition as a column reads it as false through coalesce or IS TRUE.
+func TestFilterIsNullForARowWhoseTenantOrLabelIsNull(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE clusters (id text NOT NULL, tenant text, path text[] NOT NULL, labels text[])`); err != nil {
+		t.Fatal(err)
+	}
+	for id, row := range map[string]struct {
+		tenant any
+		labels []string
+	}{"c1": {"t1", []string{}}, "c2": {nil, []string{}}, "c3": {"t1", nil}} {
+		path := h.path(t, rbac.Resource{Tenant: "t1", Type: "cluster", ID: id})
+		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3, $4)`, id, row.tenant, path, row.labels); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT id || ': ' || coalesce((`+pred.SQL+`)::text, 'null') || ', ' || coalesce(`+pred.SQL+`, false)
+		|| ', ' || ((`+pred.SQL+`) IS TRUE) FROM clusters ORDER BY id`, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"c1: true, true, true", "c2: null, false, false", "c3: null, false, false"}; !slices.Equal(got, want) {
+		t.Errorf("Filter's condition, coalesced and IS TRUE, of a row, of one of a NULL tenant and of one of NULL labels: %q, want %q", got, want)
+	}
+	var kept []string
+	if err := h.pool.QueryRow(ctx, `SELECT array_agg(id ORDER BY id) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(kept, []string{"c1"}) {
+		t.Errorf("Filter keeps %v", kept)
+	}
+}
+
 // A table holding several types is listed through its path's index as one of a type is: each row's
 // type is tested among the rows the index finds, so a list of the clusters in one workspace reads
 // those and the workspace's own row, not the tenant's.

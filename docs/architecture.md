@@ -1569,13 +1569,16 @@ flowchart LR
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
   package's makes a temporary object, `AsOf`'s included. What runs after the commit record is the
   rest of the commit: the host's own deferred triggers and constraints of statements after its last
-  change, the session's temporary tables dropped or emptied, about half a millisecond each at the
-  default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
-  the temporary buffers; 2,000 held a commit about 5.4 s at `temp_buffers = 4GB`, which
-  `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
-  those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
-  can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
-  queue, which only `max_notify_queue_pages` bounds), each loaded extension's pre-commit callbacks,
+  change, queued before the commit record's own event and so fired before it, which wait for a lock
+  as long as the session's `lock_timeout` lets them, without end by default; and from that event on,
+  which sets `lock_timeout` to 100 ms where the session's is longer or none, the session's temporary
+  tables dropped or emptied, about half a millisecond each at the default `temp_buffers` but seconds
+  at a large one (emptying an `ON COMMIT DELETE ROWS` table scans the temporary buffers; 2,000 held
+  a commit about 5.4 s at `temp_buffers = 4GB`, which `lock_timeout` doesn't bound), waiting for no
+  lock past 100 ms, as another session can hold one of those tables, writing the notifications the
+  transaction queued to PostgreSQL's queue, which no SQL can see beforehand and any role can queue
+  (about 1.6 ms a MB, up to some 13 s at the default 8 GB queue, which only `max_notify_queue_pages`
+  bounds), each loaded extension's pre-commit callbacks,
   in which postgres_fdw commits the transaction's remote transactions, each waiting for what the
   remote server has it wait for, as a remote deferred foreign key's check, which no local
   `lock_timeout` bounds (1.5 s in a test), the wait for synchronous replication, and for a prepared
@@ -1653,11 +1656,15 @@ flowchart LR
   would have at a past time, with the catalog and the label dimensions as they are now. Migrating
   makes them (`0028_as_of_views`, and `rbac_as_of_views` again for a later migration that changes a
   table), in a schema beside the package's, named as it with `_as_of` after, one named as each
-  table, and AsOf names that schema first on the search_path of its transaction, or a savepoint of
-  the host's, which it makes READ ONLY and rolls back: so the package's statements, a hook's on the
-  `DB` it is given, the host's on that transaction and `rbac_group_members`, which reads by its
-  caller's search_path, read the tables by name as they were. It makes no object and takes no
-  transaction id, so the role reading needs no `TEMPORARY`, and the read holds no export back but
+  table. PostgreSQL cuts a name to 63 bytes, so beside a package's schema named in more than 57 the
+  views' would be named otherwise, and at 63 be the package's own: `rbac_as_of_views`, where it
+  names the views' schema, refuses such a package's schema before it makes anything (SQLSTATE
+  42622), and AsOf, finding no views beside one, says to rename it. AsOf names the views' schema
+  first on the search_path of its transaction, or a savepoint of the host's, which it makes READ
+  ONLY and rolls back: so the package's statements, a hook's on the `DB` it is given, the host's on
+  that transaction and `rbac_group_members`, which reads by its caller's search_path, read the
+  tables by name as they were. It makes no object and takes no transaction id, so the role reading
+  needs no `TEMPORARY`, and the read holds no export back but
   where a statement in it writes a session's temporary table, which READ ONLY lets through; and it
   reads on a hot standby too, as of what the standby has replayed. Each view reads the tenant, the
   time and the cluster from settings of the transaction (`rbac.as_of_tenant`, `rbac.as_of`,
