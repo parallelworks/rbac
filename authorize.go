@@ -163,8 +163,9 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 		}
 	}
 	var conditional []holding
+	givesP := givesOnce(roles, p, r.Type)
 	for _, h := range held {
-		if !gives(roles, h, p, r.Type) {
+		if !givesP(h) {
 			continue
 		}
 		if !h.conditional {
@@ -223,9 +224,8 @@ func (a *Authorizer) explain(ctx context.Context, s Subject, p Permission, r Res
 	}
 	readingRoles()
 	d := Decision{Reason: "no grant gives it"}
-	grants = slices.DeleteFunc(grants, func(g Grant) bool {
-		return !gives(roles, holding{Binding: g.Binding}, p, r.Type)
-	})
+	givesP := givesOnce(roles, p, r.Type)
+	grants = slices.DeleteFunc(grants, func(g Grant) bool { return !givesP(holding{Binding: g.Binding}) })
 	// Evaluated in the order Authorize evaluates them, so a budget runs out where it does for it.
 	byCost := slices.Clone(grants)
 	cheapestFirst(byCost, Grant.expression)
@@ -290,6 +290,24 @@ func gives(roles book, h holding, p Permission, resourceType string) bool {
 	return ok && roles.gives(h.Role, def, p, resourceType) && h.carries(def, p)
 }
 
+// givesOnce is gives of p on a resource type, decided once for each role and carrier
+// (roleCarrier), however many grants hold it: decided for each grant, a check of a permission a
+// custom role of 1,000 doesn't give, beside a subject in 1,000 groups each granted it on the 4
+// scopes of a path, read 4 million entries of its permissions, and took twice what one of a
+// built-in role did.
+func givesOnce(roles book, p Permission, resourceType string) func(holding) bool {
+	given := map[roleCarrier]bool{}
+	return func(h holding) bool {
+		k := h.roleCarrier()
+		g, ok := given[k]
+		if !ok {
+			g = gives(roles, h, p, resourceType)
+			given[k] = g
+		}
+		return g
+	}
+}
+
 // carries reports whether a grant held as h gives p, which def gives: as its principal carries
 // it, and for a privileged role never through the tenant's members or the public, so a catalog
 // change that makes a role privileged reaches what they hold.
@@ -345,10 +363,16 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 	if !slices.ContainsFunc(perms, func(p Permission) bool { return a.decidedOn(p, r).Labels.asks() }) {
 		return perms, nil
 	}
-	h, _, err := a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels)
-	switch {
-	case err != nil:
+	// On the tenant, the values were decided with the rest, each as a check of it decides it, on the
+	// bare tenant: so they decide the label, and a constraint is asked about each once, as a check
+	// asks, where deciding them again asked it twice.
+	var h Holding
+	if r.Type == TenantScope {
+		h = a.holdingGiven(r.Tenant, perms, excluded)
+	} else if h, _, err = a.holdingFor(ctx, r.Tenant, s, onTenant(r.Tenant, held, ds, roles), r.Labels); err != nil {
 		return nil, err
+	}
+	switch {
 	case h.Unsatisfied(r.Labels) == "":
 		return perms, nil
 	case r.Type != TenantScope:
@@ -1463,7 +1487,10 @@ type Predicate struct {
 // a table of one type: a host listing a type from a table of several tests its own column of the
 // type too, whose statistics count them, and indexes it after the tenant and before what a page
 // sorts by, as (tenant, type, id): with an index of the tenant alone, a sorted page of a type of
-// few rows reads the rows of every type until it is full.
+// few rows reads the rows of every type until it is full. For a row whose tenant or label column
+// is NULL, the condition can be NULL rather than false, as SQL compares NULL: a WHERE clause leaves
+// the row out all the same, but a host that selects the condition as a column reads it through
+// coalesce(..., false) or IS TRUE.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (_ Predicate, err error) {
 	defer conflicting(&err)
 	a = a.still()
@@ -2256,6 +2283,34 @@ func (a *Authorizer) readHeld(ctx context.Context, q DB, tenant string, s Subjec
 	return got, nil
 }
 
+// readingConditions runs as conditionsOf reads n conditions' expressions. A test counts them.
+var readingConditions = func(n int) {}
+
+// conditionsSQL is the statement conditionsOf reads conditions by, of the grants whose ids,
+// principals and scopes are in the arrays $1, $3 and $4, in the tenant $2: only each expression, as
+// a check reads nothing else of one, with the ids of the grants holding it, so one that many grants
+// share is read once. Each grant is looked up by its id alone, a row at a time, and its tenant,
+// principal and scope tested once found, so one moved since reads as gone: tested against arrays of
+// every grant's, a generic plan compared each grant it read with every entry, and a subject in 1,000
+// groups, each granted a role on the 4 scopes of a path under one condition, waited 170 ms for them;
+// looked up by its principal and scope too, a plan could read every grant of the principal on the
+// scope for each. As of a time, history finds a grant's versions by its principal and scope, not by
+// its id, so each principal's grants on each scope are read once, and found there by their ids:
+// looked up a grant at a time, each was read again for each grant of the principal on the scope.
+func (a *Authorizer) conditionsSQL() string {
+	if a.history != "" {
+		return `SELECT g.condition, array_agg(g.id::text) FROM (SELECT principal, scope, array_agg(id) AS ids
+		    FROM unnest($1::uuid[], $3::text[], $4::text[]) AS w(id, principal, scope) GROUP BY principal, scope) w
+		  CROSS JOIN LATERAL (SELECT id, condition FROM rbac_grants
+		    WHERE tenant = $2 AND principal = w.principal AND scope = w.scope AND id = ANY(w.ids) OFFSET 0) g
+		GROUP BY g.condition`
+	}
+	return `SELECT g.condition, array_agg(g.id::text) FROM unnest($1::uuid[], $3::text[], $4::text[]) AS w(id, principal, scope)
+		  CROSS JOIN LATERAL (SELECT id, tenant, principal, scope, condition FROM rbac_grants WHERE id = w.id OFFSET 0) g
+		WHERE g.tenant = $2 AND g.principal = w.principal AND g.scope = w.scope
+		GROUP BY g.condition`
+}
+
 // conditionsOf reads the conditions of the conditional grants among held not read already, in
 // place.
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
@@ -2270,20 +2325,18 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 	if len(ids) == 0 {
 		return nil
 	}
-	// Only the expression: a check reads nothing else of a condition. By principal too: as of a
-	// time, history finds a grant's versions by its principal, not by its id. And by scope, so every
-	// index a generic plan can pick seeks those grants: by the principals alone, it would read every
-	// grant of a group granted on thousands of resources.
-	rows, err := a.queryIndexed(ctx, q, `SELECT id::text, condition FROM rbac_grants
-		WHERE id = ANY($1::uuid[]) AND tenant = $2 AND principal = ANY($3::text[]) AND scope = ANY($4::text[])`,
-		ids, tenant, principals, scopes)
+	rows, err := a.queryIndexed(ctx, q, a.conditionsSQL(), ids, tenant, principals, scopes)
 	if err != nil {
 		return err
 	}
 	found := map[string]string{}
-	var id, expr string
-	_, err = pgx.ForEachRow(rows, []any{&id, &expr}, func() error {
-		found[id] = expr
+	var expr string
+	var of []string
+	_, err = pgx.ForEachRow(rows, []any{&expr, &of}, func() error {
+		readingConditions(1)
+		for _, id := range of {
+			found[id] = expr
+		}
 		return nil
 	})
 	if err != nil {

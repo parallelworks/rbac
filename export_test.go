@@ -571,6 +571,25 @@ func SetReadingEntries(t *testing.T, f func(n int)) {
 	t.Cleanup(func() { readingEntries = old })
 }
 
+// SetReadingConditions runs f each time a decision reads n conditions of its conditional grants,
+// until t ends.
+func SetReadingConditions(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := readingConditions
+	readingConditions = f
+	t.Cleanup(func() { readingConditions = old })
+}
+
+// ConditionsSQL is the statement a decision reads the conditions of its conditional grants by, as
+// of a time or not (conditionsSQL).
+func ConditionsSQL(asOf bool) string {
+	a := &Authorizer{}
+	if asOf {
+		a.history = "rbac_history"
+	}
+	return a.conditionsSQL()
+}
+
 // SetDerivingRoles runs f each time a read derives n custom roles as the catalog has them now,
 // until t ends.
 func SetDerivingRoles(t *testing.T, f func(n int)) {
@@ -1198,6 +1217,9 @@ var RestsSQL = restsSQL
 // CutSQL is the statement a change cuts activations short with: their ids $1, their ends $2 in the
 // same order, the actor's key $3.
 const CutSQL = cutSQL
+
+// UUIDText is whether a revoke takes s as a grant's ID, a uuid.
+func UUIDText(s string) bool { return uuidText(s) }
 
 // EndsSQL is the statement a change reads when its actor's paths to each key it holds end with:
 // tenant $1, the identity's key $2, now $3.

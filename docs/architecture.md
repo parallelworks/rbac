@@ -456,13 +456,25 @@ flowchart LR
 `Authorize` answers whether a subject may do one permission on one resource. It reads in one
 statement, the grants and denies on the tenant its label values are decided by too, apart from the
 conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
-something allows. So a label is decided by the values the subject held as it held its grants.
+something allows. So a label is decided by the values the subject held as it held its grants. It
+reads those conditions each grant by its id, a row at a time, and each distinct expression once,
+with the ids of the grants holding it (`conditionsSQL`): tested against arrays of every grant's id,
+principal and scope, a generic plan compared each grant with every entry, and each expression was
+read for each grant, so a subject in 1,000 groups each granted a role on the 4 scopes of a path under
+one condition of 2 KB read 8 MB of it, and waited 170 ms for a check, against 44 now. As of a time,
+history finds a grant's versions by its principal and scope, so it reads each principal's grants on
+each scope once there. It decides whether a role gives the permission once for each carrier its
+grants have (`givesOnce`), as `Explain` does: once for each grant, the same subject granted a custom
+role of 1,000 permissions read 4 million entries of it for a permission it doesn't give, and a
+check took 26 ms, twice what one of a built-in role took, against 1,001 entries in 11 ms now.
 `Permissions` decides each permission as a check of it would, by one such read, and the label only
 once the grants give something it decides, so it asks the constraints about values only where a
-check would; and it walks a role's permissions once for each carrier its grants have, and once for
-each carrier and condition its conditional ones have (`permissionsOf`), however many groups grant
-it: once for each grant, a subject in 1,000 groups each granted a role of 1,000 permissions on the
-4 scopes of a path had it read 4 million entries, in 180 ms, against 2,000 in 17.
+check would, and of the tenant, whose values it decides with the rest, by those, so it asks about
+each once, as a check does, where deciding them again for the label asked twice; and it walks a
+role's permissions once for each carrier its grants have, and once for each carrier and condition
+its conditional ones have (`permissionsOf`), however many groups grant it: once for each grant, a
+subject in 1,000 groups each granted a role of 1,000 permissions on the 4 scopes of a path had it
+read 4 million entries, in 180 ms, against 2,000 in 17.
 
 ```mermaid
 flowchart TB
@@ -1516,7 +1528,19 @@ flowchart TB
   the tables migrates them, as a migration makes what it makes its maker's, and from
   `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
   role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
-  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after,
+  where its login may set its role to that one, as PostgreSQL checks it against the login, and is
+  refused as `ErrInvalid` too where it may not. It decides again once it holds the lock, before it
+  reads what is applied, as the replica it waited for can have made the tables, or given them to
+  another role, meanwhile: it reads the tables' owner by name at the statement's snapshot, as
+  `to_regclass` reads the session's catalog cache, which keeps what it read before the lock until
+  the session takes a relation's lock, which the advisory lock isn't, and only a table, not
+  another relation so named. Where none are made, the role migrating makes them as itself, a
+  superuser too, never as the schema's owner or the database's, which can be the application's
+  role; under the lock it refuses any role, a superuser too, as `ErrInvalid`, naming the other,
+  where `<schema>_as_of` is made and another role's, as `0028_as_of_views` would fail there after
+  making every table before it the role migrating's, and before the lock and under it, where the
+  schema is named in more than 57 bytes, which `0028_as_of_views` refuses for every role.
 
 ```mermaid
 flowchart TB
@@ -1527,7 +1551,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
+    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
@@ -1590,13 +1614,16 @@ flowchart LR
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
   package's makes a temporary object, `AsOf`'s included. What runs after the commit record is the
   rest of the commit: the host's own deferred triggers and constraints of statements after its last
-  change, the session's temporary tables dropped or emptied, about half a millisecond each at the
-  default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
-  the temporary buffers; 2,000 held a commit about 5.4 s at `temp_buffers = 4GB`, which
-  `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
-  those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
-  can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
-  queue, which only `max_notify_queue_pages` bounds), each loaded extension's pre-commit callbacks,
+  change, queued before the commit record's own event and so fired before it, which wait for a lock
+  as long as the session's `lock_timeout` lets them, without end by default; and from that event on,
+  which sets `lock_timeout` to 100 ms where the session's is longer or none, the session's temporary
+  tables dropped or emptied, about half a millisecond each at the default `temp_buffers` but seconds
+  at a large one (emptying an `ON COMMIT DELETE ROWS` table scans the temporary buffers; 2,000 held
+  a commit about 5.4 s at `temp_buffers = 4GB`, which `lock_timeout` doesn't bound), waiting for no
+  lock past 100 ms, as another session can hold one of those tables, writing the notifications the
+  transaction queued to PostgreSQL's queue, which no SQL can see beforehand and any role can queue
+  (about 1.6 ms a MB, up to some 13 s at the default 8 GB queue, which only `max_notify_queue_pages`
+  bounds), each loaded extension's pre-commit callbacks,
   in which postgres_fdw commits the transaction's remote transactions, each waiting for what the
   remote server has it wait for, as a remote deferred foreign key's check, which no local
   `lock_timeout` bounds (1.5 s in a test), the wait for synchronous replication, and for a prepared
@@ -1674,11 +1701,15 @@ flowchart LR
   would have at a past time, with the catalog and the label dimensions as they are now. Migrating
   makes them (`0028_as_of_views`, and `rbac_as_of_views` again for a later migration that changes a
   table), in a schema beside the package's, named as it with `_as_of` after, one named as each
-  table, and AsOf names that schema first on the search_path of its transaction, or a savepoint of
-  the host's, which it makes READ ONLY and rolls back: so the package's statements, a hook's on the
-  `DB` it is given, the host's on that transaction and `rbac_group_members`, which reads by its
-  caller's search_path, read the tables by name as they were. It makes no object and takes no
-  transaction id, so the role reading needs no `TEMPORARY`, and the read holds no export back but
+  table. PostgreSQL cuts a name to 63 bytes, so beside a package's schema named in more than 57 the
+  views' would be named otherwise, and at 63 be the package's own: `rbac_as_of_views`, where it
+  names the views' schema, refuses such a package's schema before it makes anything (SQLSTATE
+  42622), and AsOf, finding no views beside one, says to rename it. AsOf names the views' schema
+  first on the search_path of its transaction, or a savepoint of the host's, which it makes READ
+  ONLY and rolls back: so the package's statements, a hook's on the `DB` it is given, the host's on
+  that transaction and `rbac_group_members`, which reads by its caller's search_path, read the
+  tables by name as they were. It makes no object and takes no transaction id, so the role reading
+  needs no `TEMPORARY`, and the read holds no export back but
   where a statement in it writes a session's temporary table, which READ ONLY lets through; and it
   reads on a hot standby too, as of what the standby has replayed. Each view reads the tenant, the
   time and the cluster from settings of the transaction (`rbac.as_of_tenant`, `rbac.as_of`,

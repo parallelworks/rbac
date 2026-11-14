@@ -42,8 +42,9 @@
 -- COMMIT DELETE ROWS, it locks each, and its TOAST table, which another session of the role can
 -- hold, the TOAST table by preparing a statement that names it, for as long as it likes: so the
 -- commit record's event, at the commit, has the rest of it wait for no lock past 100 ms. What runs
--- after it is then the package's, the host's, as its own deferred triggers and
--- constraints of statements after the transaction's last change to the tables, and the commit's: the
+-- after the record is then the host's, as its own deferred triggers and constraints of statements
+-- after the transaction's last change to the tables, which fire before the record's event, and so
+-- wait for a lock as long as the session's lock_timeout lets them, and the commit's: the
 -- session's temporary tables emptied or dropped, about half a millisecond each at the default
 -- temp_buffers, but seconds at a large one, as emptying an ON COMMIT DELETE ROWS table scans the
 -- temporary buffers (2,000 held a commit about 5.4 s at temp_buffers = 4GB), which lock_timeout

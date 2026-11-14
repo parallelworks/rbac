@@ -57,7 +57,10 @@
 -- is another role's, or in which another may create, is refused, however it came to be so, as by
 -- the role's default privileges, which a schema made for it takes too, a grant since the views
 -- were made, or an extension installed there. Its default privileges hold no object and are let
--- be. Neither takes a lock that a check, a change or a read of history waits for.
+-- be. Neither takes a lock that a check, a change or a read of history waits for. PostgreSQL cuts a
+-- name to 63 bytes, so where it would name the schema, it refuses a package's schema named in more
+-- than 57 before it makes anything: the views' would be named otherwise than the README says, and
+-- at 63 bytes would be the package's own.
 CREATE FUNCTION rbac_as_of_views() RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     here     pg_catalog.text := pg_catalog.current_schema();
@@ -121,6 +124,11 @@ BEGIN
     END IF;
     views := made[1];
     IF views IS NULL THEN
+        IF pg_catalog.octet_length(here) > 57 THEN
+            RAISE EXCEPTION 'schema % is named in % bytes, too many for the schema of AsOf''s views, named as it with _as_of after, in at most 63',
+                here, pg_catalog.octet_length(here)
+                USING ERRCODE = 'name_too_long', HINT = 'Rename it to a name of at most 57 bytes, and set the search_path to that.';
+        END IF;
         named := here || '_as_of';
         views := pg_catalog.to_regnamespace(pg_catalog.quote_ident(named));
         IF views IS NULL THEN

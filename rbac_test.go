@@ -689,6 +689,51 @@ func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 	})
 }
 
+// Filter's condition is NULL rather than false for a row whose tenant or label column is NULL that
+// it would otherwise keep, as its docs say: a WHERE clause leaves the row out all the same, and a
+// host selecting the condition as a column reads it as false through coalesce or IS TRUE.
+func TestFilterIsNullForARowWhoseTenantOrLabelIsNull(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE clusters (id text NOT NULL, tenant text, path text[] NOT NULL, labels text[])`); err != nil {
+		t.Fatal(err)
+	}
+	for id, row := range map[string]struct {
+		tenant any
+		labels []string
+	}{"c1": {"t1", []string{}}, "c2": {nil, []string{}}, "c3": {"t1", nil}} {
+		path := h.path(t, rbac.Resource{Tenant: "t1", Type: "cluster", ID: id})
+		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3, $4)`, id, row.tenant, path, row.labels); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT id || ': ' || coalesce((`+pred.SQL+`)::text, 'null') || ', ' || coalesce(`+pred.SQL+`, false)
+		|| ', ' || ((`+pred.SQL+`) IS TRUE) FROM clusters ORDER BY id`, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"c1: true, true, true", "c2: null, false, false", "c3: null, false, false"}; !slices.Equal(got, want) {
+		t.Errorf("Filter's condition, coalesced and IS TRUE, of a row, of one of a NULL tenant and of one of NULL labels: %q, want %q", got, want)
+	}
+	var kept []string
+	if err := h.pool.QueryRow(ctx, `SELECT array_agg(id ORDER BY id) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(kept, []string{"c1"}) {
+		t.Errorf("Filter keeps %v", kept)
+	}
+}
+
 // A table holding several types is listed through its path's index as one of a type is: each row's
 // type is tested among the rows the index finds, so a list of the clusters in one workspace reads
 // those and the workspace's own row, not the tenant's.
@@ -2130,6 +2175,145 @@ func TestOnlyTheHostChangesTheSourcesItOwns(t *testing.T) {
 		if !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("DeleteGrants with %s: %v", name, err)
 		}
+	}
+}
+
+// A revoke by ID, through Apply and DeleteGrants, reads it as PostgreSQL reads a uuid and matches
+// the grant by value: written otherwise, as in capitals, without hyphens or in braces, it revokes
+// the grant, where compared as text it matched none and the call succeeded leaving the grant in
+// force. One PostgreSQL can't read as a uuid is refused as invalid, leaving the grant, rather than
+// matching nothing.
+func TestARevokeByIDMatchesItsGrantHoweverItsUUIDIsWritten(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, bob := h.as(t, "owner"), h.as(t, "bob")
+	held := rbac.Binding{Role: "cluster.login", Principal: bob.Principal}
+	byID := func(id string) rbac.Binding { return rbac.Binding{ID: id, Role: held.Role, Principal: held.Principal} }
+	revokes := map[string]func(id string) error{
+		"Apply": func(id string) error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Revoke: []rbac.Binding{byID(id)}})
+		},
+		"DeleteGrants": func(id string) error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: byID(id)}})
+		},
+	}
+	bare := func(id string) string { return strings.ReplaceAll(id, "-", "") }
+	for _, c := range []struct {
+		written string
+		reads   bool
+		spell   func(id string) string
+	}{
+		{"in capitals", true, strings.ToUpper},
+		{"without hyphens", true, bare},
+		{"in braces", true, func(id string) string { return "{" + id + "}" }},
+		{"with a hyphen after every four digits", true, func(id string) string {
+			var fours []string
+			for d := bare(id); d != ""; d = d[4:] {
+				fours = append(fours, d[:4])
+			}
+			return strings.Join(fours, "-")
+		}},
+		{"in capitals and braces without hyphens", true, func(id string) string { return "{" + strings.ToUpper(bare(id)) + "}" }},
+		{"with a space after it", false, func(id string) string { return id + " " }},
+		{"a digit short", false, func(id string) string { return id[:len(id)-1] }},
+		{"a digit long", false, func(id string) string { return id + "0" }},
+		{"with two hyphens together", false, func(id string) string { return strings.Replace(id, "-", "--", 1) }},
+		{"with a hyphen inside four digits", false, func(id string) string { return id[:2] + "-" + id[2:] }},
+		{"ending in a hyphen", false, func(id string) string { return id + "-" }},
+		{"with a brace on one side", false, func(id string) string { return "{" + id }},
+		{"with a letter past f", false, func(id string) string { return "g" + id[1:] }},
+		{"as no uuid at all", false, func(string) string { return "bob's login" }},
+	} {
+		for _, call := range []string{"Apply", "DeleteGrants"} {
+			if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{held}}); err != nil {
+				t.Fatal(err)
+			}
+			grants, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{bob.Principal}})
+			if err != nil || len(grants) != 1 {
+				t.Fatalf("Grants = %+v, %v", grants, err)
+			}
+			id := c.spell(grants[0].ID)
+			var reads bool
+			if err := h.pool.QueryRow(ctx, `SELECT pg_input_is_valid($1, 'uuid')`, id).Scan(&reads); err != nil || reads != c.reads {
+				t.Fatalf("PostgreSQL reads %q as a uuid: %t, %v", id, reads, err)
+			}
+			if reads {
+				var read string
+				if err := h.pool.QueryRow(ctx, `SELECT $1::text::uuid::text`, id).Scan(&read); err != nil || read != grants[0].ID {
+					t.Fatalf("PostgreSQL reads %q as %q, %v, not %q", id, read, err, grants[0].ID)
+				}
+			}
+			err = revokes[call](id)
+			switch may := allowed(t, h, bob, login, cluster); {
+			case reads && (err != nil || may):
+				t.Errorf("%s by the grant's ID %s, %q: %v, and bob may still log in: %t", call, c.written, id, err, may)
+			case !reads && (!errors.Is(err, rbac.ErrInvalid) || !may):
+				t.Errorf("%s by the grant's ID %s, %q: %v, not refused as invalid, and bob may still log in: %t", call, c.written, id, err, may)
+			}
+		}
+	}
+}
+
+// A revoke takes as a grant's ID exactly what PostgreSQL's uuid input reads: one PostgreSQL can't
+// read that a revoke took would fail its change with PostgreSQL's error rather than as invalid, and
+// one it reads that a revoke refused is a grant's ID that a host can't revoke the grant by.
+func TestARevokeTakesAsAnIDWhatPostgreSQLReadsAsAUUID(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	rng := mathrand.New(mathrand.NewPCG(1, 2))
+	const digits, alphabet = "0123456789abcdefABCDEF", "0123456789abcdefABCDEF-{} g"
+	written := []string{"", "{}", "-", "{-}", "{{}}"}
+	// 32 digits, a hyphen after some groups of four but the last, braced, on one side or not at all,
+	// then edited at random: some read, most not.
+	for range 20000 {
+		var b []byte
+		braces := rng.IntN(4)
+		if braces == 1 || braces == 2 {
+			b = append(b, '{')
+		}
+		for i := range 32 {
+			b = append(b, digits[rng.IntN(len(digits))])
+			if i%4 == 3 && i < 31 && rng.IntN(2) == 0 {
+				b = append(b, '-')
+			}
+		}
+		if braces == 1 || braces == 3 {
+			b = append(b, '}')
+		}
+		for range rng.IntN(3) {
+			i, c := rng.IntN(len(b)+1), alphabet[rng.IntN(len(alphabet))]
+			switch {
+			case rng.IntN(3) == 0:
+				b = slices.Insert(b, i, c)
+			case i == len(b):
+			case rng.IntN(2) == 0:
+				b = slices.Delete(b, i, i+1)
+			default:
+				b[i] = c
+			}
+		}
+		written = append(written, string(b))
+	}
+	rows, err := pool.Query(ctx, `SELECT s, pg_input_is_valid(s, 'uuid') FROM unnest($1::text[]) s`, written)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s string
+	var reads bool
+	read := 0
+	if _, err := pgx.ForEachRow(rows, []any{&s, &reads}, func() error {
+		if reads {
+			read++
+		}
+		if rbac.UUIDText(s) != reads {
+			return fmt.Errorf("PostgreSQL reads %q as a uuid: %t, and a revoke takes it: %t", s, reads, !reads)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if read < len(written)/10 || read > len(written)*9/10 {
+		t.Fatalf("PostgreSQL reads %d of %d as uuids", read, len(written))
 	}
 }
 
@@ -14243,6 +14427,249 @@ func TestPermissionsWalkARoleOnceHoweverManyGrantsHoldIt(t *testing.T) {
 		t.Errorf("Permissions read %d entries more for each group granted a role of %d permissions on 4 scopes, and another under a condition", each, len(given))
 	}
 	lists(false)
+}
+
+// Authorize and Explain decide whether a role gives the permission once for each carrier its grants
+// have, however many grants hold it, as Permissions walks it: for a subject in a thousand groups each
+// granted a custom role of a thousand permissions on each scope of a cluster's path, they read the
+// role's permissions once for each grant, 4 million entries for a permission it doesn't give, and
+// took twice what a check of a built-in role did. They decide as before: every grant of the role
+// gives what it gives, under a condition only where the condition holds, and a privileged one
+// granted to the tenant's members gives them nothing.
+func TestChecksDecideARoleOnceHoweverManyGrantsHoldIt(t *testing.T) {
+	var given []rbac.Permission
+	for i := range 500 {
+		given = append(given, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "given", Permissions: given, ResourceTypes: []string{"cluster"}})
+	})
+	ctx := t.Context()
+	u := h.as(t, "u")
+	mfa := `request.attributes.mfa == true`
+	// custom.rooted gives root, which only privileged roles give, so it is privileged: granted to the
+	// tenant's members, it gives them nothing.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.given', $1, '{cluster}'), ('t1', 'custom.rooted', '{cluster:root}', '{cluster}')`, []any{given}},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'members', 't1', 'custom.rooted')`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// u in groups from to to, each granted the custom role on every scope of the cluster's path, and
+	// on the cluster under the condition too.
+	inGroups := func(from, to int) {
+		t.Helper()
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', s.type, s.id, 'group', 'g' || i, 'custom.given' FROM generate_series($1::int, $2) AS i,
+				  (VALUES ('cluster', 'c1'), ('workspace', 'w1'), ('org', 'o1'), ('tenant', 't1')) AS s(type, id)`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+				SELECT 't1', 'cluster', 'c1', 'group', 'g' || i, 'custom.given', $3 FROM generate_series($1::int, $2) AS i`, []any{mfa}},
+		} {
+			if _, err := h.pool.Exec(ctx, q.sql, append([]any{from, to}, q.args...)...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(k int) { read += k })
+	// decides checks and explains a few permissions with mfa or without, for groups groups, and
+	// returns how many entries a check and Explain of view, which the role doesn't give, read.
+	decides := func(groups int, withMFA bool) int {
+		t.Helper()
+		c := rbac.WithRequest(ctx, map[string]any{"mfa": withMFA})
+		for _, p := range []rbac.Permission{view, root, given[0], given[len(given)-1]} {
+			err := h.authz.Authorize(c, u, p, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			d, xerr := h.authz.Explain(c, u, p, cluster)
+			if xerr != nil {
+				t.Fatal(xerr)
+			}
+			want := 0
+			if slices.Contains(given, p) {
+				want = 4 * groups
+				if withMFA {
+					want += groups
+				}
+			}
+			if d.Allowed != (err == nil) || d.Allowed != (want > 0) || len(d.Grants) != want {
+				t.Errorf("with mfa %t, in %d groups, Authorize of %s: %v, Explain allows %t by %d grants, not %d", withMFA, groups, p, err, d.Allowed, len(d.Grants), want)
+			}
+		}
+		read = 0
+		if err := h.authz.Authorize(c, u, view, cluster); !errors.Is(err, rbac.ErrDenied) {
+			t.Fatalf("Authorize of %s: %v", view, err)
+		}
+		if _, err := h.authz.Explain(c, u, view, cluster); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	inGroups(1, 1)
+	one := decides(1, true)
+	inGroups(2, 100)
+	if each := (decides(100, true) - one) / 99; each >= len(given) {
+		t.Errorf("a check and Explain read %d entries more for each group granted a custom role of %d permissions on 4 scopes, and on one under a condition", each, len(given))
+	}
+	decides(100, false)
+}
+
+// A decision reads each distinct condition of the conditional grants it reads once, with the ids of
+// the grants holding it, however many share it, under a generic plan too: read for each grant, a
+// subject in 1,000 groups, each granted a role on the 4 scopes of a cluster's path under one
+// condition of 2 KB, had a check read 8 MB of them. Each grant decides as before: a check, a listing
+// and the subject's label values hold under the condition and not without it, and a grant under
+// another condition beside them by its own.
+func TestAConditionManyGrantsShareIsReadOnce(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "jit=off&plan_cache_mode=force_generic_plan"), withLabels)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	mfa, office := `request.attributes.mfa == true`, `request.attributes.office == true`
+	// u in 250 groups, each granted the login role on every scope of the cluster's path, and a level on
+	// the tenant, under mfa; and in one more granted the login role on the cluster under office.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(0, 250) AS i`, nil},
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series(0, 250) AS i`, nil},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+			SELECT 't1', s.type, s.id, 'group', 'g' || i, s.role, $1 FROM generate_series(1, 250) AS i,
+			  (VALUES ('cluster', 'c1', 'cluster.login'), ('workspace', 'w1', 'cluster.login'), ('org', 'o1', 'cluster.login'),
+			    ('tenant', 't1', 'cluster.login'), ('tenant', 't1', 'level.high')) AS s(type, id, role)`, []any{mfa}},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+			VALUES ('t1', 'cluster', 'c1', 'group', 'g0', 'cluster.login', $1)`, []any{office}},
+		{`ANALYZE rbac_grants, rbac_members, rbac_groups, rbac_memberships`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := 0
+	rbac.SetReadingConditions(t, func(n int) { read += n })
+	high := rbac.Label{"level": {"high"}}
+	for _, request := range []map[string]any{{"mfa": true}, {"office": true}, {}} {
+		c := rbac.WithRequest(ctx, request)
+		allows := request["mfa"] == true || request["office"] == true
+		// Several times, as a session plans a statement generically from its sixth run on.
+		for range 7 {
+			read = 0
+			err := h.authz.Authorize(c, u, login, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			if (err == nil) != allows || read != 2 {
+				t.Fatalf("with %v, Authorize of login: %v, reading %d conditions", request, err, read)
+			}
+		}
+		read = 0
+		perms, err := h.authz.Permissions(c, u, cluster)
+		if err != nil || slices.Contains(perms, login) != allows || read != 2 {
+			t.Errorf("with %v, Permissions = %v, %v, reading %d conditions", request, perms, err, read)
+		}
+		read = 0
+		held, err := h.authz.Holding(c, "t1", u)
+		if err != nil || held.Satisfies(high) != (request["mfa"] == true) || read != 1 {
+			t.Errorf("with %v, Holding satisfies %v: %t, %v, reading %d conditions", request, high, held.Satisfies(high), err, read)
+		}
+	}
+}
+
+// A decision reads the conditions of its conditional grants by each grant's id, a row at a time,
+// under a generic plan too: tested against arrays of every grant's id, principal and scope, a
+// generic plan compared each grant it read with every entry, so a subject in 1,000 groups, each
+// granted a role on the 4 scopes of a cluster's path under one condition, waited 170 ms for a check,
+// against 45. No count of rows or pages shows that, as it read no more of either, its time spent in
+// the comparisons, so its plan is read: no scan of the grants tests one against an array passed,
+// and one seeks each grant by its id. As of a time, history finds a grant's versions by its
+// principal and scope, so there one seeks each principal's grants on each scope, by either, and
+// tests them against only the ids of those: looked up by its id, each grant read all of history.
+func TestAConditionsGrantsAreReadByTheirIDs(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', 'cluster', 'c' || i, 'group', 'g' || i, 'cluster.login', 'request.attributes.mfa == true' FROM generate_series(1, 1000) AS i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_history`); err != nil {
+		t.Fatal(err)
+	}
+	type node struct {
+		Relation  string `json:"Relation Name"`
+		IndexCond string `json:"Index Cond"`
+		Filter    string `json:"Filter"`
+		Recheck   string `json:"Recheck Cond"`
+		Plans     []node `json:"Plans"`
+	}
+	// checkPlan plans the statement as of a time or not on tx generically, with sequential scans off
+	// as a decision reads it (queryIndexed), and fails unless a scan of relation seeks by one of seek.
+	checkPlan := func(tx pgx.Tx, asOf bool, relation string, seek ...string) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('enable_seqscan', 'off', true)`); err != nil {
+			return err
+		}
+		// By the simple protocol, which binds no parameters: GENERIC_PLAN plans with none.
+		results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN, FORMAT JSON) "+rbac.ConditionsSQL(asOf)).ReadAll()
+		if err != nil {
+			return err
+		}
+		plan := results[len(results)-1].Rows[0][0]
+		var plans []struct{ Plan node }
+		if err := json.Unmarshal(plan, &plans); err != nil {
+			return err
+		}
+		seeks := false
+		var walk func(node)
+		walk = func(n node) {
+			for _, cond := range []string{n.IndexCond, n.Filter, n.Recheck} {
+				if strings.Contains(cond, "ANY ($") {
+					t.Errorf("as of a time %t, the statement reading conditions tests rows against an array passed: %s", asOf, cond)
+				}
+			}
+			for _, by := range seek {
+				seeks = seeks || n.Relation == relation && strings.Contains(n.IndexCond, by)
+			}
+			for _, c := range n.Plans {
+				walk(c)
+			}
+		}
+		walk(plans[0].Plan)
+		if !seeks {
+			t.Errorf("as of a time %t, the statement reading conditions seeks no %s by %s: %s", asOf, relation, strings.Join(seek, " or "), plan)
+		}
+		return nil
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := checkPlan(tx, false, "rbac_grants", "id = w.id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error {
+		return checkPlan(tx, true, "rbac_history", "w.principal", "w.scope")
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // A change's read of its actor's authority decides each permission the actor hands on by the
