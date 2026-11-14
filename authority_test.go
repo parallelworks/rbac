@@ -8054,3 +8054,68 @@ func TestAChangeDecidesARoleOnceBesideUnreadGrantsEndingBetweenItsGrants(t *test
 		t.Errorf("granting %d, each until its own time, checked %d roles, where granting one checked %d", n, checks, once)
 	}
 }
+
+// Every change deciding by the actor's conditions returns the error of a read of them that failed,
+// as Apply does, not a refusal OnRefused is told of: where the actor holds the power only through
+// them, deleting roles, setting denies and managing groups and their members; and where it has
+// power of its own besides, a change needing what they give, and Grantable.
+func TestEveryChangeWhoseConditionsCantBeReadReturnsWhy(t *testing.T) {
+	always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+	guard := rbac.RoleDefinition{ID: "cluster.guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+	granter := rbac.RoleDefinition{ID: "cluster.granter", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	var refused []rbac.Refusal
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guard, granter)
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refused = append(refused, r) }
+	})
+	ctx := t.Context()
+	under := func(g rbac.Grant) rbac.Grant { g.Condition = always; return g }
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, under(grant(tenant, "tenant.roles", rbac.User, "ann")), under(grant(cluster.Scope(), "cluster.guard", rbac.User, "ann")),
+		under(grant(tenant, "tenant.groups", rbac.User, "ann")), under(grant(tenant, "group.members", rbac.User, "ann")),
+		grant(cluster.Scope(), "cluster.granter", rbac.User, "pat"), under(grant(cluster.Scope(), "cluster.admin", rbac.User, "pat")))
+	ann, pat := h.as(t, "ann"), h.as(t, "pat")
+	h.join(t, "u")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "devs"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.x', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("u"), Condition: always}}}
+	changes := []struct {
+		name string
+		f    func(context.Context) error
+	}{
+		{"DeleteRole", func(ctx context.Context) error { return h.authz.DeleteRole(ctx, ann, "t1", "custom.x") }},
+		{"SetDeny", func(ctx context.Context) error {
+			return h.authz.SetDeny(ctx, ann, cluster, rbac.Deny{ID: "d1", Principals: []rbac.Principal{identity("u")}, Permissions: []rbac.Permission{root}})
+		}},
+		{"SetGroup", func(ctx context.Context) error {
+			return h.authz.SetGroup(ctx, ann, "t1", rbac.GroupDefinition{ID: "devs", Name: "renamed"})
+		}},
+		{"ChangeMembers", func(ctx context.Context) error {
+			return h.authz.ChangeMembers(ctx, ann, "t1", []rbac.Member{{Group: "devs", Principal: identity("u")}}, nil)
+		}},
+		{"Apply by power of its own", func(ctx context.Context) error { return h.authz.Apply(ctx, pat, cluster, sudo) }},
+		{"Grantable by power of its own", func(ctx context.Context) error {
+			_, err := h.authz.Grantable(ctx, pat, cluster)
+			return err
+		}},
+	}
+	for _, c := range changes {
+		canceled, cancel := context.WithCancel(ctx)
+		rbac.SetReadingRoles(t, cancel)
+		refused = nil
+		if err := c.f(canceled); !errors.Is(err, context.Canceled) || len(refused) > 0 {
+			t.Errorf("%s: %v, refusals told %v", c.name, err, refused)
+		}
+		cancel()
+	}
+	rbac.SetReadingRoles(t, func() {})
+	for _, c := range changes {
+		if err := c.f(ctx); err != nil {
+			t.Errorf("%s with its conditions read: %v", c.name, err)
+		}
+	}
+}
