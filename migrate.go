@@ -286,7 +286,7 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &mine, &super, &set, &login, &role, &views, &bytes); err != nil {
 		return nil, err
 	}
-	planted, err := plantedFor(ctx, tx, schema)
+	planted, trigger, err := plantedFor(ctx, tx, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +295,9 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 		return nil, err
 	}
 	switch {
+	case trigger:
+		return nil, fmt.Errorf("%w: schema %s holds %s, which none of the package's migrations makes, and which would run as the role migrating, on a migration's writes, whatever made it: drop it, and make it again after migrating if it is one of the host's own",
+			ErrInvalid, schema, *planted)
 	case planted != nil && owner == nil:
 		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, but holds %s, which a migration would find in its place, run, or call as the role migrating: drop it, or migrate in another schema",
 			ErrInvalid, schema, *planted)
@@ -348,16 +351,14 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 // tables' owner, nor history's once they are made, nor a superuser owns it, and rbac_migrations is
 // unless it is an ordinary table of the tables' owner's. So is a function or operator in the
 // schema that none of those owns, which a statement whose arguments it matches better than
-// pg_catalog's would call, as format(text, name) does format(..., current_schema()), and a trigger
-// on any of the tables calling a function none of those owns: its maker needs only TRIGGER on the
-// table, and it fires on the migration's writes. Its WHEN clause runs as the role migrating too,
-// whatever function it executes, as pg_catalog's own, so a trigger is one where anything it
-// depends on, a function, operator or type, as a domain whose check calls one, is another's, and
-// one with a WHEN clause or arguments at all, whoever made it, none of the package's has either:
-// pg_catalog's own functions run SQL text, as query_to_xml('SELECT f()', ...) does, which depends on
-// nothing another role owns, set_config would undo the search_path the migrations run under, and a
-// superuser's trigger function can run what its arguments name, as refint's check_primary_key reads
-// the relation they do, which can be another role's view calling its function. So too is any other object in the schema that names
+// pg_catalog's would call, as format(text, name) does format(..., current_schema()). So is any
+// trigger on one of the tables that isn't one of packageTriggers exactly, whoever made it: its maker
+// needs only TRIGGER on the table, and it fires on the migration's writes as the role migrating, and
+// a trigger names no owner to trust. Refusing only one running another's function let through what
+// a trusted one runs: its WHEN clause, which can run SQL text through pg_catalog's own functions, as
+// query_to_xml('SELECT f()', ...) does; its arguments, which a superuser's function can run, as
+// refint's check_primary_key reads the relation they name, which can be another role's view calling
+// its function; or a table a superuser's function writes, whose own trigger is another role's. So too is any other object in the schema that names
 // can find, but tables, views and indexes not named rbac_, which a migration names only so: a type
 // or domain, a composite type, collation, conversion, text search configuration or dictionary,
 // statistics object, foreign table, or a sequence no column owns, which a name a migration gives
@@ -365,9 +366,8 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 // and policies only a table's owner makes, and operator classes and families, text search parsers
 // and templates only a superuser. The tables' owner is the role that will make them, the current
 // one, where they aren't made.
-func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) {
-	var planted *string
-	err := tx.QueryRow(ctx, `WITH s AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1),
+func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (planted *string, trigger bool, err error) {
+	err = tx.QueryRow(ctx, `WITH s AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1),
 		  ns AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname IN ($1, $1 || '_as_of')),
 		  tables AS (SELECT c.relowner FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
 		    WHERE c.relname = 'rbac_grants' AND c.relkind IN ('r', 'p')),
@@ -391,17 +391,14 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		    WHERE p.proowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oid, o.oprowner, 1 FROM pg_catalog.pg_operator o JOIN s ON o.oprnamespace = s.oid
 		    WHERE o.oprowner NOT IN (SELECT t.oid FROM trusted t)
-		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, u.owner, 1 FROM pg_catalog.pg_trigger g
-		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid
-		    JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_trigger'::pg_catalog.regclass AND d.objid = g.oid
-		    JOIN (SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass AS class, p.oid, p.proowner AS owner FROM pg_catalog.pg_proc p
-		      UNION ALL SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oid, o.oprowner FROM pg_catalog.pg_operator o
-		      UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner FROM pg_catalog.pg_type y) u
-		      ON u.class = d.refclassid AND u.oid = d.refobjid
-		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND u.owner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, 0::pg_catalog.oid, 1 FROM pg_catalog.pg_trigger g
 		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid
-		    WHERE NOT g.tgisinternal AND (g.tgqual IS NOT NULL OR g.tgnargs > 0) AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_')
+		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND NOT EXISTS (SELECT
+		      FROM (VALUES `+packageTriggers+`) k (rel, name, fn, type, deferred), s, pg_catalog.pg_proc p
+		      WHERE c.relnamespace = s.oid AND c.relkind IN ('r', 'p') AND c.relname = k.rel AND g.tgname = k.name
+		        AND p.oid = g.tgfoid AND p.pronamespace = s.oid AND p.proname = k.fn AND p.pronargs = 0
+		        AND g.tgtype = k.type AND (g.tgconstraint <> 0) = k.deferred AND g.tgdeferrable = k.deferred AND g.tginitdeferred = k.deferred
+		        AND g.tgnargs = 0 AND g.tgqual IS NULL AND g.tgattr::pg_catalog.text = '' AND g.tgoldtable IS NULL AND g.tgnewtable IS NULL)
 		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, 1 FROM pg_catalog.pg_type y JOIN s ON y.typnamespace = s.oid
 		    WHERE y.typrelid = 0 AND y.typowner NOT IN (SELECT t.oid FROM trusted t) AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
 		    UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, c.relowner, 1 FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
@@ -418,15 +415,41 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		    WHERE d.dictowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass, x.oid, x.stxowner, 1 FROM pg_catalog.pg_statistic_ext x JOIN s ON x.stxnamespace = s.oid
 		    WHERE x.stxowner NOT IN (SELECT t.oid FROM trusted t))
-		SELECT pg_catalog.pg_describe_object(p.class, p.oid, 0) || CASE WHEN p.owner <> 0 THEN ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s'
-		  WHEN (SELECT g.tgqual IS NOT NULL FROM pg_catalog.pg_trigger g WHERE g.oid = p.oid) THEN ', whose WHEN clause runs as the role migrating'
-		  ELSE ', whose arguments name what its function runs as the role migrating' END
-		FROM planted p ORDER BY p.rank, 1 LIMIT 1`, schema).Scan(&planted)
+		SELECT pg_catalog.pg_describe_object(p.class, p.oid, 0) || CASE WHEN p.owner <> 0 THEN ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s' ELSE '' END,
+		  p.owner = 0
+		FROM planted p ORDER BY p.rank, 1 LIMIT 1`, schema).Scan(&planted, &trigger)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+		return nil, false, nil
 	}
-	return planted, err
+	return planted, trigger, err
 }
+
+// packageTriggers are the triggers the migrations make on the package's tables, as rows of table,
+// trigger, function in the table's schema, pg_trigger.tgtype, and whether it is a constraint
+// trigger deferred to the commit: rbac_history_committed runs rbac_record from 0027_commit_dates
+// and rbac_history_commit from 0029_commit_trigger on.
+const packageTriggers = `('rbac_grants', 'rbac_grants_history', 'rbac_record', 29, false),
+		  ('rbac_roles', 'rbac_roles_history', 'rbac_record', 29, false),
+		  ('rbac_denies', 'rbac_denies_history', 'rbac_record', 29, false),
+		  ('rbac_eligibilities', 'rbac_eligibilities_history', 'rbac_record', 29, false),
+		  ('rbac_memberships', 'rbac_memberships_history', 'rbac_record', 29, false),
+		  ('rbac_groups', 'rbac_groups_history', 'rbac_record', 29, false),
+		  ('rbac_members', 'rbac_members_history', 'rbac_record', 29, false),
+		  ('rbac_expired', 'rbac_expired_history', 'rbac_record', 29, false),
+		  ('rbac_grants', 'rbac_grants_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_roles', 'rbac_roles_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_denies', 'rbac_denies_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_eligibilities', 'rbac_eligibilities_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_memberships', 'rbac_memberships_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_groups', 'rbac_groups_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_members', 'rbac_members_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_expired', 'rbac_expired_no_truncate', 'rbac_no_truncate', 34, false),
+		  ('rbac_expired', 'rbac_expired_until', 'rbac_expired_until', 23, false),
+		  ('rbac_history', 'rbac_history_append_only', 'rbac_history_append_only', 27, false),
+		  ('rbac_history', 'rbac_history_no_truncate', 'rbac_history_append_only', 34, false),
+		  ('rbac_history', 'rbac_history_pruned', 'rbac_history_pruned', 9, true),
+		  ('rbac_history', 'rbac_history_committed', 'rbac_record', 5, true),
+		  ('rbac_history', 'rbac_history_committed', 'rbac_history_commit', 5, true)`
 
 // creatorIn names a role, or PUBLIC, that may create in schema but neither owns the package's
 // tables, the role that will make them where they aren't made, nor owns history once they are, nor

@@ -399,7 +399,8 @@ func TestMigratingTakesTheWritesOfExpiredsColumnToo(t *testing.T) {
 // do, would run that role's code as the table's owner once rbac_expired_through writes the table,
 // whoever calls it: migrating to 0032 refuses it, having changed nothing, and goes on once it is
 // dropped, beside triggers whose functions the table's owner and a superuser own, which run only
-// what they wrote.
+// what they wrote, as a host's own tool applies it: Migrate refuses those too, as it does any
+// trigger none of the migrations makes.
 func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing.T) {
 	ctx := t.Context()
 	r := newReadmeRoles(t)
@@ -447,8 +448,13 @@ func TestMigratingRefusesATriggerOnExpiredRunningAnotherRolesFunction(t *testing
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
-		t.Fatalf("migrating once the trigger is dropped: %v", err)
+	// Migrate refuses any trigger none of the migrations makes, whatever function it runs.
+	if err := rbac.Migrate(ctx, r.adminPool); !errors.Is(err, rbac.ErrInvalid) ||
+		!strings.Contains(err.Error(), "trigger owners on table rbac_expired, which none of the package's migrations makes") {
+		t.Fatalf("migrating with the owner's trigger on rbac_expired: %v", err)
+	}
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "0032", "0033"); err != nil {
+		t.Fatalf("applying 0032 once the trigger is dropped: %v", err)
 	}
 }
 

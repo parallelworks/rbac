@@ -1855,9 +1855,20 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 			`CREATE FUNCTION {own}.planted_when() RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM {own}.rbac_planted_seen(); RETURN false; END $$`,
 			`CREATE TRIGGER planted BEFORE INSERT ON rbac_migrations FOR EACH ROW WHEN ({own}.planted_when()) EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()`,
 		}, `DROP OWNED BY {app} CASCADE`},
-		{"a trigger whose WHEN clause runs another's SQL through pg_catalog's", "trigger planted on table rbac_migrations, whose WHEN clause", []string{`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`}, []string{
+		{"a trigger whose WHEN clause runs another's SQL through pg_catalog's", "trigger planted on table rbac_migrations", []string{`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`}, []string{
 			`CREATE TRIGGER planted BEFORE INSERT ON rbac_migrations FOR EACH ROW WHEN (pg_catalog.query_to_xml('SELECT {own}.rbac_planted_seen()', false, false, '') IS NULL) EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()`,
 		}, `DROP TRIGGER planted ON {schema}.rbac_migrations; DROP OWNED BY {app} CASCADE`},
+		// A superuser's own function, as a host's audit trigger, with no WHEN clause or arguments,
+		// writing a table the application's role owns, whose own trigger runs its function.
+		{"a trigger running a superuser's function that writes another's table", "trigger planted on table rbac_migrations", []string{
+			`CREATE SCHEMA {schema}_audit`, `GRANT USAGE ON SCHEMA {schema}_audit TO PUBLIC`,
+			`CREATE FUNCTION {schema}_audit.logged() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO {own}.audit VALUES (TG_TABLE_NAME); RETURN NULL; END $$`,
+			`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`,
+		}, []string{
+			`CREATE TABLE {own}.audit (name text)`, `GRANT INSERT ON {own}.audit TO PUBLIC`,
+			`CREATE TRIGGER fire AFTER INSERT ON {own}.audit FOR EACH ROW EXECUTE FUNCTION {own}.rbac_planted_fire()`,
+			`CREATE TRIGGER planted AFTER INSERT ON {schema}.rbac_migrations FOR EACH ROW EXECUTE FUNCTION {schema}_audit.logged()`,
+		}, `DROP TRIGGER planted ON {schema}.rbac_migrations; DROP SCHEMA {schema}_audit CASCADE; DROP OWNED BY {app} CASCADE`},
 		{"a trigger on rbac_grants", "trigger planted on table rbac_grants", []string{`GRANT TRIGGER ON {schema}.rbac_grants TO {app}`}, []string{
 			`CREATE TRIGGER planted AFTER INSERT OR UPDATE OR DELETE ON rbac_grants FOR EACH STATEMENT EXECUTE FUNCTION {own}.rbac_planted_fire()`,
 		}, `DROP OWNED BY {app} CASCADE`},
@@ -1883,7 +1894,9 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 					t.Fatal(err)
 				}
 			}
-			p.plant(t, c.sqls...)
+			for _, sql := range c.sqls {
+				p.plant(t, named.Replace(sql))
+			}
 			var before int
 			if err := r.super.QueryRow(ctx, `SELECT max(version) FROM `+r.schema+`.rbac_migrations`).Scan(&before); err != nil {
 				t.Fatal(err)
@@ -1907,6 +1920,33 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 			}
 			if s := r.strangers(t); len(s) > 0 {
 				t.Errorf("migrating left %v another role's", s)
+			}
+		})
+	}
+}
+
+// Migrate refuses every trigger on the package's tables but those its migrations make, so from each
+// version a database can stand at, under the README's roles from the views on, the triggers there are
+// only those, and Migrate goes on to the latest.
+func TestMigrateGoesOnFromEachVersionWithTheTriggersItsMigrationsMade(t *testing.T) {
+	names, err := fs.Glob(rbac.Migrations(), "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, _ := madeViews(t)
+	for _, to := range names[1:] {
+		t.Run("to "+to, func(t *testing.T) {
+			ctx := t.Context()
+			r := newReadmeRoles(t)
+			if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", to); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, r.adminPool, to)
+			if to > made {
+				r.harden(t)
+			}
+			if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+				t.Fatalf("Migrate from before %s: %v", to, err)
 			}
 		})
 	}
@@ -1950,7 +1990,7 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeATriggerWithArguments(t *testing
 		`GRANT SELECT ON {own}.versions TO PUBLIC`,
 		`CREATE TRIGGER planted AFTER INSERT ON `+r.schema+`.rbac_migrations FOR EACH ROW EXECUTE FUNCTION refint.check_primary_key('version', '{own}.versions', 'v')`,
 	)
-	plantedRefused(t, rbac.Migrate(ctx, r.adminPool), "trigger planted on table rbac_migrations, whose arguments")
+	plantedRefused(t, rbac.Migrate(ctx, r.adminPool), "trigger planted on table rbac_migrations")
 	p.fired(t)
 	var after int
 	if err := r.super.QueryRow(ctx, `SELECT max(version) FROM `+r.schema+`.rbac_migrations`).Scan(&after); err != nil || after != before {
