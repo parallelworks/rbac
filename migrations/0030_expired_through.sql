@@ -12,7 +12,7 @@
 -- has ended in every tenant. History doesn't record it, and AsOf doesn't read it: as of a time, a
 -- read decides at that time.
 CREATE TABLE rbac_expired (
-    until timestamptz NOT NULL CHECK (isfinite(until))
+    until timestamptz NOT NULL CHECK (pg_catalog.isfinite(until))
 );
 
 -- Every check and change reads the latest by it.

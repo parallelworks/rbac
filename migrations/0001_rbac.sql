@@ -13,11 +13,11 @@ CREATE TABLE rbac_grants (
     source                text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
     expires_at            timestamptz,
     -- A grant's condition, in CEL; empty for none.
-    condition_title       text        NOT NULL DEFAULT '' CHECK (length(condition_title) <= 128),
-    condition_description text        NOT NULL DEFAULT '' CHECK (length(condition_description) <= 2048),
-    condition             text        COLLATE "C" NOT NULL DEFAULT '' CHECK (length(condition) <= 2048),
+    condition_title       text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(condition_title) <= 128),
+    condition_description text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(condition_description) <= 2048),
+    condition             text        COLLATE "C" NOT NULL DEFAULT '' CHECK (pg_catalog.length(condition) <= 2048),
     -- Why a grant was made; an activated grant's justification.
-    note                  text        NOT NULL DEFAULT '' CHECK (length(note) <= 2048),
+    note                  text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(note) <= 2048),
     -- Principals as `kind:id`: who approved an activation that needed it, empty for none; who made
     -- the grant, and who last changed its note.
     approved_by           text        NOT NULL DEFAULT '',
@@ -43,7 +43,7 @@ CREATE TABLE rbac_grants (
 -- index-only scan on this: principals and scopes as arrays, with expiry, and whether a grant has
 -- a condition, which a check reads by id only when no unconditional grant allows.
 CREATE UNIQUE INDEX rbac_grants_key ON rbac_grants
-    (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), length(condition), hashtextextended(condition, 0))
+    (tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), pg_catalog.length(condition), pg_catalog.hashtextextended(condition, 0))
     INCLUDE (id, expires_at, conditional);
 
 -- A principal holds one activation of a role on a scope, which activating again extends, so an
@@ -68,10 +68,10 @@ CREATE INDEX rbac_grants_custom_role ON rbac_grants (tenant, role) WHERE role LI
 CREATE TABLE rbac_roles (
     tenant          text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
     id              text        COLLATE "C" NOT NULL CHECK (id ~ '^custom[.][a-z0-9._-]{1,121}$'),
-    name            text        NOT NULL DEFAULT '' CHECK (length(name) <= 128),
-    description     text        NOT NULL DEFAULT '' CHECK (length(description) <= 2048),
-    permissions     text[]      COLLATE "C" NOT NULL CHECK (cardinality(permissions) > 0),
-    resource_types  text[]      COLLATE "C" NOT NULL CHECK (cardinality(resource_types) > 0),
+    name            text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(name) <= 128),
+    description     text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(description) <= 2048),
+    permissions     text[]      COLLATE "C" NOT NULL CHECK (pg_catalog.cardinality(permissions) > 0),
+    resource_types  text[]      COLLATE "C" NOT NULL CHECK (pg_catalog.cardinality(resource_types) > 0),
     privileged      boolean     NOT NULL DEFAULT false,
     public          boolean     NOT NULL DEFAULT false,
     grantable_roles text[]      COLLATE "C" NOT NULL DEFAULT '{}',
@@ -88,15 +88,15 @@ CREATE TABLE rbac_denies (
     scope_type            text        COLLATE "C" NOT NULL CHECK (scope_type ~ '^[a-z][a-z0-9_-]{0,62}$'),
     scope_id              text        COLLATE "C" NOT NULL CHECK (scope_id <> '' AND (scope_type <> 'tenant' OR scope_id = tenant)),
     id                    text        COLLATE "C" NOT NULL CHECK (id ~ '^[a-z0-9][a-z0-9._-]{0,127}$'),
-    name                  text        NOT NULL DEFAULT '' CHECK (length(name) <= 128),
+    name                  text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(name) <= 128),
     -- Principals as `kind:id`; `public:` is everyone, `members:<tenant>` every member.
-    principals            text[]      COLLATE "C" NOT NULL CHECK (cardinality(principals) BETWEEN 1 AND 256),
-    exempt                text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (cardinality(exempt) <= 256),
+    principals            text[]      COLLATE "C" NOT NULL CHECK (pg_catalog.cardinality(principals) BETWEEN 1 AND 256),
+    exempt                text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (pg_catalog.cardinality(exempt) <= 256),
     -- `type:verb`, or `type:*` for every permission on a type.
-    permissions           text[]      COLLATE "C" NOT NULL CHECK (cardinality(permissions) BETWEEN 1 AND 256),
-    condition_title       text        NOT NULL DEFAULT '' CHECK (length(condition_title) <= 128),
-    condition_description text        NOT NULL DEFAULT '' CHECK (length(condition_description) <= 2048),
-    condition             text        NOT NULL DEFAULT '' CHECK (length(condition) <= 4096),
+    permissions           text[]      COLLATE "C" NOT NULL CHECK (pg_catalog.cardinality(permissions) BETWEEN 1 AND 256),
+    condition_title       text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(condition_title) <= 128),
+    condition_description text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(condition_description) <= 2048),
+    condition             text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(condition) <= 4096),
     created_by            text        NOT NULL DEFAULT '',
     created_at            timestamptz NOT NULL DEFAULT now(),
     updated_by            text        NOT NULL DEFAULT '',
@@ -123,10 +123,10 @@ CREATE TABLE rbac_eligibilities (
     max_seconds    bigint      NOT NULL CHECK (max_seconds BETWEEN 1 AND 31622400),
     expires_at     timestamptz,
     -- What activating needs, in CEL; empty for nothing more.
-    requires       text        NOT NULL DEFAULT '' CHECK (length(requires) <= 2048),
+    requires       text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(requires) <= 2048),
     -- Who approves each activation, identities or groups as `kind:id`; empty for no one.
-    approvers      text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (cardinality(approvers) <= 16),
-    note           text        NOT NULL DEFAULT '' CHECK (length(note) <= 2048),
+    approvers      text[]      COLLATE "C" NOT NULL DEFAULT '{}' CHECK (pg_catalog.cardinality(approvers) <= 16),
+    note           text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(note) <= 2048),
     created_by     text        NOT NULL DEFAULT '',
     created_at     timestamptz NOT NULL DEFAULT now(),
     scope          text        COLLATE "C" GENERATED ALWAYS AS (scope_type || ':' || scope_id) STORED,

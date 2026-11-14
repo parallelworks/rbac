@@ -12,7 +12,7 @@ CREATE FUNCTION rbac_group_members(tenant text, groups text[], at timestamptz, p
     RETURNS TABLE (group_id text, principal text, guest boolean) LANGUAGE plpgsql STABLE PARALLEL RESTRICTED AS $$
 BEGIN
     -- Planning the query costs more than finding no groups.
-    IF cardinality(groups) > 0 THEN
+    IF pg_catalog.cardinality(groups) > 0 THEN
         RETURN QUERY EXECUTE 'SELECT m.group_id::text, m.principal::text, ' || CASE WHEN standing
             THEN 's.guest FROM rbac_members m JOIN rbac_memberships s ON s.tenant = m.tenant AND s.principal = m.principal
               AND NOT s.suspended AND (s.expires_at IS NULL OR s.expires_at > $3)'

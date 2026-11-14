@@ -6249,7 +6249,16 @@ func colliding(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(shadowed.Close)
-	return setupOn(t, shadowed)
+	h := setupOn(t, shadowed)
+	// Migrate makes the index under its own search_path, which finds PostgreSQL's hash, so it is
+	// made again as 0001 makes it but with the schema's.
+	if _, err := pool.Exec(ctx, `DROP INDEX rbac_grants_key; CREATE UNIQUE INDEX rbac_grants_key ON rbac_grants
+		(tenant, principal, scope, role, source, coalesce(expires_at, 'infinity'), pg_catalog.length(condition), `+
+		pgx.Identifier{schema, "hashtextextended"}.Sanitize()+`(condition, 0))
+		INCLUDE (id, expires_at, conditional)`); err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 // Two grants of one role to one principal on one scope, from one source until one time, whose

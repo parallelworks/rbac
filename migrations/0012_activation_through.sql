@@ -19,7 +19,7 @@
 -- outlast the eligibility of, rather than on the one it was extended through.
 ALTER TABLE rbac_grants ADD COLUMN activated_through text COLLATE "C", ADD COLUMN eligibility_id bigint,
     ADD CONSTRAINT rbac_grants_activated_through_check CHECK (activated_through ~ '^[a-z][a-z0-9_-]{0,62}:'
-        AND octet_length(substr(activated_through, strpos(activated_through, ':') + 1)) BETWEEN 1 AND 512) NOT VALID;
+        AND pg_catalog.octet_length(substr(activated_through, strpos(activated_through, ':') + 1)) BETWEEN 1 AND 512) NOT VALID;
 
 -- An activation in force is recorded as made through the one eligibility for its role on its scope,
 -- of those stored, whose principal its holder reaches now, by its membership in force, suspended
@@ -45,7 +45,7 @@ WITH RECURSIVE activations AS (
     SELECT a.id, min(e.principal) AS through, min(e.id) AS eligibility FROM activations a
     JOIN reaching r ON r.tenant = a.tenant AND r.holder = a.principal
     JOIN rbac_eligibilities e ON e.tenant = a.tenant AND e.scope = a.scope AND e.role = a.role AND e.principal = r.k
-    GROUP BY a.id HAVING count(*) = 1 AND max(octet_length(e.principal_id)) <= 512
+    GROUP BY a.id HAVING count(*) = 1 AND max(pg_catalog.octet_length(e.principal_id)) <= 512
 )
 UPDATE rbac_grants g SET activated_through = m.through, eligibility_id = m.eligibility FROM made m WHERE g.id = m.id;
 SELECT set_config('rbac.change', '', true);
