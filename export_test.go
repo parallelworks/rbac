@@ -580,6 +580,15 @@ func SetReadingEntries(t *testing.T, f func(n int)) {
 	t.Cleanup(func() { readingEntries = old })
 }
 
+// SetFindingGains runs f each time a change to members finds the n grants and eligibilities the
+// members it adds gain, until t ends.
+func SetFindingGains(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := findingGains
+	findingGains = f
+	t.Cleanup(func() { findingGains = old })
+}
+
 // SetReadingConditions runs f each time a decision reads n conditions of its conditional grants,
 // until t ends.
 func SetReadingConditions(t *testing.T, f func(n int)) {

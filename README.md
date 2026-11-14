@@ -753,9 +753,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   host is asked about each as each member's, so the members one `ChangeMembers` adds gain at most
   `rbac.MaxBindings` grants and eligibilities in all, each member's counted apart, but no more
   than one place alone gains, whatever its group and those it is in hold. A member is its
-  principal, however many groups, or places in one, the change gives it: what they reach counts,
-  and the host is asked about it, once for each end its places give it, so a group two of them are
-  in counts once, as does a group it is placed in from two sources until one end; but a member
+  principal, however many groups, or places in one, the change gives it: each grant or
+  eligibility they reach counts, and the host is asked about it, once for each end the member gains
+  it until, the sooner of its own end and a place's, so a group two of them are in counts once, as
+  does a group it is placed in from two sources until one end, or until two ends after what it
+  holds ends; but a member
   joining several groups that give more than `rbac.MaxBindings` together, and more than any one of
   them alone, joins them in more than one change.
   `ImportMembers`, the host's own write, which no actor's access decides, has no such bound: it asks
@@ -1332,7 +1334,11 @@ the package's uses foreign data, so none of the roles needs any.
   and `pg_temp` alone, so nothing made in the schema runs before it is refused; while migrating, it
   is the package's schema and then `pg_temp`, whatever the host's names, so nothing in another schema runs in place of PostgreSQL's,
   and no temporary table of the session is read in place of the package's, as one named
-  `rbac_migrations` holding every version made `Migrate` apply nothing. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
+  `rbac_migrations` holding every version made `Migrate` apply nothing. `Migrate` doesn't look at
+  event triggers, which only a superuser makes and which fire on every role's DDL in the database,
+  a migration's too, as the role running it: one whose function another role owns, or can replace,
+  runs that role's code as the administrator on each migration, so a superuser makes event
+  triggers run only functions it or the administrator owns. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
   role's, as the administrator's is in [History](#history), a first `Migrate` as any other role, a
   superuser too, is refused as `rbac.ErrInvalid` naming that role, having made nothing, as
   `0028_as_of_views` would fail there after making every table before it the role migrating's.
