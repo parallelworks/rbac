@@ -1566,9 +1566,12 @@ flowchart TB
   would be bound into `rbac_grants_key` and run as the tables' owner on every insert; a trigger on
   one of the tables calling such a function, or depending on one or on such an operator or type,
   as its `WHEN` clause can while it runs a trusted function, which ran another role's function as
-  the administrator on each version recorded, and one with a `WHEN` clause at all, whoever made it,
-  as pg_catalog's own functions run SQL text, as `query_to_xml('SELECT f()', ...)` does, which
-  depends on nothing another role owns (none of the package's triggers has one); and a type, domain, composite type, collation,
+  the administrator on each version recorded, and one with a `WHEN` clause or arguments at all,
+  whoever made it, as pg_catalog's own functions run SQL text, as `query_to_xml('SELECT f()', ...)`
+  does, which depends on nothing another role owns, and a superuser's trigger function can run what
+  its arguments name, as contrib `refint`'s `check_primary_key` reads the relation they do, which
+  can be another role's view calling its function (none of the package's triggers has either); and
+  a type, domain, composite type, collation,
   conversion, text search configuration or dictionary, statistics object, foreign table or sequence
   no column owns. And it refuses a schema in which any other role, or `PUBLIC`, may create
   (`creatorIn`), as one could make such an object between the check and a migration's statement:
