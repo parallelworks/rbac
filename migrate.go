@@ -63,7 +63,10 @@ func Migrations() fs.FS {
 // before it applies anything or takes any lock, but as a superuser, which it runs each migration as
 // that role for, by SET LOCAL ROLE, and as itself again after: so a superuser's migration makes
 // and checks what that role's own would, and fails where that one's would, saying what to grant.
-// Where the tables aren't made yet, the role migrating makes them, and owns them.
+// A superuser whose login may not SET ROLE to that role is refused too. It decides so again once it
+// holds the schema's lock, as the replica it waited for can have made the tables meanwhile. Where
+// the tables aren't made yet, the role migrating makes them, and owns them, a superuser too, which
+// it refuses, as ErrInvalid, where the schema of AsOf's views is made and another role's.
 //
 // A migration waits at most 100 ms for any lock it takes on the package's tables, as it holds those
 // it took before meanwhile, which every statement reading them waits for: a change that reads them
@@ -240,49 +243,51 @@ func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
 // refuses a superuser whose login may not, as one that is a superuser only by SET ROLE to a
 // superuser role, as ErrInvalid saying to migrate as the owner: setting the role would fail with
 // SQLSTATE 42501 even with nothing pending, and as itself it would make what it makes its own.
-// Where the tables aren't made, another role makes them as itself, but a superuser as the
-// schema's owner, or the database's where pg_database_owner owns the schema, as it does public
-// from PostgreSQL 15 on, unless that is a superuser too: as itself, its first migration would
-// leave them its own, which no other role could migrate, in a schema the README's administrator's
-// role owns, whose migration would make them its own. Migrate calls it before it takes the
-// schema's lock, locked false, where it only refuses, so a role is refused without waiting for
-// another replica's migration, and again once it holds the lock, locked true, where it sets the
-// role, as that replica can have made the tables, or given them to another role, since it read
+// Where the tables aren't made, the role migrating makes them as itself, a superuser too: never as
+// the schema's owner or the database's, which can be the application's role, as where it owns the
+// database and so public, and that role, owning them, could disable history's triggers. But once it
+// holds the lock, it refuses a superuser where the schema of AsOf's views is made and another
+// role's, as the README's administrator's role's is, naming that role: 0028_as_of_views would fail
+// there, having made every table before it the superuser's, which that role then couldn't migrate.
+// Migrate calls it before it takes the schema's lock, locked false, where it only refuses, so a
+// role is refused without waiting for another replica's migration, and again once it holds the
+// lock, locked true, where it sets the role, or refuses a superuser on a schema holding none of the
+// tables, as that replica can have made the tables, or given them to another role, since it read
 // them: a superuser that read none would make the next migration's tables its own, which the
 // owner's migrations after it then fail on. The current schema is the first on the search_path the
 // role has USAGE on, which "$user" names by the role, so it refuses an owner it is another for.
 func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restore func() error, err error) {
-	var owner *string
-	var made, mine, super, set bool
+	var owner, views *string
+	var mine, super, set bool
 	var login, role string
 	// The tables by name, read at the statement's snapshot, not by to_regclass: the session caches
 	// the table's absence as it looks it up before the lock, and reads the replica's tables only once
-	// it takes a table's lock, so under the lock it would read none of those made meanwhile.
-	if err := tx.QueryRow(ctx, `SELECT o.rolname::pg_catalog.text, c.oid IS NOT NULL, coalesce(o.oid = r.oid, false), r.rolsuper,
-		  coalesce(pg_catalog.pg_has_role(SESSION_USER, o.oid, 'SET'), false), SESSION_USER::pg_catalog.text, pg_catalog.current_setting('role')
+	// it takes a table's lock, so under the lock it would read none of those made meanwhile. A table
+	// only: another relation so named is no owner's of the tables, but a role that may create in the
+	// schema could make one to have a superuser migrate as that role.
+	if err := tx.QueryRow(ctx, `SELECT o.rolname::pg_catalog.text, coalesce(o.oid = r.oid, false), r.rolsuper,
+		  coalesce(pg_catalog.pg_has_role(SESSION_USER, o.oid, 'SET'), false), SESSION_USER::pg_catalog.text, pg_catalog.current_setting('role'),
+		  (SELECT pg_catalog.pg_get_userbyid(v.nspowner)::pg_catalog.text FROM pg_catalog.pg_namespace v
+		    WHERE v.nspname = $1 || '_as_of' AND v.nspowner <> r.oid)
 		FROM pg_catalog.pg_roles r
 		LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = $1
-		LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = 'rbac_grants'
-		LEFT JOIN pg_catalog.pg_database d ON d.datname = pg_catalog.current_database()
-		LEFT JOIN pg_catalog.pg_roles m ON c.oid IS NULL AND r.rolsuper AND NOT m.rolsuper
-		  AND m.oid = CASE WHEN n.nspowner = pg_catalog.to_regrole('pg_database_owner') THEN d.datdba ELSE n.nspowner END
-		LEFT JOIN pg_catalog.pg_roles o ON o.oid = coalesce(c.relowner, m.oid)
-		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &made, &mine, &super, &set, &login, &role); err != nil {
+		LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = 'rbac_grants' AND c.relkind IN ('r', 'p')
+		LEFT JOIN pg_catalog.pg_roles o ON o.oid = c.relowner
+		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &mine, &super, &set, &login, &role, &views); err != nil {
 		return nil, err
 	}
 	switch {
+	case owner == nil && super && locked && views != nil:
+		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, which a migration makes its maker's, and 0028_as_of_views makes AsOf's views only in a schema %s_as_of of its maker's, which is %s's: migrate as %[4]s, or give that schema to this role",
+			ErrInvalid, schema, schema, *views)
 	case owner == nil || mine:
 		return nil, nil
 	case !super:
 		return nil, fmt.Errorf("%w: the package's tables in schema %s are %s's, and a migration makes what it makes its maker's: migrate as %[3]s, or as a superuser, which migrates as that role",
 			ErrInvalid, schema, *owner)
 	case !set:
-		whose := fmt.Sprintf("the package's tables in schema %s are %s's", schema, *owner)
-		if !made {
-			whose = fmt.Sprintf("a superuser makes the package's tables in schema %s, which holds none yet, as %s, its owner", schema, *owner)
-		}
-		return nil, fmt.Errorf("%w: %s, and a migration makes what it makes its maker's: a superuser's migration sets its role to that one, which this session's login, %s, may not SET ROLE to; migrate as %[4]s, connecting as it or setting the role to it from a login that may",
-			ErrInvalid, whose, login, *owner)
+		return nil, fmt.Errorf("%w: the package's tables in schema %s are %s's, and a migration makes what it makes its maker's: a superuser's migration sets its role to that one, which this session's login, %s, may not SET ROLE to; migrate as %[3]s, connecting as it or setting the role to it from a login that may",
+			ErrInvalid, schema, *owner, login)
 	case !locked:
 		return nil, nil
 	}
@@ -294,7 +299,7 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 		return nil, err
 	}
 	if current == nil || *current != schema {
-		return nil, fmt.Errorf("%w: as %s, which a superuser migrates schema %s as, that schema isn't the first on the search_path: that role has no USAGE on it, or the search_path names another for it first", ErrInvalid, *owner, schema)
+		return nil, fmt.Errorf("%w: as %s, which owns the package's tables, schema %s isn't the first on the search_path: that role has no USAGE on it, or the search_path names another for it first", ErrInvalid, *owner, schema)
 	}
 	return func() error {
 		_, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('role', $1, true)`, role)
