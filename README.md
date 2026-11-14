@@ -343,7 +343,8 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   50,000 short strings, nearly 16,000 maps of one entry each, nearly 40,000 timestamps or JSON texts
   of a byte, or 53,000 slices of a byte, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
-  may reading, about 20 ms: each map charged one, as a number is, a
+  may reading, about 20 ms, or about 29 ms where what it holds nests thousands deep, as lists or
+  JSON arrays 3,000 to 9,999 deep took 160 to 230 ns a unit to convert: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
   empty maps took 108 ms, and each JSON text or slice of bytes charged as one value and a tenth of
   its length, a check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy

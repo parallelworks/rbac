@@ -710,7 +710,8 @@ sequenceDiagram
   bound up to 1,070 (`parseBound`): charged 3, 8.9884656743115790396e307 took 30 µs, so 40,000 in
   a JSON text took a check 1.2 s to convert, and a loop calling `double()` on one 38 ms within a
   condition's limit, where so charged parsing takes no more than 100 ns a unit. So weighed, a unit
-  took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
+  took 20 to 145 ns to convert (160 to 230 for lists or JSON arrays 3,000 to 9,999 deep, each
+  level a call deeper, linear in their charge) and 25 to 400 ns to copy for a hook, a copied message the most, a
   dynamic one of the host's up to 361, and times an interface holds each in a zone of the host's
   own, as parsing text with an offset of part of an hour makes them, 290, as a copy copies each
   such zone, but a microsecond for a message of the host's own type whose reflection panics, which

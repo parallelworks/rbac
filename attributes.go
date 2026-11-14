@@ -228,7 +228,9 @@ const maxConverted = 2 * maxCheckCost
 // interface holds each in a zone of the host's own, as parsing text with an offset of part of an
 // hour makes them, about 290, as a copy copies each such zone (copier.zone), but for a message of
 // the host's own type whose reflection panics, which a copy asks of each (itself), and which took a
-// microsecond a unit.
+// microsecond a unit. Values nested thousands deep take more, as each level converted is a call
+// deeper: lists or JSON arrays 3,000 to 9,999 deep took 160 to 230 ns a unit, linear in what they
+// were charged, so a check's full budget of them about 29 ms.
 const (
 	mapCost     = 8
 	listCost    = 4
