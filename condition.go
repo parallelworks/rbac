@@ -1046,9 +1046,16 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
-		for _, a := range xs {
+		for i, a := range xs {
 			own = cost.SafeAdd(own, a.text)
-			if fn == overloads.TypeConvertDouble {
+			if fn != overloads.TypeConvertDouble {
+				continue
+			}
+			// A literal costs what parsing it does, so double("1.5") isn't bounded as any string of its
+			// length.
+			if s, ok := literalString(args[i]); ok {
+				own = cost.SafeAdd(own, parseCost(s))
+			} else {
 				own = cost.SafeAdd(own, parseBound(a.bytes))
 			}
 		}
@@ -1076,14 +1083,25 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 	return cost.SafeAdd(n, own), x
 }
 
-// parseBound is the most parseCost charges a string of no more than bytes bytes: one of fewer than
-// 20 holds no digit past the 19th significant one.
+// parseBound is the most parseCost charges a string of no more than bytes bytes. One of fewer than
+// 5 can't be below 1e-307 or from 1e308, which takes an exponent of 3 digits, nor hold a digit past
+// the 19th significant one, which takes 20 bytes, so it costs nothing, and a longer one no more than
+// all 330 powers of ten and its bytes as digits.
 func parseBound(bytes uint64) uint64 {
-	if bytes < 20 {
+	if bytes < 5 {
 		return 0
 	}
 	read := min(bytes, 800)
 	return 330*(400+read)/400 + read/10
+}
+
+// literalString is the string e is where it is a literal one.
+func literalString(e ast.Expr) (string, bool) {
+	if e.Kind() != ast.LiteralKind {
+		return "", false
+	}
+	s, ok := e.AsLiteral().(types.String)
+	return string(s), ok
 }
 
 // keyCost is what a map reading key, which x bounds, costs past what CEL charges, as keying

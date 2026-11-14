@@ -4337,35 +4337,84 @@ func TestParsingANumberCostsWhatItTakes(t *testing.T) {
 		{"0.0000089884656743115790396e313", "0.0000089884656743115790000e313"},
 		{"-8.9884656743115790396E+307", "-8.9884656743115790000E+307"},
 	} {
-		for name, charge := range map[string]func(string) uint64{
-			"json.Number": func(n string) uint64 {
-				charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.Number(n)})
-				return charged
-			},
-			"JSON text": func(n string) uint64 {
-				charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.RawMessage("[" + n + "]")})
-				return charged
-			},
-			"double() of a literal": func(n string) uint64 {
-				limit, actual := rbac.ConditionCost(t, `double("`+n+`") > 0.0`, nil)
-				if actual > limit {
-					t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
-				}
-				return actual
-			},
-			"double() of an attribute": func(n string) uint64 {
-				limit, actual := rbac.ConditionCost(t, `double(request.attributes.n) > 0.0`, map[string]any{"n": n})
-				if actual > limit {
-					t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
-				}
-				return actual
-			},
-		} {
+		for name, charge := range parsingCharges(t) {
 			slow, fast := charge(c.slow), charge(c.fast)
 			if fast > 20 || slow < fast+300 {
 				t.Errorf("%s: %s charged %d, %s %d", name, c.slow, slow, c.fast, fast)
 			}
 		}
+	}
+}
+
+// strconv skips an underscore between digits, so double() of 8.988_4656743115790396e307 took 29 µs
+// and was charged as 8.988. Built with Go 1.26, which this module allows, strconv parses a number
+// below the smallest normal double or near the largest digit by digit however short: 5e-324 took 14
+// µs and 4e308 30, charged 2. Each costs what parsing it may take, built with either version, and
+// one in range what it did. A literal's bound is what parsing it costs, not what any string of its
+// length may.
+func TestParsingAnyNumberCostsWhatItMayTake(t *testing.T) {
+	charges := parsingCharges(t)
+	for _, c := range []struct {
+		slow, fast string
+		json       bool
+	}{
+		{"8.988_4656743115790396e307", "8.988_4656743115790000e307", false},
+		{"8.9884656743115790396e3_07", "8.9884656743115790000e3_07", false},
+		{"5e-324", "5e-224", true},
+		{"2.2250738585072011e-308", "2.2250738585072011e-208", true},
+		{"4e308", "4e208", true},
+		{"-1.8e308", "-1.8e208", true},
+		{"+9e309", "+9e209", false},
+	} {
+		for name, charge := range charges {
+			if !c.json && strings.HasPrefix(strings.ToLower(name), "json") {
+				continue
+			}
+			slow, fast := charge(c.slow), charge(c.fast)
+			if fast > 20 || slow < fast+300 {
+				t.Errorf("%s: %s charged %d, %s %d", name, c.slow, slow, c.fast, fast)
+			}
+		}
+	}
+	for _, n := range []string{"12345.5", "1.5e10", "-0.000001", "0x1p-1074", "Infinity"} {
+		if limit, actual := rbac.ConditionCost(t, `double("`+n+`") > 0.0`, nil); limit > actual+10 {
+			t.Errorf("double(%q) cost %d, bounded at %d", n, actual, limit)
+		}
+	}
+	for _, expr := range []string{`double("4e30" + "8") > 0.0`, `double(request.attributes.n > 0 ? "5e-324" : "") > 0.0`} {
+		if limit, actual := rbac.ConditionCost(t, expr, map[string]any{"n": 1}); actual < 300 || actual > limit {
+			t.Errorf("%s cost %d, bounded at %d", expr, actual, limit)
+		}
+	}
+}
+
+// parsingCharges is what a check charges parsing a number in a json.Number, a JSON text, and
+// double() of a literal and of an attribute, failing t where it costs past its bound.
+func parsingCharges(t *testing.T) map[string]func(string) uint64 {
+	t.Helper()
+	return map[string]func(string) uint64{
+		"json.Number": func(n string) uint64 {
+			charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.Number(n)})
+			return charged
+		},
+		"JSON text": func(n string) uint64 {
+			charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.RawMessage("[" + n + "]")})
+			return charged
+		},
+		"double() of a literal": func(n string) uint64 {
+			limit, actual := rbac.ConditionCost(t, `double("`+n+`") > 0.0`, nil)
+			if actual > limit {
+				t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
+			}
+			return actual
+		},
+		"double() of an attribute": func(n string) uint64 {
+			limit, actual := rbac.ConditionCost(t, `double(request.attributes.n) > 0.0`, map[string]any{"n": n})
+			if actual > limit {
+				t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
+			}
+			return actual
+		},
 	}
 }
 

@@ -706,10 +706,16 @@ sequenceDiagram
   microsecond for each text, so converting parses JSON itself (`jsonParser`). A number of more
   than 19 significant digits that its first 19 can't round, which strconv parses by shifting up to
   800 digits once for each power of ten between it and 1, costs that too (`parseCost`), in a JSON
-  number, JSON text or a string a condition's `double()` converts, before it is parsed, and its
-  bound up to 1,070 (`parseBound`): charged 3, 8.9884656743115790396e307 took 30 µs, so 40,000 in
-  a JSON text took a check 1.2 s to convert, and a loop calling `double()` on one 38 ms within a
-  condition's limit, where so charged parsing takes no more than 100 ns a unit. So weighed, a unit
+  number, JSON text or a string a condition's `double()` converts, before it is parsed: charged 3,
+  8.9884656743115790396e307 took 30 µs, so 40,000 in a JSON text took a check 1.2 s to convert, and
+  a loop calling `double()` on one 38 ms within a condition's limit. So does a number of any length
+  below 1e-307 or from 1e308, which strconv built with Go 1.26, as this module allows, parses so
+  however short (5e-324 took 14 µs, 4e308 30), and `parseCost` skips an underscore between digits
+  and in the exponent, as strconv does, where 8.988_4656743115790396e307 took 29 µs charged 4. So
+  charged, parsing took no more than about 110 ns a unit on either version over about 9,000
+  random inputs to each. A condition's bound counts what parsing a literal `double()` converts
+  costs (`literalString`), and for any other string of 5 bytes or more, the shortest that can be
+  out of range, as `1e308`, up to 1,070 (`parseBound`). So weighed, a unit
   took 20 to 145 ns to convert (160 to 230 for lists or JSON arrays 3,000 to 9,999 deep, each
   level a call deeper, linear in their charge) and 25 to 400 ns to copy for a hook, a copied message the most, a
   dynamic one of the host's up to 361, and times an interface holds each in a zone of the host's

@@ -1239,12 +1239,17 @@ func (c *converter) number(n string) ref.Val {
 // its length is charged for. It reads 19 significant digits, and where a digit past them isn't 0
 // and the 19 can't decide how the number rounds, it shifts up to 800 of them, 60 bits at a time,
 // until the number's point is in place: 8.9884656743115790396e307, charged 3 as JSON text, took 30
-// µs, so 40,000 of them took a check 1.2 s to convert, and 600 digits near 1e-308 took 90 µs. So
-// such a number costs 1 more for each power of ten between it and 1, up to 330, past which strconv
-// reads it as 0 or infinite at once, again for each 400 of its significant digits, up to 800, past
-// which it reads none, and a tenth of them, so a unit of it takes no more than 100 ns to parse
-// whatever its digits and exponent. A number of 19 significant digits or fewer, which strconv
-// rounds at once, as one exactly halfway between two doubles, costs nothing more.
+// µs, so 40,000 of them took a check 1.2 s to convert, and 600 digits near 1e-308 took 90 µs. Built
+// with Go 1.26, which this module allows, strconv does so too for a number of any length below the
+// smallest normal double or near the largest, as 5e-324 or 4e308, which took 14 and 30 µs. It skips
+// an underscore between digits, as in 8.988_4656743115790396e307, and so does parseCost. So such a
+// number, or any below 1e-307 or from 1e308, costs 1 more for each power of ten between it and 1, up
+// to 330, past which strconv reads it as 0 or infinite at once, again for each 400 of its
+// significant digits, up to 800, past which it reads none, and a tenth of them, so a unit of it
+// took no more than about 110 ns to parse on either version, whatever its digits and exponent. Any
+// other number of 19 significant digits or fewer, which strconv rounds at once, as one exactly
+// halfway between two doubles, costs nothing more, as does a hexadecimal one, which it reads 16
+// digits of, and inf or nan.
 func parseCost[T string | []byte](n T) uint64 {
 	i := 0
 	if i < len(n) && (n[i] == '-' || n[i] == '+') {
@@ -1257,6 +1262,7 @@ func parseCost[T string | []byte](n T) uint64 {
 scan:
 	for ; i < len(n); i++ {
 		switch b := n[i]; {
+		case b == '_':
 		case b == '.' && !sawPoint:
 			sawPoint, point = true, digits
 		case b == '0' && digits == 0:
@@ -1268,7 +1274,7 @@ scan:
 			break scan
 		}
 	}
-	if !past {
+	if digits == 0 {
 		return 0
 	}
 	if !sawPoint {
@@ -1284,12 +1290,17 @@ scan:
 			i++
 		}
 		e := 0
-		for ; i < len(n) && '0' <= n[i] && n[i] <= '9'; i++ {
-			e = min(e*10+int(n[i]-'0'), 10000)
+		for ; i < len(n) && ('0' <= n[i] && n[i] <= '9' || n[i] == '_'); i++ {
+			if n[i] != '_' && e < 10000 {
+				e = e*10 + int(n[i]-'0')
+			}
 		}
 		point += sign * e
 	}
-	shifts, read := uint64(min(max(point, -point), 330)), uint64(min(digits, 800)) //nolint:gosec // G115: both are 0 or more
+	if !past && -307 < point && point < 309 {
+		return 0
+	}
+	shifts, read := uint64(min(max(point, -point), 330)), uint64(min(digits, 800))
 	return shifts*(400+read)/400 + read/10
 }
 
