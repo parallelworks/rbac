@@ -252,8 +252,9 @@ func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
 // couldn't migrate, and which, where the application's role may create in the schema, would be
 // that role's. So it refuses any role too, before the lock and under it, where the schema is named
 // in more than maxAsOfSchema bytes, which 0028_as_of_views refuses for every role, as the views'
-// schema, named as it with _as_of after, would be cut short: the schema is a UTF-8 string from
-// the server, which Migrate refuses in another encoding, so len counts the bytes it does.
+// schema, named as it with _as_of after, would be cut short: the server counts them, as it cuts a
+// name, in the database's encoding, not len in the session's client_encoding, which a host can set
+// to one that counts fewer.
 // Migrate calls it before it takes the schema's lock, locked false, where it only refuses, so a
 // role is refused without waiting for another replica's migration, and again once it holds the
 // lock, locked true, where it sets the role, or refuses a role on a schema holding none of the
@@ -265,6 +266,7 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 	var owner, views *string
 	var mine, super, set bool
 	var login, role string
+	var bytes int
 	// The tables by name, read at the statement's snapshot, not by to_regclass: the session caches
 	// the table's absence as it looks it up before the lock, and reads the replica's tables only once
 	// it takes a table's lock, so under the lock it would read none of those made meanwhile. A table
@@ -275,18 +277,19 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 	if err := tx.QueryRow(ctx, `SELECT o.rolname::pg_catalog.text, coalesce(o.oid = r.oid, false), r.rolsuper,
 		  coalesce(pg_catalog.pg_has_role(SESSION_USER, o.oid, 'SET'), false), SESSION_USER::pg_catalog.text, pg_catalog.current_setting('role'),
 		  (SELECT pg_catalog.pg_get_userbyid(v.nspowner)::pg_catalog.text FROM pg_catalog.pg_namespace v
-		    WHERE v.nspname = $1 || '_as_of' AND v.nspowner <> r.oid)
+		    WHERE v.nspname = $1 || '_as_of' AND v.nspowner <> r.oid),
+		  pg_catalog.octet_length($1)
 		FROM pg_catalog.pg_roles r
 		LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = $1
 		LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = 'rbac_grants' AND c.relkind IN ('r', 'p')
 		LEFT JOIN pg_catalog.pg_roles o ON o.oid = c.relowner
-		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &mine, &super, &set, &login, &role, &views); err != nil {
+		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &mine, &super, &set, &login, &role, &views, &bytes); err != nil {
 		return nil, err
 	}
 	switch {
-	case owner == nil && len(schema) > maxAsOfSchema:
+	case owner == nil && bytes > maxAsOfSchema:
 		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, which a migration makes its maker's, and is named in %d bytes, too many for the schema of AsOf's views, named as it with _as_of after, in at most 63, so 0028_as_of_views fails there for every role: rename it to a name of at most %d bytes",
-			ErrInvalid, schema, len(schema), maxAsOfSchema)
+			ErrInvalid, schema, bytes, maxAsOfSchema)
 	case owner == nil && locked && views != nil:
 		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, which a migration makes its maker's, and 0028_as_of_views makes AsOf's views only in a schema %s_as_of of its maker's, which is %s's: migrate as %[4]s, or give that schema to this role",
 			ErrInvalid, schema, schema, *views)

@@ -1473,7 +1473,7 @@ func TestARoleIsRefusedTheTablesWhereTheSchemaIsNamedTooLongForTheViews(t *testi
 			t.Fatal(err)
 		}
 	}
-	on := func(user, schema string) *pgxpool.Pool {
+	on := func(user, schema string, encoding ...string) *pgxpool.Pool {
 		cfg, err := pgxpool.ParseConfig(pgtest.URL(t))
 		if err != nil {
 			t.Fatal(err)
@@ -1482,6 +1482,13 @@ func TestARoleIsRefusedTheTablesWhereTheSchemaIsNamedTooLongForTheViews(t *testi
 			cfg.ConnConfig.User = user
 		}
 		cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{schema}.Sanitize()
+		// Set once connected, as the search_path is sent in UTF-8.
+		if len(encoding) > 0 {
+			cfg.AfterConnect = func(ctx context.Context, c *pgx.Conn) error {
+				_, err := c.Exec(ctx, `SELECT pg_catalog.set_config('client_encoding', $1, false)`, encoding[0])
+				return err
+			}
+		}
 		pool, err := pgxpool.NewWithConfig(ctx, cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -1489,8 +1496,12 @@ func TestARoleIsRefusedTheTablesWhereTheSchemaIsNamedTooLongForTheViews(t *testi
 		t.Cleanup(pool.Close)
 		return pool
 	}
-	for _, c := range []struct{ name, user string }{{"a superuser", ""}, {"the application's role", r.app}, {"the administrator's role", r.admin}} {
-		if err := rbac.Migrate(ctx, on(c.user, long)); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "at most 57 bytes") {
+	// A session whose client_encoding counts the name's é in a byte, as LATIN1 does, reads it in 57.
+	for _, c := range []struct{ name, user, encoding string }{
+		{"a superuser", "", "UTF8"}, {"the application's role", r.app, "UTF8"}, {"the administrator's role", r.admin, "UTF8"},
+		{"a superuser whose session's client_encoding is LATIN1", "", "LATIN1"},
+	} {
+		if err := rbac.Migrate(ctx, on(c.user, long, c.encoding)); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "at most 57 bytes") {
 			t.Errorf("Migrate as %s on a schema named in 58 bytes: %v", c.name, err)
 		}
 		var made bool
