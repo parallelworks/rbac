@@ -419,8 +419,11 @@ func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *const
 	return h, byCondition, got, err
 }
 
-// valuesOn reads on q what s's label values in a tenant are decided by, the conditions of its
-// conditional grants too, so a read of one snapshot decides them as of it.
+// valuesOn reads on q what s's label values in a tenant are decided by, narrowed to what gives
+// values (labeling), and the conditions of its conditional grants too, so a read of one snapshot
+// decides them as of it. It reads only those of the grants it keeps: read before narrowing, a
+// subject whose group held a role giving no value on the tenant 10,000 times under a condition had
+// Reachable look up every one of them, 30,000 pages, where a labeled check read 400.
 func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subject) (*valuesRead, error) {
 	if len(a.labels) == 0 {
 		return &valuesRead{roles: a.builtinBook()}, nil
@@ -429,10 +432,12 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 	if err != nil {
 		return nil, err
 	}
-	if err := a.conditionsOf(ctx, q, tenant, held); err != nil {
+	v := a.labeling(&valuesRead{held: held, ds: ds, roles: roles})
+	if err := a.conditionsOf(ctx, q, tenant, v.held); err != nil {
 		return nil, err
 	}
-	return &valuesRead{held: held, ds: ds, roles: roles}, nil
+	v.narrowed = true
+	return v, nil
 }
 
 // labeling is v of what gives label values and powers to release alone: its grants of roles that
