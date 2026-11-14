@@ -205,17 +205,23 @@ func givingCustomSQL(custom bool, tenant, perm, resourceType, principal string) 
 	if !custom {
 		return ""
 	}
-	// Each step's upper bound is tested after it: one bounding the seek would imply the predicate of
-	// rbac_grants_custom_principal, which holds the scope before the role, and a plan sorted every
-	// grant of a custom role the principal held to find the first.
+	// Each step is the next entry of rbac_grants_principal_role after the last, a row comparison in
+	// its order, which only an index leading to the principal, the tenant and the role reads in order,
+	// and ended past the principal's custom roles after it. Bounded by the principal, the tenant and
+	// the role apart, as each a plan counts a key holding one row or so, a plan read and sorted every
+	// grant of the principal by an index leading to the scope after them, its 10,000 of a built-in
+	// role, or bounded by the prefix too, every grant of a custom role it held, by
+	// rbac_grants_custom_principal, whose predicate that implies.
 	next := func(after string) string {
-		return fmt.Sprintf(`SELECT g.role FROM rbac_grants g WHERE g.principal = %[1]s AND g.tenant = %[2]s::text AND g.role %[3]s
-			ORDER BY g.role LIMIT 1`, principal, tenant, after)
+		return fmt.Sprintf(`SELECT g.principal, g.tenant, g.role FROM rbac_grants g WHERE (g.principal, g.tenant, g.role) %s
+			ORDER BY g.principal, g.tenant, g.role LIMIT 1`, after)
 	}
-	return fmt.Sprintf(`ARRAY(WITH RECURSIVE held(role) AS ((%[1]s) UNION ALL SELECT (%[2]s) FROM held h WHERE h.role < 'custom/')
-		SELECT cr.id FROM held h CROSS JOIN LATERAL (SELECT cr.id FROM rbac_roles cr WHERE cr.tenant = %[3]s::text AND cr.id = h.role
-		  AND %[4]s::text = ANY(cr.permissions) AND %[5]s::text = ANY(cr.resource_types) OFFSET 0) cr)`,
-		next(">= 'custom.'"), next("> h.role"), tenant, perm, resourceType)
+	mine := fmt.Sprintf(`h.principal = %s AND h.tenant = %s::text AND h.role < 'custom/'`, principal, tenant)
+	return fmt.Sprintf(`ARRAY(WITH RECURSIVE held(principal, tenant, role) AS ((%[1]s)
+		  UNION ALL SELECT n.* FROM held h CROSS JOIN LATERAL (%[2]s) n WHERE %[3]s)
+		SELECT cr.id FROM held h CROSS JOIN LATERAL (SELECT cr.id FROM rbac_roles cr WHERE cr.tenant = %[4]s::text AND cr.id = h.role
+		  AND %[5]s::text = ANY(cr.permissions) AND %[6]s::text = ANY(cr.resource_types) OFFSET 0) cr WHERE %[3]s)`,
+		next(fmt.Sprintf(">= (%s, %s::text, 'custom.')", principal, tenant)), next("> (h.principal, h.tenant, h.role)"), mine, tenant, perm, resourceType)
 }
 
 // broadArgs are a search's arguments for the roles giving p on a resource type that give it
