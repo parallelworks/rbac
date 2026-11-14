@@ -1662,21 +1662,34 @@ func (a *Authorizer) byType(types, cols, where string) string {
 // scope alone and tested for the role after, every grant of a role giving nothing, as the public's
 // or the tenant's members' of a viewer on thousands of resources, cost a list a page or more; and
 // tested as `= ANY` of the roles, a generic plan still read them by rbac_grants_principal, which
-// holds the role after the scope. As of a time it reads them all, as before.
+// holds the role after the scope. But a seek costs a descent of the index, so a role at a time, a
+// key's few grants of a type cost a search a seek for each role giving the permission, of each key
+// and type: beside 40 roles giving it, a subject in 200 groups read 72,000 pages where by the scope
+// it read 3,300. So it reads each key's grants on a type by the scope, as before, up to
+// heldByScope of them, and only a key holding that many there a role at a time.
 func (a *Authorizer) heldByType(types, principals, roles string, custom bool, cols, where string) string {
 	held := fmt.Sprintf(`SELECT %[1]s FROM rbac_grants g WHERE %[2]s AND g.principal = keyed.k AND %[3]s`, cols, where, a.ofType())
 	if a.history != "" {
 		held += " OFFSET 0"
 	} else {
 		given := held
-		held = fmt.Sprintf(`SELECT %[1]s FROM unnest(%[2]s::text[]) AS r(r) CROSS JOIN LATERAL (%[3]s AND g.role = r.r OFFSET 0) g`, cols, roles, given)
+		byRole := fmt.Sprintf(`SELECT %[1]s FROM unnest(%[2]s::text[]) AS r(r) CROSS JOIN LATERAL (%[3]s AND g.role = r.r OFFSET 0) g`, cols, roles, given)
 		if custom {
-			held = "(" + held + ") UNION ALL (" + given + a.customOnly("g.role") + " OFFSET 0)"
+			byRole = "(" + byRole + ") UNION ALL (" + given + a.customOnly("g.role") + " OFFSET 0)"
 		}
+		// Each arm runs only where its count holds, which reads few once, so a key's grants are read
+		// one way, once.
+		held = fmt.Sprintf(`WITH few AS MATERIALIZED (%[1]s LIMIT %[3]d) SELECT * FROM few WHERE (SELECT count(*) FROM few) < %[3]d
+			UNION ALL SELECT * FROM (%[2]s) g WHERE (SELECT count(*) FROM few) = %[3]d`, given, byRole, heldByScope)
 	}
 	return fmt.Sprintf(`SELECT %[2]s FROM unnest(%[1]s::text[]) AS t(t) CROSS JOIN unnest(%[3]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
 		%[4]s) g`, types, cols, principals, held)
 }
+
+// heldByScope is how many grants of a key on scopes of a type heldByType reads by the scope, of any
+// role, before it reads them a role at a time instead: about where reading them costs as many pages
+// as seeking a few dozen roles. A test lowers it.
+var heldByScope = 64
 
 // ofType is SQL for whether a grant g's scope is of the type t.t, as byType tests it.
 func (a *Authorizer) ofType() string {
