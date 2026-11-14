@@ -728,7 +728,7 @@ sequenceDiagram
   random inputs to each, and 92 over 60,000 on Go 1.27. Built with Go 1.26, a number of 15 to 19
   digits that its fast path (Eisel-Lemire) can't round falls back to a slower one: one exactly
   halfway between two doubles, as 1776810790486016e20, or whose 128-bit product its own half-way
-  test rejects, as 1884579087778198e2, with a power of ten from about -27 to 42. It took up to
+  test rejects, as 1884579087778198e2. It took up to
   1.3 µs, charged 2 to 4: 70,000 json.Number values took 74 ms for a charge of 140,013, about 530 ns
   a unit, and a JSON text of them used a check's budget in 70 ms. That is left documented: telling
   such numbers apart without parsing them means copying 1.26's test, which charged about a fifth of
@@ -1056,8 +1056,11 @@ sequenceDiagram
   (`handsOnAt`). So widening a role granted on a resource of one type to give another of its
   types' `:grant` needs only the power to change grants on that other type (`holdsRole`), but
   `Apply` granting the role again on such a resource asks the actor to hold that permission for the
-  resource's type, which no role gives, and refuses it: an accepted limit, failing closed, as the
-  role can still be granted on a container or the tenant. Their answers are read back under the lock, where a scope it gives more on that
+  resource's type, as it asks of every permission, so it refuses an actor that holds it there only
+  through the power, not through a grant giving it there as the widened role itself does: an
+  accepted limit, failing closed, as the role can still be granted on a container or the tenant.
+  A holder of the widened role on the resource holds that permission there but changes no grants
+  with it, as nothing on a resource of one type is of another. Their answers are read back under the lock, where a scope it gives more on that
   they weren't asked about refuses it with `ErrConflict` (`handedOnStopped`, `handing`). Without
   `Config.ResourceOf`, a scope is asked about as stored where that is all of it (`resolves`), and
   otherwise of no resource, which stands for every such scope. A scope where a role listing it is
