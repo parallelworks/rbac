@@ -1013,7 +1013,8 @@ nothing in its read writes, a hook's or the host's query either, but to a sessio
 table, and rolls back, which leaves a host's transaction as it was, writable where it was. It reads
 history through views that migrating makes (`0028_as_of_views`), in a schema beside the package's
 named as it with `_as_of` after (so name the package's schema in at most 57 bytes: PostgreSQL cuts
-a name to 63, and migrating refuses a longer one as it would make the views, with SQLSTATE 42622),
+a name to 63, and migrating refuses a longer one: `Migrate`, before making any table, as
+`rbac.ErrInvalid`, and the migration making the views, with SQLSTATE 42622),
 each named as the table it stands in for, which it names first on its transaction's search_path: a
 statement there, the package's, a hook's through the `DB` it is given or the host's on that
 transaction, reads a table by its name as it was then,
@@ -1275,7 +1276,9 @@ the package's uses foreign data, so none of the roles needs any.
   administrator's role. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
   role's, as the administrator's is in [History](#history), a first `Migrate` as any other role, a
   superuser too, is refused as `rbac.ErrInvalid` naming that role, having made nothing, as
-  `0028_as_of_views` would fail there after making every table before it the role migrating's. Only a table named `rbac_grants`
+  `0028_as_of_views` would fail there after making every table before it the role migrating's.
+  So it is, as any role is, where the package's schema is named in more than 57 bytes, which
+  `0028_as_of_views` refuses for every role, as it says below. Only a table named `rbac_grants`
   says who owns them: another relation so named, as a view, doesn't. Where a superuser's first
   `Migrate` made them its own and the administrator's role is to own them, give them to it as
   below. Before this release, a
@@ -1481,8 +1484,10 @@ the package's uses foreign data, so none of the roles needs any.
   that has come to be so when a later migration makes the views again. Where the package's schema
   is named in more than 57 bytes, the views' schema's name would be cut to 63, so the migration
   fails with SQLSTATE 42622, having made nothing, as does `rbac_as_of_views` wherever it would name
-  that schema: rename the package's schema to a name of at most 57 bytes (Renaming the schema), and
-  migrate again. It gives the views and their schema to each role that may read history and use
+  that schema, and `Migrate` refuses a schema holding none of the tables yet as `rbac.ErrInvalid`
+  before it makes any, as otherwise the role migrating would make every table before it its own:
+  rename the package's schema to a name of at most 57 bytes (Renaming the schema), and migrate
+  again. It gives the views and their schema to each role that may read history and use
   the package's schema then, as the application's role above, so that role needs no new grant, and
   `rbac_as_of_views` does again to each that may when it runs. It takes no lock a check, a change
   or a read of history waits for. Code from before it makes temporary views for `AsOf`, as it still

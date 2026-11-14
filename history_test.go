@@ -1445,6 +1445,77 @@ func TestARoleIsRefusedTheTablesWhereAnotherOwnsTheViewsSchema(t *testing.T) {
 	}
 }
 
+// A schema named in more than 57 bytes can have no schema of AsOf's views beside it, which
+// 0028_as_of_views refuses for every role: Migrate refuses every role on it before making anything,
+// counting its bytes, not its characters, as otherwise the first role to migrate, the application's
+// role given CREATE on it, or a superuser, made 0001 through 0027 its own, and the administrator's
+// role, once it renamed the schema, couldn't migrate. At 57 bytes, it migrates.
+func TestARoleIsRefusedTheTablesWhereTheSchemaIsNamedTooLongForTheViews(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	named := func(n int) string {
+		s := "Rbac é " + strings.TrimPrefix(r.schema, "rbac_")
+		return s + strings.Repeat("x", n-len(s))
+	}
+	long, short := named(58), named(57)
+	t.Cleanup(func() {
+		for _, s := range []string{long, short} {
+			if _, err := r.super.Exec(context.WithoutCancel(ctx), `DROP SCHEMA IF EXISTS `+pgtest.WithViews(s)+` CASCADE`); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	for _, sql := range []string{
+		`CREATE SCHEMA ` + pgx.Identifier{long}.Sanitize() + ` AUTHORIZATION ` + r.admin,
+		`GRANT USAGE, CREATE ON SCHEMA ` + pgx.Identifier{long}.Sanitize() + ` TO ` + r.app,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	on := func(user, schema string) *pgxpool.Pool {
+		cfg, err := pgxpool.ParseConfig(pgtest.URL(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if user != "" {
+			cfg.ConnConfig.User = user
+		}
+		cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{schema}.Sanitize()
+		pool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		return pool
+	}
+	for _, c := range []struct{ name, user string }{{"a superuser", ""}, {"the application's role", r.app}, {"the administrator's role", r.admin}} {
+		if err := rbac.Migrate(ctx, on(c.user, long)); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "at most 57 bytes") {
+			t.Errorf("Migrate as %s on a schema named in 58 bytes: %v", c.name, err)
+		}
+		var made bool
+		if err := r.super.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname::text = $1)`, long).Scan(&made); err != nil || made {
+			t.Fatalf("Migrate as %s, refused, made something: %t, %v", c.name, made, err)
+		}
+	}
+	for _, sql := range []string{
+		`ALTER SCHEMA ` + pgx.Identifier{long}.Sanitize() + ` RENAME TO ` + pgx.Identifier{short}.Sanitize(),
+		`REVOKE CREATE ON SCHEMA ` + pgx.Identifier{short}.Sanitize() + ` FROM ` + r.app,
+		`CREATE SCHEMA ` + pgx.Identifier{short + "_as_of"}.Sanitize() + ` AUTHORIZATION ` + r.admin,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rbac.Migrate(ctx, on(r.admin, short)); err != nil {
+		t.Fatalf("Migrate as the administrator's role once the schema is named in 57 bytes: %v", err)
+	}
+	if got, want := notOwned(t, r.super, short, r.admin), []string{}; !slices.Equal(got, want) {
+		t.Errorf("migrating left %v another role's than %s", got, r.admin)
+	}
+}
+
 // Where a superuser's migration of the tables the administrator's role owns ran as itself, as
 // before Migrate migrated as the role owning them, what the README says gives back what it made.
 // From before 0028_as_of_views, it made AsOf's views, their schema and rbac_as_of_views its own,

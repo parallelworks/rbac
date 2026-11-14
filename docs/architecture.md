@@ -1506,7 +1506,8 @@ flowchart TB
   superuser too, never as the schema's owner or the database's, which can be the application's
   role; under the lock it refuses any role, a superuser too, as `ErrInvalid`, naming the other,
   where `<schema>_as_of` is made and another role's, as `0028_as_of_views` would fail there after
-  making every table before it the role migrating's.
+  making every table before it the role migrating's, and before the lock and under it, where the
+  schema is named in more than 57 bytes, which `0028_as_of_views` refuses for every role.
 
 ```mermaid
 flowchart TB
@@ -1517,7 +1518,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's (asOwner)"| invalid(["ErrInvalid"])
+    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
