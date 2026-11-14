@@ -1601,9 +1601,10 @@ the package's uses foreign data, so none of the roles needs any.
   exist yet, and fails as `rbac.ErrInvalid`, saying so: run `DeleteExpired` only from code after it
   once it is applied. Their checks, searches and changes run beside each other, applied or not.
   `0034_giving_role_seeks` adds `rbac_grants_principal_role`, which leads to a grant's principal,
-  tenant and role before its scope, so `Filter` and `Reachable` seek their subject's grants, and its
-  groups', the tenant's members' and the public's, of each role giving the permission alone: they
-  read every grant of those keys on scopes of the listed type, of any role, so beside a viewer's
+  tenant and role before its scope, so where one of their subject's keys, or its groups', the
+  tenant's members' or the public's, holds more than 64 grants on scopes of the listed type, `Filter`
+  and `Reachable` seek those of each role giving the permission alone: they read every grant of
+  those keys on scopes of the listed type, of any role, so beside a viewer's
   grants to the tenant's members on 20,000 clusters a member's `Reachable` read 4,700 pages and a
   query of `Filter`'s condition 14,000, against 41 for `Authorize`. Building it keeps every write to
   `rbac_grants` waiting until migrating commits, though checks and searches go on.

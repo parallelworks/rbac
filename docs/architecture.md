@@ -285,12 +285,17 @@ erDiagram
   statement, from `rbac_grants_custom_principal`, which holds only grants of custom roles, by
   principal and scope, and reads only those its subject counts: the anonymous and a guest read none
   of the members', and a search of a permission no public role gives none of the public's, so their
-  grants of built-in roles on thousands of resources cost it nothing. Of the grants of built-in
-  roles, it reads those of each role giving the permission alone, by `rbac_grants_principal_role`
+  grants of built-in roles on thousands of resources cost it nothing. It reads a key's grants on a
+  type's scopes by the scope, of any role, up to 64 of them (`heldByScope`), and a key holding that
+  many there, those of each role giving the permission alone, by `rbac_grants_principal_role`
   (0034), which leads to the role before the scope: sought by the scope and tested for the role
   after, every grant of a key on the type's scopes, of a viewer on thousands of resources to the
   members, the public, the subject or its group, cost a page or more, and tested as `= ANY` of the
-  roles, a generic plan still read them by `rbac_grants_principal`. A key's conditional grants of a
+  roles, a generic plan still read them by `rbac_grants_principal`. A role at a time for every key,
+  each seek a descent of the index, cost a key holding a grant or two a seek for each role giving
+  the permission: beside 40 such roles, a subject in 200 groups read 72,000 pages where by the
+  scope it read 3,300. Each key is read one way, once: both ways count what the first read, held
+  apart (`few`). A key's conditional grants of a
   role giving the permission it still reads, from that index alone, though `Filter` counts none:
   holding whether a grant is conditional before the scope, the index was costed as the scope's by a
   generic plan, which then read every grant of the key there. It names a custom role as that
