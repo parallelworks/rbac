@@ -5631,6 +5631,15 @@ func TestSearchesReadOnlyTheBroadGrantsTheyCount(t *testing.T) {
 								t.Fatal(err)
 							}
 							defer func() { _ = tx.Rollback(ctx) }()
+							// A generic plan is built on a statement's first run in a session after
+							// ANALYZE, and building it read some two dozen pages of the indexes, as
+							// many beside 500 grants as beside 50,000, on whichever run built it; the
+							// session runs the plan from then on, so the run after is the one counted.
+							if plan == "force_generic_plan" {
+								if err := f(tx, h.authz.WithTx(tx)); err != nil {
+									t.Fatalf("%s: %v", what, err)
+								}
+							}
 							start := pagesRead(ctx, t, tx, "rbac_grants")
 							if err := f(tx, h.authz.WithTx(tx)); err != nil {
 								t.Fatalf("%s: %v", what, err)
