@@ -4324,6 +4324,100 @@ func TestASearchCostingMoreThanAConditionMayIsRefusedBeforeItRuns(t *testing.T) 
 	}
 }
 
+// A number of 20 significant digits that its first 19 can't round, as 8.9884656743115790396e307,
+// took strconv 30 µs to parse, charged 2 or 3 as any number of its length: 40,000 in a JSON text
+// took a check 1.2 s to convert, and a loop calling double() on one 38 ms within a condition's
+// limit. Parsing one costs what it takes, however it is written, and one of the same length whose
+// digits past the 19th are 0 what it did.
+func TestParsingANumberCostsWhatItTakes(t *testing.T) {
+	for _, c := range []struct{ slow, fast string }{
+		{"8.9884656743115790396e307", "8.9884656743115790000e307"},
+		{"8.9884656743115790396e0000307", "8.9884656743115790000e0000307"},
+		{"89884656743115790396e288", "89884656743115790000e288"},
+		{"0.0000089884656743115790396e313", "0.0000089884656743115790000e313"},
+		{"-8.9884656743115790396E+307", "-8.9884656743115790000E+307"},
+	} {
+		for name, charge := range parsingCharges(t) {
+			slow, fast := charge(c.slow), charge(c.fast)
+			if fast > 20 || slow < fast+300 {
+				t.Errorf("%s: %s charged %d, %s %d", name, c.slow, slow, c.fast, fast)
+			}
+		}
+	}
+}
+
+// strconv skips an underscore between digits, so double() of 8.988_4656743115790396e307 took 29 µs
+// and was charged as 8.988. Built with Go 1.26, which this module allows, strconv parses a number
+// below the smallest normal double or near the largest digit by digit however short: 5e-324 took 14
+// µs and 4e308 30, charged 2. Each costs what parsing it may take, built with either version, and
+// one in range what it did. A literal's bound is what parsing it costs, not what any string of its
+// length may.
+func TestParsingAnyNumberCostsWhatItMayTake(t *testing.T) {
+	charges := parsingCharges(t)
+	for _, c := range []struct {
+		slow, fast string
+		json       bool
+	}{
+		{"8.988_4656743115790396e307", "8.988_4656743115790000e307", false},
+		{"8.9884656743115790396e3_07", "8.9884656743115790000e3_07", false},
+		{"5e-324", "5e-224", true},
+		{"2.2250738585072011e-308", "2.2250738585072011e-208", true},
+		{"4e308", "4e208", true},
+		{"-1.8e308", "-1.8e208", true},
+		{"+9e309", "+9e209", false},
+	} {
+		for name, charge := range charges {
+			if !c.json && strings.HasPrefix(strings.ToLower(name), "json") {
+				continue
+			}
+			slow, fast := charge(c.slow), charge(c.fast)
+			if fast > 20 || slow < fast+300 {
+				t.Errorf("%s: %s charged %d, %s %d", name, c.slow, slow, c.fast, fast)
+			}
+		}
+	}
+	for _, n := range []string{"12345.5", "1.5e10", "-0.000001", "0x1p-1074", "Infinity"} {
+		if limit, actual := rbac.ConditionCost(t, `double("`+n+`") > 0.0`, nil); limit > actual+10 {
+			t.Errorf("double(%q) cost %d, bounded at %d", n, actual, limit)
+		}
+	}
+	for _, expr := range []string{`double("4e30" + "8") > 0.0`, `double(request.attributes.n > 0 ? "5e-324" : "") > 0.0`} {
+		if limit, actual := rbac.ConditionCost(t, expr, map[string]any{"n": 1}); actual < 300 || actual > limit {
+			t.Errorf("%s cost %d, bounded at %d", expr, actual, limit)
+		}
+	}
+}
+
+// parsingCharges is what a check charges parsing a number in a json.Number, a JSON text, and
+// double() of a literal and of an attribute, failing t where it costs past its bound.
+func parsingCharges(t *testing.T) map[string]func(string) uint64 {
+	t.Helper()
+	return map[string]func(string) uint64{
+		"json.Number": func(n string) uint64 {
+			charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.Number(n)})
+			return charged
+		},
+		"JSON text": func(n string) uint64 {
+			charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.RawMessage("[" + n + "]")})
+			return charged
+		},
+		"double() of a literal": func(n string) uint64 {
+			limit, actual := rbac.ConditionCost(t, `double("`+n+`") > 0.0`, nil)
+			if actual > limit {
+				t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
+			}
+			return actual
+		},
+		"double() of an attribute": func(n string) uint64 {
+			limit, actual := rbac.ConditionCost(t, `double(request.attributes.n) > 0.0`, map[string]any{"n": n})
+			if actual > limit {
+				t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
+			}
+			return actual
+		},
+	}
+}
+
 // CEL charges a list literal 10 and a map literal 30 however many elements or entries they hold, so
 // a loop rebuilding a list of 700 or a map of 230 at each step took ten times what a condition
 // charged as much takes. A literal costs 1 more for each element it builds, and 2 for each entry,
@@ -5787,5 +5881,55 @@ func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 				t.Fatalf("Activate: %v", err)
 			}
 		})
+	}
+}
+
+// CEL hashes a key to find it in a map, or to build one, and bytes, a slice, panic as one, which
+// reads as the condition failing at its limit: a grant's `dyn(b"a") in {"a": 1} || true` gave
+// nothing, and a deny's `dyn(b"a") in {"a": 1}` applied, where CEL finds no such key. Bytes are no
+// key, so `in` a map is false for them, a map built keyed by them fails, costing what it ran, and
+// a literal keying a map by them is refused.
+func TestBytesAreNoKey(t *testing.T) {
+	attributes := map[string]any{"by": []byte("a"), "m": map[string]any{"a": 1}}
+	for _, expr := range []string{
+		`dyn(b"a") in {"a": 1} || true`, `!(dyn(b"a") in {1: 1})`, `!(b"xyz" in request.attributes)`,
+		`!(request.attributes.by in request.attributes.m)`, `!(request.attributes.by in {"a": 1})`,
+		`!(dyn([1]) in {"a": 1})`, `dyn(b"a") in [b"a"]`,
+	} {
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); !held || !evaluated {
+			t.Errorf("%s: held %t, evaluated %t", expr, held, evaluated)
+		}
+	}
+	for _, expr := range []string{
+		`{dyn(b"a"): 1} == {"a": 1}`, `{"a": 1} != {request.attributes.by: 1}`, `size({dyn(b"a"): 1}) == 1`,
+	} {
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); evaluated {
+			t.Errorf("%s: held %t", expr, held)
+		}
+		if limit, actual := rbac.ConditionCost(t, expr, attributes); actual >= limit {
+			t.Errorf("%s cost %d, its limit %d, as if it panicked", expr, actual, limit)
+		}
+	}
+	if _, _, _, err := rbac.EvaluateCondition(t, `dyn({b"a": 1}) == {"a": 1}`, nil); err == nil {
+		t.Error(`{b"a": 1} was planned`)
+	}
+
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole) })
+	expr := `dyn(b"a") in {"a": 1} || true`
+	given := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	given.Condition = rbac.Condition{Expression: expr}
+	h.seed(t, given, grant(cluster.Scope(), "cluster.login", rbac.User, "d"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	ctx := t.Context()
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "bytes", Principals: []rbac.Principal{identity("d")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `dyn(b"a") in {"a": 1}`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Authorize(ctx, h.as(t, "u"), login, cluster); err != nil {
+		t.Errorf("a grant whose condition is %s gives nothing: %v", expr, err)
+	}
+	if err := h.authz.Authorize(ctx, h.as(t, "d"), login, cluster); err != nil {
+		t.Errorf(`a deny whose condition is dyn(b"a") in {"a": 1} applied: %v`, err)
 	}
 }

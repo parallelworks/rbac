@@ -710,9 +710,13 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
-		// These read strings and bytes whole, and lists and maps by their length.
+		// These read strings and bytes whole, and lists and maps by their length, and double() parses
+		// a string as a JSON number is (parseCost).
 		for _, v := range args {
 			n += textSize(v)
+			if s, ok := v.(types.String); ok && function == overloads.TypeConvertDouble {
+				n += parseCost(string(s))
+			}
 		}
 	default:
 		if !timePart(function) || len(args) < 2 {
@@ -1042,8 +1046,18 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
-		for _, a := range xs {
+		for i, a := range xs {
 			own = cost.SafeAdd(own, a.text)
+			if fn != overloads.TypeConvertDouble {
+				continue
+			}
+			// A literal costs what parsing it does, so double("1.5") isn't bounded as any string of its
+			// length.
+			if s, ok := literalString(args[i]); ok {
+				own = cost.SafeAdd(own, parseCost(s))
+			} else {
+				own = cost.SafeAdd(own, parseBound(a.bytes))
+			}
 		}
 		if fn == operators.Add && len(xs) == 2 {
 			x = added(xs[0], xs[1])
@@ -1067,6 +1081,27 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		}
 	}
 	return cost.SafeAdd(n, own), x
+}
+
+// parseBound is the most parseCost charges a string of no more than bytes bytes. One of fewer than
+// 5 can't be below 1e-307 or from 1e308, which takes an exponent of 3 digits, nor hold a digit past
+// the 19th significant one, which takes 20 bytes, so it costs nothing, and a longer one no more than
+// all 330 powers of ten and its bytes as digits.
+func parseBound(bytes uint64) uint64 {
+	if bytes < 5 {
+		return 0
+	}
+	read := min(bytes, 800)
+	return 330*(400+read)/400 + read/10
+}
+
+// literalString is the string e is where it is a literal one.
+func literalString(e ast.Expr) (string, bool) {
+	if e.Kind() != ast.LiteralKind {
+		return "", false
+	}
+	s, ok := e.AsLiteral().(types.String)
+	return string(s), ok
 }
 
 // keyCost is what a map reading key, which x bounds, costs past what CEL charges, as keying
@@ -1149,6 +1184,12 @@ func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable
 		op = func(x, y ref.Val, _ uint64) ref.Val {
 			if l, ok := y.(traits.Lister); ok {
 				return contains(l, x)
+			}
+			// CEL hashes the key to find it in a map it built, and bytes, a slice, panic as one,
+			// which CEL reads as the condition failing at its limit. No map holds such a key
+			// (comparableKey), so none is found, as CEL defines.
+			if _, keyed := y.(traits.Mapper); keyed && unhashable(x) {
+				return types.False
 			}
 			if c, ok := y.(traits.Container); ok {
 				return c.Contains(x)
@@ -1905,8 +1946,8 @@ func (*counting) Parent() interpreter.Activation { return nil }
 // literal of it does, by its length: the map hashes it whole, which CEL charges as 1 however long
 // it is, so a loop looking up a long string the host passes would take time growing with its
 // length, charged only for the steps. Each costs a tenth of its bytes more, as reading it does
-// (textSize), counted beside the steps (counting). A double that isn't finite, or attributes no
-// condition reads, fail as a key (comparableKey).
+// (textSize), counted beside the steps (counting). A double that isn't finite, attributes no
+// condition reads, or bytes, fail as a key (comparableKey).
 type keying struct {
 	// keys are the ids of the keys checked computes, and planned what CEL planned each as last,
 	// which is what it reads: it plans an index whose key isn't an attribute as an attribute under
@@ -1925,7 +1966,8 @@ func newKeying(env *cel.Env, checked *ast.AST, limit uint64) *keying {
 		fac: interpreter.NewAttributeFactory(env.Container, env.CELTypeAdapter(), env.CELTypeProvider()),
 	}
 	key := func(e ast.Expr) {
-		if computed(e) {
+		// A literal of bytes is planned too, so decorate refuses it.
+		if computed(e) || e.Kind() == ast.LiteralKind && e.AsLiteral().Type() == types.BytesType {
 			k.keys[e.ID()] = true
 		}
 	}
@@ -1971,6 +2013,9 @@ func (k *keying) decorate(i interpreter.InterpretableV2) (interpreter.Interpreta
 		// Another version of CEL may fold a key, as `0.0 / 0.0`, which comparableKey wouldn't see.
 		if nonFinite(i.Value()) {
 			return nil, errors.New("a key is a double that isn't finite")
+		}
+		if unhashable(i.Value()) {
+			return nil, errors.New("a key is bytes")
 		}
 	case interpreter.InterpretableAttribute:
 		planned = &keyedAttribute{InterpretableAttribute: i, k: k}
@@ -2219,7 +2264,20 @@ func comparableKey(key ref.Val) ref.Val {
 	if nonFinite(key) {
 		return types.WrapErr(errNonFiniteKey)
 	}
+	// Building the map would hash it, and bytes panic as one, which CEL reads as the condition
+	// failing at its limit.
+	if unhashable(key) {
+		return types.WrapErr(errBytesKey)
+	}
 	return key
+}
+
+var errBytesKey = errors.New("rbac: bytes can't be a key")
+
+// unhashable reports whether a Go map can't hash v, as bytes, a slice: CEL's own maps hash a key
+// to find it and panic.
+func unhashable(v ref.Val) bool {
+	return v != nil && !reflect.TypeOf(v).Comparable()
 }
 
 // keyedCall is a key CEL plans as a call, charged once it has run.
