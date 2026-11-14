@@ -964,9 +964,13 @@ sequenceDiagram
   members put that on every member's change. The conditions read in a call are kept by grant id
   for the rest of it, so the read under the locks takes them from there: a grant's condition never
   changes in place, as `Apply` and `Import` replace a grant only under an equal condition, and a
-  grant made again has a new id. A grant whose condition isn't read can only split what the change
-  is decided by finer (`decidedAs`, `kindsLasting`), never change a decision, as its role gives
-  nothing the change asks, or a grant read already gives it for good. A read that fails leaves the
+  grant made again has a new id. A grant whose condition isn't read never changes a decision, as
+  its role gives nothing the change asks, or a grant read already gives it for good; but a grant
+  made until a time is decided with the others its actor's grants can't tell apart, so under a
+  condition, the unread grants of roles giving what deciding it can ask about that end at or after
+  it are read first (`decidedAs`): standing in unread by their ends, 64 grants of a role giving
+  nothing asked, ending between those of a change's 64 grants, split it into 64 decisions, each
+  walking every role the role granted lists. A read that fails leaves the
   grants it was for met by nothing, and the change, or `Grantable`, returns its error.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,

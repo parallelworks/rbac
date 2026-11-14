@@ -995,7 +995,9 @@ type authority struct {
 	// long each kind of its grants lasts (decidedAs).
 	given  map[heldKey][]lasting
 	powers map[heldKey]powerLasting
-	kinds  map[string][]lasting
+	kinds  map[kindsKey][]lasting
+	// asks are the permissions deciding a grant of each role can ask about (asking).
+	asks map[Role]map[Permission]bool
 	// values is what the actor's label values are decided by, read with its grants, so a change
 	// checks a label by what it held as it held its power there.
 	values *valuesRead
@@ -1035,6 +1037,17 @@ func (l lasting) with(h holding) lasting {
 type conditionReads struct {
 	load func([]holding) error
 	err  error
+	// n is how many reads were made, so what was found of the grants before one is found again
+	// (decidedAs).
+	n int
+}
+
+// count is how many reads were made.
+func (r *conditionReads) count() int {
+	if r == nil {
+		return 0
+	}
+	return r.n
 }
 
 // failed is the error a read of conditions met, if one did.
@@ -1062,6 +1075,7 @@ func (au authority) read(keeps func(holding) bool) {
 	for j, i := range at {
 		gs[j] = au.held[i]
 	}
+	au.reads.n++
 	if err := au.reads.load(gs); err != nil {
 		au.reads.err = cmp.Or(au.reads.err, err)
 		if au.constrained != nil && au.constrained.err == nil {
@@ -1653,7 +1667,8 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 		denied, handsOn = orDenied(denied, out), orDenied(handsOn, out)
 	}
 	return authority{
-		held: held, reads: &conditionReads{load: func(gs []holding) error { return a.conditionsOf(ctx, q, on.Tenant, gs) }}, roles: b.keepingSets(), given: map[heldKey][]lasting{}, powers: map[heldKey]powerLasting{}, kinds: map[string][]lasting{},
+		held: held, reads: &conditionReads{load: func(gs []holding) error { return a.conditionsOf(ctx, q, on.Tenant, gs) }}, roles: b.keepingSets(), given: map[heldKey][]lasting{}, powers: map[heldKey]powerLasting{}, kinds: map[kindsKey][]lasting{},
+		asks: map[Role]map[Permission]bool{},
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
@@ -1798,23 +1813,29 @@ func (h holding) lasts(until time.Time) bool {
 	return h.ends.IsZero() || !until.IsZero() && !h.ends.Before(until)
 }
 
-// decidedAs is the condition and end a grant made under condition until until is decided by, the
-// same for every grant the actor's grants can't tell apart, so a change granting a role to many,
-// each until its own time, decides it once. A condition none of its conditional grants has gives
-// it what none does: its conditional grants give nothing under either, nor list a role for it,
-// and the others give under both what they give. And of the grants that count under it, a decision
-// reads only the role of each, how its principal carries what the role gives, and whether it lasts
-// until until: so it decides until until just as until the soonest time at or after it that the
-// longest lasting of a kind of them ends, or for good where none ends then. Grants of one role to
-// the actor's many groups, each ending at its own time, are one kind, so grants made until any
-// time up to the last of their ends are decided as one. Its exemption from a deny ending tells
+// decidedAs is the condition and end a grant of def made under condition until until is decided
+// by, the same for every grant the actor's grants can't tell apart, so a change granting a role to
+// many, each until its own time, decides it once. A condition none of its conditional grants has
+// gives it what none does: its conditional grants give nothing under either, nor list a role for
+// it, and the others give under both what they give. And of the grants that count under it, a
+// decision reads only the role of each, how its principal carries what the role gives, and whether
+// it lasts until until: so it decides until until just as until the soonest time at or after it
+// that the longest lasting of a kind of them ends, or for good where none ends then. Grants of one
+// role to the actor's many groups, each ending at its own time, are one kind, so grants made until
+// any time up to the last of their ends are decided as one. Its exemption from a deny ending tells
 // grants apart as a kind ending does.
 //
 // Its conditional grants' conditions are read only as a decision needs them, so it keeps a
 // condition that none of those read has while any is unread: under it the decision is the same as
 // under none, as a grant counts under it only where its condition is the same, and only the
-// grants giving what the decision asks about are read to find out.
-func (au authority) decidedAs(condition string, until time.Time) (string, time.Time) {
+// grants giving what the decision asks about are read to find out. Under it, of those unread, the
+// grants of roles giving what deciding def can ask about (asking) that end at or after until are
+// read first, as one that counts tells grants apart by its end: the rest end before until, last
+// for good, or give nothing the decision reads. Each one's end standing in for it unread split a
+// change granting a role to 64, each until its own time, by an actor holding 64 grants of a role
+// giving nothing it asked, ending between theirs, into 64 decisions, each walking every role the
+// role lists: seven times the time reading their conditions took.
+func (au authority) decidedAs(def RoleDefinition, condition string, until time.Time) (string, time.Time) {
 	if condition != "" && !slices.ContainsFunc(au.held, func(g holding) bool {
 		return g.conditional && (g.Condition.Expression == condition || g.Condition.Expression == "")
 	}) {
@@ -1823,11 +1844,28 @@ func (au authority) decidedAs(condition string, until time.Time) (string, time.T
 	if until.IsZero() {
 		return condition, time.Time{}
 	}
-	kinds, ok := au.kinds[condition]
+	if condition != "" {
+		asks, gives := au.asking(def), map[Role]bool{}
+		au.read(func(g holding) bool {
+			if g.ends.IsZero() || g.ends.Before(until) {
+				return false
+			}
+			given, ok := gives[g.Role]
+			if !ok {
+				r, known := au.roles.role(g.Role)
+				given = known && slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[p] })
+				gives[g.Role] = given
+			}
+			return given
+		})
+	}
+	// Kept until a read finds more of the grants.
+	k := kindsKey{condition: condition, reads: au.reads.count()}
+	kinds, ok := au.kinds[k]
 	if !ok {
 		kinds = au.kindsLasting(condition)
 		if au.kinds != nil {
-			au.kinds[condition] = kinds
+			au.kinds[k] = kinds
 		}
 	}
 	var at time.Time
@@ -1844,31 +1882,55 @@ func (au authority) decidedAs(condition string, until time.Time) (string, time.T
 	return condition, at.UTC()
 }
 
+// kindsKey is what kindsLasting is asked, a condition, as of how many reads of conditions were made.
+type kindsKey struct {
+	condition string
+	reads     int
+}
+
+// asking is every permission deciding whether the actor may grant def can ask about: what def
+// gives, and what each role it lists gives, through others too (holdsRole).
+func (au authority) asking(def RoleDefinition) map[Permission]bool {
+	if asks, ok := au.asks[def.ID]; ok {
+		return asks
+	}
+	asks, seen, next := map[Permission]bool{}, map[Role]bool{def.ID: true}, []RoleDefinition{def}
+	for len(next) > 0 {
+		r := next[len(next)-1]
+		next = next[:len(next)-1]
+		for _, p := range r.Permissions {
+			asks[p] = true
+		}
+		for _, id := range r.GrantableRoles {
+			if listed, known := au.named(id); known && !seen[id] {
+				seen[id] = true
+				next = append(next, listed)
+			}
+		}
+	}
+	if au.asks != nil {
+		au.asks[def.ID] = asks
+	}
+	return asks
+}
+
 // kindsLasting is how long each kind of the actor's grants that count under condition lasts: those
 // of a role through principals of one carrier, which carry what it gives alike (Principal.carrier).
+// One whose condition isn't read counts under none.
 func (au authority) kindsLasting(condition string) []lasting {
 	type kind struct {
 		role    Role
 		carrier PrincipalKind
 	}
 	by := map[kind]lasting{}
-	var unread []lasting
 	for _, g := range au.held {
-		// One whose condition isn't read may count under it once read: its own end stands for it.
-		// A decision's ends are each of a kind's grants that count, so any end it compares with is
-		// among these, and grants made until the soonest of them at or after until still decide as
-		// made until until; ends of grants that turn out not to count only split them finer.
-		if g.conditional && condition != "" && g.Condition.Expression == "" {
-			unread = append(unread, lasting{}.with(g))
-			continue
-		}
 		if !g.under(au.subjects, condition) {
 			continue
 		}
 		k := kind{g.Role, g.Principal.carrier()}
 		by[k] = by[k].with(g)
 	}
-	return append(slices.Collect(maps.Values(by)), unread...)
+	return slices.Collect(maps.Values(by))
 }
 
 // holdsFor reports whether the actor holds p for resources of each of types, which typesKey names,
@@ -2122,7 +2184,7 @@ func (a *Authorizer) grantsDecided(au authority, pw power, scopeType string, gra
 		if !known || !a.grantableOn(def, scopeType) {
 			continue
 		}
-		condition, until := au.decidedAs(b.Condition.Expression, b.ExpiresAt)
+		condition, until := au.decidedAs(def, b.Condition.Expression, b.ExpiresAt)
 		k := grantAsked{role: b.Role, condition: condition, until: until}
 		d, ok := decisions[k]
 		if !ok {

@@ -7996,3 +7996,61 @@ func TestAChangeWhoseConditionsCantBeReadReturnsWhy(t *testing.T) {
 		t.Errorf("Apply with its conditions read: %v", err)
 	}
 }
+
+// A change granting a role to many, each until its own time, under a condition the actor's power
+// is held by, decides it once beside unread conditional grants of a role giving nothing it asks
+// ending between theirs: each one's end standing in for it split the change into a decision for
+// each grant, each walking every role the role lists, seven times the time reading the conditions
+// took.
+func TestAChangeDecidesARoleOnceBesideUnreadGrantsEndingBetweenItsGrants(t *testing.T) {
+	const n = 16
+	h := setup(t)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.r' || i, '{cluster:grant,cluster:view,cluster:login}'::text[], '{cluster}'::text[],
+		  ARRAY(SELECT 'custom.r' || j FROM generate_series(1, 8) AS j)
+		FROM generate_series(1, 8) AS i
+		UNION ALL SELECT 't1', 'custom.big', '{cluster:grant,cluster:view}', '{cluster}', ARRAY(SELECT 'custom.r' || j FROM generate_series(1, 8) AS j)
+		UNION ALL SELECT 't1', 'custom.root', '{cluster:root}', '{cluster}', '{}'`); err != nil {
+		t.Fatal(err)
+	}
+	always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+	admin := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+	admin.Condition = always
+	grants := []rbac.Grant{admin}
+	for i := range n {
+		g := grant(cluster.Scope(), "custom.root", rbac.User, "ann")
+		g.Condition = rbac.Condition{Expression: fmt.Sprintf(`resource.id == "z%d"`, i)}
+		g.ExpiresAt = h.now.Add(time.Duration(10*i+5) * time.Minute)
+		grants = append(grants, g)
+	}
+	h.seed(t, grants...)
+	change := func(ids ...string) rbac.Change {
+		var c rbac.Change
+		for k, id := range ids {
+			h.as(t, id)
+			end := h.now.Add(time.Duration(10*k+1) * time.Minute)
+			c.Grant = append(c.Grant, rbac.Binding{Role: "custom.big", Principal: identity(id), Condition: always, ExpiresAt: end})
+		}
+		return c
+	}
+	var ids []string
+	for k := range n {
+		ids = append(ids, fmt.Sprintf("u%d", k))
+	}
+	one, many := change("v"), change(ids...)
+	checks := 0
+	rbac.SetCheckingRole(t, func() { checks++ })
+	if err := h.authz.Apply(ctx, ann, cluster, one); err != nil {
+		t.Fatal(err)
+	}
+	once := checks
+	checks = 0
+	if err := h.authz.Apply(ctx, ann, cluster, many); err != nil {
+		t.Fatal(err)
+	}
+	if checks != once {
+		t.Errorf("granting %d, each until its own time, checked %d roles, where granting one checked %d", n, checks, once)
+	}
+}
