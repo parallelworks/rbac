@@ -1912,6 +1912,58 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 	}
 }
 
+// A trigger's arguments can name what its function runs, a superuser's too, as refint's
+// check_primary_key reads the relation they name, which can be another role's view calling its
+// function: so Migrate refuses a trigger with arguments on one of the package's tables, which the
+// application's role, holding TRIGGER on it, made to run a superuser's function, before it applies
+// anything, and the view's function never runs. Once the trigger is dropped, the administrator's
+// role migrates.
+func TestARoleIsRefusedMigratingWhereAnotherMadeATriggerWithArguments(t *testing.T) {
+	ctx := t.Context()
+	_, version := madeViews(t)
+	to := fmt.Sprintf("%04d", version+2)
+	_, base := pgtest.Database(t, "")
+	r := newReadmeRolesIn(t, base)
+	if err := applyMigrations(ctx, r.adminPool, pgx.ReadCommitted, "", to); err != nil {
+		t.Fatal(err)
+	}
+	recordMigrations(t, r.adminPool, to)
+	r.harden(t)
+	for _, sql := range []string{
+		`CREATE SCHEMA refint`,
+		`CREATE EXTENSION refint SCHEMA refint`,
+		`GRANT USAGE ON SCHEMA refint TO PUBLIC`,
+		`GRANT TRIGGER ON ` + r.schema + `.rbac_migrations TO ` + r.app,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	var before int
+	if err := r.super.QueryRow(ctx, `SELECT max(version) FROM `+r.schema+`.rbac_migrations`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	p := newPlanter(t, r.super, r.appPool, r.app, r.schema+"_planted")
+	p.plant(t,
+		`CREATE FUNCTION {own}.versions() RETURNS boolean LANGUAGE sql AS $$ SELECT {own}.rbac_planted_seen(); SELECT true $$`,
+		`CREATE VIEW {own}.versions AS SELECT v FROM pg_catalog.generate_series(1, 10000) v WHERE {own}.versions()`,
+		`GRANT SELECT ON {own}.versions TO PUBLIC`,
+		`CREATE TRIGGER planted AFTER INSERT ON `+r.schema+`.rbac_migrations FOR EACH ROW EXECUTE FUNCTION refint.check_primary_key('version', '{own}.versions', 'v')`,
+	)
+	plantedRefused(t, rbac.Migrate(ctx, r.adminPool), "trigger planted on table rbac_migrations, whose arguments")
+	p.fired(t)
+	var after int
+	if err := r.super.QueryRow(ctx, `SELECT max(version) FROM `+r.schema+`.rbac_migrations`).Scan(&after); err != nil || after != before {
+		t.Errorf("a refused migration applied up to %d from %d: %v", after, before, err)
+	}
+	if _, err := r.super.Exec(ctx, `DROP TRIGGER planted ON `+r.schema+`.rbac_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("Migrate as the administrator's role: %v", err)
+	}
+}
+
 // A role that may create in the package's schema, but neither owns the tables nor history nor is a
 // superuser, could make there what a migration finds after Migrate reads the schema and before the
 // migration's statement runs, so Migrate refuses it, as ErrInvalid naming that role, or PUBLIC, before
