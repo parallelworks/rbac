@@ -298,9 +298,11 @@ erDiagram
   the permission: beside 40 such roles, a subject in 200 groups read 72,000 pages where by the
   scope it read 3,300, and the bound alone, 64, left a catalog of 1,000 roles giving it costing 20
   groups holding 100 grants each 60,000 pages where by the scope they read 700: so the bound grows
-  with the roles giving the permission. The custom roles it seeks are those of the tenant giving the
-  permission on the type, read in the statement as `givingSQL` reads them, and only for a key past
-  64; a key's every grant of a custom role, as a tenant's viewer's to the members on 20,000
+  with the roles giving the permission. The custom roles it seeks are those giving the permission on
+  the type among those the key holds, found by stepping from one role of the key to the next in
+  `rbac_grants_principal_role`, a seek each, and looked up by key, and only for a key past 64: read
+  by the tenant, a plan made while the tables were small read every custom role of it. A key's
+  every grant of a custom role, as a tenant's viewer's to the members on 20,000
   clusters, read whatever the role gave, cost a member's `Reachable` 8,900 pages, as did deciding
   which custom roles the members' grants name (`broadOn`), which past 64 tests each giving custom
   role alike. Each key is read one way, once: both ways count what the first read, held apart

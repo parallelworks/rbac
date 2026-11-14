@@ -1649,7 +1649,7 @@ the package's uses foreign data, so none of the roles needs any.
   `Reachable` seek those of each such role alone: they read every grant of those keys on scopes of
   the listed type, of any role, so beside a viewer's grants to the tenant's members on 20,000
   clusters a member's `Reachable` read 4,700 pages and a query of `Filter`'s condition 14,000,
-  against 41 for `Authorize`; beside a custom viewer's, 8,900 and 17,900, against 130 and 310 now.
+  against 41 for `Authorize`; beside a custom viewer's, 8,900 and 17,900, against 160 and 360 now.
   A key holding fewer they read by the scope, as before, so beside a catalog of 1,000 roles giving
   the permission, a subject in 20 groups holding 100 grants each reads 700 pages, not the 60,000 a
   seek for each role cost. As of a time they read by the scope, every grant of the keys on the
