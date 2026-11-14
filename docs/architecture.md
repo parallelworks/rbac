@@ -928,7 +928,7 @@ sequenceDiagram
     H->>A: Apply(ctx, actor, resource, change)
     A->>A: validate inputs, MaxBindings
     A->>C: changing: Deny of type:grant on the scope
-    A->>DB: authorityOn: the actor's grants, denies and roles<br/>in one statement, then their conditions
+    A->>DB: authorityOn: the actor's grants, denies and roles<br/>in one statement; a grant's condition only once a decision needs it
     A->>C: where the scope is labeled, Deny of each value its label<br/>asks for that the actor's grants give
     A->>C: hand-on rules: Deny of each permission it hands on
     A->>DB: stand: the standing of the principals named
@@ -939,7 +939,7 @@ sequenceDiagram
     A->>DB: lock: exclusive/tenant if a dimension is Exclusive, then the tenant<br/>shared and the scope and principals exclusive, or past 64 the tenant exclusive
     A->>DB: holdRevoked: the grants it revokes, in order, before it reads the time
     A->>DB: the groups named exist, and stillStanding:<br/>memberships unchanged since the host was asked
-    A->>DB: authority again, under the locks, the constraints' answers read back
+    A->>DB: authority again, under the locks, the constraints' answers<br/>and the conditions read before carried by grant id
     A->>A: the actor's label values again, where the scope is labeled, the answers read back
     A->>DB: revoke and upsert
     DB->>DB: rbac_record writes rbac_history, as the actor
@@ -954,6 +954,19 @@ sequenceDiagram
   `GrantableRoles`, it may grant only those roles, without holding them. Through any other role, it
   may grant a role only if it holds every permission of it, for every type the grant reaches.
   Either way, a limited grant permission can't mint a larger one.
+- **The actor's conditions.** A change reads the condition of a grant of the actor's only once a
+  decision needs it, and only for grants whose role gives the permission that decision asks
+  about, as the type's `:grant` power or one the change hands on (`conditionReads`), as a check
+  reads only those of the roles giving the permission it checks. Read for every conditional
+  grant on the path, before anything was decided, and again under the locks, an actor holding
+  20,000 conditional grants of a role giving nothing the change asked had each `Apply` look them all
+  up twice, 121,000 pages where `Authorize` read 600; and conditional grants to the tenant's
+  members put that on every member's change. The conditions read in a call are kept by grant id
+  for the rest of it, so the read under the locks takes them from there: a grant's condition never
+  changes in place, as `Apply` and `Import` replace a grant only under an equal condition, and a
+  grant made again has a new id. A grant whose condition isn't read can only split what the change
+  is decided by finer (`decidedAs`, `kindsLasting`), never change a decision, as its role gives
+  nothing the change asks.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
