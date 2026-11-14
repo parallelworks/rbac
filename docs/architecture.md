@@ -699,7 +699,13 @@ sequenceDiagram
   each slice it copies apart (`copied`) and converting keeps each text it parses (`once`): charged
   one and a tenth of its length, 150,000 slices of a byte took 76 ms to copy, and 79,000 JSON texts
   of a byte 80 ms to convert, each read through a `json.Decoder` of its own, which took most of a
-  microsecond for each text, so converting parses JSON itself (`jsonParser`). So weighed, a unit
+  microsecond for each text, so converting parses JSON itself (`jsonParser`). A number of more
+  than 19 significant digits that its first 19 can't round, which strconv parses by shifting up to
+  800 digits once for each power of ten between it and 1, costs that too (`parseCost`), in a JSON
+  number, JSON text or a string a condition's `double()` converts, before it is parsed, and its
+  bound up to 1,070 (`parseBound`): charged 3, 8.9884656743115790396e307 took 30 µs, so 40,000 in
+  a JSON text took a check 1.2 s to convert, and a loop calling `double()` on one 38 ms within a
+  condition's limit, where so charged parsing takes no more than 100 ns a unit. So weighed, a unit
   took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
   dynamic one of the host's up to 361, and times an interface holds each in a zone of the host's
   own, as parsing text with an offset of part of an hour makes them, 290, as a copy copies each

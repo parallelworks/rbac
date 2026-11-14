@@ -710,9 +710,13 @@ func (c costs) CallCost(function, _ string, args []ref.Val, _ ref.Val) *uint64 {
 	case operators.Add, overloads.Size, overloads.TypeConvertInt, overloads.TypeConvertUint, overloads.TypeConvertDouble,
 		overloads.TypeConvertBool, overloads.TypeConvertString, overloads.TypeConvertBytes,
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
-		// These read strings and bytes whole, and lists and maps by their length.
+		// These read strings and bytes whole, and lists and maps by their length, and double() parses
+		// a string as a JSON number is (parseCost).
 		for _, v := range args {
 			n += textSize(v)
+			if s, ok := v.(types.String); ok && function == overloads.TypeConvertDouble {
+				n += parseCost(string(s))
+			}
 		}
 	default:
 		if !timePart(function) || len(args) < 2 {
@@ -1044,6 +1048,9 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		overloads.TypeConvertTimestamp, overloads.TypeConvertDuration:
 		for _, a := range xs {
 			own = cost.SafeAdd(own, a.text)
+			if fn == overloads.TypeConvertDouble {
+				own = cost.SafeAdd(own, parseBound(a.bytes))
+			}
 		}
 		if fn == operators.Add && len(xs) == 2 {
 			x = added(xs[0], xs[1])
@@ -1067,6 +1074,16 @@ func (w worst) call(e ast.Expr) (uint64, extent) {
 		}
 	}
 	return cost.SafeAdd(n, own), x
+}
+
+// parseBound is the most parseCost charges a string of no more than bytes bytes: one of fewer than
+// 20 holds no digit past the 19th significant one.
+func parseBound(bytes uint64) uint64 {
+	if bytes < 20 {
+		return 0
+	}
+	read := min(bytes, 800)
+	return 330*(400+read)/400 + read/10
 }
 
 // keyCost is what a map reading key, which x bounds, costs past what CEL charges, as keying

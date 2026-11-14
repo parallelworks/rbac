@@ -347,7 +347,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   check of a resource whose tags held 156,000
   empty maps took 108 ms, and each JSON text or slice of bytes charged as one value and a tenth of
   its length, a check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy
-  150,000 slices of a byte. Past that every condition reading an attribute fails, as it does where
+  150,000 slices of a byte. A JSON number of more than 19 significant digits that its first 19
+  can't round costs more again, for each power of ten between it and 1 and for its digits, up to
+  1,070, as does a string `double()` converts in a condition, which parsing one digit by digit
+  takes: charged 3, 40,000 of `8.9884656743115790396e307` took a check 1.2 s to convert. Past that
+  every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,

@@ -4324,6 +4324,51 @@ func TestASearchCostingMoreThanAConditionMayIsRefusedBeforeItRuns(t *testing.T) 
 	}
 }
 
+// A number of 20 significant digits that its first 19 can't round, as 8.9884656743115790396e307,
+// took strconv 30 µs to parse, charged 2 or 3 as any number of its length: 40,000 in a JSON text
+// took a check 1.2 s to convert, and a loop calling double() on one 38 ms within a condition's
+// limit. Parsing one costs what it takes, however it is written, and one of the same length whose
+// digits past the 19th are 0 what it did.
+func TestParsingANumberCostsWhatItTakes(t *testing.T) {
+	for _, c := range []struct{ slow, fast string }{
+		{"8.9884656743115790396e307", "8.9884656743115790000e307"},
+		{"8.9884656743115790396e0000307", "8.9884656743115790000e0000307"},
+		{"89884656743115790396e288", "89884656743115790000e288"},
+		{"0.0000089884656743115790396e313", "0.0000089884656743115790000e313"},
+		{"-8.9884656743115790396E+307", "-8.9884656743115790000E+307"},
+	} {
+		for name, charge := range map[string]func(string) uint64{
+			"json.Number": func(n string) uint64 {
+				charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.Number(n)})
+				return charged
+			},
+			"JSON text": func(n string) uint64 {
+				charged, _ := rbac.ConvertingCharge(map[string]any{"n": json.RawMessage("[" + n + "]")})
+				return charged
+			},
+			"double() of a literal": func(n string) uint64 {
+				limit, actual := rbac.ConditionCost(t, `double("`+n+`") > 0.0`, nil)
+				if actual > limit {
+					t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
+				}
+				return actual
+			},
+			"double() of an attribute": func(n string) uint64 {
+				limit, actual := rbac.ConditionCost(t, `double(request.attributes.n) > 0.0`, map[string]any{"n": n})
+				if actual > limit {
+					t.Errorf("double(%q) cost %d, past its bound, %d", n, actual, limit)
+				}
+				return actual
+			},
+		} {
+			slow, fast := charge(c.slow), charge(c.fast)
+			if fast > 20 || slow < fast+300 {
+				t.Errorf("%s: %s charged %d, %s %d", name, c.slow, slow, c.fast, fast)
+			}
+		}
+	}
+}
+
 // CEL charges a list literal 10 and a map literal 30 however many elements or entries they hold, so
 // a loop rebuilding a list of 700 or a map of 230 at each step took ten times what a condition
 // charged as much takes. A literal costs 1 more for each element it builds, and 2 for each entry,
