@@ -1664,13 +1664,12 @@ func TestARoleIsRefusedTheTablesWhereAnotherMadeWhatTheMigrationsFind(t *testing
 	}
 }
 
-// The role owning a database owns public, so may make there what a superuser's first migration of
-// public would find: rbac_migrations, whose trigger ran as the superuser on each of its 33 versions.
-// Migrate refuses it, having run and made nothing, and once that role drops it, the superuser's
-// migrates, making the tables its own.
-func TestASuperuserIsRefusedPublicWhereTheDatabasesOwnerMadeRbacMigrations(t *testing.T) {
+// anothersPublic makes a role, and a database it owns, so owning public, and connects to public there
+// as a superuser and as that role, which it names.
+func anothersPublic(t *testing.T) (owner string, superuser, app *pgxpool.Pool) {
+	t.Helper()
 	ctx := t.Context()
-	owner := "rbac_owner_" + strings.ToLower(rand.Text())
+	owner = "rbac_owner_" + strings.ToLower(rand.Text())
 	super, err := pgx.Connect(ctx, pgtest.URL(t))
 	if err != nil {
 		t.Fatal(err)
@@ -1706,7 +1705,16 @@ func TestASuperuserIsRefusedPublicWhereTheDatabasesOwnerMadeRbacMigrations(t *te
 		t.Cleanup(pool.Close)
 		return pool
 	}
-	superuser, app := on(""), on(owner)
+	return owner, on(""), on(owner)
+}
+
+// The role owning a database owns public, so may make there what a superuser's first migration of
+// public would find: rbac_migrations, whose trigger ran as the superuser on each of its 33 versions.
+// Migrate refuses it, having run and made nothing, and once that role drops it, the superuser's
+// migrates, making the tables its own.
+func TestASuperuserIsRefusedPublicWhereTheDatabasesOwnerMadeRbacMigrations(t *testing.T) {
+	ctx := t.Context()
+	owner, superuser, app := anothersPublic(t)
 	p := newPlanter(t, superuser, app, owner, "planted")
 	p.plant(t,
 		`CREATE TABLE rbac_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`,
@@ -1729,6 +1737,47 @@ func TestASuperuserIsRefusedPublicWhereTheDatabasesOwnerMadeRbacMigrations(t *te
 	if got, want := notOwned(t, superuser, "public", me), []string{"schema public"}; !slices.Equal(got, want) {
 		t.Errorf("a superuser's migration of public left %v another role's than %s", got, me)
 	}
+}
+
+// overload is hashtextextended(text, integer), which 0001's index expression hashtextextended(condition,
+// 0) matches exactly, and pg_catalog's (text, bigint) only through a cast: made in the package's
+// schema, the index would call it, its maker's, as whoever writes or analyzes grants.
+const overload = `CREATE FUNCTION hashtextextended(t text, s integer) RETURNS bigint LANGUAGE plpgsql IMMUTABLE AS $$
+	BEGIN PERFORM {own}.rbac_planted_seen(); RETURN pg_catalog.hashtextextended(t, s::bigint); END $$`
+
+// A role that may create in the schema, having made none of the package's tables, rbac_migrations
+// neither, but only an overload of a function of pg_catalog's that 0001's index binds, is refused,
+// before anything is made, and the overload never runs: as the administrator's role, where the
+// application's role may create in its schema, and as a superuser, on public of a database the
+// application's role owns. The index made it ran as the administrator's role, and the superuser, on
+// every write and analysis of grants.
+func TestMigrateIsRefusedWhereAnotherRoleMadeAnOverloadAnIndexBinds(t *testing.T) {
+	t.Run("the administrator's schema", func(t *testing.T) {
+		ctx := t.Context()
+		r := newReadmeRoles(t)
+		if _, err := r.super.Exec(ctx, `GRANT USAGE, CREATE ON SCHEMA `+r.schema+` TO `+r.app); err != nil {
+			t.Fatal(err)
+		}
+		p := newPlanter(t, r.super, r.appPool, r.app, r.schema+"_planted")
+		p.plant(t, overload)
+		plantedRefused(t, rbac.Migrate(ctx, r.adminPool), "function hashtextextended(text,integer)")
+		p.fired(t)
+		if got, want := notOwned(t, r.super, r.schema, r.app), []string{"schema " + r.schema, "schema " + r.schema + "_as_of"}; !slices.Equal(got, want) {
+			t.Errorf("a refused migration made %v", got)
+		}
+	})
+	t.Run("public, in a database the application's role owns", func(t *testing.T) {
+		ctx := t.Context()
+		owner, superuser, app := anothersPublic(t)
+		p := newPlanter(t, superuser, app, owner, "planted")
+		p.plant(t, overload)
+		plantedRefused(t, rbac.Migrate(ctx, superuser), "function hashtextextended(text,integer)")
+		p.fired(t)
+		var made bool
+		if err := superuser.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace)`).Scan(&made); err != nil || made {
+			t.Errorf("a refused migration made something: %t, %v", made, err)
+		}
+	})
 }
 
 // Once the tables are made, partly, under the README's roles, Migrate refuses, before it applies
