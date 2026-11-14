@@ -262,7 +262,11 @@ func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
 // them: a superuser that read none would make the next migration's tables its own, which the
 // owner's migrations after it then fail on. The current schema is the first on the search_path the
 // role has USAGE on, which "$user" names by the role, so it refuses an owner it is another for.
-func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restore func() error, err error) {
+// guard has it refuse what plantedFor and creatorIn find: under the lock always, and before it only
+// on a host's transaction, where historyUnwritten reads the schema's tables before the lock; in a
+// transaction of Migrate's own, nothing before the lock reads the schema, and reading the catalogs
+// twice for each migration made migrating a new schema several times slower.
+func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked, guard bool) (restore func() error, err error) {
 	var owner, views *string
 	var mine, super, set bool
 	var login, role string
@@ -286,13 +290,18 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 		WHERE r.rolname = CURRENT_USER`, schema).Scan(&owner, &mine, &super, &set, &login, &role, &views, &bytes); err != nil {
 		return nil, err
 	}
-	planted, trigger, err := plantedFor(ctx, tx, schema)
-	if err != nil {
-		return nil, err
-	}
-	creator, err := creatorIn(ctx, tx, schema)
-	if err != nil {
-		return nil, err
+	// Where guard says to: plantedFor reads the schema's catalogs whole, once for each migration, so
+	// Migrate reads them before the lock only where it reads the schema's tables there too, as
+	// historyUnwritten does on a host's transaction, and always under it, which guards the migration.
+	var planted, creator *string
+	var trigger bool
+	if guard {
+		if planted, trigger, err = plantedFor(ctx, tx, schema); err != nil {
+			return nil, err
+		}
+		if creator, err = creatorIn(ctx, tx, schema); err != nil {
+			return nil, err
+		}
 	}
 	switch {
 	case trigger:
@@ -369,6 +378,10 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (planted *string, trigger bool, err error) {
 	err = tx.QueryRow(ctx, `WITH s AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1),
 		  ns AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname IN ($1, $1 || '_as_of')),
+		  cls AS MATERIALIZED (SELECT c.oid, c.relname, c.relkind, c.relowner, c.relnamespace FROM pg_catalog.pg_class c
+		    WHERE c.relnamespace IN (SELECT ns.oid FROM ns)),
+		  procs AS MATERIALIZED (SELECT p.oid, p.proname, p.proowner, p.pronamespace FROM pg_catalog.pg_proc p
+		    WHERE p.pronamespace IN (SELECT ns.oid FROM ns)),
 		  tables AS (SELECT c.relowner FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
 		    WHERE c.relname = 'rbac_grants' AND c.relkind IN ('r', 'p')),
 		  maker AS (SELECT coalesce((SELECT t.relowner FROM tables t),
@@ -379,20 +392,20 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (planted *string,
 		  named AS (SELECT 'pg_catalog.pg_class'::pg_catalog.regclass AS class, c.oid, c.relowner AS owner,
 		      c.relname = 'rbac_migrations' AND (c.relkind <> 'r' OR c.relowner <> (SELECT m.oid FROM maker m)) AS wrong,
 		      CASE WHEN c.relname = 'rbac_migrations' THEN 0 WHEN c.relkind IN ('i', 'I') THEN 2 ELSE 1 END AS rank
-		    FROM pg_catalog.pg_class c JOIN ns ON c.relnamespace = ns.oid WHERE pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_')
+		    FROM cls c WHERE pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_')
 		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, false, 1
 		    FROM pg_catalog.pg_type y JOIN ns ON y.typnamespace = ns.oid
 		    WHERE y.typrelid = 0 AND pg_catalog.starts_with(y.typname::pg_catalog.text, 'rbac_') AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
 		    UNION ALL SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid, p.proowner, false, 1
-		    FROM pg_catalog.pg_proc p JOIN ns ON p.pronamespace = ns.oid WHERE pg_catalog.starts_with(p.proname::pg_catalog.text, 'rbac_')),
+		    FROM procs p WHERE pg_catalog.starts_with(p.proname::pg_catalog.text, 'rbac_')),
 		  planted AS (SELECT n.class, n.oid, n.owner, n.rank FROM named n
 		    WHERE n.wrong OR n.owner NOT IN (SELECT t.oid FROM trusted t)
-		    UNION ALL SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid, p.proowner, 1 FROM pg_catalog.pg_proc p JOIN s ON p.pronamespace = s.oid
+		    UNION ALL SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid, p.proowner, 1 FROM procs p JOIN s ON p.pronamespace = s.oid
 		    WHERE p.proowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oid, o.oprowner, 1 FROM pg_catalog.pg_operator o JOIN s ON o.oprnamespace = s.oid
 		    WHERE o.oprowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, 0::pg_catalog.oid, 1 FROM pg_catalog.pg_trigger g
-		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid
+		    JOIN cls c ON c.oid = g.tgrelid
 		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND NOT EXISTS (SELECT
 		      FROM (VALUES `+packageTriggers+`) k (rel, name, fn, type, deferred), s, pg_catalog.pg_proc p
 		      WHERE c.relnamespace = s.oid AND c.relkind IN ('r', 'p') AND c.relname = k.rel AND g.tgname = k.name
@@ -401,7 +414,7 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (planted *string,
 		        AND g.tgnargs = 0 AND g.tgqual IS NULL AND g.tgattr::pg_catalog.text = '' AND g.tgoldtable IS NULL AND g.tgnewtable IS NULL)
 		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, 1 FROM pg_catalog.pg_type y JOIN s ON y.typnamespace = s.oid
 		    WHERE y.typrelid = 0 AND y.typowner NOT IN (SELECT t.oid FROM trusted t) AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
-		    UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, c.relowner, 1 FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
+		    UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, c.relowner, 1 FROM cls c JOIN s ON c.relnamespace = s.oid
 		    WHERE c.relkind IN ('S', 'c', 'f') AND c.relowner NOT IN (SELECT t.oid FROM trusted t)
 		      AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
 		        AND d.objid = c.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjsubid <> 0 AND d.deptype IN ('a', 'i'))
@@ -547,7 +560,7 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		if encoding != "UTF8" {
 			return fmt.Errorf("rbac: the database's encoding is %s, not UTF8", encoding)
 		}
-		if _, err := asOwner(ctx, tx, *schema, false); err != nil {
+		if _, err := asOwner(ctx, tx, *schema, false, !own); err != nil {
 			return err
 		}
 		if !own {
@@ -572,7 +585,7 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		if _, err := tx.Exec(ctx, `SELECT FROM pg_catalog.pg_get_object_address('schema', ARRAY[$1::pg_catalog.text], '{}')`, *schema); err != nil {
 			return err
 		}
-		restore, err := asOwner(ctx, tx, *schema, true)
+		restore, err := asOwner(ctx, tx, *schema, true, true)
 		if err != nil {
 			return err
 		}
