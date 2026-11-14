@@ -285,7 +285,15 @@ erDiagram
   statement, from `rbac_grants_custom_principal`, which holds only grants of custom roles, by
   principal and scope, and reads only those its subject counts: the anonymous and a guest read none
   of the members', and a search of a permission no public role gives none of the public's, so their
-  grants of built-in roles on thousands of resources cost it nothing. It names a custom role as that
+  grants of built-in roles on thousands of resources cost it nothing. Of the grants of built-in
+  roles, it reads those of each role giving the permission alone, by `rbac_grants_principal_role`
+  (0034), which leads to the role before the scope: sought by the scope and tested for the role
+  after, every grant of a key on the type's scopes, of a viewer on thousands of resources to the
+  members, the public, the subject or its group, cost a page or more, and tested as `= ANY` of the
+  roles, a generic plan still read them by `rbac_grants_principal`. A key's conditional grants of a
+  role giving the permission it still reads, from that index alone, though `Filter` counts none:
+  holding whether a grant is conditional before the scope, the index was costed as the scope's by a
+  generic plan, which then read every grant of the key there. It names a custom role as that
   index's predicate does, as a range of the C collation, from `custom.` to just before `custom/`,
   which no LIKE implies, so `rbac_grants_custom_role`, whose predicate is a LIKE and which leads to
   the tenant alone, serves no plan of it: by statistics from before the tenant granted custom roles,
