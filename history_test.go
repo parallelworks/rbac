@@ -1498,7 +1498,9 @@ func TestARoleIsRefusedTheTablesWhereTheSchemaIsNamedTooLongForTheViews(t *testi
 	}
 	// A session whose client_encoding counts the name's é in a byte, as LATIN1 does, reads it in 57.
 	for _, c := range []struct{ name, user, encoding string }{
-		{"a superuser", "", "UTF8"}, {"the application's role", r.app, "UTF8"}, {"the administrator's role", r.admin, "UTF8"},
+		{"a superuser", "", "UTF8"},
+		{"the application's role", r.app, "UTF8"},
+		{"the administrator's role", r.admin, "UTF8"},
 		{"a superuser whose session's client_encoding is LATIN1", "", "LATIN1"},
 	} {
 		if err := rbac.Migrate(ctx, on(c.user, long, c.encoding)); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "at most 57 bytes") {
