@@ -1209,6 +1209,9 @@ func DeepCopy(attributes map[string]any) map[string]any {
 	return copied
 }
 
+// RefusedWhole reports whether a check refuses every value of type t by its type, empty or nil too.
+func RefusedWhole(t reflect.Type) bool { return refusedWhole(t) }
+
 // Copies reports whether attributes can be copied for a hook, within what a check converts.
 func Copies(attributes map[string]any) bool {
 	_, ok := deepCopy(attributes)
@@ -1277,6 +1280,17 @@ func CountCopies(t *testing.T) *int {
 	old, n := copying, new(int)
 	copying = func() { *n++ }
 	t.Cleanup(func() { copying = old })
+	return n
+}
+
+// CountTypesWalked counts the types copying and converting walk to find what they find of each, an
+// array's or a struct's whether a copy shares it, what it costs, whether hashing it reads more and
+// whether a copy can hold it, and whether a type of the host's own is a lock, until t ends.
+func CountTypesWalked(t *testing.T) *int {
+	t.Helper()
+	old, n := walkingType, new(int)
+	walkingType = func() { *n++ }
+	t.Cleanup(func() { walkingType = old })
 	return n
 }
 

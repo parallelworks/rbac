@@ -413,6 +413,9 @@ func TestAListOrAPointerOfValuesNoConditionReadsFailsItsConditionsEmptyToo(t *te
 		"an empty map of a host's doubles": map[string]hostDouble{}, "a nil pointer to a host's double": (*hostDouble)(nil),
 		"a nil message of another type": (*emptypb.Empty)(nil), "an empty slice of messages of another type": []*emptypb.Empty{},
 		"an empty slice of maps keyed by doubles": []map[float64]int{}, "an empty slice of messages of an int": []*intMessage{},
+		"an empty slice of locks of the host's own": []spinLock{}, "a nil pointer to one": (*spinLock)(nil),
+		"an empty map keyed by one": map[spinLock]int{}, "an empty slice of locks of the host's own that are bytes": []byteLock{},
+		"a nil one": []byteLock(nil), "an array of them": [2]byteLock{},
 	} {
 		for _, expr := range []string{`request.attributes.v != 1`, `request.attributes.ok == true`} {
 			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": v, "ok": true}); err != nil || evaluated {
@@ -425,7 +428,7 @@ func TestAListOrAPointerOfValuesNoConditionReadsFailsItsConditionsEmptyToo(t *te
 		"an empty slice of bytes saying they are ints": []intByte{}, "an empty slice of arrays of them": [][2]intByte{},
 		"an empty map of slices of them": map[string][]intByte{}, "a nil pointer to a slice of them": (*[]intByte)(nil),
 		"an empty slice of times": []time.Time{}, "an empty slice of CEL's strings": []types.String{},
-		"a nil pointer to CEL's timestamp": (*types.Timestamp)(nil), "a nil Struct": (*structpb.Struct)(nil),
+		"a nil pointer to CEL's timestamp": (*types.Timestamp)(nil), "a nil Value": (*structpb.Value)(nil),
 		"an empty slice of Values": []*structpb.Value{}, "a nil pointer to an int": (*int)(nil),
 		"an empty slice of interfaces": []any{}, "an empty slice of maps keyed by an interface": []map[any]int{},
 		"a nil list holding lists": list(nil), "an empty list holding lists": list{},
@@ -928,6 +931,37 @@ func TestADeclaredAttributePassedAsANilPointerFailsItsConditions(t *testing.T) {
 	}
 }
 
+// CEL reads a nil Struct, ListValue, Timestamp or Duration as {}, [], the epoch or zero, and fails
+// on a nil Any, where a nil pointer is null: read as null, a grant's `request.attributes.v == null`
+// gave its role, and a deny's `request.attributes.v != null` lifted, where CEL decided otherwise.
+// Each is refused wherever it lies, so every condition reading its kind fails, while a nil Value or
+// wrapper is null, as CEL reads it.
+func TestANilMessageCELReadsAsAValueFailsItsConditions(t *testing.T) {
+	for name, v := range map[string]proto.Message{
+		"Struct": (*structpb.Struct)(nil), "ListValue": (*structpb.ListValue)(nil), "Timestamp": (*timestamppb.Timestamp)(nil),
+		"Duration": (*durationpb.Duration)(nil), "Any": (*anypb.Any)(nil),
+	} {
+		if types.DefaultTypeAdapter.NativeToValue(v) == types.NullValue {
+			t.Errorf("CEL reads a nil %s as null", name)
+		}
+		for by, attribute := range map[string]any{"alone": v, "in a list": []any{v}, "in a map": map[string]proto.Message{"a": v}, "behind a pointer": &v} {
+			for _, expr := range []string{`request.attributes.v == null`, `request.attributes.v != null`, `request.attributes.ok == true`} {
+				if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"v": attribute, "ok": true}); err != nil || evaluated {
+					t.Errorf("a nil %s %s: %s evaluated %t, %v", name, by, expr, evaluated, err)
+				}
+			}
+		}
+	}
+	for name, v := range map[string]proto.Message{"Value": (*structpb.Value)(nil), "wrapper": (*wrapperspb.StringValue)(nil)} {
+		if read := types.DefaultTypeAdapter.NativeToValue(v); read != types.NullValue {
+			t.Errorf("CEL reads a nil %s as %v", name, read)
+		}
+		if held, _, _, err := rbac.EvaluateCondition(t, `request.attributes.v == null && request.attributes.ok == true`, map[string]any{"v": v, "ok": true}); err != nil || !held {
+			t.Errorf("a nil %s: held %t, %v", name, held, err)
+		}
+	}
+}
+
 // doubling is a condition that nests a list of leaf in itself k times, so it holds 2^k leaves, at
 // little cost, and then compares it with itself, which reads them all in one call.
 func doubling(leaf string, k int, compare string) string {
@@ -1278,6 +1312,25 @@ type reflected struct{ protoreflect.Message }
 
 func (m *reflected) Interface() protoreflect.ProtoMessage { return m }
 func (m *reflected) ProtoReflect() protoreflect.Message   { return m }
+
+// reflectionOf is a host's type that is a message's reflection by the one it embeds, nil in its zero
+// value, whose methods then panic.
+type reflectionOf struct{ protoreflect.Message }
+
+// mistyped is a reflecting whose type says, by its empty message, that it makes its own, and makes
+// dynamic messages.
+type mistyped struct{ *dynamicpb.Message }
+
+func (m *mistyped) Interface() protoreflect.ProtoMessage { return m }
+func (m *mistyped) ProtoReflect() protoreflect.Message   { return m }
+func (m *mistyped) Type() protoreflect.MessageType       { return mistypedType{m.Message.Type()} }
+
+type mistypedType struct{ protoreflect.MessageType }
+
+func (t mistypedType) Zero() protoreflect.Message {
+	made, _ := t.MessageType.Zero().(*dynamicpb.Message)
+	return &mistyped{made}
+}
 
 // hostListValue is a host's type embedding a ListValue.
 type hostListValue struct{ *structpb.ListValue }
@@ -2697,7 +2750,7 @@ func TestConvertingAttributesAllocatesForWhatItConvertsThemTo(t *testing.T) {
 // empty maps 108 ms; and each JSON text and slice of bytes was charged one and a tenth of its
 // length, though converting a text made a json.Decoder and a copy keeps each slice apart, so a
 // check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy 150,000 slices of a
-// byte. Timed, a unit now takes 20 to 145 ns to convert and 25 to 360 ns to copy, whatever holds
+// byte. Timed, a unit now takes 20 to 145 ns to convert and 25 to 400 ns to copy, whatever holds
 // it, where reading one in a condition takes 70 to 145. What each allocates stands in for the time
 // here, as -race and a slower machine change neither: no unit charged allocates more
 // than a few times what one of a string does, by count or by bytes. Converting an empty map made
@@ -2769,6 +2822,18 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 					"and %.0f bytes", doing, n, name, a, b, allocations, bytes)
 			}
 		}
+	}
+	// A copy grows its copy of a slice's elements at least twice over for a longer length, whatever
+	// room the slice has past it: grown no further than that, slices of one array, each one longer
+	// than the one before it and with no room past it, were each copied anew, so 2,000 of strings
+	// allocated 8,514 bytes for each unit charged, and 40,000 took 3.7 s and 12 GB, charged 80,016.
+	// Converting reads each as a list of its own, at the cost of each, so it isn't asked here.
+	texts := make([]string, n)
+	if w := least(rbac.CopyingWork, listed(func(i int) any { return texts[: i+1 : i+1] })); !w.Done ||
+		float64(w.Allocations)/float64(w.Charged) > 2.5*allocations || float64(w.Bytes)/float64(w.Charged) > 5*bytes {
+		t.Errorf("copying %d slices of one array of strings, each one longer, done %t, allocated %.2f times and %.0f bytes for "+
+			"each unit charged, where converting strings allocates %.2f times and %.0f bytes", n, w.Done,
+			float64(w.Allocations)/float64(w.Charged), float64(w.Bytes)/float64(w.Charged), allocations, bytes)
 	}
 	// A struct no condition reads is refused whatever it holds, but converting a map of them read
 	// each entry into one value, moving it whole, charged two, and a hook's copy set a struct holding
@@ -2895,6 +2960,55 @@ func TestConvertingOrCopyingAValueCostsWhatBuildingItDoes(t *testing.T) {
 		if w := rbac.ConvertingWork(attributes); w.Done || w.Bytes > 1<<20 {
 			t.Errorf("converting %s read it %t, allocating %d bytes", name, w.Done, w.Bytes)
 		}
+	}
+	// A copy walks a struct's or an array's type to find what copying it costs and whether it shares
+	// it, which allocates nothing, so it is timed here, against copying strings: walked for each
+	// value, a slice of 10,000 structs of 4,000 empty fields, charged 10,013, took 2.3 s to copy,
+	// 225 µs a unit, and 100 values of a type nesting two empty arrays of the type before it 20 deep,
+	// walked along each path through them, charged 113, 19.6 s; 12 deep, 2,000 of them took 1.6 s.
+	// Each type is walked once, and none an empty array would hold, and each field walked costs a
+	// tenth, so the 10,000 structs of 4,000 fields are past what a copy holds, and 100 cost 40,000.
+	// copying is how long copying attributes takes for each unit it charges, the least of up to tries,
+	// stopping once it is no more than most, and what it charges.
+	copying := func(attributes map[string]any, tries int, most float64) (per float64, charged uint64) {
+		per = math.Inf(1)
+		for range tries {
+			start := time.Now()
+			charged, _ = rbac.CopyingCharge(attributes)
+			if per = min(per, float64(time.Since(start))/float64(charged)); per <= most {
+				break
+			}
+		}
+		return per, charged
+	}
+	perString, _ := copying(listed(func(i int) any { return strconv.Itoa(i) }), 5, 0)
+	fields := make([]reflect.StructField, 4000)
+	for i := range fields {
+		fields[i] = reflect.StructField{Name: fmt.Sprint("F", i), Type: reflect.TypeFor[struct{}]()}
+	}
+	emptyFields := reflect.StructOf(fields)
+	nested := reflect.TypeFor[struct{ A, B int }]()
+	for range 12 {
+		nested = reflect.StructOf([]reflect.StructField{{Name: "A", Type: reflect.ArrayOf(0, nested)}, {Name: "B", Type: reflect.ArrayOf(0, nested)}})
+	}
+	for name, attributes := range map[string]map[string]any{
+		"10,000 structs of 4,000 empty fields":      {"l": reflect.MakeSlice(reflect.SliceOf(emptyFields), 10_000, 10_000).Interface()},
+		"100 structs of 4,000 empty fields":         {"l": reflect.MakeSlice(reflect.SliceOf(emptyFields), 100, 100).Interface()},
+		"2,000 values nesting empty arrays 12 deep": {"l": reflect.MakeSlice(reflect.SliceOf(nested), 2000, 2000).Interface()},
+	} {
+		if per, charged := copying(attributes, 3, 8*perString); per > 8*perString {
+			t.Errorf("copying %s took %.0f ns for each unit charged, of %d, where copying strings takes %.0f", name, per, charged, perString)
+		}
+	}
+	if _, charged := copying(map[string]any{"l": reflect.MakeSlice(reflect.SliceOf(emptyFields), 100, 100).Interface()}, 1, 0); charged < 100*4000/10 {
+		t.Errorf("copying 100 structs of 4,000 empty fields charged %d", charged)
+	}
+	// So counted, the fields of a struct of no size count each path through them, and a struct holding
+	// 2^62 structs of 8 empty fields counts past what a uint64 holds: it is past what a copy holds,
+	// not charged what the count wraps to.
+	paths := reflect.StructOf([]reflect.StructField{{Name: "X", Type: reflect.ArrayOf(1<<62, reflect.StructOf(fields[:8]))}})
+	if rbac.Copies(map[string]any{"s": reflect.New(paths).Elem().Interface()}) {
+		t.Error("a struct holding 2^62 structs of 8 empty fields was copied")
 	}
 }
 
@@ -4493,6 +4607,10 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	listed := &structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("a"), structpb.NewNumberValue(0.5)}}
+	// A Value holding a nil Struct or ListValue is read as CEL reads the Value itself, an empty map or
+	// list, as protobuf writes it and a hook's copy holds it: read as null, a grant's
+	// `request.attributes.v == null` gave its role where CEL found it false.
+	nilStruct, nilList := &structpb.Value{Kind: &structpb.Value_StructValue{}}, &structpb.Value{Kind: &structpb.Value_ListValue{}}
 	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
 	text, celText, nothing, id := "a", types.String("a"), (*string)(nil), make([]byte, 16)
 	id[0] = 1
@@ -4505,6 +4623,7 @@ func TestFiniteValuesDecideAsCELDoes(t *testing.T) {
 		"a NullValue": {structpb.NullValue_NULL_VALUE, nil}, "a wrapper": {wrapperspb.Int64(3), 3},
 		"a timestamp": {timestamppb.New(at), at}, "a duration": {durationpb.New(time.Minute), time.Minute},
 		"a Value whose kind is a nil of its type": {&structpb.Value{Kind: (*structpb.Value_StructValue)(nil)}, nil},
+		"a Value of a nil Struct":                 {nilStruct, nilStruct}, "a Value of a nil ListValue": {nilList, nilList},
 		"a list": {[]any{"a", 0.5}, []any{"a", 0.5}}, "a map": {map[string]any{"a": "a"}, map[string]any{"a": "a"}},
 		"an id": {[16]byte{1}, id}, "ids": {[][16]byte{{1}}, []any{id}}, "bytes": {[]byte("a"), []byte("a")},
 		"a list of a type's name": {[]any{"int", "a"}, []any{"int", "a"}}, "a named string": {named("a"), "a"},

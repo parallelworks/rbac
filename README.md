@@ -286,10 +286,13 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `bool`, a string, an int, a uint or a float of any size, of a type of the host's own too, as a
   named string, read by its kind; `time.Time`, in UTC, and `time.Duration`; bytes, as `[]byte` or an array
   of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
-  reads, below; maps of these keyed by a bool, a
+  reads, or to a `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any`, below; maps of these keyed
+  by a bool, a
   string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
-  `Timestamp` and `Duration`, and an `Any` packing one of them; and CEL's own scalar values.
+  `Timestamp` and `Duration`, and an `Any` packing one of them, a `Value` holding a nil `Struct`
+  or `ListValue` read as an empty one, as CEL reads it and protobuf writes it; and CEL's own scalar
+  values.
   A kind's attributes, the subject's, the resource's or the request's, holding anything else,
   however deep, can't be read as a whole, as a policy engine fails input it can't read: every
   condition reading any of them fails, `has()` and `in` included, and so does one keying a map by
@@ -307,14 +310,20 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `request.attributes in {subject.attributes: true}` held, and a deny guarded by its negation
   lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
-  struct, a channel, a func, any other message, a map keyed by anything else, as a double or an
-  array, and a slice, a pointer or a map of any of these, or an array holding one, holding none
-  too, as an empty slice of structs or a nil pointer to one, read as `[]` or `null`, left a kind
+  struct, a channel, a func, a lock of the host's own, as an integer a pointer to which locks and
+  unlocks, which no hook can be given either, below, any other message, a map keyed by anything
+  else, as a double, an array or a lock, and a slice, a pointer or a map of any of these, or an
+  array holding one, holding none too, as an empty slice of structs or a nil pointer to one, read as
+  `[]` or `null`, left a kind
   readable until it held one, a map holding two keys read as the same value, as `1`
   and `1u`, and so JSON text naming a member of an object twice, once unescaped, or an `Any`
   packing a message that sets a field twice, as a `Struct` with two entries of `role`: each is read
   as the last, where a host reading the first reads another. A `Struct` the host passes holds each
-  key once, as a Go map does. So do invalid
+  key once, as a Go map does. So do those holding a nil `Struct`, `ListValue`, `Timestamp`,
+  `Duration` or `Any`, which CEL reads as `{}`, `[]`, the epoch or zero, or fails on, where a nil
+  pointer is null: read as null, a grant's `request.attributes.v == null` held where CEL found it
+  false, and read as CEL reads it, a declared timestamp passed as one met a grant's condition. A nil
+  `Value` or wrapper is null, as CEL reads it. So do invalid
   JSON, JSON text that isn't UTF-8 or escapes half a surrogate pair, which `encoding/json` reads as
   U+FFFD, a `json.Number` that isn't a number as JSON writes one, as `0x1p4` or `Inf`, a value
   holding itself, or one that does, and a value nested more than 10,000 deep, as JSON text can't
@@ -473,11 +482,21 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `null` where one holding such a value couldn't be read; and a map's values no condition reads,
   as a host's own array saying it is a double, or nesting past 10,000 deep, each cost at least 1
   for each 24 bytes they hold in place, so the kinds converted after them can be past what a check
-  converts. Attributes
+  converts. Attributes holding a lock of the host's own that isn't a struct, as an integer a pointer
+  to which locks and unlocks, were read by its kind, or as bytes in an array or a slice of ones that
+  are bytes, and now can't be, failing every condition reading their kind, as no hook can be given
+  them either, below, nor can ones holding an empty slice or map of them, or a nil pointer to one,
+  read as `[]`, `{}` or `null`, while an empty array of ones that are bytes, read as empty bytes,
+  is now read as `[]`, as an empty array of any other lock is; and a `Value`
+  holding a nil `Struct` or `ListValue`, read as null, is now read as an empty map or list, as CEL
+  reads it, so a condition comparing it with `null`, as a grant's `request.attributes.v == null`,
+  no longer holds, and one reading its size does; but attributes holding a nil `Struct`,
+  `ListValue`, `Timestamp`, `Duration` or `Any` the host passes, read as null, now can't be read,
+  failing every condition reading their kind, a declared one's too, which failed only those reading
+  it. Attributes
   holding maps, lists, pointers, messages, slices of bytes or JSON text are charged what building
   them costs, so ones a check converted before can be past what it converts now, as 80,000 empty
-  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are, or lists and JSON texts that
-  are slices of one array, one with room to grow, now each converted, as a hook's copy copies each,
+  maps, 79,000 JSON texts of a byte or 150,000 slices of a byte are,
   failing every condition reading an attribute, and past what a hook's copy holds, so a
   call asking a constraint about them, or `ValidateGrant` about an actor holding them, is refused
   whatever grants it, and so can ones holding structs that hold a map, a slice, a pointer or an
@@ -492,8 +511,29 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   arrays and messages, counting each time one is reached, however shallow, which were copied
   whole, and ones holding a lock, an unsafe pointer or a struct's unexported field holding a
   pointer, a slice, a map or an interface, which a hook was given copied whole, sharing what the
-  field held with the host; and a condition building a list or a map holding attributes no condition can
-  read, or reading the `subject`, the `resource` or the `request` holding them whole, as one
+  field held with the host, and ones holding a channel or a func, which a hook was given shared
+  with the host, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
+  which a hook was given alone, in an array, or in a slice or a map of arrays, and not in an array
+  of arrays, and ones holding a map keyed by a pointer, or by a value holding one, in place or in an
+  interface, or by a struct or an array whose interface held a channel or a lock, which a hook was
+  given holding the host's pointer or channel, or the lock, and ones holding a message, or a
+  message's reflection, whose copying panics, as that of a struct of the host's embedding a nil
+  reflection or of a dynamic message made without its type does, which panicked every call asking a
+  hook about them, or makes a message of another type, which a hook was given as that type, or
+  which panicked such a call in a list of its own; and ones holding structs whose fields
+  hold nothing in place, as empty structs or empty arrays, which a copy charged nothing for them and
+  now charges a tenth for each, can be past what a hook's copy holds, as 1,000 structs of 4,000
+  empty fields are, while a struct holding an empty array of funcs, which marks it only never to be
+  compared, or of a struct holding a lock that isn't itself one, was refused and is now copied, as
+  are ones holding a slice reached at one length with several capacities, as three-index slices of
+  one array are, which a copy charged for each, past what converting them costs; and a hook's copy
+  of a time in a zone of the host's own, as `time.FixedZone` and `time.LoadLocation` make, which
+  shared that zone with the host, so a constraint writing through `Location()` wrote the host's, is
+  now in a copy of the zone, which `==` tells from the host's, though `Equal` doesn't, and so is the
+  expiry of a grant `ValidateGrant` is asked about, which was in the host's; and
+  a condition building a list or a map
+  holding attributes no condition can read, or reading the `subject`, the `resource` or the
+  `request` holding them whole, as one
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
   `has({"k": 0.0 / 0.0}.k)`, or a map naming a key twice, which keys a condition computes can do
@@ -550,26 +590,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   `Permissions` does for each permission and a check of a labeled resource for each value its label
   asks for, so one writing to its copy reads its write later in the call, and nothing else does;
   copied for each ask, `Permissions` of 300 permissions on a resource of 20,000 tags took a second.
-  `ValidateGrant` is given its copy of the actor's attributes once for a call too. A copy holds no
-  more than a check converts, counted alike, and nothing nesting past 20,000 deep, twice what a
-  condition reads, along any path, wherever a value reached twice is reached first, nor a value
-  holding itself, as a graph of objects with links back can, that reaches 20,000 maps, lists,
-  pointers, structs, arrays and messages, counting each time it reaches one, however shallow: how
-  deep a path around the cycle nests turns on where the copy enters it, which the order a map's
-  entries come in picks, so two links each holding the other, beside a chain of 9,998 links to one
-  of them, were copied on one call and refused on the next. Nor does it hold what can't be copied
-  as a value: a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
-  value holds, an unsafe pointer, as a `reflect.Value` holds, or a struct's unexported field, which
-  a copy can't set, holding a pointer, a slice, a map or an interface, as another package's types
-  keep their state in; a host's type that is its own reflection by a generated message's it embeds
-  is given holding the reflection of a copy of the message. Where the attributes hold more, nest
-  deeper, hold themselves so or hold what can't be copied, the hook can't be asked, rather than be
-  given part of them,
-  and the call is refused as any other, a `DeniedError` of the permission on the resource
-  asked about, or the tenant, whose `Reason` names the hook and whose message doesn't: a tenant's
-  users can write what takes attributes past it, as a resource's tags, and the message named the
-  constraint. What one removes from an actor the actor can't hand on, but for a
-  role a role it holds lists in `GrantableRoles`, which it grants without holding. A freeze stops
+  `ValidateGrant` is given its copy of the actor's attributes once for a call too, and the grant's
+  expiry in a copy of its zone, as a copy holds a time, and neither is given what a copy can't
+  hold (see What a hook's copy holds). `OnChange` is told what a change wrote, not given copies:
+  its event's times are as PostgreSQL returns them, in none of the host's zones. What one removes
+  from an actor the actor can't hand on, but for a role a role it holds lists in `GrantableRoles`,
+  which it grants without holding. A freeze stops
   every change an actor makes to grants under it, and every change taking access away there: one
   removing `<type>:grant` from the actor, or a deny on the path doing so, stops `Apply` granting and
   revoking there, and so it stops any change taking access away there, whatever the actor's grants,
@@ -609,6 +635,47 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   member's own membership takes that member's lock alone, so one committing after the change reads
   them again isn't seen: a host whose policy rests on a group's members checks the group's grants
   when it changes a membership, as `SetMemberships` says.
+- **What a hook's copy holds:** what the host passed, its maps, lists, pointers and messages its
+  own, a host's type that is its own reflection by a generated message's it embeds holding the
+  reflection of a copy of the message, a time in a zone of the host's own, as `time.FixedZone` and
+  `time.LoadLocation` make, in a copy of the zone, one for each copy, wherever it lies, an
+  unexported field or a map's key too, and none of what follows. A zone's methods write none of it,
+  but assigning through `Location()` writes it whole: shared, a constraint writing
+  `*t.Location() = *time.UTC` wrote the host's zone, and every time in it. A time in UTC or the
+  local zone, which any code can reach, is as the host passed it. `ValidateGrant` is given a grant's
+  expiry so too, apart from any copy: in the host's zone, a hook writing through it wrote the
+  host's. Where what a hook would be given
+  holds any of it, the hook can't be asked, rather than be given part of it, and the call is
+  refused as any other, a `DeniedError` of the permission on the resource asked about, or the
+  tenant, whose `Reason` names the hook and whose message doesn't: a tenant's users can write what
+  takes attributes past it, as a resource's tags, and the message named the constraint.
+  - **Size:** more than a check converts, counted alike.
+  - **Depth:** what nests past 20,000 deep, twice what a condition reads, along any path, wherever
+    a value reached twice is reached first.
+  - **Cycles:** a value holding itself, as a graph of objects with links back can, that reaches
+    20,000 maps, lists, pointers, structs, arrays and messages, counting each time it reaches one,
+    however shallow: how deep a path around the cycle nests turns on where the copy enters it,
+    which the order a map's entries come in picks, so two links each holding the other, beside a
+    chain of 9,998 links to one of them, were copied on one call and refused on the next.
+  - **Locks:** a lock, as a mutex, a `WaitGroup`, an atomic value or a protobuf message held by
+    value holds, or a lock of the host's own, as an integer a pointer to which locks and unlocks,
+    wherever it lies, alone or in an array, a slice, a map or a struct, which can't be copied as a
+    value, and which no condition reads either.
+  - **Unsafe pointers:** as a `reflect.Value` holds, which can't be copied as a value either.
+  - **Another package's state:** a struct's unexported field, which a copy can't set, holding a
+    pointer, a slice, a map or an interface, as another package's types keep their state in.
+  - **Channels and funcs:** wherever they lie, which a copy could only share with the host: a
+    constraint sending on its copy's channel sent on the host's, and calling its copy's func ran
+    the host's closure.
+  - **Maps keyed by pointers:** a map keyed by a pointer, or by a value holding one, in place or in
+    an interface, however deep in the key: a copy gives a key as it is, as it finds an entry only by
+    the host's own key, so a constraint writing through a pointer key wrote to the host's, and an
+    interface in a struct or an array key gave it the host's channel, or a lock. No condition reads
+    such a map either, as CEL keys are bools, ints, uints and strings.
+  - **Reflections that fail:** a message, or a message's reflection, whose copying panics, as that
+    of a struct of the host's embedding a nil reflection, or of a dynamic message made without its
+    type, does, which panicked every call asking a hook about it, or makes a message of another
+    type than the host passed, which a hook was given as that type.
 
 ## Principals
 
