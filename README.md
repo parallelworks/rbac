@@ -54,9 +54,11 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   64-bit hash, so one whose condition shares both with another's of the same grant otherwise is
   refused with `ErrInvalid`. Each has an `ID`, who made it and when, and who last changed it.
 - **Changes:** `Apply` grants and revokes on one scope in one transaction. A revoke removes a
-  role's grants to a principal from a source, or with an `ID`, still naming the role, one grant;
-  revoking and granting a role at once replaces its grants, keeping those granted again as they
-  are.
+  role's grants to a principal from a source, or with an `ID`, still naming the role, one grant.
+  The `ID` is the grant's uuid, matched by value in any spelling PostgreSQL's uuid input reads, as
+  in capitals, without hyphens or in braces, and one that isn't a uuid is refused with
+  `ErrInvalid`, by `DeleteGrants` too. Revoking and granting a role at once replaces its grants,
+  keeping those granted again as they are.
 - **Sources:** a host that manages some grants itself, such as those it syncs from a directory,
   grants them from a `Source` of its own and revokes only those. Listed in `Config.Sources`, only
   the host changes them: `Apply` refuses to grant or revoke from one, and the host writes them with
@@ -107,7 +109,10 @@ where that is past the database's clock, where a check is refused (Expiry), and 
 column keeps no row once that is as late as the first time after `Filter` read the holding that the
 subject's membership, or its last path to one of its groups, ended. It compares the
 tenant and keys byte for byte, as `Authorize` does, whatever the columns' collation, in
-which their indexes still serve. The subject's grants are matched through the path's index, whose
+which their indexes still serve. For a row whose tenant or label column is NULL, the condition can
+be NULL rather than false, as SQL compares NULL: a `WHERE` clause leaves the row out all the same,
+but a query that selects the condition as a column reads it through `coalesce(..., false)` or
+`IS TRUE`. The subject's grants are matched through the path's index, whose
 cost for each row it finds grows with their number. Past a few on resources of the listed type, or
 past 128 on containers and the tenant, as one holding a grant on everything it created does, each of
 a row's keys is looked up among them instead, so a row costs a few lookups however many it holds; no
@@ -925,18 +930,22 @@ still running the rest of its commit; one waiting for synchronous replication, a
 set to `remote_apply` to wait for a standby to replay it; or one prepared for two-phase commit,
 whose deferred triggers fire, and whose commit is recorded, as it is prepared, not committed. The
 rest of a commit is the host's own deferred triggers and constraints of statements after its last
-change to the package's tables, and what they wait for, as a deferred foreign key's check waits for
-a row another session has locked; the session's temporary tables made `ON COMMIT DROP` or `ON COMMIT
-DELETE ROWS`, which it drops or empties, about half a millisecond each at the default `temp_buffers`,
-so a session with thousands holds its commit back for a second or so; and no lock it waits for longer
-than 100 ms, where the session's `lock_timeout` is longer, as another session that holds one of those
-temporary tables would have it wait, or past which it fails with SQLSTATE 55P03. Emptying an `ON
-COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large `temp_buffers` it
-costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s past its commit
-record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that sets a large
-`temp_buffers` and makes many such tables holds its own commit back accordingly; set `temp_buffers`
-no larger than the session's temporary data needs. The rest of a commit also writes the
-notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQL's notification
+change to the package's tables, which fire after the commit record is written but before its own
+event, and what they wait for, as a deferred foreign key's check waits for a row another session
+has locked, for as long as the session's `lock_timeout` lets them, without end by default; the
+session's temporary tables made `ON COMMIT DROP` or `ON COMMIT DELETE ROWS`, which it drops or
+empties, about half a millisecond each at the default `temp_buffers`, so a session with thousands
+holds its commit back for a second or so; and, from the commit record's own event on, no lock it
+waits for longer than 100 ms, where the session's `lock_timeout` is longer, as another session that
+holds one of those temporary tables would have it wait, or past which it fails with SQLSTATE 55P03.
+A host that wants its own deferred triggers and constraints bounded too sets `lock_timeout`: for
+its whole transaction, or with `SET LOCAL lock_timeout` just before `COMMIT`, for the commit alone.
+Emptying an `ON COMMIT DELETE ROWS` table scans the session's temporary buffers, so at a large
+`temp_buffers` it costs more: at `temp_buffers = 4GB`, 2,000 such tables held a commit about 5.4 s
+past its commit record, which `lock_timeout` doesn't bound, as it isn't a lock wait. A session that
+sets a large `temp_buffers` and makes many such tables holds its own commit back accordingly; set
+`temp_buffers` no larger than the session's temporary data needs. The rest of a commit also writes
+the notifications the transaction queued, with `NOTIFY` or `pg_notify`, to PostgreSQL's notification
 queue, which no SQL can see beforehand: about 1.6 ms a MB on a test server, 260 ms for 160 MB, and
 some 13 s at the default queue of 8 GB, which `lock_timeout` doesn't bound either. Any role may
 `NOTIFY`, which takes no privilege, so revoking `EXECUTE` on `pg_notify` from `PUBLIC` bounds
@@ -1007,9 +1016,11 @@ reads in a transaction, or under `WithTx` a savepoint of the host's, that it mak
 nothing in its read writes, a hook's or the host's query either, but to a session's own temporary
 table, and rolls back, which leaves a host's transaction as it was, writable where it was. It reads
 history through views that migrating makes (`0028_as_of_views`), in a schema beside the package's
-named as it with `_as_of` after, each named as the table it stands in for, which it names first on
-its transaction's search_path: a statement there, the package's, a hook's through the `DB` it is
-given or the host's on that transaction, reads a table by its name as it was then,
+named as it with `_as_of` after (so name the package's schema in at most 57 bytes: PostgreSQL cuts
+a name to 63, and migrating refuses a longer one as it would make the views, with SQLSTATE 42622),
+each named as the table it stands in for, which it names first on its transaction's search_path: a
+statement there, the package's, a hook's through the `DB` it is given or the host's on that
+transaction, reads a table by its name as it was then,
 `rbac_group_members` too, and `current_schema()` there is the views' schema. So it makes no object
 and takes no transaction id: it needs no `TEMPORARY`, and while its read runs it holds no `History`
 or `Export` back, though under `WithTx` a host's transaction that has taken one holds them back, as
@@ -1144,10 +1155,11 @@ have the server load a library or run a program of its choosing; and:
    disable the triggers that record them. Once they are made, `Migrate` as another role is refused,
    but as a superuser, which migrates as that role ([Running it](#running-it), Tables). A later
    migration can change history too, so the administrator's role keeps both owners' rights. It
-   owns the schema of `AsOf`'s views too, named
-   as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
-   database, which a role that doesn't own it hasn't by default, so a superuser makes it first,
-   empty, `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
+   owns the schema of `AsOf`'s views too, named as the package's with `_as_of` after, so name the
+   package's in at most 57 bytes, as no name is longer than 63. `0028_as_of_views` makes the
+   views' schema: that takes `CREATE` on the database, which a role that doesn't own it hasn't by
+   default, so a superuser makes it first, empty,
+   `CREATE SCHEMA <schema>_as_of AUTHORIZATION <administrator>` (the database's owner can
    only where it may `SET ROLE` to the administrator's), and grants no other role `CREATE` there,
    nor do the administrator's default privileges, which a schema made for it takes. `AsOf` names it
    first on its search_path, so migrating, and `AsOf` itself, refuse one that holds more than the
@@ -1432,15 +1444,18 @@ the package's uses foreign data, so none of the roles needs any.
   its session has an enabled deferrable trigger on a temporary table: declare the cursor in a
   transaction of its own, or without `HOLD`, and drop or disable the trigger, make it `NOT
   DEFERRABLE`, or change the package's tables on another connection. The rest of its commit, from
-  its commit record on, waits for a lock at most 100 ms where its `lock_timeout` is longer, and
-  fails past it with SQLSTATE 55P03, as where another session holds one of its session's temporary
-  tables, or a transaction with `NOTIFY` waits behind many others committing theirs: retry it. It
-  fails with SQLSTATE 42501 where its session set `rbac.cluster`, the setting history stamps each
-  record's cluster from, to another than the server's: reset it. A host transaction may set its
-  constraints immediate, by name or `ALL`, before or after its changes:
-  `rbac_history_committed` is deferred again as it fires. And `AsOf` under `WithTx` no longer counts
-  the host transaction's own changes, which haven't committed, where earlier code counted those
-  dated by its time: read them after the transaction commits.
+  its commit record's own event on, waits for a lock at most 100 ms where its `lock_timeout` is
+  longer, and fails past it with SQLSTATE 55P03, as where another session holds one of its
+  session's temporary tables, or a transaction with `NOTIFY` waits behind many others committing
+  theirs: retry it. The host's own deferred triggers and constraints of its statements after its
+  last change to the tables fire after the commit record but before that event, and wait for a lock
+  as long as its `lock_timeout` lets them: set one to bound them (see History). It fails with
+  SQLSTATE 42501 where its session set `rbac.cluster`, the setting history stamps each record's
+  cluster from, to another than the server's: reset it. A host transaction may set its constraints
+  immediate, by name or `ALL`, before or after its changes: `rbac_history_committed` is deferred
+  again as it fires. And `AsOf` under `WithTx` no longer counts the host transaction's own changes,
+  which haven't committed, where earlier code counted those dated by its time: read them after the
+  transaction commits.
   `0028_as_of_views` makes the views `AsOf` reads history through, one of each of the package's
   tables, in a schema beside the package's named as it with `_as_of` after, and the function
   `rbac_as_of_views`, which makes them again for a later migration that changes a table. Making the
@@ -1448,23 +1463,27 @@ the package's uses foreign data, so none of the roles needs any.
   with SQLSTATE 42501, recording nothing, until a superuser makes the schema for that role, empty,
   as the roles above say, and one that holds anything, is another role's or in which another may
   create, as the role's default privileges can have it, fails it with SQLSTATE 42P15, as does one
-  that has come to be so when a later migration makes the views again. It gives the views and their
-  schema to each role that may read history and use the package's schema then, as the application's
-  role above, so that role needs no new grant, and `rbac_as_of_views` does again to each that may
-  when it runs. It takes no lock a check, a change or a read of history waits for. Code from before
-  it makes temporary views for `AsOf`, as it still may beside it, and code from it on reads these,
-  refusing as `rbac.ErrInvalid` to read as of a time where they aren't made: migrate before running
-  it. From it on `AsOf` needs no `TEMPORARY`, so once no replica runs code from before it, revoke it
-  from `PUBLIC` with no exception; and it takes no transaction id, so its read holds no `History` or
-  `Export` back. Hooks and a host's queries on its transaction read the package's tables by name as
-  of the time, as before, but its read runs READ ONLY, with the views' schema first on the
-  search_path: `current_schema()` there names the views' schema, a write there but to a temporary
-  table fails with SQLSTATE 25006 rather than roll back with the read, and one that leaves the
-  search_path, the role, `rbac.as_of`, `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise
-  fails `AsOf` as `rbac.ErrInvalid` once its read returns, as does the views' schema holding more
-  than the views, or another role being able to create there, when the read begins or as it ends, or
-  one of the views dropped as it ran. Drop the views' schema with the package's: dropping the
-  package's drops the views, which read its history, but not their schema.
+  that has come to be so when a later migration makes the views again. Where the package's schema
+  is named in more than 57 bytes, the views' schema's name would be cut to 63, so the migration
+  fails with SQLSTATE 42622, having made nothing, as does `rbac_as_of_views` wherever it would name
+  that schema: rename the package's schema to a name of at most 57 bytes (Renaming the schema), and
+  migrate again. It gives the views and their schema to each role that may read history and use
+  the package's schema then, as the application's role above, so that role needs no new grant, and
+  `rbac_as_of_views` does again to each that may when it runs. It takes no lock a check, a change
+  or a read of history waits for. Code from before it makes temporary views for `AsOf`, as it still
+  may beside it, and code from it on reads these, refusing as `rbac.ErrInvalid` to read as of a
+  time where they aren't made: migrate before running it. From it on `AsOf` needs no `TEMPORARY`,
+  so once no replica runs code from before it, revoke it from `PUBLIC` with no exception; and it
+  takes no transaction id, so its read holds no `History` or `Export` back. Hooks and a host's
+  queries on its transaction read the package's tables by name as of the time, as before, but its
+  read runs READ ONLY, with the views' schema first on the search_path: `current_schema()` there
+  names the views' schema, a write there but to a temporary table fails with SQLSTATE 25006 rather
+  than roll back with the read, and one that leaves the search_path, the role, `rbac.as_of`,
+  `rbac.as_of_tenant` or `rbac.as_of_cluster` set otherwise fails `AsOf` as `rbac.ErrInvalid` once
+  its read returns, as does the views' schema holding more than the views, or another role being
+  able to create there, when the read begins or as it ends, or one of the views dropped as it ran.
+  Drop the views' schema with the package's: dropping the package's drops the views, which read its
+  history, but not their schema.
   `0029_commit_trigger` has `rbac_history_committed` run a function of its own,
   `rbac_history_commit`, in place of `rbac_record`. The trigger fires as a transaction commits once
   for each record the transaction wrote, which ran with `rbac_record`'s settings and start and read
@@ -1563,7 +1582,8 @@ the package's uses foreign data, so none of the roles needs any.
   refused. Never move one of the package's tables to another schema: its changes would be recorded
   in that schema's history, or with none there, in a session's own table of its name. `AsOf` finds
   its views by the history they read, whatever either schema is named, so renaming either keeps it
-  reading.
+  reading; but where they are gone, they are made again only beside a schema named in at most 57
+  bytes, in one named as it with `_as_of` after.
 - **Goroutines:** an Authorizer `New` returns on a pool is safe for concurrent use. One bound to a
   transaction or a connection, as `WithTx` and `AsOf`'s read give and `New` returns on a `pgx.Tx`
   or a `*pgx.Conn`, runs every call on that one connection, so it is for one goroutine at a time,
@@ -1598,8 +1618,10 @@ the package's uses foreign data, so none of the roles needs any.
   deferrable trigger on a temporary table of its session: history refuses each as the transaction
   commits, with SQLSTATE 0A000, as it would have its changes counted before they commit (see
   History), or where constraints were set immediate, as the statement that did, or the first change
-  after it. And the rest of its commit waits for no lock past 100 ms, failing with SQLSTATE 55P03,
-  where its `lock_timeout` is longer.
+  after it. And the rest of its commit, from its commit record's own event on, waits for no lock
+  past 100 ms, failing with SQLSTATE 55P03, where its `lock_timeout` is longer; its own deferred
+  triggers and constraints of statements after its last change to the tables fire before that
+  event, and wait for a lock as long as its `lock_timeout` lets them: set one to bound them.
 - **What the host passes:** a check reads grants, memberships and groups as they are; only
   conditions, compiled or found not to compile, are cached. Read a resource's ancestors and
   attributes from where they are stored, never from request input, no earlier than the content

@@ -1218,6 +1218,9 @@ var RestsSQL = restsSQL
 // same order, the actor's key $3.
 const CutSQL = cutSQL
 
+// UUIDText is whether a revoke takes s as a grant's ID, a uuid.
+func UUIDText(s string) bool { return uuidText(s) }
+
 // EndsSQL is the statement a change reads when its actor's paths to each key it holds end with:
 // tenant $1, the identity's key $2, now $3.
 var EndsSQL = `WITH RECURSIVE ` + endsSQL("$2::text", "$3") + ` SELECT k, e FROM ends`

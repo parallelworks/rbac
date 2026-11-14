@@ -689,6 +689,51 @@ func TestFilterKeepsOnlyTheRowsOfTheListedType(t *testing.T) {
 	})
 }
 
+// Filter's condition is NULL rather than false for a row whose tenant or label column is NULL that
+// it would otherwise keep, as its docs say: a WHERE clause leaves the row out all the same, and a
+// host selecting the condition as a column reads it as false through coalesce or IS TRUE.
+func TestFilterIsNullForARowWhoseTenantOrLabelIsNull(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE clusters (id text NOT NULL, tenant text, path text[] NOT NULL, labels text[])`); err != nil {
+		t.Fatal(err)
+	}
+	for id, row := range map[string]struct {
+		tenant any
+		labels []string
+	}{"c1": {"t1", []string{}}, "c2": {nil, []string{}}, "c3": {"t1", nil}} {
+		path := h.path(t, rbac.Resource{Tenant: "t1", Type: "cluster", ID: id})
+		if _, err := h.pool.Exec(ctx, `INSERT INTO clusters VALUES ($1, $2, $3, $4)`, id, row.tenant, path, row.labels); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pred, err := h.authz.Filter(ctx, u, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := h.pool.Query(ctx, `SELECT id || ': ' || coalesce((`+pred.SQL+`)::text, 'null') || ', ' || coalesce(`+pred.SQL+`, false)
+		|| ', ' || ((`+pred.SQL+`) IS TRUE) FROM clusters ORDER BY id`, pred.Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"c1: true, true, true", "c2: null, false, false", "c3: null, false, false"}; !slices.Equal(got, want) {
+		t.Errorf("Filter's condition, coalesced and IS TRUE, of a row, of one of a NULL tenant and of one of NULL labels: %q, want %q", got, want)
+	}
+	var kept []string
+	if err := h.pool.QueryRow(ctx, `SELECT array_agg(id ORDER BY id) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(kept, []string{"c1"}) {
+		t.Errorf("Filter keeps %v", kept)
+	}
+}
+
 // A table holding several types is listed through its path's index as one of a type is: each row's
 // type is tested among the rows the index finds, so a list of the clusters in one workspace reads
 // those and the workspace's own row, not the tenant's.
@@ -2130,6 +2175,145 @@ func TestOnlyTheHostChangesTheSourcesItOwns(t *testing.T) {
 		if !errors.Is(err, rbac.ErrInvalid) {
 			t.Errorf("DeleteGrants with %s: %v", name, err)
 		}
+	}
+}
+
+// A revoke by ID, through Apply and DeleteGrants, reads it as PostgreSQL reads a uuid and matches
+// the grant by value: written otherwise, as in capitals, without hyphens or in braces, it revokes
+// the grant, where compared as text it matched none and the call succeeded leaving the grant in
+// force. One PostgreSQL can't read as a uuid is refused as invalid, leaving the grant, rather than
+// matching nothing.
+func TestARevokeByIDMatchesItsGrantHoweverItsUUIDIsWritten(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	owner, bob := h.as(t, "owner"), h.as(t, "bob")
+	held := rbac.Binding{Role: "cluster.login", Principal: bob.Principal}
+	byID := func(id string) rbac.Binding { return rbac.Binding{ID: id, Role: held.Role, Principal: held.Principal} }
+	revokes := map[string]func(id string) error{
+		"Apply": func(id string) error {
+			return h.authz.Apply(ctx, owner, cluster, rbac.Change{Revoke: []rbac.Binding{byID(id)}})
+		},
+		"DeleteGrants": func(id string) error {
+			return h.authz.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: cluster.Scope(), Binding: byID(id)}})
+		},
+	}
+	bare := func(id string) string { return strings.ReplaceAll(id, "-", "") }
+	for _, c := range []struct {
+		written string
+		reads   bool
+		spell   func(id string) string
+	}{
+		{"in capitals", true, strings.ToUpper},
+		{"without hyphens", true, bare},
+		{"in braces", true, func(id string) string { return "{" + id + "}" }},
+		{"with a hyphen after every four digits", true, func(id string) string {
+			var fours []string
+			for d := bare(id); d != ""; d = d[4:] {
+				fours = append(fours, d[:4])
+			}
+			return strings.Join(fours, "-")
+		}},
+		{"in capitals and braces without hyphens", true, func(id string) string { return "{" + strings.ToUpper(bare(id)) + "}" }},
+		{"with a space after it", false, func(id string) string { return id + " " }},
+		{"a digit short", false, func(id string) string { return id[:len(id)-1] }},
+		{"a digit long", false, func(id string) string { return id + "0" }},
+		{"with two hyphens together", false, func(id string) string { return strings.Replace(id, "-", "--", 1) }},
+		{"with a hyphen inside four digits", false, func(id string) string { return id[:2] + "-" + id[2:] }},
+		{"ending in a hyphen", false, func(id string) string { return id + "-" }},
+		{"with a brace on one side", false, func(id string) string { return "{" + id }},
+		{"with a letter past f", false, func(id string) string { return "g" + id[1:] }},
+		{"as no uuid at all", false, func(string) string { return "bob's login" }},
+	} {
+		for _, call := range []string{"Apply", "DeleteGrants"} {
+			if err := h.authz.Apply(ctx, owner, cluster, rbac.Change{Grant: []rbac.Binding{held}}); err != nil {
+				t.Fatal(err)
+			}
+			grants, err := h.authz.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{bob.Principal}})
+			if err != nil || len(grants) != 1 {
+				t.Fatalf("Grants = %+v, %v", grants, err)
+			}
+			id := c.spell(grants[0].ID)
+			var reads bool
+			if err := h.pool.QueryRow(ctx, `SELECT pg_input_is_valid($1, 'uuid')`, id).Scan(&reads); err != nil || reads != c.reads {
+				t.Fatalf("PostgreSQL reads %q as a uuid: %t, %v", id, reads, err)
+			}
+			if reads {
+				var read string
+				if err := h.pool.QueryRow(ctx, `SELECT $1::text::uuid::text`, id).Scan(&read); err != nil || read != grants[0].ID {
+					t.Fatalf("PostgreSQL reads %q as %q, %v, not %q", id, read, err, grants[0].ID)
+				}
+			}
+			err = revokes[call](id)
+			switch may := allowed(t, h, bob, login, cluster); {
+			case reads && (err != nil || may):
+				t.Errorf("%s by the grant's ID %s, %q: %v, and bob may still log in: %t", call, c.written, id, err, may)
+			case !reads && (!errors.Is(err, rbac.ErrInvalid) || !may):
+				t.Errorf("%s by the grant's ID %s, %q: %v, not refused as invalid, and bob may still log in: %t", call, c.written, id, err, may)
+			}
+		}
+	}
+}
+
+// A revoke takes as a grant's ID exactly what PostgreSQL's uuid input reads: one PostgreSQL can't
+// read that a revoke took would fail its change with PostgreSQL's error rather than as invalid, and
+// one it reads that a revoke refused is a grant's ID that a host can't revoke the grant by.
+func TestARevokeTakesAsAnIDWhatPostgreSQLReadsAsAUUID(t *testing.T) {
+	ctx := t.Context()
+	pool := pgtest.Open(t, "")
+	rng := mathrand.New(mathrand.NewPCG(1, 2))
+	const digits, alphabet = "0123456789abcdefABCDEF", "0123456789abcdefABCDEF-{} g"
+	written := []string{"", "{}", "-", "{-}", "{{}}"}
+	// 32 digits, a hyphen after some groups of four but the last, braced, on one side or not at all,
+	// then edited at random: some read, most not.
+	for range 20000 {
+		var b []byte
+		braces := rng.IntN(4)
+		if braces == 1 || braces == 2 {
+			b = append(b, '{')
+		}
+		for i := range 32 {
+			b = append(b, digits[rng.IntN(len(digits))])
+			if i%4 == 3 && i < 31 && rng.IntN(2) == 0 {
+				b = append(b, '-')
+			}
+		}
+		if braces == 1 || braces == 3 {
+			b = append(b, '}')
+		}
+		for range rng.IntN(3) {
+			i, c := rng.IntN(len(b)+1), alphabet[rng.IntN(len(alphabet))]
+			switch {
+			case rng.IntN(3) == 0:
+				b = slices.Insert(b, i, c)
+			case i == len(b):
+			case rng.IntN(2) == 0:
+				b = slices.Delete(b, i, i+1)
+			default:
+				b[i] = c
+			}
+		}
+		written = append(written, string(b))
+	}
+	rows, err := pool.Query(ctx, `SELECT s, pg_input_is_valid(s, 'uuid') FROM unnest($1::text[]) s`, written)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s string
+	var reads bool
+	read := 0
+	if _, err := pgx.ForEachRow(rows, []any{&s, &reads}, func() error {
+		if reads {
+			read++
+		}
+		if rbac.UUIDText(s) != reads {
+			return fmt.Errorf("PostgreSQL reads %q as a uuid: %t, and a revoke takes it: %t", s, reads, !reads)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if read < len(written)/10 || read > len(written)*9/10 {
+		t.Fatalf("PostgreSQL reads %d of %d as uuids", read, len(written))
 	}
 }
 
