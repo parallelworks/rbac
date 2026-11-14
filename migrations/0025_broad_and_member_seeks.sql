@@ -45,7 +45,7 @@ DECLARE
     keys text[];
 BEGIN
     -- Planning the query costs more than finding no groups.
-    IF coalesce(cardinality(groups), 0) = 0 THEN
+    IF coalesce(pg_catalog.cardinality(groups), 0) = 0 THEN
         RETURN;
     END IF;
     IF standing IS NOT TRUE THEN

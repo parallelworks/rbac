@@ -11,7 +11,7 @@ CREATE TABLE rbac_memberships (
     suspended      boolean     NOT NULL DEFAULT false,
     source         text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
     expires_at     timestamptz,
-    note           text        NOT NULL DEFAULT '' CHECK (length(note) <= 2048),
+    note           text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(note) <= 2048),
     created_by     text        NOT NULL DEFAULT '',
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_by     text        NOT NULL DEFAULT '',
@@ -28,9 +28,9 @@ CREATE INDEX rbac_memberships_expires ON rbac_memberships (expires_at) WHERE exp
 -- A tenant's groups of identities and other groups; `group:<id>` names one only in its tenant.
 CREATE TABLE rbac_groups (
     tenant      text        COLLATE "C" NOT NULL CHECK (tenant <> ''),
-    id          text        COLLATE "C" NOT NULL CHECK (id <> '' AND length(id) <= 128),
-    name        text        NOT NULL DEFAULT '' CHECK (length(name) <= 128),
-    description text        NOT NULL DEFAULT '' CHECK (length(description) <= 2048),
+    id          text        COLLATE "C" NOT NULL CHECK (id <> '' AND pg_catalog.length(id) <= 128),
+    name        text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(name) <= 128),
+    description text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(description) <= 2048),
     -- Empty when made directly, or the host's, such as a directory it syncs from.
     source      text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
     created_by  text        NOT NULL DEFAULT '',
@@ -49,7 +49,7 @@ CREATE TABLE rbac_members (
     principal_id   text        COLLATE "C" NOT NULL CHECK (principal_id <> ''),
     source         text        COLLATE "C" NOT NULL DEFAULT '' CHECK (source ~ '^([a-z][a-z0-9._:/-]{0,62})?$'),
     expires_at     timestamptz,
-    note           text        NOT NULL DEFAULT '' CHECK (length(note) <= 2048),
+    note           text        NOT NULL DEFAULT '' CHECK (pg_catalog.length(note) <= 2048),
     created_by     text        NOT NULL DEFAULT '',
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_by     text        NOT NULL DEFAULT '',
