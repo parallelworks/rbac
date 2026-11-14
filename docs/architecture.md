@@ -1553,17 +1553,23 @@ flowchart TB
   trigger that runs on each version recorded; a function or operator, which a statement whose
   arguments it matches better than pg_catalog's would call, as an overload of `hashtextextended`
   would be bound into `rbac_grants_key` and run as the tables' owner on every insert; a trigger on
-  one of the tables calling such a function; and a type, domain, composite type, collation,
+  one of the tables calling such a function, or depending on one or on such an operator or type,
+  as its `WHEN` clause can while it runs a trusted function, which ran another role's function as
+  the administrator on each version recorded; and a type, domain, composite type, collation,
   conversion, text search configuration or dictionary, statistics object, foreign table or sequence
   no column owns. And it refuses a schema in which any other role, or `PUBLIC`, may create
   (`creatorIn`), as one could make such an object between the check and a migration's statement:
-  the schema's owner and its members count, as the owner can grant itself `CREATE`, so do the
-  database's owner where `pg_database_owner` owns the schema, as it does `public`; roles that may
-  `SET ROLE` to, or use the rights of, the tables' owner, history's or a superuser don't, as they
-  could act as that one anyway. On a schema holding none of the tables it refuses that only under
+  the schema's owner counts, as the owner can grant itself `CREATE`, and so does a role that may act
+  as it (`USAGE`, `SET` or `ADMIN` on it, not membership alone), as does the database's owner where
+  `pg_database_owner` owns the schema, as it does `public`; roles that may `SET ROLE` to, or use
+  the rights of, the tables' owner, history's or a superuser don't, as they could act as that one
+  anyway, nor do those holding `ADMIN` on the tables' owner or history's, as the role that made it
+  with `CREATEROLE` does, which can grant itself that role. On a schema holding none of the tables it refuses that only under
   the lock, as the replica it waited for can make them, whose owner may then create. While
-  migrating, the search_path is the schema alone, after pg_catalog, so nothing in a schema later on
-  the host's search_path is called in place of pg_catalog's, and the migrations call PostgreSQL's
+  migrating, the search_path is the schema and then `pg_temp`, after pg_catalog, so nothing in a
+  schema later on the host's search_path is called in place of pg_catalog's, and no temporary
+  table of the session is read in place of the schema's, as `pg_temp` named nowhere is searched
+  first for relations, where a temporary `rbac_migrations` made `Migrate` apply nothing, and the migrations call PostgreSQL's
   functions by pg_catalog's name. Right after the advisory lock it locks the schema as an object
   (`pg_get_object_address`), which has the session take in the catalog changes committed while it
   waited, which the advisory lock doesn't: otherwise, where the replica it waited for gave the

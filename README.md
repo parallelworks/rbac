@@ -1305,19 +1305,23 @@ the package's uses foreign data, so none of the roles needs any.
   is a superuser. That is a relation, type or function named `rbac_` there or in `<schema>_as_of`,
   an `rbac_migrations` that isn't an ordinary table of the tables' owner, any function or operator,
   which a migration's statement could call in place of PostgreSQL's, a trigger on one of the tables
-  calling such a function, and any type, domain, collation, conversion, text search configuration
+  calling such a function, or depending on one, as through its `WHEN` clause, and any type, domain, collation, conversion, text search configuration
   or dictionary, statistics object, foreign table or sequence no column owns: drop it, as the role
   owning it or a superuser, and migrate again. And it refuses a schema in which another role, or
   `PUBLIC`, may create, as that role could make one while a migration runs, on a schema holding none
   of the tables only under the lock: the schema's owner may, and its members, as may the database's
-  owner in `public`, which `pg_database_owner` owns; a role that may `SET ROLE` to the tables'
-  owner, history's or a superuser isn't counted. So a superuser's first `Migrate` on `public` of a
+  owner in `public`, which `pg_database_owner` owns, counted only where they may act as the owner
+  (`USAGE`, `SET` or `ADMIN` on it); a role that may `SET ROLE` to the tables' owner, history's or a
+  superuser isn't counted, nor one holding `ADMIN` on the tables' owner or history's, as the role
+  that made it with `CREATEROLE` does, which can give itself that role anyway. So a superuser's first `Migrate` on `public` of a
   database another role owns is refused, as is one on a schema the application's role owns or may
   create in. A superuser gives the schema to the administrator's role,
   `ALTER SCHEMA <schema> OWNER TO <administrator>`, and revokes `CREATE` from each other role it
   names, `REVOKE CREATE ON SCHEMA <schema> FROM <role>`, or `FROM PUBLIC`, and then the
-  administrator's role migrates. While migrating, the search_path is the package's schema alone,
-  whatever the host's names after it, so nothing in another schema runs in place of PostgreSQL's. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
+  administrator's role migrates. While migrating, the search_path is the package's schema and then
+  `pg_temp`, whatever the host's names, so nothing in another schema runs in place of PostgreSQL's,
+  and no temporary table of the session is read in place of the package's, as one named
+  `rbac_migrations` holding every version made `Migrate` apply nothing. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
   role's, as the administrator's is in [History](#history), a first `Migrate` as any other role, a
   superuser too, is refused as `rbac.ErrInvalid` naming that role, having made nothing, as
   `0028_as_of_views` would fail there after making every table before it the role migrating's.
