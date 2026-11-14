@@ -285,6 +285,16 @@ func TestListingsAgreeWithChecksInRandomTenants(t *testing.T) {
 					filterAgrees(t, e)
 				}
 			})
+			// As they read for a subject holding many grants of a type: a role at a time.
+			t.Run("reading grants a role at a time", func(t *testing.T) {
+				rbac.SetHeldByScope(t, 0)
+				for _, e := range expect {
+					filterAgrees(t, e)
+					if reached, unchecked := reachedBy(t, w.h, w.clusters, e.s, e.p); !slices.Equal(reached, e.want) || !slices.Equal(unchecked, e.unchecked) {
+						t.Errorf("%+v %s: Reachable %v, unchecked %v, Authorize %v, unchecked %v", e.s, e.p, reached, unchecked, e.want, e.unchecked)
+					}
+				}
+			})
 			for _, r := range w.clusters {
 				for _, p := range []rbac.Permission{view, login, root} {
 					w.holdersAgree(t, p, r)

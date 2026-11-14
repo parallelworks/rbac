@@ -1547,18 +1547,21 @@ func TestASuperusersMigrationAsItselfIsGivenBackAsTheReadmeSays(t *testing.T) {
 		t.Fatal(err)
 	}
 	made, _ := madeViews(t)
-	last := names[len(names)-1]
 	sqls := migrationSQL(t)
-	var grantsDenied string
+	// remade is the last migration making the views again, which a superuser's migration failed at.
+	var grantsDenied, remade string
 	for _, name := range names {
 		if strings.Contains(sqls[name], "CREATE FUNCTION rbac_changes_grants(") {
 			grantsDenied = name
 		}
+		if name > made && strings.Contains(sqls[name], "rbac_as_of_views") {
+			remade = name
+		}
 	}
 	quoted := func(name string) string { return pgx.Identifier{name}.Sanitize() }
 	// From before the views, whose schema wasn't made for the administrator's role, to the last, and
-	// from earlier still; and from after them, as far as the last, which failed.
-	for _, c := range []struct{ from, to string }{{made, ""}, {grantsDenied, ""}, {names[slices.Index(names, made)+1], last}} {
+	// from earlier still; and from after them, as far as the one making them again, which failed.
+	for _, c := range []struct{ from, to string }{{made, ""}, {grantsDenied, ""}, {names[slices.Index(names, made)+1], remade}} {
 		before := c.to == ""
 		t.Run(fmt.Sprintf("from %s", c.from), func(t *testing.T) {
 			ctx := t.Context()

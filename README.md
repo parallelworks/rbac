@@ -1600,6 +1600,15 @@ the package's uses foreign data, so none of the roles needs any.
   fails with SQLSTATE 42501, and code after it, before it is applied, by the function, which doesn't
   exist yet, and fails as `rbac.ErrInvalid`, saying so: run `DeleteExpired` only from code after it
   once it is applied. Their checks, searches and changes run beside each other, applied or not.
+  `0034_giving_role_seeks` adds `rbac_grants_principal_role`, which leads to a grant's principal,
+  tenant and role before its scope, so where one of their subject's keys, or its groups', the
+  tenant's members' or the public's, holds more than 64 grants on scopes of the listed type, `Filter`
+  and `Reachable` seek those of each role giving the permission alone: they read every grant of
+  those keys on scopes of the listed type, of any role, so beside a viewer's
+  grants to the tenant's members on 20,000 clusters a member's `Reachable` read 4,700 pages and a
+  query of `Filter`'s condition 14,000, against 41 for `Authorize`. Building it keeps every write to
+  `rbac_grants` waiting until migrating commits, though checks and searches go on.
+  Code from before it reads as it did, by the scope, so replicas of either release run side by side.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
   rolling upgrade across the two is unsafe: they key every lock apart, so a change by one waits for
   none by the other, and what each checks under its locks can change before it commits, as two

@@ -1348,7 +1348,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	// they name (namedCustom).
 	alone := a.labelPermission(p)
 	rows, err := a.queryIndexed(ctx, a.db, `
-		WITH held AS MATERIALIZED (`+a.heldByType("$5", "$2", "g.scope, g.conditional, g.role, g.principal", `
+		WITH held AS MATERIALIZED (`+a.heldByType("$5", "$2", "$3", custom, "g.scope, g.conditional, g.role, g.principal", `
 		  g.tenant = $1 AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
 		SELECT scope, bool_and(conditional) FROM held
 		WHERE role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, namedCustom("SELECT role FROM held"), false, alone)+`)
@@ -1655,11 +1655,41 @@ func (a *Authorizer) byType(types, cols, where string) string {
 // heldByType is byType of the grants to the principals in the array principals, each principal's
 // on its own (byKey): beside `= ANY` of them, a plan by no statistics, as of a table never
 // analyzed, read a type's range of the scopes' index, every grant on a scope of the type, as
-// cheaper than seeking each principal there.
-func (a *Authorizer) heldByType(types, principals, cols, where string) string {
-	return fmt.Sprintf(`SELECT %[2]s FROM unnest(%[1]s::text[]) AS t(t) CROSS JOIN unnest(%[5]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
-		SELECT %[2]s FROM rbac_grants g WHERE %[3]s AND g.principal = keyed.k AND %[4]s OFFSET 0) g`, types, cols, where, a.ofType(), principals)
+// cheaper than seeking each principal there. Of those, it reads only the grants of the built-in
+// roles in the array roles, a role at a time, by rbac_grants_principal_role, which leads to the
+// role before the scope, and with custom those of every custom role, by
+// rbac_grants_custom_principal, whose ids the caller reads from them (namedCustom). Read by the
+// scope alone and tested for the role after, every grant of a role giving nothing, as the public's
+// or the tenant's members' of a viewer on thousands of resources, cost a list a page or more; and
+// tested as `= ANY` of the roles, a generic plan still read them by rbac_grants_principal, which
+// holds the role after the scope. But a seek costs a descent of the index, so a role at a time, a
+// key's few grants of a type cost a search a seek for each role giving the permission, of each key
+// and type: beside 40 roles giving it, a subject in 200 groups read 72,000 pages where by the scope
+// it read 3,300. So it reads each key's grants on a type by the scope, as before, up to
+// heldByScope of them, and only a key holding that many there a role at a time.
+func (a *Authorizer) heldByType(types, principals, roles string, custom bool, cols, where string) string {
+	held := fmt.Sprintf(`SELECT %[1]s FROM rbac_grants g WHERE %[2]s AND g.principal = keyed.k AND %[3]s`, cols, where, a.ofType())
+	if a.history != "" {
+		held += " OFFSET 0"
+	} else {
+		given := held
+		byRole := fmt.Sprintf(`SELECT %[1]s FROM unnest(%[2]s::text[]) AS r(r) CROSS JOIN LATERAL (%[3]s AND g.role = r.r OFFSET 0) g`, cols, roles, given)
+		if custom {
+			byRole = "(" + byRole + ") UNION ALL (" + given + a.customOnly("g.role") + " OFFSET 0)"
+		}
+		// Each arm runs only where its count holds, which reads few once, so a key's grants are read
+		// one way, once.
+		held = fmt.Sprintf(`WITH few AS MATERIALIZED (%[1]s LIMIT %[3]d) SELECT * FROM few WHERE (SELECT count(*) FROM few) < %[3]d
+			UNION ALL SELECT * FROM (%[2]s) g WHERE (SELECT count(*) FROM few) = %[3]d`, given, byRole, heldByScope)
+	}
+	return fmt.Sprintf(`SELECT %[2]s FROM unnest(%[1]s::text[]) AS t(t) CROSS JOIN unnest(%[3]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
+		%[4]s) g`, types, cols, principals, held)
 }
+
+// heldByScope is how many grants of a key on scopes of a type heldByType reads by the scope, of any
+// role, before it reads them a role at a time instead: about where reading them costs as many pages
+// as seeking a few dozen roles. A test lowers it.
+var heldByScope = 64
 
 // ofType is SQL for whether a grant g's scope is of the type t.t, as byType tests it.
 func (a *Authorizer) ofType() string {
@@ -1863,13 +1893,14 @@ func (a *Authorizer) filterHolding(arg func(int) string, first int, lapses time.
 // that they name (namedCustom), with alone only those givingSQL reads so. arg numbers Filter's
 // arguments.
 func (a *Authorizer) filterGrants(arg func(int) string, custom, alone bool, types string) string {
-	return `WITH held AS MATERIALIZED (` + a.filterHeld(arg, types) + `)
+	return `WITH held AS MATERIALIZED (` + a.filterHeld(arg, custom, types) + `)
 		SELECT scope COLLATE "default" FROM held WHERE ` + filterCounted(arg, custom, alone)
 }
 
-// filterHeld is SQL selecting the subject's grants filterGrants reads, as held.
-func (a *Authorizer) filterHeld(arg func(int) string, types string) string {
-	return a.heldByType(types, a.filterKeys(arg, countedKeys(arg(13), arg(17))), "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text
+// filterHeld is SQL selecting the subject's grants filterGrants reads, as held: with custom, those
+// of custom roles too.
+func (a *Authorizer) filterHeld(arg func(int) string, custom bool, types string) string {
+	return a.heldByType(types, a.filterKeys(arg, countedKeys(arg(13), arg(17))), arg(3), custom, "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text
 		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), a.filterAt(arg)))
 }
 
@@ -1911,7 +1942,7 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container b
 		return fmt.Sprintf(`(WITH held AS MATERIALIZED (%[1]s) SELECT CASE
 			WHEN (SELECT count(*) FROM (SELECT FROM held WHERE %[2]s LIMIT %[4]d) g) = %[4]d THEN %[4]d
 			ELSE (SELECT count(*) FROM (SELECT FROM held WHERE %[3]s LIMIT %[4]d) g) END)`,
-			a.filterHeld(arg, types), filterCounted(arg, false, false), filterCounted(arg, true, alone), limit)
+			a.filterHeld(arg, true, types), filterCounted(arg, false, false), filterCounted(arg, true, alone), limit)
 	}
 	onResources := "0"
 	if !container {
