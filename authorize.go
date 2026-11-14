@@ -1348,7 +1348,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	// they name (namedCustom).
 	alone := a.labelPermission(p)
 	rows, err := a.queryIndexed(ctx, a.db, `
-		WITH held AS MATERIALIZED (`+a.heldByType("$5", "$2", "$3", givingCustomSQL(custom, "$1", "$8", "$9"), "g.scope, g.conditional, g.role, g.principal", `
+		WITH held AS MATERIALIZED (`+a.heldByType("$5", "$2", "$3", givingCustomSQL(custom, "$1", "$8", "$9", "keyed.k"), "g.scope, g.conditional, g.role, g.principal", `
 		  g.tenant = $1 AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
 		SELECT scope, bool_and(conditional) FROM held
 		WHERE role = ANY(`+givingSQL("$3", "$1", "$8", "$9", custom, namedCustom("SELECT role FROM held"), false, alone)+`)
@@ -1670,8 +1670,8 @@ func (a *Authorizer) byType(types, cols, where string) string {
 // only a key holding that many there a role at a time (byScopeOrRole): beside a catalog of 1,000
 // roles giving it, a role at a time, 20 groups holding 100 grants each read 60,000 pages, where by
 // the scope they read 700. The custom roles it seeks are those of the tenant that give the
-// permission on the type, custom, SQL for an array of them read in the statement (givingCustomSQL),
-// empty for none: every grant of a custom role, as a tenant's viewer's to the members on thousands of
+// permission on the type that the key holds, custom, SQL for an array of them read in the statement
+// by key (givingCustomSQL), empty for none: every grant of a custom role, as a tenant's viewer's to the members on thousands of
 // resources, read by the scope cost a list a page or more, though the role gave nothing there. They
 // are read only for a key holding more than the built-in ones' bound, so a list whose keys hold few
 // grants reads none.
@@ -1680,34 +1680,36 @@ func (a *Authorizer) heldByType(types, principals, roles, custom, cols, where st
 	if a.history != "" {
 		held += " OFFSET 0"
 	} else {
-		givers, bound := roles+"::text[]", scopeBound(roles+"::text[]")
+		givers := roles + "::text[]"
 		if custom != "" {
 			givers = "(" + roles + "::text[] || " + custom + ")"
 		}
-		byRole := fmt.Sprintf(`SELECT %[1]s FROM unnest(%[2]s) AS r(r) CROSS JOIN LATERAL (%[3]s AND g.role = r.r OFFSET 0) g`, cols, givers, held)
-		held = byScopeOrRole(held, byRole, bound, scopeBound(givers))
+		byRole := func(givers string) string {
+			return fmt.Sprintf(`SELECT %[1]s FROM unnest(%[2]s) AS r(r) CROSS JOIN LATERAL (%[3]s AND g.role = r.r OFFSET 0) g`, cols, givers, held)
+		}
+		held = byScopeOrRole(held, byRole, scopeBound(roles+"::text[]"), givers)
 	}
 	return fmt.Sprintf(`SELECT %[2]s FROM unnest(%[1]s::text[]) AS t(t) CROSS JOIN unnest(%[3]s::text[]) AS keyed(k) CROSS JOIN LATERAL (
 		%[4]s) g`, types, cols, principals, held)
 }
 
 // byScopeOrRole is SQL selecting the rows given selects, a key's on a type, by the scope where it
-// holds fewer than first, or than bound past that, and as byRole selects them, a role at a time,
-// where it holds bound or more. bound, SQL for no fewer than first, is read only past first, so a
-// list whose keys hold few reads none of what it reads, as the custom roles giving the permission,
-// and where it is first, a key's grants aren't read by the scope again. Each arm runs only where its
-// counts hold, read in turn in a CASE, which the planner doesn't reorder, so a key's grants are read
-// one way, once, and by the scope at most twice, up to bound.
-func byScopeOrRole(given, byRole, first, bound string) string {
-	if first == bound {
-		return fmt.Sprintf(`WITH few AS MATERIALIZED (%[1]s LIMIT %[3]s) SELECT * FROM few WHERE (SELECT count(*) FROM few) < %[3]s
-			UNION ALL SELECT * FROM (%[2]s) g WHERE (SELECT count(*) FROM few) = %[3]s`, given, byRole, first)
-	}
-	return fmt.Sprintf(`WITH few AS MATERIALIZED (%[1]s LIMIT %[3]s), more AS MATERIALIZED (%[1]s LIMIT %[4]s)
+// holds fewer than first, or past that than the bound for the roles giving the permission, givers,
+// SQL for an array of them (scopeBound), and as byRole selects them for an array of those roles, a
+// role at a time, where it holds the bound or more. givers, and so the bound, are read once, and only
+// past first, so a list whose keys hold few reads none of what they read, as the custom roles giving
+// the permission; and where the bound is first, a key's grants aren't read by the scope again. Each
+// arm runs only where its counts hold, read in turn in a CASE, which the planner doesn't reorder, so
+// a key's grants are read one way, once, and by the scope at most twice, up to the bound.
+func byScopeOrRole(given string, byRole func(givers string) string, first, givers string) string {
+	return fmt.Sprintf(`WITH few AS MATERIALIZED (%[1]s LIMIT %[3]s), giving(r) AS MATERIALIZED (SELECT %[4]s),
+		bound(n) AS MATERIALIZED (SELECT %[5]s FROM giving), more AS MATERIALIZED (%[1]s LIMIT (SELECT n FROM bound))
 		SELECT * FROM few WHERE (SELECT count(*) FROM few) < %[3]s
-		UNION ALL SELECT * FROM more WHERE CASE WHEN (SELECT count(*) FROM few) = %[3]s THEN CASE WHEN %[4]s > %[3]s THEN (SELECT count(*) FROM more) < %[4]s END END
-		UNION ALL SELECT * FROM (%[2]s) g WHERE CASE WHEN (SELECT count(*) FROM few) = %[3]s THEN CASE WHEN %[4]s > %[3]s THEN (SELECT count(*) FROM more) = %[4]s ELSE true END END`,
-		given, byRole, first, bound)
+		UNION ALL SELECT * FROM more WHERE CASE WHEN (SELECT count(*) FROM few) = %[3]s THEN CASE WHEN (SELECT n FROM bound) > %[3]s
+		  THEN (SELECT count(*) FROM more) < (SELECT n FROM bound) END END
+		UNION ALL SELECT * FROM (%[2]s) g WHERE CASE WHEN (SELECT count(*) FROM few) = %[3]s THEN CASE WHEN (SELECT n FROM bound) > %[3]s
+		  THEN (SELECT count(*) FROM more) = (SELECT n FROM bound) ELSE true END END`,
+		given, byRole("(SELECT r FROM giving)"), first, givers, scopeBound("r"))
 }
 
 // scopeBound is SQL for how many grants of a key on a type byScopeOrRole reads by the scope before
@@ -1750,12 +1752,14 @@ func (a *Authorizer) broadOn(principal string) string {
 	if a.history != "" {
 		return a.byType("$4", "g.role", where)
 	}
-	custom := givingCustomSQL(true, "$1", "$2", "$3")
+	custom := givingCustomSQL(true, "$1", "$2", "$3", principal)
 	given := fmt.Sprintf(`SELECT g.role FROM rbac_grants g WHERE %s%s AND %s`, where, a.customOnly("g.role"), a.ofType())
-	byRole := fmt.Sprintf(`SELECT r.r AS role FROM unnest(%s) AS r(r) WHERE EXISTS (SELECT FROM rbac_grants g WHERE %s AND g.role = r.r AND %s)`,
-		custom, where, a.ofType())
+	byRole := func(givers string) string {
+		return fmt.Sprintf(`SELECT r.r AS role FROM unnest(%s) AS r(r) WHERE EXISTS (SELECT FROM rbac_grants g WHERE %s AND g.role = r.r AND %s)`,
+			givers, where, a.ofType())
+	}
 	return fmt.Sprintf(`SELECT g.role FROM unnest($4::text[]) AS t(t) CROSS JOIN LATERAL (%s) g`,
-		byScopeOrRole(given, byRole, fmt.Sprint(heldByScope), scopeBound(custom)))
+		byScopeOrRole(given, byRole, fmt.Sprint(heldByScope), custom))
 }
 
 // broadAt is broadOn for the scopes in the array $4, a scope at a time.
@@ -1948,7 +1952,7 @@ func (a *Authorizer) filterGrants(arg func(int) string, custom, alone bool, type
 // filterHeld is SQL selecting the subject's grants filterGrants reads, as held: with custom, those
 // of custom roles too.
 func (a *Authorizer) filterHeld(arg func(int) string, custom bool, types string) string {
-	return a.heldByType(types, a.filterKeys(arg, countedKeys(arg(13), arg(17))), arg(3), givingCustomSQL(custom, arg(1), arg(8), arg(9)), "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text
+	return a.heldByType(types, a.filterKeys(arg, countedKeys(arg(13), arg(17))), arg(3), givingCustomSQL(custom, arg(1), arg(8), arg(9), "keyed.k"), "g.scope, g.role, g.principal", fmt.Sprintf(`g.tenant = %s::text
 		  AND (g.expires_at IS NULL OR g.expires_at > %s) AND NOT g.conditional`, arg(1), a.filterAt(arg)))
 }
 

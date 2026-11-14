@@ -193,16 +193,29 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids stri
 	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
 
-// givingCustomSQL is SQL for an array of the custom roles of a tenant that give perm on a resource
-// type, as givingSQL tests a custom role, of which it keeps those it is given: so a search reading
-// grants a role at a time (heldByType, broadOn) reads every grant givingSQL can keep, in the same
-// statement, which sees each role as it does. Empty without custom, for none.
-func givingCustomSQL(custom bool, tenant, perm, resourceType string) string {
+// givingCustomSQL is SQL for an array of the custom roles of a tenant giving perm on a resource type
+// that the principal whose key is principal holds a grant of there, as givingSQL tests a custom role,
+// of which it keeps those it is given: so a search reading grants a role at a time (heldByType,
+// broadOn) reads every grant givingSQL can keep, in the same statement, which sees each role as it
+// does. It finds the roles the principal holds by stepping from one to the next in
+// rbac_grants_principal_role, a seek each, and looks each up by its key: read by the tenant, a plan
+// made while the tables were small read every custom role of it, of which a tenant can hold
+// MaxCustomRoles. Empty without custom, for none.
+func givingCustomSQL(custom bool, tenant, perm, resourceType, principal string) string {
 	if !custom {
 		return ""
 	}
-	return fmt.Sprintf(`ARRAY(SELECT cr.id FROM rbac_roles cr WHERE cr.tenant = %s::text AND %s::text = ANY(cr.permissions) AND %s::text = ANY(cr.resource_types))`,
-		tenant, perm, resourceType)
+	// Each step's upper bound is tested after it: one bounding the seek would imply the predicate of
+	// rbac_grants_custom_principal, which holds the scope before the role, and a plan sorted every
+	// grant of a custom role the principal held to find the first.
+	next := func(after string) string {
+		return fmt.Sprintf(`SELECT g.role FROM rbac_grants g WHERE g.principal = %[1]s AND g.tenant = %[2]s::text AND g.role %[3]s
+			ORDER BY g.role LIMIT 1`, principal, tenant, after)
+	}
+	return fmt.Sprintf(`ARRAY(WITH RECURSIVE held(role) AS ((%[1]s) UNION ALL SELECT (%[2]s) FROM held h WHERE h.role < 'custom/')
+		SELECT cr.id FROM held h CROSS JOIN LATERAL (SELECT cr.id FROM rbac_roles cr WHERE cr.tenant = %[3]s::text AND cr.id = h.role
+		  AND %[4]s::text = ANY(cr.permissions) AND %[5]s::text = ANY(cr.resource_types) OFFSET 0) cr)`,
+		next(">= 'custom.'"), next("> h.role"), tenant, perm, resourceType)
 }
 
 // broadArgs are a search's arguments for the roles giving p on a resource type that give it
