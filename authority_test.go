@@ -5442,29 +5442,13 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				read := func() map[string]int64 {
-					t.Helper()
-					pages := map[string]int64{}
-					for what, f := range searches {
-						func() {
-							tx, err := h.pool.Begin(ctx)
-							if err != nil {
-								t.Fatal(err)
-							}
-							defer func() { _ = tx.Rollback(ctx) }()
-							start := pagesRead(ctx, t, tx, "rbac_grants")
-							if err := f(tx, h.authz.WithTx(tx)); err != nil {
-								t.Fatalf("%s: %v", what, err)
-							}
-							pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
-						}()
-					}
-					return pages
-				}
+				// Under a generic plan, Filter's statements are planned on whichever search runs them first
+				// after ANALYZE, Filter or a query of its condition, in the map's order, which read 80 pages
+				// more: so each is counted on its second run (searchPages).
 				more(500)
-				few := read()
+				few := searchPages(ctx, t, h, plan, searches)
 				more(5000)
-				for what, many := range read() {
+				for what, many := range searchPages(ctx, t, h, plan, searches) {
 					if many > few[what]*3/2+deeper {
 						t.Errorf("%s read %d pages beside 500 grants that are %s, and %d beside 5000", what, few[what], other.what, many)
 					}
