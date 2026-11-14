@@ -290,6 +290,10 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 	if err != nil {
 		return nil, err
 	}
+	creator, err := creatorIn(ctx, tx, schema)
+	if err != nil {
+		return nil, err
+	}
 	switch {
 	case planted != nil && owner == nil:
 		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, but holds %s, which a migration would find in its place, run, or call as the role migrating: drop it, or migrate in another schema",
@@ -303,6 +307,9 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 	case owner == nil && locked && views != nil:
 		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, which a migration makes its maker's, and 0028_as_of_views makes AsOf's views only in a schema %s_as_of of its maker's, which is %s's: migrate as %[4]s, or give that schema to this role",
 			ErrInvalid, schema, schema, *views)
+	case creator != nil && (owner == nil && locked || mine || super && set):
+		return nil, fmt.Errorf("%w: in schema %s, %s may create, which could make there, while the migration runs, what it would find in place of its own, run, or call as the role migrating: revoke CREATE on the schema from it, or give the schema to the role owning the package's tables",
+			ErrInvalid, schema, *creator)
 	case owner == nil || mine:
 		return nil, nil
 	case !super:
@@ -402,6 +409,41 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		return nil, nil
 	}
 	return planted, err
+}
+
+// creatorIn names a role, or PUBLIC, that may create in schema but neither owns the package's
+// tables, the role that will make them where they aren't made, nor owns history once they are, nor
+// is a superuser, or nil where there is none. plantedFor reads the schema as it is, but such a role
+// could make what it refuses after it reads it and before a migration's statement finds it, as a
+// session creating in a schema waits for no lock a migration holds: an overload a migration's
+// statement calls, a relation named as one a later migration makes. The schema's owner may, as it
+// can grant itself CREATE whatever its privileges say, as can a member of it, the database's owner
+// too where pg_database_owner owns it, as public, and any member of a role that may. A role holding
+// the rights of one of those, as a login that may SET ROLE to the tables' owner, could do as that
+// one anyway, so isn't named. asOwner refuses it on a schema holding none of the tables only under
+// the lock, as the replica it waits for can make them meanwhile, whose owner may then create.
+func creatorIn(ctx context.Context, tx pgx.Tx, schema string) (*string, error) {
+	var creator *string
+	err := tx.QueryRow(ctx, `WITH s AS (SELECT n.oid, n.nspowner, n.nspacl FROM pg_catalog.pg_namespace n WHERE n.nspname = $1),
+		  tables AS (SELECT c.relowner FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
+		    WHERE c.relname = 'rbac_grants' AND c.relkind IN ('r', 'p')),
+		  maker AS (SELECT coalesce((SELECT t.relowner FROM tables t),
+		    (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = CURRENT_USER)) AS oid),
+		  trusted AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolsuper OR r.oid = (SELECT m.oid FROM maker m)
+		    OR r.oid IN (SELECT c.relowner FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
+		      WHERE c.relname = 'rbac_history' AND c.relkind IN ('r', 'p') AND EXISTS (SELECT FROM tables))),
+		  trusting AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE EXISTS (SELECT FROM trusted t
+		    WHERE pg_catalog.pg_has_role(r.oid, t.oid, 'USAGE') OR pg_catalog.pg_has_role(r.oid, t.oid, 'SET'))),
+		  creators AS (SELECT 0 AS rank, 'PUBLIC'::pg_catalog.text AS name FROM s, pg_catalog.aclexplode(s.nspacl) a
+		    WHERE a.grantee = 0 AND a.privilege_type = 'CREATE'
+		    UNION ALL SELECT 1, pg_catalog.quote_ident(r.rolname) FROM pg_catalog.pg_roles r, s
+		    WHERE r.rolname <> 'pg_database_owner' AND r.oid NOT IN (SELECT t.oid FROM trusting t)
+		      AND (pg_catalog.pg_has_role(r.oid, s.nspowner, 'MEMBER') OR pg_catalog.has_schema_privilege(r.oid, s.oid, 'CREATE')))
+		SELECT c.name FROM creators c ORDER BY c.rank, c.name LIMIT 1`, schema).Scan(&creator)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return creator, err
 }
 
 // milliseconds is d as a setting such as lock_timeout reads it.
