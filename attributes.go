@@ -1289,7 +1289,7 @@ scan:
 		}
 		point += sign * e
 	}
-	shifts, read := uint64(min(max(point, -point), 330)), uint64(min(digits, 800))
+	shifts, read := uint64(min(max(point, -point), 330)), uint64(min(digits, 800)) //nolint:gosec // G115: both are 0 or more
 	return shifts*(400+read)/400 + read/10
 }
 
