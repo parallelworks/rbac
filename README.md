@@ -753,9 +753,11 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   host is asked about each as each member's, so the members one `ChangeMembers` adds gain at most
   `rbac.MaxBindings` grants and eligibilities in all, each member's counted apart, but no more
   than one place alone gains, whatever its group and those it is in hold. A member is its
-  principal, however many groups, or places in one, the change gives it: what they reach counts,
-  and the host is asked about it, once for each end its places give it, so a group two of them are
-  in counts once, as does a group it is placed in from two sources until one end; but a member
+  principal, however many groups, or places in one, the change gives it: each grant or
+  eligibility they reach counts, and the host is asked about it, once for each end the member gains
+  it until, the sooner of its own end and a place's, so a group two of them are in counts once, as
+  does a group it is placed in from two sources until one end, or until two ends after what it
+  holds ends; but a member
   joining several groups that give more than `rbac.MaxBindings` together, and more than any one of
   them alone, joins them in more than one change.
   `ImportMembers`, the host's own write, which no actor's access decides, has no such bound: it asks

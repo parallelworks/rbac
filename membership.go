@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -2303,25 +2304,55 @@ func (r reach) activatedBy(leaving []Member) []Scope {
 // eligibilities in all, as many as one Apply makes, and more than one place alone gains: the host
 // is asked about each as the member's, so an actor that may change members would otherwise
 // multiply what the host and the change do. A member is its principal, however many groups, or
-// places in one, it gains: what they reach is counted once for each end its places give it, as
-// the host is asked about each once (askMemberships), so a group two of its groups are in counts
-// once. One place gains whatever its group and those it is in hold, as a grant to a group reaches
-// each member, or a group holding more could never gain one; but a change gaining more than that,
-// as one principal joining several groups, does no more than MaxBindings allows. Refused before
-// anything is asked about them, and never more under the locks, where stillReached refuses a group
-// holding more than was read.
+// places in one, it gains: each grant or eligibility they reach is counted once for each end the
+// member gains it until, the sooner of its own end and that of a place reaching it, as the host is
+// asked about each once (askMemberships), so a group two of its groups are in counts once, and so
+// do two places ending after what it holds. One place gains whatever its group and those it is in
+// hold, as a grant to a group reaches each member, or a group holding more could never gain one;
+// but a change gaining more than that, as one principal joining several groups, does no more than
+// MaxBindings allows. Refused before anything is asked about them, and never more under the locks,
+// where stillReached refuses a group holding more than was read, or what it holds ending otherwise.
 func (r reach) gainsWithin(add []Member) error {
 	places := r.gaining(add)
-	n, gainers := 0, map[Principal]bool{}
-	// Each of held names one holder, so what a group holds is counted by the keys it reaches,
-	// without reading it: many groups in one holding many are refused for as little as one.
-	for i, keys := range r.reached(places) {
-		for _, key := range keys {
-			n += len(r.heldOf[key])
+	type reaching struct {
+		p   Principal
+		key string
+	}
+	gainers, until := map[Principal]bool{}, map[reaching]map[int64]bool{}
+	for _, m := range places {
+		for key := range r.up[m.Group] {
+			if len(r.heldOf[key]) == 0 {
+				continue
+			}
+			x := reaching{m.Principal, key}
+			if until[x] == nil {
+				until[x] = map[int64]bool{}
+			}
+			until[x][endOf(m.ExpiresAt)], gainers[m.Principal] = true, true
 		}
-		if len(keys) > 0 {
-			gainers[places[i].Principal] = true
+	}
+	// What a group holds is counted by the ends of its places reaching it, each held one's end found
+	// once however many places reach it: many groups in one holding many are refused for about as
+	// little as one.
+	ends := map[string][]int64{}
+	n := 0
+	for x, at := range until {
+		es, ok := ends[x.key]
+		if !ok {
+			for _, i := range r.heldOf[x.key] {
+				es = append(es, endOf(r.held[i].binding.ExpiresAt))
+			}
+			slices.Sort(es)
+			ends[x.key] = es
 		}
+		// One ending after a place is gained until that place's end, a different end for each; the
+		// rest, ending no later than the last of them, are gained until their own.
+		last := int64(math.MinInt64)
+		for p := range at {
+			n += len(es) - after(es, p)
+			last = max(last, p)
+		}
+		n += after(es, last)
 	}
 	alone := 0
 	for _, m := range places {
@@ -2332,10 +2363,29 @@ func (r reach) gainsWithin(add []Member) error {
 		alone = max(alone, k)
 	}
 	if n > MaxBindings && n > alone {
-		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each principal's counted apart, or what one place gains alone, and these %d gain %d: add fewer at a time",
+		return fmt.Errorf("%w: the members a change adds gain at most %d grants and eligibilities of their groups in all, each principal's counted apart, or what one place alone gains, and these %d gain %d: add fewer at a time",
 			ErrInvalid, MaxBindings, len(gainers), n)
 	}
 	return nil
+}
+
+// endOf orders an end, none last.
+func endOf(t time.Time) int64 {
+	if t.IsZero() {
+		return math.MaxInt64
+	}
+	return t.UnixMicro()
+}
+
+// after is where in es, sorted, the first end later than p is.
+func after(es []int64, p int64) int {
+	i, _ := slices.BinarySearchFunc(es, p, func(e, p int64) int {
+		if e <= p {
+			return -1
+		}
+		return 1
+	})
+	return i
 }
 
 // reached is, for each of places, members a change adds that gain a place (placed.gaining), the
@@ -2363,9 +2413,10 @@ func (r reach) reached(places []Member) [][]string {
 }
 
 // gained is, for each of places, as for reached, where in held what it gains is, in order: each
-// grant and eligibility once for each principal and end, as gainsWithin counts them, so what one
-// change builds and asks the host about grows with that, not with how many of a principal's
-// groups, or places in one, reach it.
+// grant and eligibility once for each principal and end of its places, which askMemberships asks
+// about once for each end it is gained until, as gainsWithin counts them, so what one change builds
+// and asks the host about grows with that, not with how many of a principal's groups, or places in
+// one, reach it.
 func (r reach) gained(places []Member) [][]int {
 	held := make([][]int, len(places))
 	for i, keys := range r.reached(places) {
@@ -2501,8 +2552,8 @@ func (v revalidation) as(m Member) Binding {
 // askMemberships asks Config.ValidateGrant, before a change's transaction, about each grant and
 // eligibility each member set adds gains, as the member's, and returns the standing of the members
 // it asked about, which the answers rest on. A member gaining one through several of its places
-// until the same end, as through two groups in one that holds it, is asked about it once, as
-// gainsWithin counts it (gained).
+// until the same end, as through two groups in one that holds it, or through places ending after
+// it does, is asked about it once, as gainsWithin counts it (gained).
 func (a *Authorizer) askMemberships(ctx context.Context, actor Subject, tenant string, set []Member, rc reach) (standing, error) {
 	gaining := rc.gaining(set)
 	held := rc.gained(gaining)
