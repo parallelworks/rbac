@@ -1855,6 +1855,9 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 			`CREATE FUNCTION {own}.planted_when() RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM {own}.rbac_planted_seen(); RETURN false; END $$`,
 			`CREATE TRIGGER planted BEFORE INSERT ON rbac_migrations FOR EACH ROW WHEN ({own}.planted_when()) EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()`,
 		}, `DROP OWNED BY {app} CASCADE`},
+		{"a trigger whose WHEN clause runs another's SQL through pg_catalog's", "trigger planted on table rbac_migrations, whose WHEN clause", []string{`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`}, []string{
+			`CREATE TRIGGER planted BEFORE INSERT ON rbac_migrations FOR EACH ROW WHEN (pg_catalog.query_to_xml('SELECT {own}.rbac_planted_seen()', false, false, '') IS NULL) EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()`,
+		}, `DROP TRIGGER planted ON {schema}.rbac_migrations; DROP OWNED BY {app} CASCADE`},
 		{"a trigger on rbac_grants", "trigger planted on table rbac_grants", []string{`GRANT TRIGGER ON {schema}.rbac_grants TO {app}`}, []string{
 			`CREATE TRIGGER planted AFTER INSERT OR UPDATE OR DELETE ON rbac_grants FOR EACH STATEMENT EXECUTE FUNCTION {own}.rbac_planted_fire()`,
 		}, `DROP OWNED BY {app} CASCADE`},
@@ -1899,7 +1902,7 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 			if err := rbac.Migrate(ctx, r.adminPool); err != nil {
 				t.Fatalf("Migrate as the administrator's role: %v", err)
 			}
-			if c.undo != `DROP OWNED BY {app} CASCADE` {
+			if !strings.HasSuffix(c.undo, `DROP OWNED BY {app} CASCADE`) {
 				p.fired(t)
 			}
 			if s := r.strangers(t); len(s) > 0 {

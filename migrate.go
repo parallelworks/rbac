@@ -352,7 +352,10 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 // on any of the tables calling a function none of those owns: its maker needs only TRIGGER on the
 // table, and it fires on the migration's writes. Its WHEN clause runs as the role migrating too,
 // whatever function it executes, as pg_catalog's own, so a trigger is one where anything it
-// depends on, a function, operator or type, as a domain whose check calls one, is another's. So too is any other object in the schema that names
+// depends on, a function, operator or type, as a domain whose check calls one, is another's, and
+// one with a WHEN clause at all, whoever made it, none of the package's has one: pg_catalog's own
+// functions run SQL text, as query_to_xml('SELECT f()', ...) does, which depends on nothing another
+// role owns, and set_config would undo the search_path the migrations run under. So too is any other object in the schema that names
 // can find, but tables, views and indexes not named rbac_, which a migration names only so: a type
 // or domain, a composite type, collation, conversion, text search configuration or dictionary,
 // statistics object, foreign table, or a sequence no column owns, which a name a migration gives
@@ -394,6 +397,9 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		      UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner FROM pg_catalog.pg_type y) u
 		      ON u.class = d.refclassid AND u.oid = d.refobjid
 		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND u.owner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, 0::pg_catalog.oid, 1 FROM pg_catalog.pg_trigger g
+		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid
+		    WHERE NOT g.tgisinternal AND g.tgqual IS NOT NULL AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_')
 		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, 1 FROM pg_catalog.pg_type y JOIN s ON y.typnamespace = s.oid
 		    WHERE y.typrelid = 0 AND y.typowner NOT IN (SELECT t.oid FROM trusted t) AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
 		    UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, c.relowner, 1 FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
@@ -410,7 +416,8 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		    WHERE d.dictowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass, x.oid, x.stxowner, 1 FROM pg_catalog.pg_statistic_ext x JOIN s ON x.stxnamespace = s.oid
 		    WHERE x.stxowner NOT IN (SELECT t.oid FROM trusted t))
-		SELECT pg_catalog.pg_describe_object(p.class, p.oid, 0) || ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s'
+		SELECT pg_catalog.pg_describe_object(p.class, p.oid, 0) || CASE WHEN p.owner = 0 THEN ', whose WHEN clause runs as the role migrating'
+		  ELSE ', ' || pg_catalog.pg_get_userbyid(p.owner)::pg_catalog.text || '''s' END
 		FROM planted p ORDER BY p.rank, 1 LIMIT 1`, schema).Scan(&planted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
