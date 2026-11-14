@@ -156,7 +156,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   change grants there, and what the role gives, on a resource for that resource's type alone;
   without `Config.ResourceOf`, about each scope as stored where that is all of it, and otherwise of
   no resource, which then stands for every such scope, so a constraint answering false of no
-  resource doesn't stop it there (see Host policy). A grant widens by what
+  resource doesn't stop it there (see Host policy). On a resource, a `<type>:grant` of another of
+  the role's types is a permission like any other, so widening a role already granted on a resource
+  of one type to give another of its types' `:grant` is allowed where the actor may change grants on
+  that other type, but granting the role again on such a resource then asks the actor to hold that
+  permission for the resource's type, as `Apply` asks of every permission, and may be refused: grant
+  it on a container or the tenant instead. A grant widens by what
   it gives through its principal, as checks read it: one to the tenant's members of a privileged
   role, or to the public of a role not marked `Public`, gives nothing, so widening the role asks
   nothing about it, and a redefinition that has it give something, as narrowing the role so that it
@@ -362,8 +367,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   condition, which parsing one digit by digit takes, reading an underscore between digits as
   strconv does: charged 3, 40,000 of `8.9884656743115790396e307` took a check 1.2 s to convert, and
   so charged, a unit of parsing takes no more than about 110 ns on Go 1.27. Built with Go 1.26, a
-  number of 15 to 19 digits that 1.26 can't round at once takes up to about 840 ns, charged 3 or 4,
-  about 280 ns a unit, so a check's budget of them about 34 ms. A condition's
+  number of 15 to 19 digits that 1.26 can't round at once, with a power of ten from about -27 to
+  42, as `1776810790486016e20`, takes up to about 1.3 µs, charged 2 to 4: 70,000 of them took a
+  check 74 ms to convert, about 530 ns a unit, so a check's budget of them about 85 ms. Build with
+  Go 1.27 for the bound above. A condition's
   bound counts what parsing a literal string `double()` converts costs, and up to 1,070 for any
   other string of 5 bytes or more. Past that
   every condition reading an attribute fails, as it does where
