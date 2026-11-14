@@ -571,6 +571,25 @@ func SetReadingEntries(t *testing.T, f func(n int)) {
 	t.Cleanup(func() { readingEntries = old })
 }
 
+// SetReadingConditions runs f each time a decision reads n conditions of its conditional grants,
+// until t ends.
+func SetReadingConditions(t *testing.T, f func(n int)) {
+	t.Helper()
+	old := readingConditions
+	readingConditions = f
+	t.Cleanup(func() { readingConditions = old })
+}
+
+// ConditionsSQL is the statement a decision reads the conditions of its conditional grants by, as
+// of a time or not (conditionsSQL).
+func ConditionsSQL(asOf bool) string {
+	a := &Authorizer{}
+	if asOf {
+		a.history = "rbac_history"
+	}
+	return a.conditionsSQL()
+}
+
 // SetDerivingRoles runs f each time a read derives n custom roles as the catalog has them now,
 // until t ends.
 func SetDerivingRoles(t *testing.T, f func(n int)) {

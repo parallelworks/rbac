@@ -456,13 +456,25 @@ flowchart LR
 `Authorize` answers whether a subject may do one permission on one resource. It reads in one
 statement, the grants and denies on the tenant its label values are decided by too, apart from the
 conditions of conditional grants, read only when no unconditional grant allows, and refuses unless
-something allows. So a label is decided by the values the subject held as it held its grants.
+something allows. So a label is decided by the values the subject held as it held its grants. It
+reads those conditions each grant by its id, a row at a time, and each distinct expression once,
+with the ids of the grants holding it (`conditionsSQL`): tested against arrays of every grant's id,
+principal and scope, a generic plan compared each grant with every entry, and each expression was
+read for each grant, so a subject in 1,000 groups each granted a role on the 4 scopes of a path under
+one condition of 2 KB read 8 MB of it, and waited 170 ms for a check, against 44 now. As of a time,
+history finds a grant's versions by its principal and scope, so it reads each principal's grants on
+each scope once there. It decides whether a role gives the permission once for each carrier its
+grants have (`givesOnce`), as `Explain` does: once for each grant, the same subject granted a custom
+role of 1,000 permissions read 4 million entries of it for a permission it doesn't give, and a
+check took 26 ms, twice what one of a built-in role took, against 1,001 entries in 11 ms now.
 `Permissions` decides each permission as a check of it would, by one such read, and the label only
 once the grants give something it decides, so it asks the constraints about values only where a
-check would; and it walks a role's permissions once for each carrier its grants have, and once for
-each carrier and condition its conditional ones have (`permissionsOf`), however many groups grant
-it: once for each grant, a subject in 1,000 groups each granted a role of 1,000 permissions on the
-4 scopes of a path had it read 4 million entries, in 180 ms, against 2,000 in 17.
+check would, and of the tenant, whose values it decides with the rest, by those, so it asks about
+each once, as a check does, where deciding them again for the label asked twice; and it walks a
+role's permissions once for each carrier its grants have, and once for each carrier and condition
+its conditional ones have (`permissionsOf`), however many groups grant it: once for each grant, a
+subject in 1,000 groups each granted a role of 1,000 permissions on the 4 scopes of a path had it
+read 4 million entries, in 180 ms, against 2,000 in 17.
 
 ```mermaid
 flowchart TB

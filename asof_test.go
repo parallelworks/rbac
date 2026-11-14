@@ -1487,6 +1487,88 @@ func TestAsOfReadsNoCustomRoleACheckDoesntName(t *testing.T) {
 	}
 }
 
+// As of a time, a check reads the conditions of its conditional grants by each principal's grants on
+// each scope, once, however many of them it holds there, as history finds a grant's versions by its
+// principal and scope, not by its id, however its statements are planned: looked up a grant at a
+// time, as checks look them up now, each was read again for every grant of its principal on its
+// scope, so a subject in 20 groups, each granted a role 20 times on each scope of a path under a
+// condition, read ten times the history it read in 400 groups granted it once each.
+func TestAsOfAChecksConditionsReadEachPrincipalsGrantsOnAScopeOnce(t *testing.T) {
+	for _, plans := range []string{"", "force_generic_plan"} {
+		t.Run(cmp.Or(plans, "as AsOf plans"), func(t *testing.T) {
+			// read is the pages of history a check as of now reads, for a subject in groups groups, each
+			// granted the login role each times on each scope of the cluster's path under one condition,
+			// each time until another day.
+			read := func(groups, each int) int64 {
+				t.Helper()
+				h := setupOn(t, pgtest.Open(t, "jit=off"))
+				ctx := t.Context()
+				u := h.as(t, "u")
+				for _, q := range []struct {
+					sql  string
+					args []any
+				}{
+					{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(1, $1::int) AS i`, []any{groups}},
+					{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series(1, $1::int) AS i`, []any{groups}},
+					{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at, condition)
+						SELECT 't1', s.type, s.id, 'group', 'g' || i, 'cluster.login', '2030-01-01'::timestamptz + e * interval '1 day', 'request.attributes.mfa == true'
+						FROM generate_series(1, $1::int) AS i, generate_series(1, $2::int) AS e,
+						  (VALUES ('cluster', 'c1'), ('workspace', 'w1'), ('org', 'o1'), ('tenant', 't1')) AS s(type, id)`, []any{groups, each}},
+					{`ANALYZE rbac_history, rbac_grants`, nil},
+				} {
+					if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+						t.Fatal(err)
+					}
+				}
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				var pages int64
+				if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+					if plans != "" {
+						if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+							return err
+						}
+					}
+					// Read a grant at a time, each of a check's reads of conditions took some 25 s, and the
+					// test minutes: it fails rather than waits.
+					if _, err := tx.Exec(ctx, `SELECT set_config('statement_timeout', '10s', true)`); err != nil {
+						return err
+					}
+					check := func() error {
+						if err := a.Authorize(rbac.WithRequest(ctx, map[string]any{"mfa": false}), u, login, cluster); !errors.Is(err, rbac.ErrDenied) {
+							return fmt.Errorf("without mfa: %w", err)
+						}
+						return a.Authorize(rbac.WithRequest(ctx, map[string]any{"mfa": true}), u, login, cluster)
+					}
+					// Once before, as planning reads pages of its own (leastPages).
+					if err := check(); err != nil {
+						return err
+					}
+					pages, err = leastPages(ctx, t, tx, check)
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return pages
+			}
+			// Looked up a grant at a time, each read every version of the tenant's grants, 21 million
+			// pages for these 1,600, where read once they take some 40,000.
+			few := read(400, 1)
+			if few > 64*1600 {
+				t.Fatalf("a check as of a time read %d pages of history for 1,600 conditional grants of 400 groups", few)
+			}
+			many := read(20, 20)
+			t.Logf("few %d, many %d", few, many)
+			if many > few*3/2+deeper {
+				t.Errorf("a check as of a time read %d pages of history for 1,600 conditional grants of 400 groups, and %d for as many of 20", few, many)
+			}
+		})
+	}
+}
+
 // As of a time, Filter, Reachable and Holders, of a labeled resource too, read of the custom roles
 // only those the grants they read name, by key, however their statements are planned: they read
 // every version of each of the tenant's giving the permission, and Holders, for its holders' label
