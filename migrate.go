@@ -350,7 +350,9 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 // schema that none of those owns, which a statement whose arguments it matches better than
 // pg_catalog's would call, as format(text, name) does format(..., current_schema()), and a trigger
 // on any of the tables calling a function none of those owns: its maker needs only TRIGGER on the
-// table, and it fires on the migration's writes. So too is any other object in the schema that names
+// table, and it fires on the migration's writes. Its WHEN clause runs as the role migrating too,
+// whatever function it executes, as pg_catalog's own, so a trigger is one where anything it
+// depends on, a function, operator or type, as a domain whose check calls one, is another's. So too is any other object in the schema that names
 // can find, but tables, views and indexes not named rbac_, which a migration names only so: a type
 // or domain, a composite type, collation, conversion, text search configuration or dictionary,
 // statistics object, foreign table, or a sequence no column owns, which a name a migration gives
@@ -384,9 +386,14 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 		    WHERE p.proowner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oid, o.oprowner, 1 FROM pg_catalog.pg_operator o JOIN s ON o.oprnamespace = s.oid
 		    WHERE o.oprowner NOT IN (SELECT t.oid FROM trusted t)
-		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, p.proowner, 1 FROM pg_catalog.pg_trigger g
-		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid JOIN pg_catalog.pg_proc p ON p.oid = g.tgfoid
-		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND p.proowner NOT IN (SELECT t.oid FROM trusted t)
+		    UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass, g.oid, u.owner, 1 FROM pg_catalog.pg_trigger g
+		    JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid JOIN ns ON c.relnamespace = ns.oid
+		    JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_trigger'::pg_catalog.regclass AND d.objid = g.oid
+		    JOIN (SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass AS class, p.oid, p.proowner AS owner FROM pg_catalog.pg_proc p
+		      UNION ALL SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oid, o.oprowner FROM pg_catalog.pg_operator o
+		      UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner FROM pg_catalog.pg_type y) u
+		      ON u.class = d.refclassid AND u.oid = d.refobjid
+		    WHERE NOT g.tgisinternal AND pg_catalog.starts_with(c.relname::pg_catalog.text, 'rbac_') AND u.owner NOT IN (SELECT t.oid FROM trusted t)
 		    UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, y.oid, y.typowner, 1 FROM pg_catalog.pg_type y JOIN s ON y.typnamespace = s.oid
 		    WHERE y.typrelid = 0 AND y.typowner NOT IN (SELECT t.oid FROM trusted t) AND NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray = y.oid)
 		    UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, c.oid, c.relowner, 1 FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
@@ -417,11 +424,15 @@ func plantedFor(ctx context.Context, tx pgx.Tx, schema string) (*string, error) 
 // could make what it refuses after it reads it and before a migration's statement finds it, as a
 // session creating in a schema waits for no lock a migration holds: an overload a migration's
 // statement calls, a relation named as one a later migration makes. The schema's owner may, as it
-// can grant itself CREATE whatever its privileges say, as can a member of it, the database's owner
-// too where pg_database_owner owns it, as public, and any member of a role that may. A role holding
-// the rights of one of those, as a login that may SET ROLE to the tables' owner, could do as that
-// one anyway, so isn't named. asOwner refuses it on a schema holding none of the tables only under
-// the lock, as the replica it waits for can make them meanwhile, whose owner may then create.
+// can grant itself CREATE whatever its privileges say, as can a member of it that may use its
+// rights, SET ROLE to it, or grant itself either, holding ADMIN on it, the database's owner too
+// where pg_database_owner owns it, as public, and any member of a role that may; a member holding
+// none of those may do nothing as it. A role holding the rights of the tables' owner, history's or
+// a superuser, as a login that may SET ROLE to the tables' owner, could do as that one anyway, so
+// isn't named, nor is one holding ADMIN on the first two, which can grant itself SET, as the role
+// that made one does where a role with CREATEROLE, not a superuser, made it. asOwner refuses it on
+// a schema holding none of the tables only under the lock, as the replica it waits for can make
+// them meanwhile, whose owner may then create.
 func creatorIn(ctx context.Context, tx pgx.Tx, schema string) (*string, error) {
 	var creator *string
 	err := tx.QueryRow(ctx, `WITH s AS (SELECT n.oid, n.nspowner, n.nspacl FROM pg_catalog.pg_namespace n WHERE n.nspname = $1),
@@ -433,12 +444,15 @@ func creatorIn(ctx context.Context, tx pgx.Tx, schema string) (*string, error) {
 		    OR r.oid IN (SELECT c.relowner FROM pg_catalog.pg_class c JOIN s ON c.relnamespace = s.oid
 		      WHERE c.relname = 'rbac_history' AND c.relkind IN ('r', 'p') AND EXISTS (SELECT FROM tables))),
 		  trusting AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE EXISTS (SELECT FROM trusted t
-		    WHERE pg_catalog.pg_has_role(r.oid, t.oid, 'USAGE') OR pg_catalog.pg_has_role(r.oid, t.oid, 'SET'))),
+		    WHERE pg_catalog.pg_has_role(r.oid, t.oid, 'USAGE') OR pg_catalog.pg_has_role(r.oid, t.oid, 'SET')
+		      OR pg_catalog.pg_has_role(r.oid, t.oid, 'USAGE WITH ADMIN OPTION')
+		        AND NOT (SELECT o.rolsuper FROM pg_catalog.pg_roles o WHERE o.oid = t.oid))),
 		  creators AS (SELECT 0 AS rank, 'PUBLIC'::pg_catalog.text AS name FROM s, pg_catalog.aclexplode(s.nspacl) a
 		    WHERE a.grantee = 0 AND a.privilege_type = 'CREATE'
 		    UNION ALL SELECT 1, pg_catalog.quote_ident(r.rolname) FROM pg_catalog.pg_roles r, s
 		    WHERE r.rolname <> 'pg_database_owner' AND r.oid NOT IN (SELECT t.oid FROM trusting t)
-		      AND (pg_catalog.pg_has_role(r.oid, s.nspowner, 'MEMBER') OR pg_catalog.has_schema_privilege(r.oid, s.oid, 'CREATE')))
+		      AND (pg_catalog.pg_has_role(r.oid, s.nspowner, 'USAGE') OR pg_catalog.pg_has_role(r.oid, s.nspowner, 'SET')
+		        OR pg_catalog.pg_has_role(r.oid, s.nspowner, 'USAGE WITH ADMIN OPTION') OR pg_catalog.has_schema_privilege(r.oid, s.oid, 'CREATE')))
 		SELECT c.name FROM creators c ORDER BY c.rank, c.name LIMIT 1`, schema).Scan(&creator)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -475,8 +489,10 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		// in a schema after it on the host's search_path, another role's, as public's is where that
 		// role owns the database, would otherwise be called by a migration's statement it matches
 		// better than pg_catalog's, as format(text, name) does format(..., current_schema()), and run
-		// as the role migrating. asOwner refuses another's in the schema itself.
-		if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('search_path', pg_catalog.quote_ident($1), true)`, *schema); err != nil {
+		// as the role migrating. asOwner refuses another's in the schema itself. And pg_temp after it,
+		// which PostgreSQL otherwise searches first for a relation or type: a table the session made
+		// there, as rbac_migrations holding versions, would be read in place of the schema's.
+		if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('search_path', pg_catalog.quote_ident($1) || ', pg_temp', true)`, *schema); err != nil {
 			return err
 		}
 		// A session with it off reads a backslash in a literal as an escape, so a pattern would check

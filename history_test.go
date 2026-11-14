@@ -1823,7 +1823,8 @@ func TestMigrateIsRefusedWhereAnotherRoleMadeAnOverloadAnIndexBinds(t *testing.T
 // Once the tables are made, partly, under the README's roles, Migrate refuses, before it applies
 // anything, where rbac_migrations isn't the tables' owner's, or another role made what a migration
 // would find: a trigger on one of the tables, which TRIGGER on it lets that role make, calling its
-// function as the role migrating on the migration's writes; a function in the schema; or a relation
+// function as the role migrating on the migration's writes, as its function or in its WHEN clause,
+// which runs whatever the function, pg_catalog's too; a function in the schema; or a relation
 // named as the package's. Once that is undone, the administrator's role migrates.
 func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing.T) {
 	_, version := madeViews(t)
@@ -1849,6 +1850,10 @@ func TestARoleIsRefusedMigratingWhereAnotherMadeWhatTheMigrationsFind(t *testing
 		},
 		{"a trigger on rbac_migrations", "trigger planted on table rbac_migrations", []string{`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`}, []string{
 			`CREATE TRIGGER planted AFTER INSERT ON rbac_migrations FOR EACH ROW EXECUTE FUNCTION {own}.rbac_planted_fire()`,
+		}, `DROP OWNED BY {app} CASCADE`},
+		{"a trigger running pg_catalog's function when another's says", "trigger planted on table rbac_migrations", []string{`GRANT TRIGGER ON {schema}.rbac_migrations TO {app}`}, []string{
+			`CREATE FUNCTION {own}.planted_when() RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM {own}.rbac_planted_seen(); RETURN false; END $$`,
+			`CREATE TRIGGER planted BEFORE INSERT ON rbac_migrations FOR EACH ROW WHEN ({own}.planted_when()) EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()`,
 		}, `DROP OWNED BY {app} CASCADE`},
 		{"a trigger on rbac_grants", "trigger planted on table rbac_grants", []string{`GRANT TRIGGER ON {schema}.rbac_grants TO {app}`}, []string{
 			`CREATE TRIGGER planted AFTER INSERT OR UPDATE OR DELETE ON rbac_grants FOR EACH STATEMENT EXECUTE FUNCTION {own}.rbac_planted_fire()`,
@@ -1972,6 +1977,72 @@ func TestMigrateIsRefusedWhereAnotherRoleMayCreateInTheSchema(t *testing.T) {
 				t.Errorf("migrated to %d", v)
 			}
 		})
+	}
+}
+
+// A role holding ADMIN on the administrator's role, without INHERIT or SET, as one with CREATEROLE
+// does on a role it made, can grant itself SET on it, so could do as it anyway: Migrate doesn't
+// refuse it as a role that may create in the schema, which the administrator's role owns. A role
+// holding a membership in it that gives none of those, but CREATE on the schema, is refused.
+func TestARoleHoldingAdminOnTheTablesOwnerIsNoOtherCreator(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	maker := "rbac_maker_" + strings.ToLower(rand.Text())
+	if _, err := r.super.Exec(ctx, `CREATE ROLE `+maker+` CREATEROLE`); err != nil {
+		t.Fatal(err)
+	}
+	// Before the roles newReadmeRoles drops, as cleanups run last first.
+	t.Cleanup(func() {
+		if _, err := r.super.Exec(context.WithoutCancel(ctx), `DROP ROLE `+maker); err != nil {
+			t.Errorf("DROP ROLE %s: %v", maker, err)
+		}
+	})
+	for _, sql := range []string{
+		`GRANT ` + r.admin + ` TO ` + maker + ` WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`,
+		`GRANT ` + r.admin + ` TO ` + r.app + ` WITH ADMIN FALSE, INHERIT FALSE, SET FALSE`,
+		`GRANT CREATE ON SCHEMA ` + r.schema + ` TO ` + r.app,
+	} {
+		if _, err := r.super.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	creatorRefused(t, rbac.Migrate(ctx, r.adminPool), r.app)
+	if _, err := r.super.Exec(ctx, `REVOKE CREATE ON SCHEMA `+r.schema+` FROM `+r.app); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, r.adminPool); err != nil {
+		t.Fatalf("Migrate where a role holds ADMIN on the administrator's: %v", err)
+	}
+	if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
+		t.Errorf("migrated to %d", v)
+	}
+}
+
+// A session's temporary table named rbac_migrations, holding versions, is read in place of the
+// schema's by no migration: PostgreSQL searches pg_temp first for a relation unless the
+// search_path names it, which Migrate's does after the schema, so it applies every migration.
+func TestMigrateReadsNoTemporaryTableInPlaceOfItsOwn(t *testing.T) {
+	ctx := t.Context()
+	r := newReadmeRoles(t)
+	conn, err := r.adminPool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `CREATE TEMPORARY TABLE rbac_migrations (version integer)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO pg_temp.rbac_migrations SELECT generate_series(1, 1000)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rbac.Migrate(ctx, conn.Conn()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `DROP TABLE pg_temp.rbac_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if v := migratedTo(t, r.adminPool); v != latestMigration(t) {
+		t.Errorf("Migrate on a session holding a temporary rbac_migrations migrated to %d", v)
 	}
 }
 
