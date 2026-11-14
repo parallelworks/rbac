@@ -474,6 +474,15 @@ func SetMaxContainerOverlap(t *testing.T, n int) {
 	t.Cleanup(func() { maxContainerOverlap = old })
 }
 
+// SetHeldByScope makes searches read a key's grants on a type a role at a time once it holds n
+// there, until t ends.
+func SetHeldByScope(t *testing.T, n int) {
+	t.Helper()
+	old := heldByScope
+	heldByScope = n
+	t.Cleanup(func() { heldByScope = old })
+}
+
 // SetReadingRoles runs f once a read has read grants and the custom roles with them, until t
 // ends.
 func SetReadingRoles(t *testing.T, f func()) {

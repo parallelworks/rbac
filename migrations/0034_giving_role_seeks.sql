@@ -1,0 +1,13 @@
+-- Filter, Reachable and their counts read a subject's grants, and the public's and the tenant's
+-- members', on scopes of the types they list, a key and a type at a time, but only those of roles
+-- that give the permission count. rbac_grants_key and rbac_grants_principal lead to the scope after
+-- the principal and the tenant, so a seek of a type's range read every grant of the key there, of
+-- every role, each a page of the table or more: beside 20,000 grants to the tenant's members, to the
+-- public, to the subject or to one of its groups of a role giving nothing, as a viewer on each
+-- resource, Reachable read 4,700 pages, against 360 beside 1,000, and a host's query of Filter's
+-- condition 14,000, by a plan for its arguments or a generic one. This one leads to the role before
+-- the scope, so a search seeks each role giving the permission in turn, a range of a type's scopes
+-- of it, and holds the rest of what they read, so the read stays an index-only scan. Grants of custom
+-- roles they read by rbac_grants_custom_principal, as before.
+-- Building it keeps writes to rbac_grants waiting until the migration commits, though reads go on.
+CREATE INDEX rbac_grants_principal_role ON rbac_grants (principal, tenant, role, scope) INCLUDE (expires_at, conditional);
