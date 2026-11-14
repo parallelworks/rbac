@@ -65,8 +65,8 @@ func Migrations() fs.FS {
 // and checks what that role's own would, and fails where that one's would, saying what to grant.
 // A superuser whose login may not SET ROLE to that role is refused too. It decides so again once it
 // holds the schema's lock, as the replica it waited for can have made the tables meanwhile. Where
-// the tables aren't made yet, the role migrating makes them, and owns them, a superuser too, which
-// it refuses, as ErrInvalid, where the schema of AsOf's views is made and another role's.
+// the tables aren't made yet, the role migrating makes them, and owns them, a superuser too; it is
+// refused, as ErrInvalid, where the schema of AsOf's views is made and another role's.
 //
 // A migration waits at most 100 ms for any lock it takes on the package's tables, as it holds those
 // it took before meanwhile, which every statement reading them waits for: a change that reads them
@@ -246,12 +246,14 @@ func outwaitVacuum(ctx context.Context, tx pgx.Tx, schema string) {
 // Where the tables aren't made, the role migrating makes them as itself, a superuser too: never as
 // the schema's owner or the database's, which can be the application's role, as where it owns the
 // database and so public, and that role, owning them, could disable history's triggers. But once it
-// holds the lock, it refuses a superuser where the schema of AsOf's views is made and another
-// role's, as the README's administrator's role's is, naming that role: 0028_as_of_views would fail
-// there, having made every table before it the superuser's, which that role then couldn't migrate.
+// holds the lock, it refuses any role, a superuser too, where the schema of AsOf's views is made and
+// another role's, as the README's administrator's role's is, naming that role: 0028_as_of_views
+// would fail there, having made every table before it the role migrating's, which that role then
+// couldn't migrate, and which, where the application's role may create in the schema, would be
+// that role's.
 // Migrate calls it before it takes the schema's lock, locked false, where it only refuses, so a
 // role is refused without waiting for another replica's migration, and again once it holds the
-// lock, locked true, where it sets the role, or refuses a superuser on a schema holding none of the
+// lock, locked true, where it sets the role, or refuses a role on a schema holding none of the
 // tables, as that replica can have made the tables, or given them to another role, since it read
 // them: a superuser that read none would make the next migration's tables its own, which the
 // owner's migrations after it then fail on. The current schema is the first on the search_path the
@@ -277,7 +279,7 @@ func asOwner(ctx context.Context, tx pgx.Tx, schema string, locked bool) (restor
 		return nil, err
 	}
 	switch {
-	case owner == nil && super && locked && views != nil:
+	case owner == nil && locked && views != nil:
 		return nil, fmt.Errorf("%w: schema %s holds none of the package's tables, which a migration makes its maker's, and 0028_as_of_views makes AsOf's views only in a schema %s_as_of of its maker's, which is %s's: migrate as %[4]s, or give that schema to this role",
 			ErrInvalid, schema, schema, *views)
 	case owner == nil || mine:

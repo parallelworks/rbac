@@ -1076,8 +1076,8 @@ have the server load a library or run a program of its choosing; and:
    but as a superuser, which migrates as that role ([Running it](#running-it), Tables). The first
    `Migrate` runs as that role too, not as a superuser: whoever makes the tables owns them, and a
    superuser makes them as itself, never as the schema's owner, which could be the application's
-   role. Where that role owns the schema of `AsOf`'s views, below, a superuser's first `Migrate` is
-   refused as `rbac.ErrInvalid` naming it, having made nothing. A later
+   role. Where that role owns the schema of `AsOf`'s views, below, a first `Migrate` as any other
+   role, a superuser too, is refused as `rbac.ErrInvalid` naming it, having made nothing. A later
    migration can change history too, so the administrator's role keeps both owners' rights. It
    owns the schema of `AsOf`'s views too, named
    as the package's with `_as_of` after, which `0028_as_of_views` makes: that takes `CREATE` on the
@@ -1196,9 +1196,9 @@ the package's uses foreign data, so none of the roles needs any.
   itself, never as the schema's owner or the database's, either of which can be the application's
   role, which owning them could disable history's triggers. So run the first `Migrate` as the
   administrator's role. Where the schema of `AsOf`'s views (`<schema>_as_of`) is made and another
-  role's, as the administrator's is in [History](#history), a superuser's first `Migrate` is
-  refused as `rbac.ErrInvalid` naming that role, having made nothing, as `0028_as_of_views` would
-  fail there after making every table before it the superuser's. Only a table named `rbac_grants`
+  role's, as the administrator's is in [History](#history), a first `Migrate` as any other role, a
+  superuser too, is refused as `rbac.ErrInvalid` naming that role, having made nothing, as
+  `0028_as_of_views` would fail there after making every table before it the role migrating's. Only a table named `rbac_grants`
   says who owns them: another relation so named, as a view, doesn't. Where a superuser's first
   `Migrate` made them its own and the administrator's role is to own them, give them to it as
   below. Before this release, a
