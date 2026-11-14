@@ -4485,6 +4485,18 @@ func unvacuumed(t *testing.T, h *harness, tables ...string) {
 	}
 }
 
+// filled puts a grant, in a tenant of its own, in each of rbac_grants' partial indexes: PostgreSQL
+// keeps no height of an empty btree, so planning a statement reads the metapage of each empty one for
+// each reference to the table, pages a count of what a search reads takes as its own, again wherever
+// a statement is planned again, as a session does after another changes a schema.
+func filled(t *testing.T, h *harness) {
+	t.Helper()
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, condition)
+		VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 'activation', now() + interval '1 year', 'true')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // crowdedTables are the tables crowd writes, history last, as it records the others.
 var crowdedTables = []string{
 	"rbac_grants", "rbac_roles", "rbac_groups", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies", "rbac_history",
@@ -5407,6 +5419,7 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 			t.Run(plan+"/"+other.what, func(t *testing.T) {
 				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
 				unvacuumed(t, h, "rbac_grants")
+				filled(t, h)
 				ctx := t.Context()
 				c0 := hostTable(t, h)[0]
 				m := h.as(t, "m", "g")
@@ -5446,7 +5459,8 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 				// Under a generic plan, Filter's statements are planned on whichever search runs them first
 				// after ANALYZE, Filter or a query of its condition, in the map's order, which read 80 pages
 				// more: so each is counted on its second run (searchPages), with autovacuum kept off the
-				// grants, whose vacuum between the two had them planned again.
+				// grants, whose vacuum between the two had them planned again, and the grants' partial
+				// indexes filled, so a statement planned again all the same reads nothing for it.
 				more(500)
 				few := searchPages(ctx, t, h, plan, searches)
 				more(5000)
@@ -5606,6 +5620,7 @@ func TestSearchesReadOnlyTheCustomGrantsOfRolesGivingThePermission(t *testing.T)
 			t.Run(plan+"/"+other.what, func(t *testing.T) {
 				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
 				unvacuumed(t, h, "rbac_grants")
+				filled(t, h)
 				ctx := t.Context()
 				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
 					t.Fatal(err)
@@ -5657,6 +5672,7 @@ func TestSearchesReadByTheScopeBesideManyRolesGivingThePermission(t *testing.T) 
 					}
 				})
 				unvacuumed(t, h, "rbac_grants")
+				filled(t, h)
 				ctx := t.Context()
 				c0 := hostTable(t, h)[0]
 				var groups []string
