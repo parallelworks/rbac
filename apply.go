@@ -2074,7 +2074,9 @@ func (a *Authorizer) mayChangeBy(au authority, on Resource, grants, revokes []Bi
 	cs := au.constrained
 	pw := au.over(scope.Type)
 	if pw.none() {
-		return &DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}
+		// Its grants giving the power may have been left giving nothing by a read of their
+		// conditions that failed, which the change returns rather than a refusal.
+		return cmp.Or(au.reads.failed(), error(&DeniedError{Permission: manage, Scope: scope, Reason: "the actor may not change access here"}))
 	}
 	var errs []error
 	for _, b := range revokes {
@@ -2174,7 +2176,7 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []
 	au.constrained = cs
 	pw := au.over(r.Type)
 	if pw.none() {
-		return nil, nil
+		return nil, au.reads.failed()
 	}
 	var roles []RoleDefinition
 	// Everything checked for a role the actor may grant holds, so later roles needn't check it

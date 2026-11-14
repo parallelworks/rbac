@@ -7966,3 +7966,33 @@ func TestAChangeReadsTheConditionsItDecidesByOnce(t *testing.T) {
 		t.Errorf("Apply under a condition none of the actor's grants allows the change by: %v", err)
 	}
 }
+
+// A change whose read of the conditions it decides by fails, as where its context is canceled once
+// the actor's grants are read, returns why: the actor holding its power only under a condition,
+// left giving nothing by the failed read, Apply refused the change as one the actor may not make,
+// which a host audits as a refusal, and Grantable listed nothing, as for an actor who may grant none.
+func TestAChangeWhoseConditionsCantBeReadReturnsWhy(t *testing.T) {
+	h := setup(t)
+	ann := h.as(t, "ann")
+	h.as(t, "bob")
+	onC1 := `resource.id == "c1"`
+	g := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+	g.Condition = rbac.Condition{Expression: onC1}
+	h.seed(t, g)
+	canceled := func() context.Context {
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+		rbac.SetReadingRoles(t, cancel)
+		return ctx
+	}
+	if err := h.authz.Apply(canceled(), ann, cluster, grantTo("bob", onC1)); !errors.Is(err, context.Canceled) {
+		t.Errorf("Apply: %v", err)
+	}
+	if roles, err := h.authz.Grantable(canceled(), ann, cluster); !errors.Is(err, context.Canceled) {
+		t.Errorf("Grantable: %v, %d roles", err, len(roles))
+	}
+	rbac.SetReadingRoles(t, func() {})
+	if err := h.authz.Apply(t.Context(), ann, cluster, grantTo("bob", onC1)); err != nil {
+		t.Errorf("Apply with its conditions read: %v", err)
+	}
+}
