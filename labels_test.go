@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
+	"github.com/parallelworks/rbac/internal/pgtest"
 )
 
 // labelDimensions are a level, compartments a subject must hold all of, and partners a label is
@@ -4175,4 +4176,89 @@ func TestHoldingComparesExpiryAndRequestTimeAtOneTime(t *testing.T) {
 	if !passed {
 		t.Fatal("Holding reached no hook")
 	}
+}
+
+// Reachable and Explain read the conditions only of their subject's grants on the tenant of roles
+// giving label values, as a labeled check does: they read the condition of every conditional grant
+// there first, a lookup by id each, so beside a group's grants of a role giving none under a
+// condition, thousands of them, Reachable and Explain read each, under a plan for its arguments and
+// a generic one: some thirty times what the same grants with no condition cost.
+func TestSearchesReadTheConditionsOfGrantsGivingValuesAlone(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		pages := map[string]map[string]int64{}
+		for _, condition := range []string{"", "request.attributes.mfa == true"} {
+			pages[condition] = searchConditionPages(t, plan, condition)
+		}
+		for what, conditional := range pages["request.attributes.mfa == true"] {
+			if plain := pages[""][what]; conditional > plain*3/2+deeper {
+				t.Errorf("%s: %s read %d pages beside 2000 grants on the tenant of a role giving no value under a condition, and %d with none", plan, what, conditional, plain)
+			}
+		}
+	}
+}
+
+// searchConditionPages is the pages of grants, and as of a time of history, Reachable and Explain
+// read under plan beside 2000 grants on the tenant of a role giving no value to their subject's
+// group, under condition, each with an expiry of its own, as the bound on what a check stores
+// counts distinct conditions.
+func searchConditionPages(t *testing.T, plan, condition string) map[string]int64 {
+	t.Helper()
+	h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan), withLabels)
+	ctx := t.Context()
+	u := h.as(t, "u", "g")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+		SELECT 't1', 'tenant', 't1', 'group', 'g', 'tenant.admin', $1, '2100-01-01'::timestamptz + i * interval '1 minute'
+		FROM generate_series(1, 2000) i`, condition); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_history`); err != nil {
+		t.Fatal(err)
+	}
+	mfa := rbac.WithRequest(ctx, map[string]any{"mfa": true})
+	labeled := rbac.Resource{Tenant: "t1", Type: "cluster", ID: cluster.ID, Ancestors: cluster.Ancestors, Labels: rbac.Label{"level": {"high"}}}
+	searches := map[string]func(*rbac.Authorizer) error{
+		"Reachable": func(a *rbac.Authorizer) error {
+			reach, err := a.Reachable(mfa, u, login, "t1", "cluster")
+			if err == nil && (len(reach.Scopes) != 1 || !reach.Labels.Satisfies(rbac.Label{"level": {"high"}})) {
+				err = fmt.Errorf("reached %+v", reach)
+			}
+			return err
+		},
+		"Explain": func(a *rbac.Authorizer) error {
+			d, err := a.Explain(mfa, u, login, labeled)
+			if err == nil && !d.Allowed {
+				err = fmt.Errorf("explained %+v", d)
+			}
+			return err
+		},
+	}
+	at := dbNow(t, h)
+	pages := map[string]int64{}
+	for what, f := range searches {
+		func() {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			start := pagesRead(ctx, t, tx, "rbac_grants")
+			if err := f(h.authz.WithTx(tx)); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
+			if plan != "force_custom_plan" {
+				return
+			}
+			if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+				start := historyPages(ctx, t, tx)
+				err := f(a)
+				pages[what+" as of a time"] = historyPages(ctx, t, tx) - start
+				return err
+			}); err != nil {
+				t.Fatalf("%s as of a time: %v", what, err)
+			}
+		}()
+	}
+	return pages
 }
