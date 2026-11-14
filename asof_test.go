@@ -1531,6 +1531,11 @@ func TestAsOfAChecksConditionsReadEachPrincipalsGrantsOnAScopeOnce(t *testing.T)
 							return err
 						}
 					}
+					// Read a grant at a time, each of a check's reads of conditions took some 25 s, and the
+					// test minutes: it fails rather than waits.
+					if _, err := tx.Exec(ctx, `SELECT set_config('statement_timeout', '10s', true)`); err != nil {
+						return err
+					}
 					check := func() error {
 						if err := a.Authorize(rbac.WithRequest(ctx, map[string]any{"mfa": false}), u, login, cluster); !errors.Is(err, rbac.ErrDenied) {
 							return fmt.Errorf("without mfa: %w", err)
@@ -1548,7 +1553,13 @@ func TestAsOfAChecksConditionsReadEachPrincipalsGrantsOnAScopeOnce(t *testing.T)
 				}
 				return pages
 			}
-			few, many := read(400, 1), read(20, 20)
+			// Looked up a grant at a time, each read every version of the tenant's grants, 21 million
+			// pages for these 1,600, where read once they take some 40,000.
+			few := read(400, 1)
+			if few > 64*1600 {
+				t.Fatalf("a check as of a time read %d pages of history for 1,600 conditional grants of 400 groups", few)
+			}
+			many := read(20, 20)
 			t.Logf("few %d, many %d", few, many)
 			if many > few*3/2+deeper {
 				t.Errorf("a check as of a time read %d pages of history for 1,600 conditional grants of 400 groups, and %d for as many of 20", few, many)

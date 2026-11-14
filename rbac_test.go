@@ -14408,8 +14408,10 @@ func TestAConditionManyGrantsShareIsReadOnce(t *testing.T) {
 // generic plan compared each grant it read with every entry, so a subject in 1,000 groups, each
 // granted a role on the 4 scopes of a cluster's path under one condition, waited 170 ms for a check,
 // against 45. No count of rows or pages shows that, as it read no more of either, its time spent in
-// the comparisons, so its plan is read: no scan of the grants tests one against an array, and one
-// seeks each grant by its id.
+// the comparisons, so its plan is read: no scan of the grants tests one against an array passed,
+// and one seeks each grant by its id. As of a time, history finds a grant's versions by its
+// principal and scope, so there one seeks each principal's grants on each scope, by either, and
+// tests them against only the ids of those: looked up by its id, each grant read all of history.
 func TestAConditionsGrantsAreReadByTheirIDs(t *testing.T) {
 	h := setup(t)
 	ctx := t.Context()
@@ -14417,24 +14419,9 @@ func TestAConditionsGrantsAreReadByTheirIDs(t *testing.T) {
 		SELECT 't1', 'cluster', 'c' || i, 'group', 'g' || i, 'cluster.login', 'request.attributes.mfa == true' FROM generate_series(1, 1000) AS i`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants, rbac_history`); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := h.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	// With sequential scans off, as a decision reads them (queryIndexed).
-	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
-		t.Fatal(err)
-	}
-	// By the simple protocol, which binds no parameters: GENERIC_PLAN plans with none.
-	results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN, FORMAT JSON) "+rbac.ConditionsSQL(false)).ReadAll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan := results[len(results)-1].Rows[0][0]
 	type node struct {
 		Relation  string `json:"Relation Name"`
 		IndexCond string `json:"Index Cond"`
@@ -14442,26 +14429,62 @@ func TestAConditionsGrantsAreReadByTheirIDs(t *testing.T) {
 		Recheck   string `json:"Recheck Cond"`
 		Plans     []node `json:"Plans"`
 	}
-	var plans []struct{ Plan node }
-	if err := json.Unmarshal(plan, &plans); err != nil {
-		t.Fatal(err)
-	}
-	seeks := false
-	var walk func(node)
-	walk = func(n node) {
-		for _, cond := range []string{n.IndexCond, n.Filter, n.Recheck} {
-			if strings.Contains(cond, "ANY (") {
-				t.Errorf("the statement reading conditions tests rows against an array: %s", cond)
+	// checkPlan plans the statement as of a time or not on tx generically, with sequential scans off
+	// as a decision reads it (queryIndexed), and fails unless a scan of relation seeks by one of seek.
+	checkPlan := func(tx pgx.Tx, asOf bool, relation string, seek ...string) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('enable_seqscan', 'off', true)`); err != nil {
+			return err
+		}
+		// By the simple protocol, which binds no parameters: GENERIC_PLAN plans with none.
+		results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN, FORMAT JSON) "+rbac.ConditionsSQL(asOf)).ReadAll()
+		if err != nil {
+			return err
+		}
+		plan := results[len(results)-1].Rows[0][0]
+		var plans []struct{ Plan node }
+		if err := json.Unmarshal(plan, &plans); err != nil {
+			return err
+		}
+		seeks := false
+		var walk func(node)
+		walk = func(n node) {
+			for _, cond := range []string{n.IndexCond, n.Filter, n.Recheck} {
+				if strings.Contains(cond, "ANY ($") {
+					t.Errorf("as of a time %t, the statement reading conditions tests rows against an array passed: %s", asOf, cond)
+				}
+			}
+			for _, by := range seek {
+				seeks = seeks || n.Relation == relation && strings.Contains(n.IndexCond, by)
+			}
+			for _, c := range n.Plans {
+				walk(c)
 			}
 		}
-		seeks = seeks || n.Relation == "rbac_grants" && strings.Contains(n.IndexCond, "id = w.id")
-		for _, c := range n.Plans {
-			walk(c)
+		walk(plans[0].Plan)
+		if !seeks {
+			t.Errorf("as of a time %t, the statement reading conditions seeks no %s by %s: %s", asOf, relation, strings.Join(seek, " or "), plan)
 		}
+		return nil
 	}
-	walk(plans[0].Plan)
-	if !seeks {
-		t.Errorf("the statement reading conditions seeks no grant by its id: %s", plan)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := checkPlan(tx, false, "rbac_grants", "id = w.id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.WithTx(tx).AsOf(ctx, "t1", dbNow(t, h), func(*rbac.Authorizer) error {
+		return checkPlan(tx, true, "rbac_history", "w.principal", "w.scope")
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
