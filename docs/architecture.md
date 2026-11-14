@@ -966,7 +966,8 @@ sequenceDiagram
   changes in place, as `Apply` and `Import` replace a grant only under an equal condition, and a
   grant made again has a new id. A grant whose condition isn't read can only split what the change
   is decided by finer (`decidedAs`, `kindsLasting`), never change a decision, as its role gives
-  nothing the change asks.
+  nothing the change asks, or a grant read already gives it for good. A read that fails leaves the
+  grants it was for met by nothing, and the change, or `Grantable`, returns its error.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
