@@ -50,11 +50,13 @@ import (
 // and rolls back, even once ctx is done, with the schema of history's views that migrating makes
 // beside the package's, named as it with _as_of after, first on the search_path: each view is
 // named as the table it stands in for and reads history as of the time, so every statement there,
-// the host's too, reads a table by its name as it was, and the current schema is the views'. Every
-// statement there is planned for its arguments, the host's under WithTx too, as plan_cache_mode
-// force_custom_plan plans them, and without JIT, until the rollback restores the settings: planned
-// so over history, a check or a host's query of a Filter condition costs past jit_above_cost for an
-// ordinary subject, and compiling it took several times as long as running it. It makes no object
+// the host's too, reads a table by its name as it was, and the current schema is the views'. As
+// PostgreSQL cuts a name to 63 bytes, migrating makes them beside no schema named in more than 57,
+// which it refuses, and AsOf, finding none there, says to rename it. Every statement there is
+// planned for its arguments, the host's under WithTx too, as plan_cache_mode force_custom_plan
+// plans them, and without JIT, until the rollback restores the settings: planned so over history,
+// a check or a host's query of a Filter condition costs past jit_above_cost for an ordinary
+// subject, and compiling it took several times as long as running it. It makes no object
 // and takes no transaction id, so the role reading needs no TEMPORARY, only USAGE on the views'
 // schema and SELECT on them, which it is refused without, and its read holds no History or Export
 // back; under WithTx, a host's transaction that has taken one holds them back as it would anyway,
@@ -254,6 +256,10 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 	return s, path, nil
 }
 
+// maxAsOfSchema is the longest, in bytes, the package's schema is named where migrating makes AsOf's
+// views beside it, in a schema named as it with _as_of after, as PostgreSQL cuts a name to 63 bytes.
+const maxAsOfSchema = 63 - len("_as_of")
+
 // noViews is the error of AsOf finding no views of history of the role owning schema's tables
 // (asOfViews), read on q, which says what makes them: migrating to 0028_as_of_views as that role,
 // which makes rbac_as_of_views and runs it, or where that is applied, running rbac_as_of_views as
@@ -263,10 +269,14 @@ func asOfViews(ctx context.Context, q DB, schema string) (standIns, string, erro
 // schema again for it, empty, as one makes the schema where it is gone. And it takes no other
 // views of history named as the package's tables standing anywhere, which rbac_as_of_views would
 // take for the views and refuse: in a schema other than the views', one that can hold anything
-// else, only those views are dropped.
+// else, only those views are dropped. And it takes schema being named in at most maxAsOfSchema
+// bytes, which rbac_as_of_views refuses otherwise, so the error says to rename it first: the
+// schema it would have a superuser make or drop, cut to 63 bytes, is another, or schema itself.
+// The server counts them, as it cuts a name, in the database's encoding.
 func noViews(ctx context.Context, q DB, schema string) error {
 	var owner, made, in, by string
 	var standing bool
+	var bytes int
 	if err := q.QueryRow(ctx, `WITH here AS (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $2),
 		  owner AS (SELECT t.relowner FROM pg_catalog.pg_class t
 		    WHERE t.relnamespace = (SELECT here.oid FROM here) AND t.relname = 'rbac_grants' AND t.relkind IN ('r', 'p')),
@@ -283,9 +293,13 @@ func noViews(ctx context.Context, q DB, schema string) error {
 		  coalesce((SELECT r.rolname::pg_catalog.text FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
 		    WHERE p.pronamespace = (SELECT here.oid FROM here) AND p.proname = 'rbac_as_of_views' AND p.pronargs = 0), ''),
 		  coalesce((SELECT v.nspname FROM v ORDER BY v.nspname, v.rolname LIMIT 1), ''), coalesce((SELECT v.rolname FROM v ORDER BY v.nspname, v.rolname LIMIT 1), ''),
-		  pg_catalog.to_regnamespace(pg_catalog.quote_ident($2 || '_as_of')) IS NOT NULL`,
-		historyTable(schema), schema).Scan(&owner, &made, &in, &by, &standing); err != nil {
+		  pg_catalog.to_regnamespace(pg_catalog.quote_ident($2 || '_as_of')) IS NOT NULL, pg_catalog.octet_length($2)`,
+		historyTable(schema), schema).Scan(&owner, &made, &in, &by, &standing, &bytes); err != nil {
 		return err
+	}
+	if bytes > maxAsOfSchema {
+		return fmt.Errorf("%w: no views of history stand beside schema %s, whose name, of %d bytes, is too long for theirs, named as it with _as_of after, in at most 63: rename it to a name of at most %d bytes",
+			ErrInvalid, schema, bytes, maxAsOfSchema)
 	}
 	if made == "" {
 		return fmt.Errorf("%w: no views of history stand beside schema %s: migrate it to 0028_as_of_views as %s, the role owning its tables", ErrInvalid, schema, owner)

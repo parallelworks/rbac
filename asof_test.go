@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -3976,6 +3977,152 @@ func TestAsOfReadsItsViewsWhateverEitherSchemaIsNamed(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Error(err)
+	}
+}
+
+// AsOf's views stand in a schema named as the package's with _as_of after, which PostgreSQL cuts to
+// 63 bytes: beside a package's schema named in 57, migrating makes them in a schema named so, and
+// one named in more, counted in bytes however few its characters, is refused before anything is made, by migrating, or by rbac_as_of_views where
+// the views are gone after a rename to such a name, which AsOf reads by while they stand; AsOf,
+// finding none, says to rename it. Named in 58 to 62 bytes, the views stood in a schema named
+// otherwise, and in 63, their schema was the package's own, which migrating refused as holding
+// more than the views.
+func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
+	ctx := t.Context()
+	super, err := pgx.Connect(ctx, pgtest.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = super.Close(context.WithoutCancel(ctx)) })
+	quoted := func(name string) string { return pgx.Identifier{name}.Sanitize() }
+	exec := func(t *testing.T, sql string) {
+		t.Helper()
+		if _, err := super.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	// dropping drops, once t ends, the schema name and the one its views' would be, as PostgreSQL
+	// cuts that name, before a character that doesn't fit whole.
+	dropping := func(t *testing.T, name string) {
+		t.Helper()
+		drop := []string{quoted(name)}
+		views := name + "_as_of"
+		for len(views) > 63 {
+			_, n := utf8.DecodeLastRuneInString(views)
+			views = views[:len(views)-n]
+		}
+		if views != name {
+			drop = append(drop, quoted(views))
+		}
+		t.Cleanup(func() {
+			if _, err := super.Exec(context.WithoutCancel(ctx), `DROP SCHEMA IF EXISTS `+strings.Join(drop, ", ")+` CASCADE`); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	// schema makes a schema named in n bytes, as many as fit of them in pad, and returns its name
+	// and a pool on it.
+	schema := func(t *testing.T, n int, pad string) (string, *pgxpool.Pool) {
+		t.Helper()
+		name := "rbac_" + strings.ToLower(rand.Text())
+		name += strings.Repeat(pad, (n-len(name))/len(pad))
+		name += strings.Repeat("x", n-len(name))
+		exec(t, `CREATE SCHEMA `+quoted(name))
+		dropping(t, name)
+		return name, superuserOn(t, quoted(name))
+	}
+	// schemas are the schemas named from prefix.
+	schemas := func(t *testing.T, prefix string) []string {
+		t.Helper()
+		var names []string
+		if err := super.QueryRow(ctx, `SELECT coalesce(array_agg(nspname::text ORDER BY nspname), '{}') FROM pg_namespace
+			WHERE starts_with(nspname::text, $1)`, prefix).Scan(&names); err != nil {
+			t.Fatal(err)
+		}
+		return names
+	}
+	const rename = "rename it to a name of at most 57 bytes"
+
+	t.Run("57 bytes", func(t *testing.T) {
+		ctx := t.Context()
+		name, pool := schema(t, 57, "é")
+		h := setupOn(t, pool)
+		owner := h.as(t, "owner")
+		at := dbNow(t, h)
+		reads := func(authz *rbac.Authorizer) error {
+			return authz.AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error { return a.Authorize(ctx, owner, login, cluster) })
+		}
+		var stand bool
+		if err := super.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = 'rbac_grants' AND c.relkind = 'v')`, name+"_as_of").Scan(&stand); err != nil || !stand {
+			t.Fatalf("the views stand in %s: %t, %v", name+"_as_of", stand, err)
+		}
+		if err := reads(h.authz); err != nil {
+			t.Fatalf("as of when owner held its role: %v", err)
+		}
+		// Renamed to 58 bytes, the package's schema is read by its views as they stand.
+		longer := name + "y"
+		dropping(t, longer)
+		exec(t, `ALTER SCHEMA `+quoted(name)+` RENAME TO `+quoted(longer))
+		long := superuserOn(t, quoted(longer))
+		authz, err := rbac.New(long, h.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reads(authz); err != nil {
+			t.Errorf("as of when owner held its role, with the package's schema renamed to 58 bytes: %v", err)
+		}
+		// Gone, they aren't made again beside it, and AsOf says to rename it.
+		exec(t, `DROP SCHEMA `+quoted(name+"_as_of")+` CASCADE`)
+		if _, err := long.Exec(ctx, `SELECT rbac_as_of_views()`); sqlState(err) != "42622" {
+			t.Errorf("making the views again beside a schema named in 58 bytes: %v", err)
+		}
+		if made := schemas(t, name); !slices.Equal(made, []string{longer}) {
+			t.Errorf("making the views again beside a schema named in 58 bytes left schemas %v", made)
+		}
+		if err := reads(authz); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), rename) {
+			t.Errorf("as of a time, with no views beside a schema named in 58 bytes: %v", err)
+		}
+		// Renamed back, they are made again in the schema named after it.
+		exec(t, `ALTER SCHEMA `+quoted(longer)+` RENAME TO `+quoted(name))
+		if _, err := pool.Exec(ctx, `SELECT rbac_as_of_views()`); err != nil {
+			t.Fatal(err)
+		}
+		if err := reads(h.authz); err != nil {
+			t.Errorf("as of when owner held its role, with the views made again: %v", err)
+		}
+	})
+
+	_, version := madeViews(t)
+	for _, c := range []struct {
+		n   int
+		pad string
+	}{{58, "x"}, {58, "é"}, {63, "x"}} {
+		n := c.n
+		t.Run(fmt.Sprintf("%d bytes of %s", n, c.pad), func(t *testing.T) {
+			ctx := t.Context()
+			name, pool := schema(t, n, c.pad)
+			if err := rbac.Migrate(ctx, pool); sqlState(err) != "42622" {
+				t.Fatalf("migrating a schema named in %d bytes: %v", n, err)
+			}
+			if v := migratedTo(t, pool); v != version-1 {
+				t.Errorf("migrated to %d", v)
+			}
+			if made := schemas(t, name); !slices.Equal(made, []string{name}) {
+				t.Errorf("migrating a schema named in %d bytes left schemas %v", n, made)
+			}
+			authz, err := rbac.New(pool, rbac.Config{
+				Catalog: catalog, ContainerTypes: []string{"org", "workspace"},
+				ValidateGrant: func(context.Context, rbac.DB, rbac.GrantInput) error { return nil },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = authz.AsOf(ctx, "t1", time.Now(), func(*rbac.Authorizer) error { return nil })
+			if !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), rename) {
+				t.Errorf("as of a time, beside a schema named in %d bytes: %v", n, err)
+			}
+		})
 	}
 }
 

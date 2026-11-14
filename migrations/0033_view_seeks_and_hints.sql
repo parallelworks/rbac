@@ -211,6 +211,11 @@ BEGIN
     END IF;
     views := made[1];
     IF views IS NULL THEN
+        IF pg_catalog.octet_length(here) > 57 THEN
+            RAISE EXCEPTION 'schema % is named in % bytes, too many for the schema of AsOf''s views, named as it with _as_of after, in at most 63',
+                here, pg_catalog.octet_length(here)
+                USING ERRCODE = 'name_too_long', HINT = 'Rename it to a name of at most 57 bytes, and set the search_path to that.';
+        END IF;
         named := here || '_as_of';
         views := pg_catalog.to_regnamespace(pg_catalog.quote_ident(named));
         IF views IS NULL THEN

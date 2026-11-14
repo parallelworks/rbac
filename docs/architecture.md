@@ -536,13 +536,22 @@ sequenceDiagram
   counts it, each value, map, list, pointer, message and slice of bytes what converting it costs
   (`mapCost`),
   whatever the copy shares or moves whole, so it counts what converting the same does, but for what
-  JSON text and packed messages decode to, which it holds as bytes, and for a message, or a longer
-  length of a slice, reached twice, which it copies once where converting counts it again. Two
-  slices of one array, one with room to grow, a copy copies apart, as appending to one writes to the
-  array and appending to the other doesn't, and so converting converts each (`copiedKeyOf`): known
-  by their length alone, converting counted them once, so lists of them a check converted were
-  past what a copy holds, and so was every JSON text of them once it cost what a slice of bytes
-  does. Past what a copy holds
+  JSON text and packed messages decode to, which it holds as bytes, and for a message, a slice of
+  bytes, or a longer length of a slice, reached twice, which it copies once where converting counts
+  it again. A slice is what a hook or a condition reads of it, its elements from where it starts,
+  as many as its length, so neither knows one by its capacity (`sliceKey`): converting knows one by
+  where it starts, its length and its type (`copiedKeyOf`), converting each length once, a list of
+  its own, and a copy by where it starts and its type, copying its elements once, as many as the
+  longest length it is reached with, each length a slice of that copy. So a copy costs no more than
+  converting the same, each slice holds in the copy what it holds in the host, and copying or
+  converting one holding itself ends, as a slice reached again while it is copied is a slice of the
+  copy, and one reached again while it is converted can't be read. Slices of one array that start apart are
+  copied apart, each as converting converts it. A copy knew a slice by its capacity too, so one
+  array's 2,000 strings reached at one length with 100 capacities were copied, and charged, 100
+  times, past what a copy holds, where converting counted them once, and so were lists and JSON
+  texts that are two slices of one array, one with room to grow, that a check converted; known so by
+  converting too, to count what that copy did, lists of the 100 a check read were past what it
+  converts. Past what a copy holds
   the hook can't be asked, and the call is refused (`uncopied`) as any other, a `DeniedError` of the
   permission on the resource asked about, or the tenant, whose `Reason` names the hook and whose
   message only the permission. Counting a list's elements twice, a string by the bytes of its
@@ -550,19 +559,52 @@ sequenceDiagram
   again for the message, attributes a check converts couldn't be copied, as a resource's nearly
   40,000 timestamps, which a check converts. A copy keeps each slice it copies apart from the maps,
   pointers and messages, changing it where it is kept as its elements are copied (`copied`), as five
-  lookups of it for each element cost about what copying the element did. A slice reached at several
-  lengths is copied once from where it starts, each length a slice of the copy, and one reached
-  while its elements are copied, before a longer length outgrew that copy, a slice of its own, whose
-  elements are copied too, as set in the longer alone it held the host's. A value holding no map,
+  lookups of it for each element cost about what copying the element did. A longer length of a
+  slice than its copy holds grows the copy at least twice over, whatever room past its length the
+  slice has (`lengthen`): grown no further than that room, 40,000 slices of one array of strings,
+  each one longer than the one before it and with no room past it, as three-index slices can be,
+  were each copied anew, taking 3.7 s and 12 GB, charged 80,016. One reached while its elements are
+  copied, before a longer length outgrew that copy, is a slice of its own, whose elements are copied
+  too, as set in the longer alone it held the host's. A value holding no map,
   slice or pointer that an interface holds, as an array, is shared, as nothing writes to it through
-  the interface. A copy copies each value in place before what it holds, as setting it does, so it
-  copies none holding a lock or an unsafe pointer there, nor a struct whose unexported field, which
-  it can't set, holds a pointer, a slice, a map or an interface (`copyable`): the hook can't be
-  asked. Such a value is another package's state, as protobuf's reflection of a generated message
-  is, whose methods find the message by where it lies, so a hook reading a copy of it alone, as a
-  host's type that is its own reflection by one held, read past it; or it holds the host's, which
-  the copy shared. A message's reflection is copied as that of a copy of the message (`pointer`),
-  and refused where that isn't of its type. A call keeps what the host passed with each copy until it returns, so where it
+  the interface. A time is shared so too, in UTC or the local zone, which any code can reach, but
+  in a zone of the host's own is moved to a copy of the zone, one for each copy (`zone`), wherever
+  it lies, an unexported field, which reflection reaches in the copy's struct (`rezone`), and a
+  map's key, set anew (`ownKey`), among them: a zone's methods write none of it, but assigning
+  through `Location()` writes it whole, so a constraint writing `*t.Location() = *time.UTC` wrote
+  the host's zone, and every time in it. `ValidateGrant` is given a grant's expiry so too
+  (`zonedApart`), apart from any copy, the rest of its input being values of its own, a role's
+  definition cloned; `OnChange` is told what a change wrote, its times as PostgreSQL returns them,
+  in none of the host's zones. A copy copies each value in place before what it holds,
+  as setting it does, so it copies none holding a lock or an unsafe pointer there, nor a struct
+  whose unexported field, which it can't set, holds a pointer, a slice, a map or an interface
+  (`copyable`): the hook can't be asked. Such a value is another package's state, as protobuf's
+  reflection of a generated message is, whose methods find the message by where it lies, so a hook
+  reading a copy of it alone, as a host's type that is its own reflection by one held, read past
+  it; or it holds the host's, which the copy shared. Nor does it copy a channel or a func, which it
+  can only share, wherever it lies, a map's key an interface holds too: set as they were, a
+  constraint sending on its copy's channel sent on the host's, and calling its copy's func ran the
+  host's closure. Nor does it copy a map
+  keyed by what it wouldn't share whole (`sharedKey`): a pointer, or a value holding one, in place
+  or in an interface, however deep in the key. It sets each key as it is, as a copied key would be
+  another key, under which the copy would find nothing the host passed: so what a pointer key
+  reached was the host's, and a constraint writing through it wrote to the host's, and an interface
+  in a struct or an array key gave a hook the host's channel, or a lock. Each interface a key holds
+  is told as hashing it is charged (`payHashed`), as it is read then anyway. No condition reads a
+  map keyed by any of them, as CEL keys are bools, ints, uints and strings. A lock is refused
+  wherever it lies too, a lock of the host's own that isn't a struct, as an integer a pointer to
+  which locks and unlocks, among them, which a converter refuses too (`hostLock`), as conditions
+  read it by its kind: asked only where a value was held in place, a copy copied one alone and in an
+  array, and refused one in an array of arrays, so every constrained call was refused for a value
+  conditions read; and a nil one that is a slice or a map, which an interface holds, was shared as
+  other nil ones are (`unreachable`). An empty array holds none of these, and marks a struct never
+  to be copied only
+  where it is of a lock (`marks`), as protobuf's own state's of a mutex is, as one of a func marks a
+  struct never to be compared, and what it would hold isn't walked. A message's reflection is
+  copied as that of a copy of the message (`pointer`), and refused where that isn't of its type,
+  as a message copied as itself is, or where copying it panics, as the methods of the host's own
+  reflection can (`reflected`): either panicked every call asking a hook about it. A
+  call keeps what the host passed with each copy until it returns, so where it
   points is no other value's meanwhile: known only by where it points, a value dropped and collected
   during the call would leave its place to one made after, which would be given the first one's
   copy.
@@ -574,11 +616,20 @@ sequenceDiagram
   (`Attributes`): bools,
   strings and numbers read by their kind, times, in UTC, as `request.time` is, durations, bytes,
   slices, arrays, pointers, maps
-  keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types.
+  keyed by bools, strings, ints or uints, JSON text and numbers, and the protobuf well-known types,
+  a `Value` holding a nil `Struct` or `ListValue` read as an empty one, as CEL reads it and
+  protobuf writes it: read as null, `request.attributes.v == null` held where CEL found it false.
+  A nil `Value` or wrapper the host passes is null, as CEL reads it and any nil pointer is read, and
+  a nil `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any` can't be read (`nilNull`): CEL reads
+  the first four as `{}`, `[]`, the epoch and zero, where a nil pointer is null, which no declared
+  type takes, and fails on the last.
   It calls no method of the host's, so a condition reads no value by one. A kind's attributes, the
   subject's, the resource's or the request's, holding anything else anywhere, a `ref.Val` of the
-  host's own, a list, map or optional of CEL's a host makes, a struct, another message, a map keyed
-  by a double or holding two keys read as the same value, and so JSON text naming a member twice
+  host's own, a list, map or optional of CEL's a host makes, a struct, a lock of the host's own, as
+  no hook can be given it (`hostLock`), one that is a byte too, in an array or a slice, which is
+  read as a list of them rather than as bytes (`byteKind`), another message, a map keyed by a
+  double or a lock or
+  holding two keys read as the same value, and so JSON text naming a member twice
   once unescaped, read by the package's own parser as `encoding/json` reads it (`parseJSON`), or a
   packed message setting a
   field or a map's key twice, read from its wire bytes (`setOnce`), as decoding either keeps the
@@ -650,11 +701,18 @@ sequenceDiagram
   of a byte 80 ms to convert, each read through a `json.Decoder` of its own, which took most of a
   microsecond for each text, so converting parses JSON itself (`jsonParser`). So weighed, a unit
   took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
-  dynamic one of the host's up to 361, but a microsecond for a message of the host's own type whose
-  reflection panics, which a copy asks of each (`itself`), whatever held it, a copy
-  charging a struct a tenth of the bytes it sets whole, and a
-  slice's elements, and a map's values, a tenth of the structs they hold in place, which it moves
-  before copying each (`inlineTenths`), and a map's keys a tenth of the bytes of an array or a
+  dynamic one of the host's up to 361, and times an interface holds each in a zone of the host's
+  own, as parsing text with an offset of part of an hour makes them, 290, as a copy copies each
+  such zone, but a microsecond for a message of the host's own type whose reflection panics, which
+  a copy asks of each (`itself`), whatever held it, a copy charging a struct a tenth of the bytes it
+  sets whole, and each of its fields at least a tenth, as finding what it costs and whether it
+  shares it walks each,
+  found once for each type (`typeFact`), and none of the types an empty array would hold: walked for
+  each value, and along each path through such arrays, a copy of 10,000 structs of 4,000 empty
+  fields, charged 10,013, took 2.3 s, and of 100 values of a type nesting two empty arrays of the
+  type before it 20 deep 19.6 s, charged 113. It charges a slice's elements, and a map's values, a
+  tenth of the structs they hold in place, which it moves before copying each (`inlineTenths`),
+  and a map's keys a tenth of the bytes of an array or a
   struct, which reading an entry moves and setting it hashes (`keyTenths`), each before it moves
   them, and of the strings such a key holds and what its interfaces hold, which hashing reads too
   (`payHashed`): charged one, a copy of 2,000 structs each holding a map beside 64 KiB took 38 ms,
@@ -1511,13 +1569,16 @@ flowchart LR
   The roles revoke `TEMPORARY` from `PUBLIC` and grant it to none of them, as no call of the
   package's makes a temporary object, `AsOf`'s included. What runs after the commit record is the
   rest of the commit: the host's own deferred triggers and constraints of statements after its last
-  change, the session's temporary tables dropped or emptied, about half a millisecond each at the
-  default `temp_buffers` but seconds at a large one (emptying an `ON COMMIT DELETE ROWS` table scans
-  the temporary buffers; 2,000 held a commit about 5.4 s at `temp_buffers = 4GB`, which
-  `lock_timeout` doesn't bound), waiting for no lock past 100 ms, as another session can hold one of
-  those tables, writing the notifications the transaction queued to PostgreSQL's queue, which no SQL
-  can see beforehand and any role can queue (about 1.6 ms a MB, up to some 13 s at the default 8 GB
-  queue, which only `max_notify_queue_pages` bounds), each loaded extension's pre-commit callbacks,
+  change, queued before the commit record's own event and so fired before it, which wait for a lock
+  as long as the session's `lock_timeout` lets them, without end by default; and from that event on,
+  which sets `lock_timeout` to 100 ms where the session's is longer or none, the session's temporary
+  tables dropped or emptied, about half a millisecond each at the default `temp_buffers` but seconds
+  at a large one (emptying an `ON COMMIT DELETE ROWS` table scans the temporary buffers; 2,000 held
+  a commit about 5.4 s at `temp_buffers = 4GB`, which `lock_timeout` doesn't bound), waiting for no
+  lock past 100 ms, as another session can hold one of those tables, writing the notifications the
+  transaction queued to PostgreSQL's queue, which no SQL can see beforehand and any role can queue
+  (about 1.6 ms a MB, up to some 13 s at the default 8 GB queue, which only `max_notify_queue_pages`
+  bounds), each loaded extension's pre-commit callbacks,
   in which postgres_fdw commits the transaction's remote transactions, each waiting for what the
   remote server has it wait for, as a remote deferred foreign key's check, which no local
   `lock_timeout` bounds (1.5 s in a test), the wait for synchronous replication, and for a prepared
@@ -1595,11 +1656,15 @@ flowchart LR
   would have at a past time, with the catalog and the label dimensions as they are now. Migrating
   makes them (`0028_as_of_views`, and `rbac_as_of_views` again for a later migration that changes a
   table), in a schema beside the package's, named as it with `_as_of` after, one named as each
-  table, and AsOf names that schema first on the search_path of its transaction, or a savepoint of
-  the host's, which it makes READ ONLY and rolls back: so the package's statements, a hook's on the
-  `DB` it is given, the host's on that transaction and `rbac_group_members`, which reads by its
-  caller's search_path, read the tables by name as they were. It makes no object and takes no
-  transaction id, so the role reading needs no `TEMPORARY`, and the read holds no export back but
+  table. PostgreSQL cuts a name to 63 bytes, so beside a package's schema named in more than 57 the
+  views' would be named otherwise, and at 63 be the package's own: `rbac_as_of_views`, where it
+  names the views' schema, refuses such a package's schema before it makes anything (SQLSTATE
+  42622), and AsOf, finding no views beside one, says to rename it. AsOf names the views' schema
+  first on the search_path of its transaction, or a savepoint of the host's, which it makes READ
+  ONLY and rolls back: so the package's statements, a hook's on the `DB` it is given, the host's on
+  that transaction and `rbac_group_members`, which reads by its caller's search_path, read the
+  tables by name as they were. It makes no object and takes no transaction id, so the role reading
+  needs no `TEMPORARY`, and the read holds no export back but
   where a statement in it writes a session's temporary table, which READ ONLY lets through; and it
   reads on a hot standby too, as of what the standby has replayed. Each view reads the tenant, the
   time and the cluster from settings of the transaction (`rbac.as_of_tenant`, `rbac.as_of`,

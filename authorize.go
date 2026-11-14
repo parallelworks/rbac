@@ -1463,7 +1463,10 @@ type Predicate struct {
 // a table of one type: a host listing a type from a table of several tests its own column of the
 // type too, whose statistics count them, and indexes it after the tenant and before what a page
 // sorts by, as (tenant, type, id): with an index of the tenant alone, a sorted page of a type of
-// few rows reads the rows of every type until it is full.
+// few rows reads the rows of every type until it is full. For a row whose tenant or label column
+// is NULL, the condition can be NULL rather than false, as SQL compares NULL: a WHERE clause leaves
+// the row out all the same, but a host that selects the condition as a column reads it through
+// coalesce(..., false) or IS TRUE.
 func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant, resourceType string, cols Columns, firstArg int) (_ Predicate, err error) {
 	defer conflicting(&err)
 	a = a.still()

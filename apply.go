@@ -797,12 +797,15 @@ func (a *Authorizer) allowed(ctx context.Context, roles book, actor Subject, via
 	// A copy of the actor, as a constraint is given, so a hook writing to its attributes changes
 	// nothing the change's transaction decides again; one for the call, however many grants it asks
 	// about. Refused as the power to change grants on the scope, as an activation that can't be made
-	// there is.
+	// there is. The binding is a value of the hook's own, its expiry in a copy of its zone where
+	// that is the host's own (zonedApart).
 	var ok bool
 	if actor.Attributes, ok = copiedFor(a, validating, actor.Attributes); !ok {
 		return nil, uncopied(GrantPermission(scope.Type), scope, "ValidateGrant")
 	}
-	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: b, Role: role.clone(), Actor: actor, Via: via})
+	given := b
+	given.ExpiresAt = zonedApart(b.ExpiresAt)
+	err := a.cfg.ValidateGrant(ctx, a.db, GrantInput{Tenant: tenant, Scope: scope, Binding: given, Role: role.clone(), Actor: actor, Via: via})
 	switch {
 	case err == nil:
 		return nil, nil
