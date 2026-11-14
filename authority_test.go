@@ -5561,8 +5561,11 @@ func TestFilterCountsAFewOfItsSubjectsGrantsOfBuiltInRoles(t *testing.T) {
 }
 
 // Revoking a grant on a scope many hold grants on reads only the revoked principal's, under its
-// lock, by Apply and by DeleteGrants, under a generic plan too: matched to the scope's grants, a
-// revoke reads each of them.
+// lock, by Apply and by DeleteGrants, by source and by an ID written otherwise than as stored, under
+// a generic plan too: matched to the scope's grants, a revoke reads each of them. Each is counted on
+// one connection once it has run there: the first run after ANALYZE plans its statements again,
+// reading pages of every index on the table, and a run by ID and one by source share them, so
+// whichever ran first, in the map's order, read twice the pages.
 func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 	for _, plan := range []string{"custom", "generic"} {
 		t.Run(plan, func(t *testing.T) {
@@ -5577,8 +5580,18 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 			ann := h.as(t, "ann")
 			h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "admin"), grant(rbac.TenantRoot("t1"), "cluster.login", rbac.User, "ann"))
 			revoke := rbac.Binding{Role: "cluster.login", Principal: ann.Principal}
+			byID := revoke
+			if err := h.pool.QueryRow(ctx, `SELECT '{' || upper(replace(id::text, '-', '')) || '}' FROM rbac_grants
+				WHERE tenant = 't1' AND principal = 'user:ann'`).Scan(&byID.ID); err != nil {
+				t.Fatal(err)
+			}
 			read := func() map[string]int64 {
 				t.Helper()
+				conn, err := h.pool.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Release()
 				pages := map[string]int64{}
 				for what, f := range map[string]func(a *rbac.Authorizer) error{
 					"Apply": func(a *rbac.Authorizer) error {
@@ -5587,21 +5600,31 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 					"DeleteGrants": func(a *rbac.Authorizer) error {
 						return a.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: rbac.TenantRoot("t1"), Binding: revoke}})
 					},
+					"Apply by ID": func(a *rbac.Authorizer) error {
+						return a.Apply(ctx, admin, tenantT1, rbac.Change{Revoke: []rbac.Binding{byID}})
+					},
+					"DeleteGrants by ID": func(a *rbac.Authorizer) error {
+						return a.DeleteGrants(ctx, host, "t1", []rbac.Grant{{Scope: rbac.TenantRoot("t1"), Binding: byID}})
+					},
 				} {
-					tx, err := h.pool.Begin(ctx)
-					if err != nil {
-						t.Fatal(err)
+					run := func() int64 {
+						tx, err := conn.Begin(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer func() { _ = tx.Rollback(ctx) }()
+						start := pagesRead(ctx, t, tx, "rbac_grants")
+						if err := f(h.authz.WithTx(tx)); err != nil {
+							t.Fatalf("%s: %v", what, err)
+						}
+						var left bool
+						if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE principal = 'user:ann')`).Scan(&left); err != nil || left {
+							t.Fatalf("%s left ann's grant: %v", what, err)
+						}
+						return pagesRead(ctx, t, tx, "rbac_grants") - start
 					}
-					start := pagesRead(ctx, t, tx, "rbac_grants")
-					if err := f(h.authz.WithTx(tx)); err != nil {
-						t.Fatalf("%s: %v", what, err)
-					}
-					var left bool
-					if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM rbac_grants WHERE principal = 'user:ann')`).Scan(&left); err != nil || left {
-						t.Fatalf("%s left ann's grant: %v", what, err)
-					}
-					pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
-					_ = tx.Rollback(ctx)
+					run()
+					pages[what] = run()
 				}
 				return pages
 			}

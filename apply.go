@@ -758,10 +758,36 @@ func checkRevoke(tenant string, b Binding) []error {
 	if b.Role == "" {
 		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke names its role, by ID too"})
 	}
-	if !validText(string(b.Role)) || !validText(b.Source) || !validText(b.ID) {
-		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke's role, source and ID are text without NUL"})
+	if !validText(string(b.Role)) || !validText(b.Source) {
+		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke's role and source are text without NUL"})
+	}
+	// As revokedSQL reads it, so one that isn't a uuid is refused as invalid rather than failing the
+	// change with PostgreSQL's error.
+	if b.ID != "" && !uuidText(b.ID) {
+		errs = append(errs, &InvalidError{Binding: b, Reason: "a revoke's ID is a grant's, a uuid"})
 	}
 	return errs
+}
+
+// uuidText reports whether PostgreSQL's uuid input reads s: 32 hex digits in either case, with a
+// hyphen after any group of four but the last, braced or not.
+func uuidText(s string) bool {
+	if inner, braced := strings.CutPrefix(s, "{"); braced {
+		var closed bool
+		if s, closed = strings.CutSuffix(inner, "}"); !closed {
+			return false
+		}
+	}
+	digits := 0
+	for i := range len(s) {
+		switch c := s[i]; {
+		case '0' <= c && c <= '9', 'a' <= c && c <= 'f', 'A' <= c && c <= 'F':
+			digits++
+		case c != '-' || digits%4 != 0 || digits == 0 || digits == 32 || s[i-1] == '-':
+			return false
+		}
+	}
+	return digits == 32
 }
 
 // allowed asks Config.ValidateGrant about a grant, and returns why it refused, or the error that
@@ -2786,12 +2812,14 @@ const revoking = `DELETE FROM rbac_grants WHERE id = ANY(ARRAY(` + revokedSQL + 
 // or where they are stored, they would deadlock with a change ending activations among them, which
 // holds no lock of the scope; and sorted as a scan of the table found them, a plan made while the
 // table was small read a whole index in that order. Those kept, which the change grants again, are
-// passed over as each is locked, as the version it locks holds them.
+// passed over as each is locked, as the version it locks holds them. A revoke's ID is read as a
+// uuid, and the grant's compared with it by value: compared as text, one written otherwise, as in
+// capitals, matched no grant, and the revoke succeeded leaving it in force.
 const revokedSQL = `
 	SELECT k.id FROM (SELECT DISTINCT x.scope, x.principal, x.id FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS r(principal, role, source, id)
 	    CROSS JOIN LATERAL (
 	      SELECT scope, principal, id FROM rbac_grants WHERE tenant = $1 AND principal = r.principal AND scope = $2 AND role = r.role
-	        AND (r.id = '' AND source = r.source OR id::text = r.id)
+	        AND (r.id = '' AND source = r.source OR id = nullif(r.id, '')::uuid)
 	      OFFSET 0) x
 	    ORDER BY ` + bindingOrder + `) k
 	  CROSS JOIN LATERAL (SELECT FROM rbac_grants g WHERE g.id = k.id
