@@ -1443,10 +1443,12 @@ flowchart TB
   reads what is applied, as the replica it waited for can have made the tables, or given them to
   another role, meanwhile: it reads the tables' owner by name at the statement's snapshot, as
   `to_regclass` reads the session's catalog cache, which keeps what it read before the lock until
-  the session takes a relation's lock, which the advisory lock isn't. Where none are made, a
-  superuser makes them as the schema's owner, or the database's where `pg_database_owner` owns the
-  schema, as it does `public`, unless that is a superuser too, so its first migration of the
-  administrator's schema leaves them that role's, as that role's own would.
+  the session takes a relation's lock, which the advisory lock isn't, and only a table, not
+  another relation so named. Where none are made, the role migrating makes them as itself, a
+  superuser too, never as the schema's owner or the database's, which can be the application's
+  role; under the lock it refuses a superuser as `ErrInvalid`, naming the role, where
+  `<schema>_as_of` is made and another role's, as `0028_as_of_views` would fail there after making
+  every table before it the superuser's.
 
 ```mermaid
 flowchart TB
