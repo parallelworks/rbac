@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -3981,7 +3982,7 @@ func TestAsOfReadsItsViewsWhateverEitherSchemaIsNamed(t *testing.T) {
 
 // AsOf's views stand in a schema named as the package's with _as_of after, which PostgreSQL cuts to
 // 63 bytes: beside a package's schema named in 57, migrating makes them in a schema named so, and
-// one named in more is refused before anything is made, by migrating, or by rbac_as_of_views where
+// one named in more, counted in bytes however few its characters, is refused before anything is made, by migrating, or by rbac_as_of_views where
 // the views are gone after a rename to such a name, which AsOf reads by while they stand; AsOf,
 // finding none, says to rename it. Named in 58 to 62 bytes, the views stood in a schema named
 // otherwise, and in 63, their schema was the package's own, which migrating refused as holding
@@ -4001,11 +4002,16 @@ func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 		}
 	}
 	// dropping drops, once t ends, the schema name and the one its views' would be, as PostgreSQL
-	// cuts that name.
+	// cuts that name, before a character that doesn't fit whole.
 	dropping := func(t *testing.T, name string) {
 		t.Helper()
 		drop := []string{quoted(name)}
-		if views := (name + "_as_of")[:min(len(name)+len("_as_of"), 63)]; views != name {
+		views := name + "_as_of"
+		for len(views) > 63 {
+			_, n := utf8.DecodeLastRuneInString(views)
+			views = views[:len(views)-n]
+		}
+		if views != name {
 			drop = append(drop, quoted(views))
 		}
 		t.Cleanup(func() {
@@ -4014,10 +4020,12 @@ func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 			}
 		})
 	}
-	// schema makes a schema named in n bytes, and returns its name and a pool on it.
-	schema := func(t *testing.T, n int) (string, *pgxpool.Pool) {
+	// schema makes a schema named in n bytes, as many as fit of them in pad, and returns its name
+	// and a pool on it.
+	schema := func(t *testing.T, n int, pad string) (string, *pgxpool.Pool) {
 		t.Helper()
 		name := "rbac_" + strings.ToLower(rand.Text())
+		name += strings.Repeat(pad, (n-len(name))/len(pad))
 		name += strings.Repeat("x", n-len(name))
 		exec(t, `CREATE SCHEMA `+quoted(name))
 		dropping(t, name)
@@ -4037,7 +4045,7 @@ func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 
 	t.Run("57 bytes", func(t *testing.T) {
 		ctx := t.Context()
-		name, pool := schema(t, 57)
+		name, pool := schema(t, 57, "é")
 		h := setupOn(t, pool)
 		owner := h.as(t, "owner")
 		at := dbNow(t, h)
@@ -4086,10 +4094,14 @@ func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 	})
 
 	_, version := madeViews(t)
-	for _, n := range []int{58, 63} {
-		t.Run(fmt.Sprint(n, " bytes"), func(t *testing.T) {
+	for _, c := range []struct {
+		n   int
+		pad string
+	}{{58, "x"}, {58, "é"}, {63, "x"}} {
+		n := c.n
+		t.Run(fmt.Sprintf("%d bytes of %s", n, c.pad), func(t *testing.T) {
 			ctx := t.Context()
-			name, pool := schema(t, n)
+			name, pool := schema(t, n, c.pad)
 			if err := rbac.Migrate(ctx, pool); sqlState(err) != "42622" {
 				t.Fatalf("migrating a schema named in %d bytes: %v", n, err)
 			}
