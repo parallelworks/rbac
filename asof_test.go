@@ -4063,12 +4063,14 @@ func TestAsOfReadsItsViewsWhateverEitherSchemaIsNamed(t *testing.T) {
 }
 
 // AsOf's views stand in a schema named as the package's with _as_of after, which PostgreSQL cuts to
-// 63 bytes: beside a package's schema named in 57, migrating makes them in a schema named so, and
-// one named in more, counted in bytes however few its characters, is refused before anything is made, by migrating, or by rbac_as_of_views where
-// the views are gone after a rename to such a name, which AsOf reads by while they stand; AsOf,
-// finding none, says to rename it. Named in 58 to 62 bytes, the views stood in a schema named
-// otherwise, and in 63, their schema was the package's own, which migrating refused as holding
-// more than the views.
+// 63 bytes: beside a package's schema named in 57, migrating makes them in a schema named so. One
+// named in more, counted in bytes however few its characters, is refused: holding none of the
+// tables, by Migrate as ErrInvalid before any is made; holding those of the migrations before the
+// views, as one renamed since can, by the views' migration with SQLSTATE 42622, having made
+// nothing; and by rbac_as_of_views where the views are gone after a rename to such a name, which
+// AsOf reads by while they stand; AsOf, finding none, says to rename it. Named in 58 to 62 bytes,
+// the views stood in a schema named otherwise, and in 63, their schema was the package's own,
+// which migrating refused as holding more than the views.
 func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 	ctx := t.Context()
 	super, err := pgx.Connect(ctx, pgtest.URL(t))
@@ -4175,7 +4177,7 @@ func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 		}
 	})
 
-	_, version := madeViews(t)
+	made, version := madeViews(t)
 	for _, c := range []struct {
 		n   int
 		pad string
@@ -4184,6 +4186,19 @@ func TestAsOfsViewsStandBesideNoSchemaNamedTooLongForTheirs(t *testing.T) {
 		t.Run(fmt.Sprintf("%d bytes of %s", n, c.pad), func(t *testing.T) {
 			ctx := t.Context()
 			name, pool := schema(t, n, c.pad)
+			// Holding none of the tables, it is refused before any is made; holding those of the
+			// migrations before the views, as a schema renamed since can, the views' fails.
+			if err := rbac.Migrate(ctx, pool); !errors.Is(err, rbac.ErrInvalid) || !strings.Contains(err.Error(), "at most 57 bytes") {
+				t.Fatalf("migrating a schema named in %d bytes, holding none of the tables: %v", n, err)
+			}
+			var none bool
+			if err := super.QueryRow(ctx, `SELECT NOT EXISTS (SELECT FROM pg_class WHERE relnamespace = $1::regnamespace)`, quoted(name)).Scan(&none); err != nil || !none {
+				t.Fatalf("a refused migration made tables: %t, %v", !none, err)
+			}
+			if err := applyMigrations(ctx, pool, pgx.ReadCommitted, "", made); err != nil {
+				t.Fatal(err)
+			}
+			recordMigrations(t, pool, made)
 			if err := rbac.Migrate(ctx, pool); sqlState(err) != "42622" {
 				t.Fatalf("migrating a schema named in %d bytes: %v", n, err)
 			}

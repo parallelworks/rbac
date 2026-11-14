@@ -1507,7 +1507,19 @@ flowchart TB
   the tables migrates them, as a migration makes what it makes its maker's, and from
   `0028_as_of_views` on checks the schema of AsOf's views against it, which AsOf finds among that
   role's views (`asOwner`): another role is refused as `ErrInvalid` before the lock, but a
-  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after.
+  superuser, which runs each migration as that role, by `SET LOCAL ROLE`, and is itself again after,
+  where its login may set its role to that one, as PostgreSQL checks it against the login, and is
+  refused as `ErrInvalid` too where it may not. It decides again once it holds the lock, before it
+  reads what is applied, as the replica it waited for can have made the tables, or given them to
+  another role, meanwhile: it reads the tables' owner by name at the statement's snapshot, as
+  `to_regclass` reads the session's catalog cache, which keeps what it read before the lock until
+  the session takes a relation's lock, which the advisory lock isn't, and only a table, not
+  another relation so named. Where none are made, the role migrating makes them as itself, a
+  superuser too, never as the schema's owner or the database's, which can be the application's
+  role; under the lock it refuses any role, a superuser too, as `ErrInvalid`, naming the other,
+  where `<schema>_as_of` is made and another role's, as `0028_as_of_views` would fail there after
+  making every table before it the role migrating's, and before the lock and under it, where the
+  schema is named in more than 57 bytes, which `0028_as_of_views` refuses for every role.
 
 ```mermaid
 flowchart TB
@@ -1518,7 +1530,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    tx -->|"before the lock: a role not owning<br/>the tables, and no superuser (asOwner)"| invalid(["ErrInvalid"])
+    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
