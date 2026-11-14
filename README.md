@@ -350,11 +350,23 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   50,000 short strings, nearly 16,000 maps of one entry each, nearly 40,000 timestamps or JSON texts
   of a byte, or 53,000 slices of a byte, and a
   unit costs about what reading one does, so a check spends no more converting than its conditions
-  may reading, about 20 ms: each map charged one, as a number is, a
+  may reading, about 20 ms, or about 29 ms where what it holds nests thousands deep, as lists or
+  JSON arrays 3,000 to 9,999 deep took 160 to 230 ns a unit to convert: each map charged one, as a number is, a
   check of a resource whose tags held 156,000
   empty maps took 108 ms, and each JSON text or slice of bytes charged as one value and a tenth of
   its length, a check took 80 ms to convert 79,000 texts of a byte, and a hook 76 ms to copy
-  150,000 slices of a byte. Past that every condition reading an attribute fails, as it does where
+  150,000 slices of a byte. A JSON number of more than 19 significant digits that its first 19
+  can't round, or of any length below 1e-307 or from 1e308, which built with Go 1.26 strconv parses
+  digit by digit however short (`5e-324` took 14 µs), costs more again, for each power of ten
+  between it and 1 and for its digits, up to 1,070, as does a string `double()` converts in a
+  condition, which parsing one digit by digit takes, reading an underscore between digits as
+  strconv does: charged 3, 40,000 of `8.9884656743115790396e307` took a check 1.2 s to convert, and
+  so charged, a unit of parsing takes no more than about 110 ns on Go 1.27. Built with Go 1.26, a
+  number of 15 to 19 digits that 1.26 can't round at once takes up to about 840 ns, charged 3 or 4,
+  about 280 ns a unit, so a check's budget of them about 34 ms. A condition's
+  bound counts what parsing a literal string `double()` converts costs, and up to 1,070 for any
+  other string of 5 bytes or more. Past that
+  every condition reading an attribute fails, as it does where
   JSON text may cost more, by its brackets, braces, commas and colons. Converting stops
   10,000 deep, so what a kind nesting deeper is charged, and whether the kinds after it fit, can
   turn on the order a map's entries come in, failing closed, and nothing else turns on that order,
@@ -541,7 +553,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
   `has({"k": 0.0 / 0.0}.k)`, or a map naming a key twice, which keys a condition computes can do
-  only as it runs, as `{subject.id: 1, "admin": 2}` does for the subject `admin`; and where no
+  only as it runs, as `{subject.id: 1, "admin": 2}` does for the subject `admin`, or a map keyed
+  by bytes, as `{b"a": 1}`, which a condition naming the key as a literal now can't be stored with;
+  bytes looked up in a map, as `b"a" in {"a": 1}`, are found in none, where CEL hashed them and
+  failed the condition at its limit, so `dyn(b"a") in {"a": 1} || true` gave a grant nothing; and where no
   declarations cover a kind, so does every condition reading its attributes where one holds such a
   double, however deep: it read the others, and that one too, as `has()` and `size()` did. Going
   back to an earlier release of this package does the same where that release bounds a shape more,

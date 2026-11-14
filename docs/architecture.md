@@ -667,7 +667,11 @@ sequenceDiagram
   refused in part, as that is larger; finding it there would read the larger value whole. A map
   literal naming a key twice fails whatever it holds, as CEL builds it holding the value named last
   and drops the one before unread, so `{"a": subject.attributes, "a": 1}.a == 1` held where
-  `{"a": 1, "a": subject.attributes}.a == 1` failed. A double that isn't finite is kept out of
+  `{"a": 1, "a": subject.attributes}.a == 1` failed. Bytes are kept out of map keys: CEL's maps
+  hash a key to find it, and a slice panics as one, which CEL recovers as the condition failing at
+  its limit. So a map built with a bytes key fails as it is built (`comparableKey`), a literal key
+  of bytes is refused as the condition is planned (`keying`), and `in` finds bytes in no map
+  (`bounded`), as no map holds them. A double that isn't finite is kept out of
   lists and maps alike: a literal holding one fails as it is built, and an attribute holding one,
   however deep, which the converter counts (`infinite`), is an error that a declared kind refuses
   in part (`declared`), as a declared double that isn't finite is, and that makes a kind no
@@ -711,8 +715,25 @@ sequenceDiagram
   each slice it copies apart (`copied`) and converting keeps each text it parses (`once`): charged
   one and a tenth of its length, 150,000 slices of a byte took 76 ms to copy, and 79,000 JSON texts
   of a byte 80 ms to convert, each read through a `json.Decoder` of its own, which took most of a
-  microsecond for each text, so converting parses JSON itself (`jsonParser`). So weighed, a unit
-  took 20 to 145 ns to convert and 25 to 400 ns to copy for a hook, a copied message the most, a
+  microsecond for each text, so converting parses JSON itself (`jsonParser`). A number of more
+  than 19 significant digits that its first 19 can't round, which strconv parses by shifting up to
+  800 digits once for each power of ten between it and 1, costs that too (`parseCost`), in a JSON
+  number, JSON text or a string a condition's `double()` converts, before it is parsed: charged 3,
+  8.9884656743115790396e307 took 30 µs, so 40,000 in a JSON text took a check 1.2 s to convert, and
+  a loop calling `double()` on one 38 ms within a condition's limit. So does a number of any length
+  below 1e-307 or from 1e308, which strconv built with Go 1.26, as this module allows, parses so
+  however short (5e-324 took 14 µs, 4e308 30), and `parseCost` skips an underscore between digits
+  and in the exponent, as strconv does, where 8.988_4656743115790396e307 took 29 µs charged 4. So
+  charged, parsing took no more than about 110 ns a unit on either version over about 9,000
+  random inputs to each, and 92 over 60,000 on Go 1.27. Built with Go 1.26, a number of 15 to 19
+  digits with a power of ten from -5 to 23 that its fast path can't round, as 2877421929889792e18,
+  falls back to a slower one and took up to 840 ns, charged 3 or 4: about 280 ns a unit, which is
+  left documented, as charging such numbers more would charge every float of 17 digits more on
+  either version. A condition's bound counts what parsing a literal `double()` converts
+  costs (`literalString`), and for any other string of 5 bytes or more, the shortest that can be
+  out of range, as `1e308`, up to 1,070 (`parseBound`). So weighed, a unit
+  took 20 to 145 ns to convert (160 to 230 for lists or JSON arrays 3,000 to 9,999 deep, each
+  level a call deeper, linear in their charge) and 25 to 400 ns to copy for a hook, a copied message the most, a
   dynamic one of the host's up to 361, and times an interface holds each in a zone of the host's
   own, as parsing text with an offset of part of an hour makes them, 290, as a copy copies each
   such zone, but a microsecond for a message of the host's own type whose reflection panics, which

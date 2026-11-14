@@ -228,7 +228,9 @@ const maxConverted = 2 * maxCheckCost
 // interface holds each in a zone of the host's own, as parsing text with an offset of part of an
 // hour makes them, about 290, as a copy copies each such zone (copier.zone), but for a message of
 // the host's own type whose reflection panics, which a copy asks of each (itself), and which took a
-// microsecond a unit.
+// microsecond a unit. Values nested thousands deep take more, as each level converted is a call
+// deeper: lists or JSON arrays 3,000 to 9,999 deep took 160 to 230 ns a unit, linear in what they
+// were charged, so a check's full budget of them about 29 ms.
 const (
 	mapCost     = 8
 	listCost    = 4
@@ -920,7 +922,10 @@ func (c *converter) json(v reflect.Value) (ref.Val, int) {
 			c.over, c.left = true, 0
 			return nil, 0
 		}
-		parsed, ok := parseJSON(v.Bytes())
+		parsed, ok, parsing := parseJSON(v.Bytes(), c.left)
+		if !c.pay(parsing) {
+			return nil, 0
+		}
 		if !ok {
 			return c.refuse(), 1
 		}
@@ -940,15 +945,17 @@ func (c *converter) json(v reflect.Value) (ref.Val, int) {
 // (GOEXPERIMENT=nojsonv2), a json.Decoder counts no depth of the brackets and braces Token returns,
 // so objects nested 79,000 deep were parsed, taking 70 ms and 48 MB, where json.Unmarshal refused
 // them. It parses the text itself (jsonParser): a json.Decoder made for each text took most of a
-// microsecond, so 79,000 texts of a byte took a check 80 ms to convert.
-func parseJSON(text []byte) (any, bool) {
+// microsecond, so 79,000 texts of a byte took a check 80 ms to convert. parsing is what parsing its
+// numbers costs past reading them (parseCost), each charged before it is parsed, so where that is
+// more than left, it stops there, unparsed.
+func parseJSON(text []byte, left uint64) (v any, ok bool, parsing uint64) {
 	if !utf8.Valid(text) {
-		return nil, false
+		return nil, false, 0
 	}
-	p := jsonParser{text: text}
-	v, ok := p.value(0)
+	p := jsonParser{text: text, left: left}
+	v, ok = p.value(0)
 	p.next()
-	return v, ok && p.at == len(text)
+	return v, ok && p.at == len(text), p.parsing
 }
 
 // jsonParser reads JSON text as encoding/json reads it into an any: an object as a map[string]any,
@@ -956,6 +963,9 @@ func parseJSON(text []byte) (any, bool) {
 type jsonParser struct {
 	text []byte
 	at   int
+	// parsing is what parsing the numbers read so far cost past reading them (parseCost), and left
+	// the most it may.
+	parsing, left uint64
 }
 
 // next is the byte at the next value or delimiter, past whitespace, or 0 at the end of the text.
@@ -1072,6 +1082,9 @@ func (p *jsonParser) number() (any, bool) {
 	}
 	n := p.text[start:p.at]
 	if !jsonNumber(n) {
+		return nil, false
+	}
+	if p.parsing += parseCost(n); p.parsing > p.left {
 		return nil, false
 	}
 	f, err := strconv.ParseFloat(string(n), 64)
@@ -1202,11 +1215,12 @@ func jsonValues(text []byte) uint64 {
 }
 
 // number is n, a JSON number, an int where it is one and a double where it isn't, as CEL reads it,
-// at a tenth of its length whether it is one or not, as parsing it reads it whole, or nil. Text that
-// isn't a JSON number no condition can read, though strconv reads some as one, as "+1", "0x1p4" as
-// 16 and "Inf", where a host reading it as JSON reads none.
+// at a tenth of its length whether it is one or not, as parsing it reads it whole, and what parsing
+// it may cost past that (parseCost), or nil. Text that isn't a JSON number no condition can read,
+// though strconv reads some as one, as "+1", "0x1p4" as 16 and "Inf", where a host reading it as
+// JSON reads none.
 func (c *converter) number(n string) ref.Val {
-	if !c.pay(uint64(len(n)) / 10) {
+	if !c.pay(uint64(len(n))/10 + parseCost(n)) {
 		return nil
 	}
 	if !jsonNumber(n) {
@@ -1219,6 +1233,76 @@ func (c *converter) number(n string) ref.Val {
 		return types.Double(f)
 	}
 	return c.refuse()
+}
+
+// parseCost is what strconv parsing n, a number's text, may cost past reading it, which a tenth of
+// its length is charged for. It reads 19 significant digits, and where a digit past them isn't 0
+// and the 19 can't decide how the number rounds, it shifts up to 800 of them, 60 bits at a time,
+// until the number's point is in place: 8.9884656743115790396e307, charged 3 as JSON text, took 30
+// µs, so 40,000 of them took a check 1.2 s to convert, and 600 digits near 1e-308 took 90 µs. Built
+// with Go 1.26, which this module allows, strconv does so too for a number of any length below the
+// smallest normal double or near the largest, as 5e-324 or 4e308, which took 14 and 30 µs. It skips
+// an underscore between digits, as in 8.988_4656743115790396e307, and so does parseCost. So such a
+// number, or any below 1e-307 or from 1e308, costs 1 more for each power of ten between it and 1, up
+// to 330, past which strconv reads it as 0 or infinite at once, again for each 400 of its
+// significant digits, up to 800, past which it reads none, and a tenth of them, so a unit of it
+// took no more than about 110 ns to parse on either version, whatever its digits and exponent. Any
+// other number of 19 significant digits or fewer, which strconv rounds at once, as one exactly
+// halfway between two doubles, costs nothing more, as does a hexadecimal one, which it reads 16
+// digits of, and inf or nan; but for one of 15 to 19 digits, a power of ten from -5 to 23, that
+// Go 1.26's fast path can't round, which its fallback took up to 840 ns to, about 280 ns a unit.
+func parseCost[T string | []byte](n T) uint64 {
+	i := 0
+	if i < len(n) && (n[i] == '-' || n[i] == '+') {
+		i++
+	}
+	// As strconv reads a decimal: point is where the point is from the first significant digit, a
+	// leading zero moving it, and digits how many significant digits it reads.
+	var point, digits int
+	sawPoint, past := false, false
+scan:
+	for ; i < len(n); i++ {
+		switch b := n[i]; {
+		case b == '_':
+		case b == '.' && !sawPoint:
+			sawPoint, point = true, digits
+		case b == '0' && digits == 0:
+			point--
+		case '0' <= b && b <= '9':
+			digits++
+			past = past || digits > 19 && b != '0'
+		default:
+			break scan
+		}
+	}
+	if digits == 0 {
+		return 0
+	}
+	if !sawPoint {
+		point = digits
+	}
+	if i < len(n) && (n[i] == 'e' || n[i] == 'E') {
+		i++
+		sign := 1
+		if i < len(n) && (n[i] == '-' || n[i] == '+') {
+			if n[i] == '-' {
+				sign = -1
+			}
+			i++
+		}
+		e := 0
+		for ; i < len(n) && ('0' <= n[i] && n[i] <= '9' || n[i] == '_'); i++ {
+			if n[i] != '_' && e < 10000 {
+				e = e*10 + int(n[i]-'0')
+			}
+		}
+		point += sign * e
+	}
+	if !past && -307 < point && point < 309 {
+		return 0
+	}
+	shifts, read := uint64(min(max(point, -point), 330)), uint64(min(digits, 800))
+	return shifts*(400+read)/400 + read/10
 }
 
 // jsonNumber reports whether n is a number as JSON writes one: an optional minus, an integer with
