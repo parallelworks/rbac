@@ -1305,7 +1305,8 @@ the package's uses foreign data, so none of the roles needs any.
   are made yet, the role migrating makes them, and owns them, a superuser too: it makes them as
   itself, never as the schema's owner or the database's, either of which can be the application's
   role, which owning them could disable history's triggers. So run the first `Migrate` as the
-  administrator's role. `Migrate`, before it takes the schema's lock and again under it, refuses as
+  administrator's role. `Migrate`, once it holds the schema's lock, and on a host's transaction
+  before it takes it too, refuses as
   `rbac.ErrInvalid`, naming it, having made nothing, a schema holding an object another role made
   that a migration could find in place of its own, run, or call as the role migrating: one that
   neither owns the tables (the role migrating, where none are made), nor history once they are, nor

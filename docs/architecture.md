@@ -1555,7 +1555,8 @@ flowchart TB
   where `<schema>_as_of` is made and another role's, as `0028_as_of_views` would fail there after
   making every table before it the role migrating's, and before the lock and under it, where the
   schema is named in more than 57 bytes, which `0028_as_of_views` refuses for every role.
-  Before the lock and under it, it refuses as `ErrInvalid`, having made nothing, a schema holding
+  Under the lock, and on a host's transaction before it too, where `historyUnwritten` reads the
+  schema's tables there, it refuses as `ErrInvalid`, having made nothing, a schema holding
   what a migration would find in place of its own, run, or call as the role migrating, a superuser
   too, that neither the tables' owner (the role migrating, where none are made), nor history's once
   they are, nor a superuser owns (`plantedFor`): a relation, type or function named `rbac_`, in the
@@ -1609,7 +1610,7 @@ flowchart TB
     one -->|"commits, more pending"| tx
     one -->|"commits, none pending"| done(["nil"])
     tx -->|"the advisory lock's wait<br/>ends (errReplica)"| conflict(["ErrConflict"])
-    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes; another role's object<br/>a migration could find, run or call (plantedFor); another<br/>role or PUBLIC may create there, under the lock where<br/>none are made (creatorIn) (asOwner)"| invalid(["ErrInvalid"])
+    tx -->|"before the lock, and again under it: a role<br/>not owning the tables, unless a superuser whose<br/>login may SET ROLE to their owner; under it, none<br/>made and the views' schema another role's; none made<br/>and the schema named in over 57 bytes; under it, and before it<br/>on a host's transaction: another role's object<br/>a migration could find, run or call (plantedFor); another<br/>role or PUBLIC may create there, only under the lock where<br/>none are made (creatorIn) (asOwner)"| invalid(["ErrInvalid"])
     one -->|"55P03 or 40P01, after a backoff"| tx
     one -->|"its 10th try"| conflict
 ```
