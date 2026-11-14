@@ -1312,7 +1312,8 @@ the package's uses foreign data, so none of the roles needs any.
   is a superuser. That is a relation, type or function named `rbac_` there or in `<schema>_as_of`,
   an `rbac_migrations` that isn't an ordinary table of the tables' owner, any function or operator,
   which a migration's statement could call in place of PostgreSQL's, a trigger on one of the tables
-  calling such a function, or depending on one, as through its `WHEN` clause, and any type, domain, collation, conversion, text search configuration
+  calling such a function, or depending on one, or with a `WHEN` clause at all, which can run SQL
+  text through PostgreSQL's own functions (none of the package's has one), and any type, domain, collation, conversion, text search configuration
   or dictionary, statistics object, foreign table or sequence no column owns: drop it, as the role
   owning it or a superuser, and migrate again. And it refuses a schema in which another role, or
   `PUBLIC`, may create, as that role could make one while a migration runs, on a schema holding none
