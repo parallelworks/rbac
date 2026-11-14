@@ -12951,6 +12951,226 @@ func TestPermissionsWalkARoleOnceHoweverManyGrantsHoldIt(t *testing.T) {
 	lists(false)
 }
 
+// Authorize and Explain decide whether a role gives the permission once for each carrier its grants
+// have, however many grants hold it, as Permissions walks it: for a subject in a thousand groups each
+// granted a custom role of a thousand permissions on each scope of a cluster's path, they read the
+// role's permissions once for each grant, 4 million entries for a permission it doesn't give, and
+// took twice what a check of a built-in role did. They decide as before: every grant of the role
+// gives what it gives, under a condition only where the condition holds, and a privileged one
+// granted to the tenant's members gives them nothing.
+func TestChecksDecideARoleOnceHoweverManyGrantsHoldIt(t *testing.T) {
+	var given []rbac.Permission
+	for i := range 500 {
+		given = append(given, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	h := setup(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), rbac.RoleDefinition{ID: "given", Permissions: given, ResourceTypes: []string{"cluster"}})
+	})
+	ctx := t.Context()
+	u := h.as(t, "u")
+	mfa := `request.attributes.mfa == true`
+	// custom.rooted gives root, which only privileged roles give, so it is privileged: granted to the
+	// tenant's members, it gives them nothing.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.given', $1, '{cluster}'), ('t1', 'custom.rooted', '{cluster:root}', '{cluster}')`, []any{given}},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role) VALUES ('t1', 'cluster', 'c1', 'members', 't1', 'custom.rooted')`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// u in groups from to to, each granted the custom role on every scope of the cluster's path, and
+	// on the cluster under the condition too.
+	inGroups := func(from, to int) {
+		t.Helper()
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series($1::int, $2) AS i`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+				SELECT 't1', s.type, s.id, 'group', 'g' || i, 'custom.given' FROM generate_series($1::int, $2) AS i,
+				  (VALUES ('cluster', 'c1'), ('workspace', 'w1'), ('org', 'o1'), ('tenant', 't1')) AS s(type, id)`, nil},
+			{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+				SELECT 't1', 'cluster', 'c1', 'group', 'g' || i, 'custom.given', $3 FROM generate_series($1::int, $2) AS i`, []any{mfa}},
+		} {
+			if _, err := h.pool.Exec(ctx, q.sql, append([]any{from, to}, q.args...)...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	read := 0
+	rbac.SetReadingEntries(t, func(k int) { read += k })
+	// decides checks and explains a few permissions with mfa or without, for groups groups, and
+	// returns how many entries a check and Explain of view, which the role doesn't give, read.
+	decides := func(groups int, withMFA bool) int {
+		t.Helper()
+		c := rbac.WithRequest(ctx, map[string]any{"mfa": withMFA})
+		for _, p := range []rbac.Permission{view, root, given[0], given[len(given)-1]} {
+			err := h.authz.Authorize(c, u, p, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			d, xerr := h.authz.Explain(c, u, p, cluster)
+			if xerr != nil {
+				t.Fatal(xerr)
+			}
+			want := 0
+			if slices.Contains(given, p) {
+				want = 4 * groups
+				if withMFA {
+					want += groups
+				}
+			}
+			if d.Allowed != (err == nil) || d.Allowed != (want > 0) || len(d.Grants) != want {
+				t.Errorf("with mfa %t, in %d groups, Authorize of %s: %v, Explain allows %t by %d grants, not %d", withMFA, groups, p, err, d.Allowed, len(d.Grants), want)
+			}
+		}
+		read = 0
+		if err := h.authz.Authorize(c, u, view, cluster); !errors.Is(err, rbac.ErrDenied) {
+			t.Fatalf("Authorize of %s: %v", view, err)
+		}
+		if _, err := h.authz.Explain(c, u, view, cluster); err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	inGroups(1, 1)
+	one := decides(1, true)
+	inGroups(2, 100)
+	if each := (decides(100, true) - one) / 99; each >= len(given) {
+		t.Errorf("a check and Explain read %d entries more for each group granted a custom role of %d permissions on 4 scopes, and on one under a condition", each, len(given))
+	}
+	decides(100, false)
+}
+
+// A decision reads each distinct condition of the conditional grants it reads once, with the ids of
+// the grants holding it, however many share it, under a generic plan too: read for each grant, a
+// subject in 1,000 groups, each granted a role on the 4 scopes of a cluster's path under one
+// condition of 2 KB, had a check read 8 MB of them. Each grant decides as before: a check, a listing
+// and the subject's label values hold under the condition and not without it, and a grant under
+// another condition beside them by its own.
+func TestAConditionManyGrantsShareIsReadOnce(t *testing.T) {
+	h := setupOn(t, pgtest.Open(t, "jit=off&plan_cache_mode=force_generic_plan"), withLabels)
+	ctx := t.Context()
+	u := h.as(t, "u")
+	mfa, office := `request.attributes.mfa == true`, `request.attributes.office == true`
+	// u in 250 groups, each granted the login role on every scope of the cluster's path, and a level on
+	// the tenant, under mfa; and in one more granted the login role on the cluster under office.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_groups (tenant, id) SELECT 't1', 'g' || i FROM generate_series(0, 250) AS i`, nil},
+		{`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) SELECT 't1', 'g' || i, 'user', 'u' FROM generate_series(0, 250) AS i`, nil},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+			SELECT 't1', s.type, s.id, 'group', 'g' || i, s.role, $1 FROM generate_series(1, 250) AS i,
+			  (VALUES ('cluster', 'c1', 'cluster.login'), ('workspace', 'w1', 'cluster.login'), ('org', 'o1', 'cluster.login'),
+			    ('tenant', 't1', 'cluster.login'), ('tenant', 't1', 'level.high')) AS s(type, id, role)`, []any{mfa}},
+		{`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+			VALUES ('t1', 'cluster', 'c1', 'group', 'g0', 'cluster.login', $1)`, []any{office}},
+		{`ANALYZE rbac_grants, rbac_members, rbac_groups, rbac_memberships`, nil},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := 0
+	rbac.SetReadingConditions(t, func(n int) { read += n })
+	high := rbac.Label{"level": {"high"}}
+	for _, request := range []map[string]any{{"mfa": true}, {"office": true}, {}} {
+		c := rbac.WithRequest(ctx, request)
+		allows := request["mfa"] == true || request["office"] == true
+		// Several times, as a session plans a statement generically from its sixth run on.
+		for range 7 {
+			read = 0
+			err := h.authz.Authorize(c, u, login, cluster)
+			if err != nil && !errors.Is(err, rbac.ErrDenied) {
+				t.Fatal(err)
+			}
+			if (err == nil) != allows || read != 2 {
+				t.Fatalf("with %v, Authorize of login: %v, reading %d conditions", request, err, read)
+			}
+		}
+		read = 0
+		perms, err := h.authz.Permissions(c, u, cluster)
+		if err != nil || slices.Contains(perms, login) != allows || read != 2 {
+			t.Errorf("with %v, Permissions = %v, %v, reading %d conditions", request, perms, err, read)
+		}
+		read = 0
+		held, err := h.authz.Holding(c, "t1", u)
+		if err != nil || held.Satisfies(high) != (request["mfa"] == true) || read != 1 {
+			t.Errorf("with %v, Holding satisfies %v: %t, %v, reading %d conditions", request, high, held.Satisfies(high), err, read)
+		}
+	}
+}
+
+// A decision reads the conditions of its conditional grants by each grant's id, a row at a time,
+// under a generic plan too: tested against arrays of every grant's id, principal and scope, a
+// generic plan compared each grant it read with every entry, so a subject in 1,000 groups, each
+// granted a role on the 4 scopes of a cluster's path under one condition, waited 170 ms for a check,
+// against 45. No count of rows or pages shows that, as it read no more of either, its time spent in
+// the comparisons, so its plan is read: no scan of the grants tests one against an array, and one
+// seeks each grant by its id.
+func TestAConditionsGrantsAreReadByTheirIDs(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', 'cluster', 'c' || i, 'group', 'g' || i, 'cluster.login', 'request.attributes.mfa == true' FROM generate_series(1, 1000) AS i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// With sequential scans off, as a decision reads them (queryIndexed).
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	// By the simple protocol, which binds no parameters: GENERIC_PLAN plans with none.
+	results, err := tx.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN, FORMAT JSON) "+rbac.ConditionsSQL(false)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := results[len(results)-1].Rows[0][0]
+	type node struct {
+		Relation  string `json:"Relation Name"`
+		IndexCond string `json:"Index Cond"`
+		Filter    string `json:"Filter"`
+		Recheck   string `json:"Recheck Cond"`
+		Plans     []node `json:"Plans"`
+	}
+	var plans []struct{ Plan node }
+	if err := json.Unmarshal(plan, &plans); err != nil {
+		t.Fatal(err)
+	}
+	seeks := false
+	var walk func(node)
+	walk = func(n node) {
+		for _, cond := range []string{n.IndexCond, n.Filter, n.Recheck} {
+			if strings.Contains(cond, "ANY (") {
+				t.Errorf("the statement reading conditions tests rows against an array: %s", cond)
+			}
+		}
+		seeks = seeks || n.Relation == "rbac_grants" && strings.Contains(n.IndexCond, "id = w.id")
+		for _, c := range n.Plans {
+			walk(c)
+		}
+	}
+	walk(plans[0].Plan)
+	if !seeks {
+		t.Errorf("the statement reading conditions seeks no grant by its id: %s", plan)
+	}
+}
+
 // A change's read of its actor's authority decides each permission the actor hands on by the
 // denies listing it alone, as Permissions does: compared with every deny's list for each, an actor
 // granting a role of 300 permissions beside 368 denies of 256 others read 85 million entries of

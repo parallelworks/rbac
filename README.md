@@ -199,10 +199,12 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   a labeled resource, once a grant allows, and `Permissions` of one, once it would list anything
   the label decides, asks it once about each value the label asks for that the subject's grants
   give, of an `Ordered` dimension those as high as the label's, and nothing about the rest, as a
-  change does for the label of each scope it checks; `Holding`, `Filter` and `Reachable`, which
-  test any label, ask about every one, as do `SetRole` and `DeleteRole`, and `ChangeMembers` taking
-  access away, which first decide whether the actor's values satisfy every label, and the approval
-  `Config.Constraints` names.
+  change does for the label of each scope it checks; `Permissions` of a labeled tenant, which lists
+  the values the subject holds there, decides the label by those it lists, asking about each value
+  its grants give once, where it asked about those the label asks for twice; `Holding`, `Filter`
+  and `Reachable`, which test any label, ask about every one, as do `SetRole` and `DeleteRole`, and
+  `ChangeMembers` taking access away, which first decide whether the actor's values satisfy every
+  label, and the approval `Config.Constraints` names.
   `Authorize`, `Explain`, `Permissions`, `Holders` and `Grantable` allow nothing else of a labeled
   resource unless what the subject holds satisfies the label, whatever its grants give, its values
   read with its grants, so none allows what no moment did, nor do

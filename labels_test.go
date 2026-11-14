@@ -2073,6 +2073,76 @@ func TestPermissionsOfALabeledResourceAsksAboutValuesOnlyOnceAGrantGivesSomethin
 	}
 }
 
+// Permissions of a labeled tenant asks the constraints about each label value once, as a check of
+// the tenant does: it decides the values with the rest of what it lists, each as a check of it
+// decides it, on the bare tenant, and the label by those, where it decided them again for the label
+// and asked about each twice. One answer decides both, so a value a constraint removes is neither
+// listed nor held: the label asking for it leaves the subject only the values it holds, as checks
+// of each refuse the rest.
+func TestPermissionsOfALabeledTenantAsksAboutEachValueOnce(t *testing.T) {
+	var mu sync.Mutex
+	asked := map[rbac.Permission]int{}
+	var removed rbac.Permission
+	h := labeled(t, func(c *rbac.Config) {
+		c.Constraints = []rbac.Constraint{{Name: "policy", Deny: func(_ context.Context, _ rbac.DB, in rbac.ConstraintInput) (bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked[in.Permission]++
+			return in.Permission == removed, nil
+		}}}
+	})
+	ctx := t.Context()
+	u := h.as(t, "u")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.admin", rbac.User, "u"))
+	h.hold(t, "u", "level:high", "comp:alpha")
+	tenant := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1", Labels: rbac.Label{"level": {"high"}, "comp": {"alpha"}}}
+	values := []rbac.Permission{"comp:alpha", "level:high"}
+	// askedIn is how many times call asked the constraint about each permission.
+	askedIn := func(call func()) map[rbac.Permission]int {
+		t.Helper()
+		mu.Lock()
+		clear(asked)
+		mu.Unlock()
+		call()
+		mu.Lock()
+		defer mu.Unlock()
+		return maps.Clone(asked)
+	}
+	for _, c := range []struct {
+		removed rbac.Permission
+		listed  []rbac.Permission
+	}{
+		{"", []rbac.Permission{"comp:alpha", "level:high", "tenant:grant", "tenant:view"}},
+		{"level:high", []rbac.Permission{"comp:alpha"}},
+	} {
+		removed = c.removed
+		var perms []rbac.Permission
+		var err error
+		byList := askedIn(func() { perms, err = h.authz.Permissions(ctx, u, tenant) })
+		if err != nil || !slices.Equal(perms, c.listed) {
+			t.Fatalf("with %q removed, Permissions of the tenant labeled %v = %v, %v", c.removed, tenant.Labels, perms, err)
+		}
+		byCheck := askedIn(func() {
+			if err := h.authz.Authorize(ctx, u, "tenant:view", tenant); (err == nil) != slices.Contains(perms, "tenant:view") {
+				t.Errorf("with %q removed, Authorize of tenant:view: %v, where Permissions lists %v", c.removed, err, perms)
+			}
+		})
+		for _, p := range values {
+			if byList[p] != 1 || byCheck[p] != 1 {
+				t.Errorf("with %q removed, Permissions of the labeled tenant asks about %s %d times, and a check of it %d", c.removed, p, byList[p], byCheck[p])
+			}
+			if err := h.authz.Authorize(ctx, u, p, tenant); (err == nil) != slices.Contains(perms, p) {
+				t.Errorf("with %q removed, Authorize of %s: %v, where Permissions lists %v", c.removed, p, err, perms)
+			}
+		}
+		for p, n := range byList {
+			if n > 1 {
+				t.Errorf("with %q removed, Permissions of the labeled tenant asks about %s %d times", c.removed, p, n)
+			}
+		}
+	}
+}
+
 // A change that checks the labels of many scopes by one read of the actor's values, as one to the
 // members of many groups, decides each label by every value it asks for, asking the constraints
 // once about each value the labels ask for, however many ask for it, and nothing about the rest.
