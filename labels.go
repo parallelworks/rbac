@@ -493,9 +493,8 @@ func grantsOf(roles book, held []holding) []holding {
 // permission, sharing shared, where not nil, with other decisions by v on the same request (runs).
 func (a *Authorizer) holdingFrom(ctx context.Context, q DB, s Subject, cs *constrained, v *valuesRead, only func(Permission) bool, shared *runs,
 ) (Holding, map[Permission]bool, error) {
-	h := Holding{tenant: cs.on.Tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: map[string]bool{}}
 	if len(a.labels) == 0 {
-		return h, nil, nil
+		return a.holdingGiven(cs.on.Tenant, nil, map[string]bool{}), nil, nil
 	}
 	// Only those values and powers to release, so neither the constraints nor the conditions of
 	// the tenant's other permissions are asked about. Each is decided apart, on a budget of its own,
@@ -504,22 +503,27 @@ func (a *Authorizer) holdingFrom(ctx context.Context, q DB, s Subject, cs *const
 	if err != nil {
 		return Holding{}, nil, err
 	}
-	h.excluded = excluded
+	return a.holdingGiven(cs.on.Tenant, perms, excluded), byCondition, nil
+}
+
+// holdingGiven is the holding in a tenant of the label values and powers to release among perms,
+// as permissionsOf lists them on the tenant, but the values of the exclusive dimensions in excluded.
+func (a *Authorizer) holdingGiven(tenant string, perms []Permission, excluded map[string]bool) Holding {
+	h := Holding{tenant: tenant, dims: a.labels, values: map[string]map[string]bool{}, releases: map[string]bool{}, excluded: excluded}
 	for _, p := range perms {
 		t, v := p.parts()
 		switch {
+		case !a.labelPermission(p):
 		case v == releaseVerb:
 			h.releases[t] = true
-			continue
 		case h.excluded[t]:
-			continue
+		case h.values[t] == nil:
+			h.values[t] = map[string]bool{v: true}
+		default:
+			h.values[t][v] = true
 		}
-		if h.values[t] == nil {
-			h.values[t] = map[string]bool{}
-		}
-		h.values[t][v] = true
 	}
-	return h, byCondition, nil
+	return h
 }
 
 // evaluations is how many times a read of a subject's label values may evaluate each of
