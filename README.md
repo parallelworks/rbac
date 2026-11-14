@@ -538,7 +538,10 @@ they held a few rows, a list read 43,736 pages of grants and 4,502 of denies bes
   deciding a label value or a power to release reads the `resource`, was decided without them and
   now fails. So does one building a list or a map holding a double that isn't finite, as
   `has({"k": 0.0 / 0.0}.k)`, or a map naming a key twice, which keys a condition computes can do
-  only as it runs, as `{subject.id: 1, "admin": 2}` does for the subject `admin`; and where no
+  only as it runs, as `{subject.id: 1, "admin": 2}` does for the subject `admin`, or a map keyed
+  by bytes, as `{b"a": 1}`, which a condition naming the key as a literal now can't be stored with;
+  bytes looked up in a map, as `b"a" in {"a": 1}`, are found in none, where CEL hashed them and
+  failed the condition at its limit, so `dyn(b"a") in {"a": 1} || true` gave a grant nothing; and where no
   declarations cover a kind, so does every condition reading its attributes where one holds such a
   double, however deep: it read the others, and that one too, as `has()` and `size()` did. Going
   back to an earlier release of this package does the same where that release bounds a shape more,

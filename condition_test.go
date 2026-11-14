@@ -5834,3 +5834,53 @@ func TestActivateTriesTheCheapestRequirementFirst(t *testing.T) {
 		})
 	}
 }
+
+// CEL hashes a key to find it in a map, or to build one, and bytes, a slice, panic as one, which
+// reads as the condition failing at its limit: a grant's `dyn(b"a") in {"a": 1} || true` gave
+// nothing, and a deny's `dyn(b"a") in {"a": 1}` applied, where CEL finds no such key. Bytes are no
+// key, so `in` a map is false for them, a map built keyed by them fails, costing what it ran, and
+// a literal keying a map by them is refused.
+func TestBytesAreNoKey(t *testing.T) {
+	attributes := map[string]any{"by": []byte("a"), "m": map[string]any{"a": 1}}
+	for _, expr := range []string{
+		`dyn(b"a") in {"a": 1} || true`, `!(dyn(b"a") in {1: 1})`, `!(b"xyz" in request.attributes)`,
+		`!(request.attributes.by in request.attributes.m)`, `!(request.attributes.by in {"a": 1})`,
+		`!(dyn([1]) in {"a": 1})`, `dyn(b"a") in [b"a"]`,
+	} {
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); !held || !evaluated {
+			t.Errorf("%s: held %t, evaluated %t", expr, held, evaluated)
+		}
+	}
+	for _, expr := range []string{
+		`{dyn(b"a"): 1} == {"a": 1}`, `{"a": 1} != {request.attributes.by: 1}`, `size({dyn(b"a"): 1}) == 1`,
+	} {
+		if held, evaluated := rbac.EvaluateConditionOf(t, expr, nil, nil, attributes); evaluated {
+			t.Errorf("%s: held %t", expr, held)
+		}
+		if limit, actual := rbac.ConditionCost(t, expr, attributes); actual >= limit {
+			t.Errorf("%s cost %d, its limit %d, as if it panicked", expr, actual, limit)
+		}
+	}
+	if _, _, _, err := rbac.EvaluateCondition(t, `dyn({b"a": 1}) == {"a": 1}`, nil); err == nil {
+		t.Error(`{b"a": 1} was planned`)
+	}
+
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(c.Catalog[:len(c.Catalog):len(c.Catalog)], guardRole) })
+	expr := `dyn(b"a") in {"a": 1} || true`
+	given := grant(cluster.Scope(), "cluster.login", rbac.User, "u")
+	given.Condition = rbac.Condition{Expression: expr}
+	h.seed(t, given, grant(cluster.Scope(), "cluster.login", rbac.User, "d"), grant(cluster.Scope(), "guard", rbac.User, "guardian"))
+	ctx := t.Context()
+	if err := h.authz.SetDeny(ctx, h.as(t, "guardian"), cluster, rbac.Deny{
+		ID: "bytes", Principals: []rbac.Principal{identity("d")}, Permissions: []rbac.Permission{login},
+		Condition: rbac.Condition{Expression: `dyn(b"a") in {"a": 1}`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authz.Authorize(ctx, h.as(t, "u"), login, cluster); err != nil {
+		t.Errorf("a grant whose condition is %s gives nothing: %v", expr, err)
+	}
+	if err := h.authz.Authorize(ctx, h.as(t, "d"), login, cluster); err != nil {
+		t.Errorf(`a deny whose condition is dyn(b"a") in {"a": 1} applied: %v`, err)
+	}
+}

@@ -655,7 +655,11 @@ sequenceDiagram
   refused in part, as that is larger; finding it there would read the larger value whole. A map
   literal naming a key twice fails whatever it holds, as CEL builds it holding the value named last
   and drops the one before unread, so `{"a": subject.attributes, "a": 1}.a == 1` held where
-  `{"a": 1, "a": subject.attributes}.a == 1` failed. A double that isn't finite is kept out of
+  `{"a": 1, "a": subject.attributes}.a == 1` failed. Bytes are kept out of map keys: CEL's maps
+  hash a key to find it, and a slice panics as one, which CEL recovers as the condition failing at
+  its limit. So a map built with a bytes key fails as it is built (`comparableKey`), a literal key
+  of bytes is refused as the condition is planned (`keying`), and `in` finds bytes in no map
+  (`bounded`), as no map holds them. A double that isn't finite is kept out of
   lists and maps alike: a literal holding one fails as it is built, and an attribute holding one,
   however deep, which the converter counts (`infinite`), is an error that a declared kind refuses
   in part (`declared`), as a declared double that isn't finite is, and that makes a kind no

@@ -1167,6 +1167,12 @@ func (g *guards) bounded(i interpreter.Interpretable) (interpreter.Interpretable
 			if l, ok := y.(traits.Lister); ok {
 				return contains(l, x)
 			}
+			// CEL hashes the key to find it in a map it built, and bytes, a slice, panic as one,
+			// which CEL reads as the condition failing at its limit. No map holds such a key
+			// (comparableKey), so none is found, as CEL defines.
+			if _, keyed := y.(traits.Mapper); keyed && unhashable(x) {
+				return types.False
+			}
 			if c, ok := y.(traits.Container); ok {
 				return c.Contains(x)
 			}
@@ -1922,8 +1928,8 @@ func (*counting) Parent() interpreter.Activation { return nil }
 // literal of it does, by its length: the map hashes it whole, which CEL charges as 1 however long
 // it is, so a loop looking up a long string the host passes would take time growing with its
 // length, charged only for the steps. Each costs a tenth of its bytes more, as reading it does
-// (textSize), counted beside the steps (counting). A double that isn't finite, or attributes no
-// condition reads, fail as a key (comparableKey).
+// (textSize), counted beside the steps (counting). A double that isn't finite, attributes no
+// condition reads, or bytes, fail as a key (comparableKey).
 type keying struct {
 	// keys are the ids of the keys checked computes, and planned what CEL planned each as last,
 	// which is what it reads: it plans an index whose key isn't an attribute as an attribute under
@@ -1942,7 +1948,8 @@ func newKeying(env *cel.Env, checked *ast.AST, limit uint64) *keying {
 		fac: interpreter.NewAttributeFactory(env.Container, env.CELTypeAdapter(), env.CELTypeProvider()),
 	}
 	key := func(e ast.Expr) {
-		if computed(e) {
+		// A literal of bytes is planned too, so decorate refuses it.
+		if computed(e) || e.Kind() == ast.LiteralKind && e.AsLiteral().Type() == types.BytesType {
 			k.keys[e.ID()] = true
 		}
 	}
@@ -1988,6 +1995,9 @@ func (k *keying) decorate(i interpreter.InterpretableV2) (interpreter.Interpreta
 		// Another version of CEL may fold a key, as `0.0 / 0.0`, which comparableKey wouldn't see.
 		if nonFinite(i.Value()) {
 			return nil, errors.New("a key is a double that isn't finite")
+		}
+		if unhashable(i.Value()) {
+			return nil, errors.New("a key is bytes")
 		}
 	case interpreter.InterpretableAttribute:
 		planned = &keyedAttribute{InterpretableAttribute: i, k: k}
@@ -2236,7 +2246,20 @@ func comparableKey(key ref.Val) ref.Val {
 	if nonFinite(key) {
 		return types.WrapErr(errNonFiniteKey)
 	}
+	// Building the map would hash it, and bytes panic as one, which CEL reads as the condition
+	// failing at its limit.
+	if unhashable(key) {
+		return types.WrapErr(errBytesKey)
+	}
 	return key
+}
+
+var errBytesKey = errors.New("rbac: bytes can't be a key")
+
+// unhashable reports whether a Go map can't hash v, as bytes, a slice: CEL's own maps hash a key
+// to find it and panic.
+func unhashable(v ref.Val) bool {
+	return v != nil && !reflect.TypeOf(v).Comparable()
 }
 
 // keyedCall is a key CEL plans as a call, charged once it has run.
