@@ -739,10 +739,14 @@ sequenceDiagram
   and in the exponent, as strconv does, where 8.988_4656743115790396e307 took 29 µs charged 4. So
   charged, parsing took no more than about 110 ns a unit on either version over about 9,000
   random inputs to each, and 92 over 60,000 on Go 1.27. Built with Go 1.26, a number of 15 to 19
-  digits with a power of ten from -5 to 23 that its fast path can't round, as 2877421929889792e18,
-  falls back to a slower one and took up to 840 ns, charged 3 or 4: about 280 ns a unit, which is
-  left documented, as charging such numbers more would charge every float of 17 digits more on
-  either version. A condition's bound counts what parsing a literal `double()` converts
+  digits that its fast path (Eisel-Lemire) can't round falls back to a slower one: one exactly
+  halfway between two doubles, as 1776810790486016e20, or whose 128-bit product its own half-way
+  test rejects, as 1884579087778198e2. It took up to
+  1.3 µs, charged 2 to 4: 70,000 json.Number values took 74 ms for a charge of 140,013, about 530 ns
+  a unit, and a JSON text of them used a check's budget in 70 ms. That is left documented: telling
+  such numbers apart without parsing them means copying 1.26's test, which charged about a fifth of
+  ordinary floats more on Go 1.27 too, where the same numbers take 92 to 121 ns a unit. A
+  condition's bound counts what parsing a literal `double()` converts
   costs (`literalString`), and for any other string of 5 bytes or more, the shortest that can be
   out of range, as `1e308`, up to 1,070 (`parseBound`). So weighed, a unit
   took 20 to 145 ns to convert (160 to 230 for lists or JSON arrays 3,000 to 9,999 deep, each
@@ -1062,7 +1066,14 @@ sequenceDiagram
   resource, and of what the role gives where the grant reaches, as `Apply` walks it: on a resource,
   for that resource's type alone, a `<type>:grant` of another type being a permission like any
   other there, which only the constraints are asked about, as `mayDefine` decides holding it
-  (`handsOnAt`). Their answers are read back under the lock, where a scope it gives more on that
+  (`handsOnAt`). So widening a role granted on a resource of one type to give another of its
+  types' `:grant` needs only the power to change grants on that other type (`holdsRole`), but
+  `Apply` granting the role again on such a resource asks the actor to hold that permission for the
+  resource's type, as it asks of every permission, so it refuses an actor that holds it there only
+  through the power, not through a grant giving it there as the widened role itself does: an
+  accepted limit, failing closed, as the role can still be granted on a container or the tenant.
+  A holder of the widened role on the resource holds that permission there but changes no grants
+  with it, as nothing on a resource of one type is of another. Their answers are read back under the lock, where a scope it gives more on that
   they weren't asked about refuses it with `ErrConflict` (`handedOnStopped`, `handing`). Without
   `Config.ResourceOf`, a scope is asked about as stored where that is all of it (`resolves`), and
   otherwise of no resource, which stands for every such scope. A scope where a role listing it is
@@ -1245,7 +1256,10 @@ flowchart TB
   many or large, cost a label nothing. A check deciding a subject's values, as `Authorize` of a
   labeled resource, `Holding`, `Filter` and `Reachable` do, narrows its read so too, and `Holders`
   its one read of every identity's values, once for all of them, so each identity's decision walks
-  that read as it is (`narrowed`).
+  that read as it is (`narrowed`). `Reachable` and `Explain` narrow theirs before they read the
+  conditions of its grants (`valuesOn`), so they look up those of roles giving values alone: read
+  first, a group's grants of a role giving none on the tenant under a condition, 2,000 of them, cost
+  each 6,200 pages, against 220 with no condition.
 - **Releasing and writing.** `ReleasePermission(dimension)`, held on the tenant, is the power to
   release data to a looser label in that dimension, so only a holder of it can downgrade data. A
   `Holding`'s `MayWrite` and `MayRelease` say whether data read under one label may be written, or
