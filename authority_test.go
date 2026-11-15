@@ -7827,3 +7827,353 @@ func TestSearchesDecideCustomRolesGrantedToBroadPrincipalsWithoutPairingTheirPer
 		t.Errorf("searches passed %.0f rows with custom roles of one permission on one type, and %.0f with roles of 200 on 20", small, large)
 	}
 }
+
+// changeReads runs warm, then counts the pages of the grants, and the conditions, run reads, in
+// one transaction under plans, rolled back: warm has the session plan each statement as plans
+// says, a generic plan made on its first run, so what run reads is what each later change does.
+func changeReads(t *testing.T, h *harness, plans string, warm func(*rbac.Authorizer) error, run func(*rbac.Authorizer, pgx.Tx) error) (pages int64, conditions int) {
+	t.Helper()
+	ctx := t.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('plan_cache_mode', $1, true)`, plans); err != nil {
+		t.Fatal(err)
+	}
+	a := h.authz.WithTx(tx)
+	if err := warm(a); err != nil {
+		t.Fatal(err)
+	}
+	rbac.SetReadingConditions(t, func(n int) { conditions += n })
+	start := pagesRead(ctx, t, tx, "rbac_grants")
+	if err := run(a, tx); err != nil {
+		t.Fatal(err)
+	}
+	return pagesRead(ctx, t, tx, "rbac_grants") - start, conditions
+}
+
+// grantTo is a change granting cluster.login on the cluster to a user, under condition.
+func grantTo(id, condition string) rbac.Change {
+	return rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: rbac.Principal{Kind: rbac.User, ID: id}, Condition: rbac.Condition{Expression: condition}}}}
+}
+
+// A change reads the conditions of only the grants its decision reaches, as a check does those of
+// the roles giving what it checks: read whole, an actor holding 20,000 conditional grants of a role
+// giving nothing the change asked about, beside an unconditional one giving the power to change
+// grants, had each Apply look them all up twice, 121,000 pages, where Authorize read 600. Such an
+// actor may grant what it holds unconditionally, and one holding them alone may grant nothing.
+func TestAChangeReadsTheConditionsOfOnlyTheGrantsItDecidesBy(t *testing.T) {
+	const n = 2000
+	h := setup(t)
+	ctx := t.Context()
+	ann, carl := h.as(t, "ann"), h.as(t, "carl")
+	h.as(t, "bob")
+	h.as(t, "dan")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', 'cluster', 'c1', 'user', u, 'cluster.login', 'resource.id == "z' || i || '"'
+		FROM generate_series(1, $1) AS i, (VALUES ('ann'), ('carl')) AS p(u)`, n); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "ann"))
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	for _, plans := range []string{"force_custom_plan", "force_generic_plan"} {
+		pages, conditions := changeReads(t, h, plans,
+			func(a *rbac.Authorizer) error { return a.Apply(ctx, ann, cluster, grantTo("dan", "")) },
+			func(a *rbac.Authorizer, _ pgx.Tx) error { return a.Apply(ctx, ann, cluster, grantTo("bob", "")) })
+		if conditions != 0 || pages > n/4 {
+			t.Errorf("under %s, Apply read %d pages of grants and %d conditions", plans, pages, conditions)
+		}
+	}
+	if err := h.authz.Apply(ctx, carl, cluster, grantTo("bob", "")); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("Apply by an actor holding only conditional logins: %v", err)
+	}
+}
+
+// The tenant's members' conditional grants, which a host's import can store thousands of within
+// every bound, are every member's: a change by one reads none of their conditions where none
+// gives what it asks about, as read whole, each member's Apply looked them up twice.
+func TestAChangeReadsNoConditionOfTheMembersGrantsGivingNothingItAsks(t *testing.T) {
+	const n = 2000
+	h := setup(t)
+	ctx := t.Context()
+	owner := h.as(t, "owner")
+	h.as(t, "bob")
+	h.as(t, "dan")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', 'tenant', 't1', 'members', 't1', 'custom.viewer', 'resource.id == "z' || i || '"' FROM generate_series(1, $1) AS i`, n); err != nil {
+		t.Fatal(err)
+	}
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "owner"))
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	for _, plans := range []string{"force_custom_plan", "force_generic_plan"} {
+		pages, conditions := changeReads(t, h, plans,
+			func(a *rbac.Authorizer) error { return a.Apply(ctx, owner, cluster, grantTo("dan", "")) },
+			func(a *rbac.Authorizer, _ pgx.Tx) error { return a.Apply(ctx, owner, cluster, grantTo("bob", "")) })
+		if conditions != 0 || pages > n/4 {
+			t.Errorf("under %s, Apply read %d pages of grants and %d conditions", plans, pages, conditions)
+		}
+	}
+}
+
+// A change reads each condition it decides by once, before its transaction, not again under its
+// locks: a grant's condition never changes, as changing it stores a new grant. An actor whose power
+// to change grants is 2,000 conditional grants decides by all of them, and read them again in the
+// transaction, twice the pages Authorize of that power reads. Its grants decide as before: under
+// the condition one of them has, it may grant a role it holds under it, and under another, nothing.
+func TestAChangeReadsTheConditionsItDecidesByOnce(t *testing.T) {
+	const n = 2000
+	h := setup(t)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	h.as(t, "bob")
+	h.as(t, "dan")
+	held := `resource.id == "c1"`
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', 'cluster', 'c1', 'user', 'ann', 'cluster.admin', CASE WHEN i = 1 THEN $2 ELSE 'resource.id == "z' || i || '"' END
+		FROM generate_series(1, $1) AS i`, n, held); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	for _, plans := range []string{"force_custom_plan", "force_generic_plan"} {
+		var checked int64
+		pages, conditions := changeReads(t, h, plans,
+			func(a *rbac.Authorizer) error { return a.Apply(ctx, ann, cluster, grantTo("dan", held)) },
+			func(a *rbac.Authorizer, tx pgx.Tx) error {
+				start := pagesRead(ctx, t, tx, "rbac_grants")
+				if err := a.Authorize(ctx, ann, grantC, cluster); err != nil {
+					return err
+				}
+				checked = pagesRead(ctx, t, tx, "rbac_grants") - start
+				return a.Apply(ctx, ann, cluster, grantTo("bob", held))
+			})
+		applied := pages - checked
+		if conditions != 2*n || applied > checked*3/2 {
+			t.Errorf("under %s, Apply read %d pages of grants, Authorize %d, and the two %d conditions", plans, applied, checked, conditions)
+		}
+	}
+	if err := h.authz.Apply(ctx, ann, cluster, grantTo("bob", `resource.id == "c2"`)); !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("Apply under a condition none of the actor's grants allows the change by: %v", err)
+	}
+}
+
+// A change whose read of the conditions it decides by fails, as where its context is canceled once
+// the actor's grants are read, returns why: the actor holding its power only under a condition,
+// left giving nothing by the failed read, Apply refused the change as one the actor may not make,
+// which a host audits as a refusal, and Grantable listed nothing, as for an actor who may grant none.
+func TestAChangeWhoseConditionsCantBeReadReturnsWhy(t *testing.T) {
+	h := setup(t)
+	ann := h.as(t, "ann")
+	h.as(t, "bob")
+	onC1 := `resource.id == "c1"`
+	g := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+	g.Condition = rbac.Condition{Expression: onC1}
+	h.seed(t, g)
+	canceled := func() context.Context {
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+		rbac.SetReadingRoles(t, cancel)
+		return ctx
+	}
+	if err := h.authz.Apply(canceled(), ann, cluster, grantTo("bob", onC1)); !errors.Is(err, context.Canceled) {
+		t.Errorf("Apply: %v", err)
+	}
+	if roles, err := h.authz.Grantable(canceled(), ann, cluster); !errors.Is(err, context.Canceled) {
+		t.Errorf("Grantable: %v, %d roles", err, len(roles))
+	}
+	rbac.SetReadingRoles(t, func() {})
+	if err := h.authz.Apply(t.Context(), ann, cluster, grantTo("bob", onC1)); err != nil {
+		t.Errorf("Apply with its conditions read: %v", err)
+	}
+}
+
+// A change granting a role to many, each until its own time, under a condition the actor's power
+// is held by, decides it once beside unread conditional grants of a role giving nothing it asks
+// ending between theirs: each one's end standing in for it split the change into a decision for
+// each grant, each walking every role the role lists, seven times the time reading the conditions
+// took.
+func TestAChangeDecidesARoleOnceBesideUnreadGrantsEndingBetweenItsGrants(t *testing.T) {
+	const n = 16
+	h := setup(t)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+		SELECT 't1', 'custom.r' || i, '{cluster:grant,cluster:view,cluster:login}'::text[], '{cluster}'::text[],
+		  ARRAY(SELECT 'custom.r' || j FROM generate_series(1, 8) AS j)
+		FROM generate_series(1, 8) AS i
+		UNION ALL SELECT 't1', 'custom.big', '{cluster:grant,cluster:view}', '{cluster}', ARRAY(SELECT 'custom.r' || j FROM generate_series(1, 8) AS j)
+		UNION ALL SELECT 't1', 'custom.root', '{cluster:root}', '{cluster}', '{}'`); err != nil {
+		t.Fatal(err)
+	}
+	always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+	admin := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+	admin.Condition = always
+	grants := []rbac.Grant{admin}
+	for i := range n {
+		g := grant(cluster.Scope(), "custom.root", rbac.User, "ann")
+		g.Condition = rbac.Condition{Expression: fmt.Sprintf(`resource.id == "z%d"`, i)}
+		g.ExpiresAt = h.now.Add(time.Duration(10*i+5) * time.Minute)
+		grants = append(grants, g)
+	}
+	h.seed(t, grants...)
+	change := func(ids ...string) rbac.Change {
+		var c rbac.Change
+		for k, id := range ids {
+			h.as(t, id)
+			end := h.now.Add(time.Duration(10*k+1) * time.Minute)
+			c.Grant = append(c.Grant, rbac.Binding{Role: "custom.big", Principal: identity(id), Condition: always, ExpiresAt: end})
+		}
+		return c
+	}
+	var ids []string
+	for k := range n {
+		ids = append(ids, fmt.Sprintf("u%d", k))
+	}
+	one, many := change("v"), change(ids...)
+	checks := 0
+	rbac.SetCheckingRole(t, func() { checks++ })
+	if err := h.authz.Apply(ctx, ann, cluster, one); err != nil {
+		t.Fatal(err)
+	}
+	once := checks
+	checks = 0
+	if err := h.authz.Apply(ctx, ann, cluster, many); err != nil {
+		t.Fatal(err)
+	}
+	if checks != once {
+		t.Errorf("granting %d, each until its own time, checked %d roles, where granting one checked %d", n, checks, once)
+	}
+}
+
+// A change granting a role to many, each until a time before the one before it, beside unread
+// grants of a role giving what it asks ending between theirs, reads their conditions in as many
+// statements as granting one does.
+func TestAChangeReadsTheConditionsOfGrantsEndingBetweenItsGrantsAtOnce(t *testing.T) {
+	const n = 16
+	h := setup(t)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.view', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+	admin := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+	admin.Condition = always
+	grants := []rbac.Grant{admin}
+	for i := range n {
+		g := grant(cluster.Scope(), "custom.view", rbac.User, "ann")
+		g.Condition = rbac.Condition{Expression: fmt.Sprintf(`resource.id == "z%d"`, i)}
+		g.ExpiresAt = h.now.Add(time.Duration(10*i+5) * time.Minute)
+		grants = append(grants, g)
+	}
+	h.seed(t, grants...)
+	change := func(ids ...string) rbac.Change {
+		var c rbac.Change
+		for k, id := range ids {
+			h.as(t, id)
+			end := h.now.Add(time.Duration(10*(len(ids)-k)+1) * time.Minute)
+			c.Grant = append(c.Grant, rbac.Binding{Role: "cluster.login", Principal: identity(id), Condition: always, ExpiresAt: end})
+		}
+		return c
+	}
+	var ids []string
+	for k := range n {
+		ids = append(ids, fmt.Sprintf("u%d", k))
+	}
+	reads := func(c rbac.Change) int {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		counting := countingPages(t, tx)
+		if err := h.authz.WithTx(counting).Apply(ctx, ann, cluster, c); err != nil {
+			t.Fatal(err)
+		}
+		read := 0
+		for _, sql := range counting.sqls {
+			if strings.HasPrefix(sql, "SELECT g.condition") {
+				read++
+			}
+		}
+		return read
+	}
+	if one, many := reads(change("v")), reads(change(ids...)); many != one {
+		t.Errorf("granting %d, each until a time before the one before it, read conditions in %d statements, where granting one read them in %d", n, many, one)
+	}
+}
+
+// Every change deciding by the actor's conditions returns the error of a read of them that failed,
+// as Apply does, not a refusal OnRefused is told of: where the actor holds the power only through
+// them, deleting roles, setting denies and managing groups and their members; and where it has
+// power of its own besides, a change needing what they give, and Grantable.
+func TestEveryChangeWhoseConditionsCantBeReadReturnsWhy(t *testing.T) {
+	always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+	guard := rbac.RoleDefinition{ID: "cluster.guard", Permissions: []rbac.Permission{rbac.DenyPermission("cluster")}, ResourceTypes: []string{"cluster"}}
+	granter := rbac.RoleDefinition{ID: "cluster.granter", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	var refused []rbac.Refusal
+	h := grouped(t, func(c *rbac.Config) {
+		c.Catalog = append(slices.Clone(c.Catalog), guard, granter)
+		c.OnRefused = func(_ context.Context, r rbac.Refusal) { refused = append(refused, r) }
+	})
+	ctx := t.Context()
+	under := func(g rbac.Grant) rbac.Grant { g.Condition = always; return g }
+	tenant := rbac.TenantRoot("t1")
+	h.seed(t, under(grant(tenant, "tenant.roles", rbac.User, "ann")), under(grant(cluster.Scope(), "cluster.guard", rbac.User, "ann")),
+		under(grant(tenant, "tenant.groups", rbac.User, "ann")), under(grant(tenant, "group.members", rbac.User, "ann")),
+		grant(cluster.Scope(), "cluster.granter", rbac.User, "pat"), under(grant(cluster.Scope(), "cluster.admin", rbac.User, "pat")))
+	ann, pat := h.as(t, "ann"), h.as(t, "pat")
+	h.join(t, "u")
+	if err := h.authz.ImportGroups(ctx, host, "t1", []rbac.GroupDefinition{{ID: "devs"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.x', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	sudo := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.sudo", Principal: identity("u"), Condition: always}}}
+	changes := []struct {
+		name string
+		f    func(context.Context) error
+	}{
+		{"DeleteRole", func(ctx context.Context) error { return h.authz.DeleteRole(ctx, ann, "t1", "custom.x") }},
+		{"SetDeny", func(ctx context.Context) error {
+			return h.authz.SetDeny(ctx, ann, cluster, rbac.Deny{ID: "d1", Principals: []rbac.Principal{identity("u")}, Permissions: []rbac.Permission{root}})
+		}},
+		{"SetGroup", func(ctx context.Context) error {
+			return h.authz.SetGroup(ctx, ann, "t1", rbac.GroupDefinition{ID: "devs", Name: "renamed"})
+		}},
+		{"ChangeMembers", func(ctx context.Context) error {
+			return h.authz.ChangeMembers(ctx, ann, "t1", []rbac.Member{{Group: "devs", Principal: identity("u")}}, nil)
+		}},
+		{"Apply by power of its own", func(ctx context.Context) error { return h.authz.Apply(ctx, pat, cluster, sudo) }},
+		{"Grantable by power of its own", func(ctx context.Context) error {
+			_, err := h.authz.Grantable(ctx, pat, cluster)
+			return err
+		}},
+	}
+	for _, c := range changes {
+		canceled, cancel := context.WithCancel(ctx)
+		rbac.SetReadingRoles(t, cancel)
+		refused = nil
+		if err := c.f(canceled); !errors.Is(err, context.Canceled) || len(refused) > 0 {
+			t.Errorf("%s: %v, refusals told %v", c.name, err, refused)
+		}
+		cancel()
+	}
+	rbac.SetReadingRoles(t, func() {})
+	for _, c := range changes {
+		if err := c.f(ctx); err != nil {
+			t.Errorf("%s with its conditions read: %v", c.name, err)
+		}
+	}
+}

@@ -1898,7 +1898,7 @@ func (a *Authorizer) mayDefine(ctx context.Context, q DB, actor Subject, root Re
 	}
 	au.constrained = cs
 	if !au.may(DefineRoles, TenantScope) {
-		return authority{}, roleRead{}, &DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}
+		return authority{}, roleRead{}, cmp.Or(au.reads.failed(), error(&DeniedError{Permission: DefineRoles, Scope: scope, Reason: "the actor may not define roles here"}))
 	}
 	if r == nil {
 		return au, read, nil
