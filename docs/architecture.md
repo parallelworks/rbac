@@ -418,8 +418,9 @@ flowchart BT
   actor's power to make it; only the host is asked about each member's, which `MaxBindings` bounds
   for `ChangeMembers` but for what one place alone gains. A member is its principal: what all the
   groups, and places in one, a change gives it reach is counted, and asked about, once for each end
-  its places give it (`gainsWithin`, `askMemberships`), so a group two of them are in counts once,
-  as does a group it is placed in from two sources until one end; past `MaxBindings`, a change
+  it is gained until, the sooner of its own end and a place's (`gainsWithin`, `askMemberships`), so
+  a group two of them are in counts once, as does a group it is placed in from two sources until
+  one end, or until two ends after what it holds ends; past `MaxBindings`, a change
   gains no more than its largest place alone does, so joining several groups never multiplies what
   one change asks, nor what it builds: the grants it checks and the footprint `stillReached`
   compares are found from what each principal gains (`gained`), and from the groups holding it,

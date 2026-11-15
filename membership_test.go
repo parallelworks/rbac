@@ -6601,6 +6601,51 @@ func TestAMemberAddedToSeveralGroupsIsOneMember(t *testing.T) {
 	}
 }
 
+// A member gains what its groups hold until the sooner of each grant's end and its place's, and
+// the host is asked about each grant once for each end it is gained until, so that is what a
+// change is counted as gaining, and builds: two places ending after the grants their groups hold
+// count, and find, each once, as it is asked about once, but two ending before them count, and are
+// asked about, twice.
+func TestAMemberGainsAGrantOnceForEachEndItIsGainedUntil(t *testing.T) {
+	var validated, found int
+	rbac.SetFindingGains(t, func(n int) { found = max(found, n) })
+	h := grouped(t, func(c *rbac.Config) {
+		validate := c.ValidateGrant
+		c.ValidateGrant = func(ctx context.Context, q rbac.DB, in rbac.GrantInput) error {
+			if in.Via == rbac.ViaMembership {
+				validated++
+			}
+			return validate(ctx, q, in)
+		}
+	})
+	ctx := t.Context()
+	h.groups(t, "g1", "top")
+	if err := h.authz.ImportMembers(ctx, host, "t1", []rbac.Member{{Group: "top", Principal: groupOf("g1")}}); err != nil {
+		t.Fatal(err)
+	}
+	// top holds a role on each of n clusters until end, which the manager may grant there.
+	const grants = 600
+	end := time.Now().Add(24 * time.Hour).Truncate(time.Second).UTC()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, expires_at)
+		SELECT 't1', 'cluster', 'top' || i, p, id, r, CASE WHEN p = 'group' THEN $2::timestamptz END FROM generate_series(1, $1::int) i,
+		  (VALUES ('group', 'top', 'cluster.login'), ('user', 'manager', 'cluster.admin')) AS g(p, id, r)`, grants, end); err != nil {
+		t.Fatal(err)
+	}
+	h.join(t, "ann", "bob")
+	manager := h.as(t, "manager")
+	later := []rbac.Member{{Group: "g1", Principal: identity("ann"), ExpiresAt: end.Add(time.Hour)}, {Group: "top", Principal: identity("ann"), ExpiresAt: end.Add(2 * time.Hour)}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", later, nil); err != nil || validated != grants || found != grants {
+		t.Fatalf("one member added to a group and the one it is in until two ends after the %d grants it gains: %v, Config.ValidateGrant asked %d times, %d found",
+			grants, err, validated, found)
+	}
+	validated = 0
+	sooner := []rbac.Member{{Group: "g1", Principal: identity("bob"), ExpiresAt: end.Add(-2 * time.Hour)}, {Group: "top", Principal: identity("bob"), ExpiresAt: end.Add(-time.Hour)}}
+	if err := h.authz.ChangeMembers(ctx, manager, "t1", sooner, nil); !errors.Is(err, rbac.ErrInvalid) || validated != 0 {
+		t.Errorf("one member added to a group and the one it is in until two ends before the %d grants it gains: %v, Config.ValidateGrant asked %d times",
+			grants, err, validated)
+	}
+}
+
 // A principal joining many groups that are all in one gains what that one holds once, so a change
 // gaining more than MaxBindings through it is no more than one place in it alone: what it builds,
 // and asks the host about, is that, not that for each group it joins, so it allocates about as
