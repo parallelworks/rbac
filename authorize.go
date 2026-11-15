@@ -2405,15 +2405,20 @@ func (a *Authorizer) conditionsSQL() string {
 }
 
 // conditionsOf reads the conditions of the conditional grants among held not read already, in
-// place.
+// place, those the call under way read before taken from it (Authorizer.conditions).
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
 	var ids, principals, scopes []string
-	for _, h := range held {
-		if h.conditional && h.Condition.Expression == "" {
-			ids = append(ids, h.ID)
-			principals = append(principals, h.Principal.key())
-			scopes = append(scopes, h.scope)
+	for i, h := range held {
+		if !h.conditional || h.Condition.Expression != "" {
+			continue
 		}
+		if expr, ok := a.conditions[h.ID]; ok {
+			held[i].Condition.Expression = expr
+			continue
+		}
+		ids = append(ids, h.ID)
+		principals = append(principals, h.Principal.key())
+		scopes = append(scopes, h.scope)
 	}
 	if len(ids) == 0 {
 		return nil
@@ -2429,6 +2434,9 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 		readingConditions(1)
 		for _, id := range of {
 			found[id] = expr
+			if a.conditions != nil {
+				a.conditions[id] = expr
+			}
 		}
 		return nil
 	})
