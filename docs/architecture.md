@@ -970,8 +970,10 @@ sequenceDiagram
   condition, the unread grants of roles giving what deciding it can ask about that end at or after
   it are read first (`decidedAs`): standing in unread by their ends, 64 grants of a role giving
   nothing asked, ending between those of a change's 64 grants, split it into 64 decisions, each
-  walking every role the role granted lists. A read that fails leaves the
-  grants it was for met by nothing, and the change, or `Grantable`, returns its error.
+  walking every role the role granted lists. Those are read for all of a change's grants at once,
+  of each role until the soonest it is granted until: read for each grant in turn, a change whose
+  grants each end before the one before it read them in a statement for each. A read that fails
+  leaves the grants it was for met by nothing, and the change, or `Grantable`, returns its error.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.

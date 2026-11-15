@@ -1836,28 +1836,12 @@ func (h holding) lasts(until time.Time) bool {
 // giving nothing it asked, ending between theirs, into 64 decisions, each walking every role the
 // role lists: seven times the time reading their conditions took.
 func (au authority) decidedAs(def RoleDefinition, condition string, until time.Time) (string, time.Time) {
-	if condition != "" && !slices.ContainsFunc(au.held, func(g holding) bool {
-		return g.conditional && (g.Condition.Expression == condition || g.Condition.Expression == "")
-	}) {
-		condition = ""
-	}
+	condition = au.kept(condition)
 	if until.IsZero() {
 		return condition, time.Time{}
 	}
 	if condition != "" {
-		asks, gives := au.asking(def), map[Role]bool{}
-		au.read(func(g holding) bool {
-			if g.ends.IsZero() || g.ends.Before(until) {
-				return false
-			}
-			given, ok := gives[g.Role]
-			if !ok {
-				r, known := au.roles.role(g.Role)
-				given = known && slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[p] })
-				gives[g.Role] = given
-			}
-			return given
-		})
+		au.readEnding([]ending{{def, until}})
 	}
 	// Kept until a read finds more of the grants.
 	k := kindsKey{condition: condition, reads: au.reads.count()}
@@ -1880,6 +1864,62 @@ func (au authority) decidedAs(def RoleDefinition, condition string, until time.T
 		}
 	}
 	return condition, at.UTC()
+}
+
+// kept is the condition a grant made under condition is decided under (decidedAs): it, or none
+// where none of the actor's conditional grants has it, nor is unread.
+func (au authority) kept(condition string) string {
+	if condition != "" && !slices.ContainsFunc(au.held, func(g holding) bool {
+		return g.conditional && (g.Condition.Expression == condition || g.Condition.Expression == "")
+	}) {
+		return ""
+	}
+	return condition
+}
+
+// ending is a grant of def made under a kept condition until until, as decidedAs reads for it.
+type ending struct {
+	def   RoleDefinition
+	until time.Time
+}
+
+// readEnding reads, in one statement, the unread conditional grants that deciding each of ends can
+// tell apart by their ends (decidedAs): those of roles giving what deciding a grant of its def can
+// ask about (asking) that end at or after its until.
+func (au authority) readEnding(ends []ending) {
+	if len(ends) == 0 {
+		return
+	}
+	asks := make([]map[Permission]bool, len(ends))
+	for i, e := range ends {
+		asks[i] = au.asking(e.def)
+	}
+	type roleFor struct {
+		held Role
+		i    int
+	}
+	gives := map[roleFor]bool{}
+	au.read(func(g holding) bool {
+		if g.ends.IsZero() {
+			return false
+		}
+		for i, e := range ends {
+			if g.ends.Before(e.until) {
+				continue
+			}
+			k := roleFor{g.Role, i}
+			given, ok := gives[k]
+			if !ok {
+				r, known := au.roles.role(g.Role)
+				given = known && slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[i][p] })
+				gives[k] = given
+			}
+			if given {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // kindsKey is what kindsLasting is asked, a condition, as of how many reads of conditions were made.
@@ -2178,6 +2218,25 @@ func (a *Authorizer) grantsDecided(au authority, pw power, scopeType string, gra
 	if proven == nil {
 		proven = newChecked()
 	}
+	// What decidedAs reads for each grant is read for all first, in one statement, for each role
+	// until the soonest end it is granted until: read for each in turn, a change granting a role to
+	// 64, each until a time before the one before it, beside grants of a role giving what it asked
+	// ending between theirs, read their conditions in 64 statements and took 70% longer than in one.
+	soonest := map[Role]int{}
+	var ends []ending
+	for _, b := range grants {
+		def, known := au.roles.role(b.Role)
+		if !known || !a.grantableOn(def, scopeType) || b.ExpiresAt.IsZero() || au.kept(b.Condition.Expression) == "" {
+			continue
+		}
+		if i, ok := soonest[b.Role]; !ok {
+			soonest[b.Role] = len(ends)
+			ends = append(ends, ending{def, b.ExpiresAt})
+		} else if b.ExpiresAt.Before(ends[i].until) {
+			ends[i].until = b.ExpiresAt
+		}
+	}
+	au.readEnding(ends)
 	for i, b := range grants {
 		decided[i].ok = true
 		def, known := au.roles.role(b.Role)

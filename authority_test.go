@@ -8055,6 +8055,64 @@ func TestAChangeDecidesARoleOnceBesideUnreadGrantsEndingBetweenItsGrants(t *test
 	}
 }
 
+// A change granting a role to many, each until a time before the one before it, beside unread
+// grants of a role giving what it asks ending between theirs, reads their conditions in as many
+// statements as granting one does.
+func TestAChangeReadsTheConditionsOfGrantsEndingBetweenItsGrantsAtOnce(t *testing.T) {
+	const n = 16
+	h := setup(t)
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.view', '{cluster:view}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+	admin := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+	admin.Condition = always
+	grants := []rbac.Grant{admin}
+	for i := range n {
+		g := grant(cluster.Scope(), "custom.view", rbac.User, "ann")
+		g.Condition = rbac.Condition{Expression: fmt.Sprintf(`resource.id == "z%d"`, i)}
+		g.ExpiresAt = h.now.Add(time.Duration(10*i+5) * time.Minute)
+		grants = append(grants, g)
+	}
+	h.seed(t, grants...)
+	change := func(ids ...string) rbac.Change {
+		var c rbac.Change
+		for k, id := range ids {
+			h.as(t, id)
+			end := h.now.Add(time.Duration(10*(len(ids)-k)+1) * time.Minute)
+			c.Grant = append(c.Grant, rbac.Binding{Role: "cluster.login", Principal: identity(id), Condition: always, ExpiresAt: end})
+		}
+		return c
+	}
+	var ids []string
+	for k := range n {
+		ids = append(ids, fmt.Sprintf("u%d", k))
+	}
+	reads := func(c rbac.Change) int {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		counting := countingPages(t, tx)
+		if err := h.authz.WithTx(counting).Apply(ctx, ann, cluster, c); err != nil {
+			t.Fatal(err)
+		}
+		read := 0
+		for _, sql := range counting.sqls {
+			if strings.HasPrefix(sql, "SELECT g.condition") {
+				read++
+			}
+		}
+		return read
+	}
+	if one, many := reads(change("v")), reads(change(ids...)); many != one {
+		t.Errorf("granting %d, each until a time before the one before it, read conditions in %d statements, where granting one read them in %d", n, many, one)
+	}
+}
+
 // Every change deciding by the actor's conditions returns the error of a read of them that failed,
 // as Apply does, not a refusal OnRefused is told of: where the actor holds the power only through
 // them, deleting roles, setting denies and managing groups and their members; and where it has
