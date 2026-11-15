@@ -5654,6 +5654,67 @@ func TestSearchesReadOnlyTheCustomGrantsOfRolesGivingThePermission(t *testing.T)
 	}
 }
 
+// Filter and Reachable step through a few of the custom roles a key holds at most, to find those
+// giving the permission, and only where its grants of custom roles on a type name few, under a
+// generic plan and one for their arguments: stepping through each, a seek each, whatever it gave and
+// wherever it was granted, the members' grants of 300 custom roles giving nothing, one on each of 300
+// clusters, cost a member's Reachable 1,900 pages where by the scope it read 210, and beside their
+// 100 grants of a custom viewer on clusters, each of 1,000 roles granted on another type cost a seek.
+func TestSearchesStepThroughFewOfTheCustomRolesAKeyHolds(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		for _, other := range []struct{ what, kind, id string }{
+			{"the members'", "members", "t1"},
+			{"its own", "user", "m"},
+		} {
+			t.Run(plan+"/"+other.what, func(t *testing.T) {
+				// read is the pages each search reads beside grants of roles custom roles, one on each of as
+				// many clusters, or with elsewhere, on as many buckets, beside 100 of a viewer on clusters.
+				read := func(roles int, elsewhere bool) map[string]int64 {
+					t.Helper()
+					h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+					unvacuumed(t, h, "rbac_grants")
+					filled(t, h)
+					ctx := t.Context()
+					c0 := hostTable(t, h)[0]
+					m := h.as(t, "m", "g")
+					h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+					grants := `WITH r AS (INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+						SELECT 't1', 'custom.r' || i, '{cluster:view}', '{cluster}' FROM generate_series(1, $1::int) i RETURNING id)
+						INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+						SELECT 't1', 'cluster', 'k' || i, $2, $3, 'custom.r' || i, '' FROM generate_series(1, $1::int) i`
+					if elsewhere {
+						grants = `WITH r AS (INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+							VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}') RETURNING id)
+							INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+							SELECT 't1', 'bucket', 'b' || i, $2, $3, 'custom.r' || i, '' FROM generate_series(1, $1::int) i
+							UNION ALL SELECT 't1', 'cluster', 'k' || i, $2, $3, 'custom.viewer', '' FROM generate_series(1, 100) i`
+					}
+					if _, err := h.pool.Exec(ctx, grants, roles, other.kind, other.id); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+						t.Fatal(err)
+					}
+					return searchPages(ctx, t, h, plan, loginSearches(ctx, m))
+				}
+				few := read(100, true)
+				for what, many := range read(1000, true) {
+					if many > few[what]*3/2+deeper {
+						t.Errorf("%s read %d pages beside grants of 100 custom roles elsewhere that are %s, and %d beside 1000", what, few[what], other.what, many)
+					}
+				}
+				stepped := read(300, false)
+				rbac.SetHeldByScope(t, 1<<30)
+				for what, scoped := range read(300, false) {
+					if stepped[what] > scoped*3/2+deeper {
+						t.Errorf("%s read %d pages beside grants of 300 custom roles that are %s, and %d by the scope", what, stepped[what], other.what, scoped)
+					}
+				}
+			})
+		}
+	}
+}
+
 // Filter and Reachable read a subject's groups' grants of a type by the scope while each holds
 // fewer than a few for each role giving the permission, under a generic plan and one for their
 // arguments: past 64 they sought each role giving it, so beside a catalog of 1,000 such roles, 20

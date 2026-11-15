@@ -286,10 +286,9 @@ erDiagram
   principal and scope, and reads only those its subject counts: the anonymous and a guest read none
   of the members', and a search of a permission no public role gives none of the public's, so their
   grants of built-in roles on thousands of resources cost it nothing. It reads a key's grants on a
-  type's scopes by the scope, of any role, up to 64 of them (`heldByScope`), or 4 for each role
-  giving the permission (`heldPerRole`) where that is more, and a key holding that many there,
-  those of each role giving the permission alone, built-in or the tenant's custom ones, by
-  `rbac_grants_principal_role`
+  type's scopes by the scope, of any role, up to 64 of them (`heldByScope`), or 4 for each built-in
+  role giving the permission (`heldPerRole`) where that is more, and a key holding that many there,
+  those of each built-in role giving the permission alone, by `rbac_grants_principal_role`
   (0034), which leads to the role before the scope: sought by the scope and tested for the role
   after, every grant of a key on the type's scopes, of a viewer on thousands of resources to the
   members, the public, the subject or its group, cost a page or more, and tested as `= ANY` of the
@@ -298,15 +297,20 @@ erDiagram
   the permission: beside 40 such roles, a subject in 200 groups read 72,000 pages where by the
   scope it read 3,300, and the bound alone, 64, left a catalog of 1,000 roles giving it costing 20
   groups holding 100 grants each 60,000 pages where by the scope they read 700: so the bound grows
-  with the roles giving the permission. The custom roles it seeks are those giving the permission on
-  the type among those the key holds, found by stepping from one role of the key to the next in
-  `rbac_grants_principal_role`, a seek each, and looked up by key, and only for a key past 64: read
-  by the tenant, a plan made while the tables were small read every custom role of it. A key's
-  every grant of a custom role, as a tenant's viewer's to the members on 20,000
-  clusters, read whatever the role gave, cost a member's `Reachable` 8,900 pages, as did deciding
-  which custom roles the members' grants name (`broadOn`), which past 64 tests each giving custom
-  role alike. Each key is read one way, once: both ways count what the first read, held apart
-  (`few`, and `more` up to the grown bound). As of a time it reads every grant of a key on the
+  with the built-in roles giving the permission. Such a key's grants of custom roles on the type it
+  reads apart: by the scope up to 64 of them, and past that, where those 64 name 16 roles or fewer,
+  those of each custom role giving the permission there that the key holds, found by stepping from
+  one custom role of the key to the next in `rbac_grants_principal_role`, a seek each, and looked up
+  by key, while it holds 4 grants there for each, and by the scope below that. A key holding more than 16 custom roles, or whose 64 name
+  more, it reads by the scope, as before: each step costs about what reading a few grants does,
+  whatever the role gives or wherever it is granted, so stepping through the members' grants of 300
+  custom roles, one on each of 300 clusters, cost a member's `Reachable` 1,900 pages where by the
+  scope it read 210, and read by the tenant, a plan made while the tables were small read every
+  custom role of it. A key's every grant of a custom role, as a tenant's viewer's to the members on
+  20,000 clusters, read whatever the role gave, cost a member's `Reachable` 8,900 pages, as did
+  deciding which custom roles the members' grants name (`broadOn`), which tests each giving custom
+  role alike. Each key is read one way, once: both ways count what the first read, held
+  apart (`few`, and `more` up to the grown bound). As of a time it reads every grant of a key on the
   type by the scope, of any role, as before 0034. A key's conditional grants of a
   role giving the permission it still reads, from that index alone, though `Filter` counts none:
   holding whether a grant is conditional before the scope, the index was costed as the scope's by a
