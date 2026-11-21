@@ -10,7 +10,7 @@ godebug fips140=only
 
 require (
 	cel.dev/cel-go v0.33.2
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	google.golang.org/protobuf v1.36.12
 )
 
