@@ -256,9 +256,10 @@ func scannedRoles() int {
 // the tenant $1 to the principal whose key is the SQL it is given there, on is the array $4
 // (Authorizer.broadOn, Authorizer.broadAt). They are decided as Authorizer.current reads them, as
 // checks read them; pairing each one's permissions and types with the catalog's in SQL took a
-// search seconds.
+// search seconds. Where few isn't nil, it reads first by few, SQL as grants up to a bound, and a
+// NULL role for a principal holding more, and only then by grants (pastNone).
 func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
-	grants func(principal string) string, on, keys []string, identity string, now time.Time,
+	grants, few func(principal string) string, on, keys []string, identity string, now time.Time,
 ) ([]any, error) {
 	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
 	// A grant to either never gives a permission to change access, so no search counts one for it.
@@ -279,16 +280,26 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	// keys at once, a generic plan read the grants by the custom roles' index on the tenant alone,
 	// every grant of one in the tenant for each scope or type; and as of a time, roles tested
 	// against the ids rather than read by them are each read at its newest version.
-	rows, err := a.queryIndexed(ctx, q, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest(`+in+`) AS b(k)
-		CROSS JOIN LATERAL (`+grants("b.k")+`) g`), "rbac_roles", "id", roleColumns,
-		"tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")+`) r
-		ORDER BY id`, args...)
+	named := func(grants string) string {
+		return byKey(namedCustom(grants), "rbac_roles", "id", roleColumns, "tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")
+	}
+	from := `SELECT g.role FROM unnest(` + in + `) AS b(k) CROSS JOIN LATERAL (`
+	sql := `SELECT ` + roleColumns + ` FROM (` + named(from+grants("b.k")+`) g`) + `) r ORDER BY id`
+	if few != nil {
+		// A principal holding more than few reads is told by a row of no id, which no role has.
+		sql = `WITH held AS MATERIALIZED (` + from + few("b.k") + `) g) SELECT ` + roleColumns + ` FROM (` + named("SELECT role FROM held") + `) r
+			WHERE NOT EXISTS (SELECT FROM held WHERE role IS NULL) UNION ALL SELECT '', '', '', '{}', '{}', false, false, '{}' WHERE EXISTS (SELECT FROM held WHERE role IS NULL) ORDER BY id`
+	}
+	rows, err := a.queryIndexed(ctx, q, sql, args...)
 	if err != nil {
 		return nil, err
 	}
 	defs, err := collectRoles(rows)
 	if err != nil {
 		return nil, err
+	}
+	if few != nil && len(defs) > 0 && defs[0].ID == "" {
+		return a.broadArgs(ctx, q, tenant, p, resourceType, roles, custom, grants, nil, on, keys, identity, now)
 	}
 	var public, unprivilegedCustom []string
 	for _, r := range a.current(defs) {

@@ -5715,6 +5715,38 @@ func TestSearchesStepThroughFewOfTheCustomRolesAKeyHolds(t *testing.T) {
 	}
 }
 
+// Filter, Reachable and a host's query of Filter's condition plan, for a subject whose keys hold few
+// grants on the type, none of the reads of a key holding many there: planning each read of
+// rbac_grants costs about 0.15ms, and reads the metapage of each of its partial indexes that is
+// empty, which a plan for their arguments does on each call. Planned with them, a subject's
+// Reachable took 4.2ms where without them it takes 2.7, and with those indexes empty read 63 pages
+// more than with them filled, its Filter 103 and the query 173, where without them 18, 23 and 48.
+func TestSearchesPlanNoReadPastTheBoundForAKeyHoldingFew(t *testing.T) {
+	read := func(fill bool) map[string]int64 {
+		t.Helper()
+		h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"))
+		unvacuumed(t, h, "rbac_grants")
+		if fill {
+			filled(t, h)
+		}
+		ctx := t.Context()
+		c0 := hostTable(t, h)[0]
+		m := h.as(t, "m", "g0", "g1", "g2", "g3", "g4")
+		h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+			t.Fatal(err)
+		}
+		return searchPages(ctx, t, h, "force_custom_plan", loginSearches(ctx, m))
+	}
+	full := read(true)
+	planned := map[string]int64{"Reachable": 25, "Filter": 35, "a query of Filter's condition": 65}
+	for what, empty := range read(false) {
+		if empty-full[what] > planned[what] {
+			t.Errorf("%s read %d pages with rbac_grants' partial indexes empty, %d more than with them filled", what, empty, empty-full[what])
+		}
+	}
+}
+
 // Filter and Reachable read a subject's groups' grants of a type by the scope while each holds
 // fewer than a few for each role giving the permission, under a generic plan and one for their
 // arguments: past 64 they sought each role giving it, so beside a catalog of 1,000 such roles, 20

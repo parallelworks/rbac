@@ -310,7 +310,16 @@ erDiagram
   20,000 clusters, read whatever the role gave, cost a member's `Reachable` 8,900 pages, as did
   deciding which custom roles the members' grants name (`broadOn`), which tests each giving custom
   role alike. Each key is read one way, once: both ways count what the first read, held
-  apart (`few`, and `more` up to the grown bound). As of a time it reads every grant of a key on the
+  apart (`few`, and `more` up to the grown bound). Yet a search plans none of that for a subject
+  whose keys hold fewer: each statement reads every key's grants on the type by the scope up to the
+  bound, and a row of NULLs in place of a key holding more (`pastNone`), and only where it finds one
+  is it run again as above. Planning each read of `rbac_grants` costs about 0.15ms, as a plan for
+  the arguments, which each call makes, also reads the metapage of each of its empty partial indexes:
+  planned whole, an ordinary subject's `Reachable` took 4.2ms and its `Filter` 5.5ms, where they take
+  2.7 and 2.8. `Filter`'s condition, which the host's query can't run again, reads past the bound as
+  it did before searches stepped through custom roles, those of built-in roles a role at a time and
+  every one of a custom role by the scope (`pastCustomByScope`), unless the count `Filter` reads
+  first finds a key there. As of a time it reads every grant of a key on the
   type by the scope, of any role, as before 0034. A key's conditional grants of a
   role giving the permission it still reads, from that index alone, though `Filter` counts none:
   holding whether a grant is conditional before the scope, the index was costed as the scope's by a

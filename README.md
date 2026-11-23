@@ -1661,7 +1661,9 @@ the package's uses foreign data, so none of the roles needs any.
   17,900, against 160 and 380 now. A key holding fewer they read by the scope, as before, so beside
   a catalog of 1,000 roles giving the permission, a subject in 20 groups holding 100 grants each
   reads 700 pages, not the 60,000 a seek for each role cost. As of a time they read by the scope,
-  every grant of the keys on the type, of any role, as before it. Building it keeps every write to
+  every grant of the keys on the type, of any role, as before it. A subject whose keys hold fewer
+  is searched by statements reading no more than that, so they plan as cheaply as before; one
+  holding more is read again past it. Building it keeps every write to
   `rbac_grants` waiting until migrating commits, though checks and searches go on.
   Code from before it reads as it did, by the scope, so replicas of either release run side by side.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
