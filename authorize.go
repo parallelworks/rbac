@@ -1768,7 +1768,7 @@ const (
 	// made on each call, and pastByRole reads it several times, so planned with it on every call, a
 	// subject's Reachable took 4.2ms where without it it takes 2.7, and read first only as far as the
 	// bound, a subject one of whose groups held 100 grants on the type paid both statements, its
-	// Reachable 4.7ms and its Filter 7.1 where in one 3.0 and 3.3.
+	// Reachable 4.3ms and its Filter 6.8 to 11.6, where in one 3.2 and 3.8.
 	pastCapped
 	// pastCustomByScope reads those of the built-in roles a role at a time and every one of a custom
 	// role by the scope, for Filter's condition where the count it reads first found no key past

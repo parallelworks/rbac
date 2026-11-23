@@ -5824,7 +5824,7 @@ func TestSearchesPlanNoReadPastTheBoundForAKeyHoldingFew(t *testing.T) {
 // Filter and Reachable read the grants of a subject one of whose groups holds many on the type, of
 // built-in roles or of fewer than 64 custom ones, in as many statements as those of a subject whose
 // groups hold few: read first only as far as the bound, and then again past it, its Reachable took
-// 4.7ms and its Filter 7.1 where in one statement they take 3.0 and 3.3. Where the tenant's members
+// 4.3ms and its Filter 6.8 to 11.6, where in one statement they take 3.2 and 3.8. Where the tenant's members
 // hold more, which the read of the broad principals' roles reads again, its grants are read past
 // the bound at once, not first as far as it too.
 func TestSearchesReadAKeyHoldingManyGrantsOfBuiltInRolesOnce(t *testing.T) {
