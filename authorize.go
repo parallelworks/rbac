@@ -963,7 +963,7 @@ func (a *Authorizer) holders(ctx context.Context, p Permission, r Resource, role
 	// One time for every statement, as one snapshot, so a grant, a membership or a group's member
 	// ending between them can't leave a holder that no single moment had.
 	now := a.cfg.Now()
-	through, err := a.broadArgs(ctx, a.db, r.Tenant, p, r.Type, roles, custom, a.broadAt, nil, r.path(),
+	through, _, err := a.broadArgs(ctx, a.db, r.Tenant, p, r.Type, roles, custom, a.broadAt, nil, r.path(),
 		broadKeys(r.Tenant, a.counting(p, r.Type)), "", time.Time{})
 	if err != nil {
 		return nil, err
@@ -1337,7 +1337,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	}
 	reaching := a.reaching(resourceType)
 	everyone := slices.DeleteFunc(broadKeys(tenant, counting), func(k string) bool { return !slices.Contains(principals, k) })
-	through, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, a.broadOn, a.broadFew(), reaching, everyone, "", time.Time{})
+	through, broadMore, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, a.broadOn, a.broadFew(), reaching, everyone, "", time.Time{})
 	if err != nil {
 		return Reach{}, err
 	}
@@ -1348,21 +1348,23 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 	// The subject's grants on scopes of the types are read once, and of the custom roles those that
 	// they name (namedCustom).
 	alone := a.labelPermission(p)
-	// First as far as the bound alone, which a key holding more there is read again past (pastNone):
-	// it tells so by a row of no scope.
+	// First with a key's grants of custom roles on a type read by the scope as far as the bound,
+	// which a key holding more there tells by a row of no scope, and only then a role at a time
+	// (pastCapped).
 	read := func(past pastBound) (Reach, bool, error) {
 		// Tested first, so the read stops at the first key holding more, rather than after every key.
 		marked, more := "", ""
-		if past == pastNone {
+		if past == pastCapped {
 			marked = "NOT EXISTS (SELECT FROM held WHERE scope IS NULL) AND "
 			more = " UNION ALL SELECT NULL, NULL WHERE EXISTS (SELECT FROM held WHERE scope IS NULL)"
 		}
 		query := a.queryIndexed
-		if past == pastByRole {
-			// Without JIT: planned for its arguments, the read past the bound is costed for every key
-			// as for one holding many, so for a subject in 200 groups, one of them holding many, past
-			// jit_above_cost, and in 1,000 past jit_optimize_above_cost: compiling it took a call
-			// 45ms where without it it takes 8, and 555ms where it takes 22.
+		if a.history == "" {
+			// Without JIT: planned for its arguments, each read is costed for every key as for one
+			// holding many grants on the type, so for a subject in 1,000 groups past jit_above_cost,
+			// and a role at a time, in 200, one of them holding many, too, and in 1,000 past
+			// jit_optimize_above_cost: compiling took a call 44ms where without it it takes 21, and
+			// 555ms where it takes 22.
 			query = func(ctx context.Context, q DB, sql string, args ...any) (pgx.Rows, error) {
 				return plannedQuery(ctx, q, a.unjitted(), sql, args...)
 			}
@@ -1385,7 +1387,7 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 		_, err = pgx.ForEachRow(rows, []any{&key, &conditional}, func() error {
 			switch {
 			case key == nil:
-				past = pastNone
+				past = pastCapped
 			case *conditional:
 				reach.Conditional = append(reach.Conditional, parseScope(*key))
 			case *key == TenantRoot(tenant).Key():
@@ -1395,9 +1397,14 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 			}
 			return nil
 		})
-		return reach, past == pastNone, err
+		return reach, past == pastCapped, err
 	}
-	reach, more, err := read(pastNone)
+	// A broad principal broadArgs found holding more holds as many here, so read first, its grants
+	// would only be read again.
+	reach, more, err := Reach{}, true, error(nil)
+	if !broadMore {
+		reach, more, err = read(pastCapped)
+	}
 	if err == nil && more {
 		reach, _, err = read(pastByRole)
 	}
@@ -1626,7 +1633,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	// the subject is one: the anonymous never is.
 	counted := counts
 	counted.members = counted.members && s.Principal != (Principal{})
-	through, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, a.broadOn, a.broadFew(), a.reaching(resourceType),
+	through, broadMore, err := a.broadArgs(ctx, a.db, tenant, p, resourceType, roles, custom, a.broadOn, a.broadFew(), a.reaching(resourceType),
 		broadKeys(tenant, counted), s.identityKey(), now)
 	if err != nil {
 		return Predicate{}, err
@@ -1637,7 +1644,7 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 			string(p), resourceType,
 		}, through...), counts.public, perm, wildcard, denied, counts.members)
 	}
-	resources, containers, past, err := a.grantCounts(ctx, custom, alone, a.contains(resourceType), filterArgs(above))
+	resources, containers, past, err := a.grantCounts(ctx, custom, alone, a.contains(resourceType), broadMore, filterArgs(above))
 	if err != nil {
 		return Predicate{}, err
 	}
@@ -1710,7 +1717,7 @@ func (a *Authorizer) byType(types, cols, where string) string {
 // every grant of a custom role, as a tenant's viewer's to the members on 20,000 clusters, read
 // whatever the role gave, cost a member's Reachable 8,900 pages. Those roles are read only for a key
 // holding 64 there, so a list whose keys hold few reads none. As past selects, it reads the grants
-// of a key holding the bound or more so, or in their place a row of NULLs (pastNone).
+// of a key holding the bound or more (pastBound).
 func (a *Authorizer) heldByType(types, principals, roles, custom string, past pastBound, cols, where string) string {
 	held := fmt.Sprintf(`SELECT %[1]s FROM rbac_grants g WHERE %[2]s AND g.principal = keyed.k AND %[3]s`, cols, where, a.ofType())
 	if a.history != "" {
@@ -1721,8 +1728,16 @@ func (a *Authorizer) heldByType(types, principals, roles, custom string, past pa
 		}
 		given := byRole(roles)
 		switch {
-		case past == pastNone:
-			given = "SELECT f.* FROM (SELECT) n LEFT JOIN few f ON false"
+		case past == pastCapped:
+			if custom != "" {
+				// The custom roles' first, so a key holding that many reads no built-in role's, as it
+				// would be read again.
+				given = fmt.Sprintf(`WITH every AS MATERIALIZED (%[2]s%[3]s LIMIT %[4]d)
+					SELECT * FROM (%[1]s) g WHERE (SELECT count(*) FROM every) < %[4]d
+					UNION ALL SELECT * FROM every WHERE (SELECT count(*) FROM every) < %[4]d
+					UNION ALL SELECT e.* FROM (SELECT) x LEFT JOIN every e ON false WHERE (SELECT count(*) FROM every) = %[4]d`,
+					given, held, a.customOnly("g.role"), heldByScope)
+			}
 		case custom == "":
 		case past == pastCustomByScope:
 			given = "(" + given + ") UNION ALL (" + held + a.customOnly("g.role") + " OFFSET 0)"
@@ -1746,12 +1761,15 @@ const (
 	// pastByRole reads them a role at a time, the custom roles' too where the key holds few of those
 	// giving the permission (byScopeOrRole).
 	pastByRole pastBound = iota
-	// pastNone reads, in their place, a row of NULLs, which tells its statement's caller to read them
-	// again pastByRole: planning each read of rbac_grants costs about 0.15ms, as a plan for the
-	// arguments, made on each call, reads past the bound several times what a subject whose keys hold
-	// few needs, so planned with them, such a subject's Reachable took 4.2ms where without them it
-	// takes 2.7ms.
-	pastNone
+	// pastCapped reads those of the built-in roles a role at a time and those of custom roles by the
+	// scope, as pastCustomByScope, but for a key holding heldByScope of custom roles there, for which
+	// it reads, in their place, a row of NULLs, which tells its statement's caller to read them again
+	// pastByRole: planning each read of rbac_grants costs about 0.15ms, as a plan for the arguments,
+	// made on each call, and pastByRole reads it several times, so planned with it on every call, a
+	// subject's Reachable took 4.2ms where without it it takes 2.7, and read first only as far as the
+	// bound, a subject one of whose groups held 100 grants on the type paid both statements, its
+	// Reachable 4.7ms and its Filter 7.1 where in one 3.0 and 3.3.
+	pastCapped
 	// pastCustomByScope reads those of the built-in roles a role at a time and every one of a custom
 	// role by the scope, for Filter's condition where the count it reads first found no key past
 	// the bound: the host's query can't read again, and runs later than that count.
@@ -1832,7 +1850,7 @@ func (a *Authorizer) broadOn(principal string) string {
 }
 
 // broadFew is broadOn up to the bound it reads by the scope alone, and for a principal holding that
-// many there a NULL in their place (pastNone), or nil as of a time, where broadOn reads no more.
+// many there a NULL in their place, as pastCapped, or nil as of a time, where broadOn reads no more.
 func (a *Authorizer) broadFew() func(principal string) string {
 	if a.history != "" {
 		return nil
@@ -2055,7 +2073,7 @@ func filterCounted(arg func(int) string, custom, alone bool) string {
 // the form. Grants the condition doesn't count, as of roles that don't give the permission, or a
 // broad principal's that give nothing, counted would trade an index that finds the few rows its
 // grants reach for a read of every row of the tenant.
-func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container bool, args []any) (resources, containers int, past pastBound, err error) {
+func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container, more bool, args []any) (resources, containers int, past pastBound, err error) {
 	// The arguments the count reads, numbered from $1 as it first reads each.
 	var read []any
 	at := map[int]int{}
@@ -2070,21 +2088,27 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container b
 	// too: which custom roles the grants name is read from every one of them, and a subject can hold
 	// thousands, as one on each resource it created, where a few of built-in roles already pick the
 	// form. Both counts read one materialized held, so the subject's grants are read once.
-	// First as far as the bound alone, which a key holding more there is read again past (pastNone):
-	// such a count is -1, as a row of no scope tells.
+	// First with a key's grants of custom roles on a type read by the scope as far as the bound, which
+	// a key holding more there tells by a row of no scope, and only then a role at a time
+	// (pastCapped): such a count is -1, unless it reached its limit, which it is whatever the key
+	// holds, and then Filter's condition reads every grant of a custom role by the scope, as it does
+	// for a key holding fewer; where a broad principal held more, as broadArgs found, more, they are
+	// read a role at a time at once.
 	count := func(types string, limit int, past pastBound) string {
-		more := ""
-		if past == pastNone {
-			more = "WHEN EXISTS (SELECT FROM held WHERE scope IS NULL) THEN -1 "
-		}
 		if !custom {
-			return fmt.Sprintf(`(WITH held AS MATERIALIZED (%[1]s) SELECT CASE %[3]sELSE (SELECT count(*) FROM (SELECT FROM held WHERE %[2]s LIMIT %[4]d) g) END)`,
-				a.filterHeld(arg, false, past, types), filterCounted(arg, false, false), more, limit)
+			return fmt.Sprintf(`(SELECT count(*) FROM (%s LIMIT %d) g)`, a.filterGrants(arg, false, false, past, types), limit)
 		}
-		return fmt.Sprintf(`(WITH held AS MATERIALIZED (%[1]s) SELECT CASE %[5]s
+		// Counted to the limit, a count is the same whatever a key holding more hides, so only one short
+		// of it, which has read every grant, tests for one: tested first, a subject in 1,000 groups
+		// read every group's grants, 13,070 pages, where to the limit it read 9,110.
+		rest := fmt.Sprintf(`(SELECT count(*) FROM (SELECT FROM held WHERE %s LIMIT %d) g)`, filterCounted(arg, true, alone), limit)
+		if past == pastCapped {
+			rest = fmt.Sprintf(`(SELECT CASE WHEN c = %[1]d THEN c WHEN EXISTS (SELECT FROM held WHERE scope IS NULL) THEN -1 ELSE c END FROM (SELECT %[2]s AS c OFFSET 0) c)`, limit, rest)
+		}
+		return fmt.Sprintf(`(WITH held AS MATERIALIZED (%[1]s) SELECT CASE
 			WHEN (SELECT count(*) FROM (SELECT FROM held WHERE %[2]s LIMIT %[4]d) g) = %[4]d THEN %[4]d
-			ELSE (SELECT count(*) FROM (SELECT FROM held WHERE %[3]s LIMIT %[4]d) g) END)`,
-			a.filterHeld(arg, true, past, types), filterCounted(arg, false, false), filterCounted(arg, true, alone), limit, more)
+			ELSE %[3]s END)`,
+			a.filterHeld(arg, true, past, types), filterCounted(arg, false, false), rest, limit)
 	}
 	counts := func(past pastBound) error {
 		onResources := "0"
@@ -2093,15 +2117,17 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container b
 		}
 		// The containers' and the tenant's are of the types Filter reads denies on by each key (16).
 		query := fmt.Sprintf(`SELECT %s, %s`, onResources, count(arg(16), max(maxOverlap, maxContainerOverlap)+1, past))
-		if past == pastNone {
+		if past == pastCapped {
 			// The containers' are read only where the first found no key holding more.
 			query = fmt.Sprintf(`SELECT r, CASE WHEN r < 0 THEN -1 ELSE %s END FROM (SELECT %s AS r OFFSET 0) x`,
 				count(arg(16), max(maxOverlap, maxContainerOverlap)+1, past), onResources)
 		}
 		return a.queryRowIndexed(ctx, a.db, query, read...).Scan(&resources, &containers)
 	}
-	if err = counts(pastNone); err != nil || resources >= 0 && containers >= 0 {
-		return resources, containers, pastCustomByScope, err
+	if !more {
+		if err = counts(pastCapped); err != nil || resources >= 0 && containers >= 0 {
+			return resources, containers, pastCustomByScope, err
+		}
 	}
 	err = counts(pastByRole)
 	return resources, containers, pastByRole, err

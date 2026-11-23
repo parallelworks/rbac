@@ -257,14 +257,15 @@ func scannedRoles() int {
 // (Authorizer.broadOn, Authorizer.broadAt). They are decided as Authorizer.current reads them, as
 // checks read them; pairing each one's permissions and types with the catalog's in SQL took a
 // search seconds. Where few isn't nil, it reads first by few, SQL as grants up to a bound, and a
-// NULL role for a principal holding more, and only then by grants (pastNone).
+// NULL role for a principal holding more, and only then by grants (pastCapped), and more reports
+// that one did, which the search's own read of its keys would find too.
 func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
 	grants, few func(principal string) string, on, keys []string, identity string, now time.Time,
-) ([]any, error) {
+) (_ []any, more bool, err error) {
 	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
 	// A grant to either never gives a permission to change access, so no search counts one for it.
 	if !custom || p.managesAccess() || len(keys) == 0 {
-		return []any{nil, unprivileged, nil}, nil
+		return []any{nil, unprivileged, nil}, false, nil
 	}
 	in, args := "$5::text[]", []any{tenant, string(p), resourceType, on, keys}
 	// The subject's membership is looked up by a key no plan sees, as groupExists looks a group up:
@@ -292,14 +293,15 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	}
 	rows, err := a.queryIndexed(ctx, q, sql, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defs, err := collectRoles(rows)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if few != nil && len(defs) > 0 && defs[0].ID == "" {
-		return a.broadArgs(ctx, q, tenant, p, resourceType, roles, custom, grants, nil, on, keys, identity, now)
+		args, _, err := a.broadArgs(ctx, q, tenant, p, resourceType, roles, custom, grants, nil, on, keys, identity, now)
+		return args, true, err
 	}
 	var public, unprivilegedCustom []string
 	for _, r := range a.current(defs) {
@@ -313,7 +315,7 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	if !a.publicGives(p, resourceType) {
 		public = nil
 	}
-	return []any{public, unprivileged, unprivilegedCustom}, nil
+	return []any{public, unprivileged, unprivilegedCustom}, false, nil
 }
 
 // broadKeys are the keys of a tenant's broad principals, the public and its members, whose grants a
