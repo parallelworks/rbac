@@ -313,10 +313,12 @@ erDiagram
   apart (`few`, and `more` up to the grown bound). Yet a search plans none of that for a subject
   whose keys hold fewer: each statement reads every key's grants on the type by the scope up to the
   bound, and a row of NULLs in place of a key holding more (`pastNone`), and only where it finds one
-  is it run again as above. Planning each read of `rbac_grants` costs about 0.15ms, as a plan for
+  is it run again as above, `Reachable`'s without JIT: planned for its arguments, it is costed for
+  every key as for one holding many, so compiling it took a subject in 1,000 groups 555ms where
+  running it takes 22. Planning each read of `rbac_grants` costs about 0.15ms, as a plan for
   the arguments, which each call makes, also reads the metapage of each of its empty partial indexes:
   planned whole, an ordinary subject's `Reachable` took 4.2ms and its `Filter` 5.5ms, where they take
-  2.7 and 2.8. `Filter`'s condition, which the host's query can't run again, reads past the bound as
+  2.7 and 3.1. `Filter`'s condition, which the host's query can't run again, reads past the bound as
   it did before searches stepped through custom roles, those of built-in roles a role at a time and
   every one of a custom role by the scope (`pastCustomByScope`), unless the count `Filter` reads
   first finds a key there. As of a time it reads every grant of a key on the

@@ -5715,6 +5715,76 @@ func TestSearchesStepThroughFewOfTheCustomRolesAKeyHolds(t *testing.T) {
 	}
 }
 
+// Reachable reads past the bound without JIT for a subject in many groups, one of which holds many
+// grants on the type: planned for its arguments, that read is costed for every key as for one
+// holding many, past jit_above_cost from 200 groups and past jit_optimize_above_cost from about
+// 900, and compiling it took a subject in 1,000 groups' call 555ms, where without JIT it takes 22.
+func TestReachableReadsPastTheBoundWithoutJIT(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "jit=on&plan_cache_mode=force_custom_plan"))
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	var groups []string
+	for i := range 1000 {
+		groups = append(groups, fmt.Sprint("g", i))
+	}
+	m := h.as(t, "m", groups...)
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'b' || i, 'group', 'g' || i, 'cluster.login' FROM generate_series(1, 999) i
+		UNION ALL SELECT 't1', 'cluster', 'a' || i, 'group', 'g0', 'cluster.login' FROM generate_series(1, 100) i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rec := recording(tx)
+	reach, err := h.authz.WithTx(rec).Reachable(ctx, m, login, "t1", "cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reach.Scopes) != 1100 {
+		t.Fatalf("Reachable found %d scopes, not 1100", len(reach.Scopes))
+	}
+	read := 0
+	for i, sql := range rec.sqls {
+		// The settings a batch plans its read with, and puts back, as it ran them.
+		if strings.HasPrefix(sql, "SELECT set_config(") {
+			if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if !strings.Contains(sql, "rbac_grants") {
+			continue
+		}
+		read++
+		var jit string
+		var threshold float64
+		if err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('jit_above_cost')::float8`).Scan(&jit, &threshold); err != nil {
+			t.Fatal(err)
+		}
+		var plan []struct {
+			Plan struct {
+				Cost float64 `json:"Total Cost"`
+			}
+		}
+		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, rec.args[i]...).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		if c := plan[0].Plan.Cost; jit == "on" && c >= threshold {
+			t.Errorf("Reachable's statement %d is costed at %.0f, past jit_above_cost, with JIT on", read, c)
+		}
+	}
+	if read == 0 {
+		t.Fatal("Reachable read no grant")
+	}
+}
+
 // Filter, Reachable and a host's query of Filter's condition plan, for a subject whose keys hold few
 // grants on the type, none of the reads of a key holding many there: planning each read of
 // rbac_grants costs about 0.15ms, and reads the metapage of each of its partial indexes that is

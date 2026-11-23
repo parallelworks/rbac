@@ -1357,7 +1357,17 @@ func (a *Authorizer) reachable(ctx context.Context, s Subject, p Permission, ten
 			marked = "NOT EXISTS (SELECT FROM held WHERE scope IS NULL) AND "
 			more = " UNION ALL SELECT NULL, NULL WHERE EXISTS (SELECT FROM held WHERE scope IS NULL)"
 		}
-		rows, err := a.queryIndexed(ctx, a.db, `
+		query := a.queryIndexed
+		if past == pastByRole {
+			// Without JIT: planned for its arguments, the read past the bound is costed for every key
+			// as for one holding many, so for a subject in 200 groups, one of them holding many, past
+			// jit_above_cost, and in 1,000 past jit_optimize_above_cost: compiling it took a call
+			// 45ms where without it it takes 8, and 555ms where it takes 22.
+			query = func(ctx context.Context, q DB, sql string, args ...any) (pgx.Rows, error) {
+				return plannedQuery(ctx, q, a.unjitted(), sql, args...)
+			}
+		}
+		rows, err := query(ctx, a.db, `
 			WITH held AS MATERIALIZED (`+a.heldByType("$5", "$2", "$3", givingCustomSQL(custom, "$1", "$8", "$9", "keyed.k"), past, "g.scope, g.conditional, g.role, g.principal", `
 			  g.tenant = $1 AND (g.expires_at IS NULL OR g.expires_at > $4)`)+`)
 			SELECT scope, bool_and(conditional) FROM held

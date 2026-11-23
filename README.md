@@ -1770,10 +1770,11 @@ the package's uses foreign data, so none of the roles needs any.
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
 - **Planner settings:** every statement a check, list or change sends to read the package's tables,
-  but as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
-  `Conflicts` turn JIT off for theirs; and each that finds rows by where they are stored, as places
-  in groups, which have no id, turns TID scans on, should the host's session have them off, as with
-  them off too a plan read every place to remove one. Each sets them in the round trip that sends
+  but as of a time, turns sequential scans off for itself, as `Holders`' read of label values,
+  `Conflicts` and `Reachable`'s read past a key's bound turn JIT off for theirs; and each that
+  finds rows by where they are stored, as places in groups, which have no id, turns TID scans on,
+  should the host's session have them off, as with them off too a plan read every place to remove
+  one. Each sets them in the round trip that sends
   the statement, several of a change's together, and puts the session's back after it, keeping each
   meanwhile in a variable of the package's own named for it, as `rbac.enable_seqscan` and
   `rbac.jit`: a connection plans a statement once for all its runs, and one planned while a table
