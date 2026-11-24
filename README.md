@@ -1864,7 +1864,10 @@ the package's uses foreign data, so none of the roles needs any.
   transaction too: so every statement sending the host's text, or reading it back, is in such a
   batch, as the one recording who made a change, `SetRole`'s write and `History`'s read of records,
   and the rest send the package's own text, or names of schemas and roles they read back in the
-  same encoding. Behind such a wrapper `AsOf` fails as its read returns. `Filter`'s condition keeps
+  same encoding. The schema's name is read as UTF-8 bytes where it keys the locks of changes and
+  `Migrate`, and `History` names it in ASCII, so a schema named past ASCII works behind such a
+  wrapper too, unless the wrapper's encoding has no character for its name. Behind such a wrapper
+  `AsOf` fails as its read returns. `Filter`'s condition keeps
   no row in a session in another (Lists). Under pgx's simple protocol
   (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments on such
   a session, every call fails there instead.
