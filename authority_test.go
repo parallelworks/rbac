@@ -8686,17 +8686,20 @@ func TestAChangeReadsNoPermissionsOfTheRolesOfTheActorsGrantsEndingBeforeWhatItG
 		apart[i] = rbac.Role(fmt.Sprint("custom.login", i))
 		defining(apart[i], []rbac.Permission{view, login})
 	}
-	entries := 0
+	entries, walked := 0, 0
 	rbac.SetReadingEntries(t, func(k int) { entries += k })
-	read := func(prefix string, roles []rbac.Role) int {
+	rbac.SetWalkingGrants(t, func(k int) { walked += k })
+	read := func(prefix string, roles []rbac.Role) (int, int) {
 		t.Helper()
-		entries = 0
+		entries, walked = 0, 0
 		granting(prefix, roles)
-		return entries
+		return entries, walked
 	}
-	one := read("a", []rbac.Role{"cluster.login"})
-	same, many := read("b", slices.Repeat([]rbac.Role{"cluster.login"}, n)), read("c", apart)
+	one, oneWalked := read("a", []rbac.Role{"cluster.login"})
+	same, sameWalked := read("b", slices.Repeat([]rbac.Role{"cluster.login"}, n))
+	many, manyWalked := read("c", apart)
 	t.Logf("read %d entries granting a role to one, %d granting it to %d, and %d granting %d roles", one, same, n, many, n)
+	t.Logf("walked %d grants granting a role to one, %d granting it to %d, and %d granting %d roles", oneWalked, sameWalked, n, manyWalked, n)
 	if same-one >= r*p {
 		t.Errorf("granting a role to one read %d entries of roles and what the constraints answered, and %d granting it to %d, beside a grant of %d roles of %d permissions ending before them",
 			one, same, n, r, p)
@@ -8704,6 +8707,11 @@ func TestAChangeReadsNoPermissionsOfTheRolesOfTheActorsGrantsEndingBeforeWhatItG
 	if many-one >= r*p {
 		t.Errorf("granting a role to one read %d entries of roles and what the constraints answered, and %d granting %d roles, beside a grant of %d roles of %d permissions ending before them",
 			one, many, n, r, p)
+	}
+	// Nor walks their grants for each: they stay unread.
+	if sameWalked-oneWalked >= r*n || manyWalked-oneWalked >= r*n {
+		t.Errorf("granting a role to one walked %d of the actor's grants, %d granting it to %d, and %d granting %d roles, beside a grant of %d roles ending before them",
+			oneWalked, sameWalked, n, manyWalked, n, r)
 	}
 }
 
