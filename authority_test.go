@@ -8991,3 +8991,36 @@ func TestEveryChangeWhoseConditionsCantBeReadReturnsWhy(t *testing.T) {
 		}
 	}
 }
+
+// A change whose actor's power is held by a conditional grant replaced between the statement
+// reading its grants and the one reading the condition, as a change extending it replaces it, was
+// refused as if the actor lacked the power, which no moment had it lack: it is refused as a race,
+// which a retry settles, as it does for one revoked for good. Grantable reads the grant again, as
+// its replacement.
+func TestAChangeWhoseActorsConditionalGrantIsReplacedAsItReadsItIsAConflict(t *testing.T) {
+	for _, forGood := range []bool{false, true} {
+		t.Run(fmt.Sprintf("forGood=%t", forGood), func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			g := grant(cluster.Scope(), "cluster.admin", rbac.User, "ann")
+			g.Condition = rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+			h.seed(t, g, grant(cluster.Scope(), "cluster.login", rbac.User, "ann"))
+			ann := h.as(t, "ann")
+			h.as(t, "bob")
+			login := rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("bob")}}}
+			ran := replacing(t, h, "ann", "cluster.admin", forGood, 0)
+			if err := h.authz.Apply(ctx, ann, cluster, login); !*ran || !errors.Is(err, rbac.ErrConflict) || errors.Is(err, rbac.ErrDenied) {
+				t.Fatalf("Apply: %v", err)
+			}
+			rbac.SetReadingRoles(t, func() {})
+			if err := h.authz.Apply(ctx, ann, cluster, login); (err == nil) != !forGood {
+				t.Errorf("Apply again: %v", err)
+			}
+			ran = replacing(t, h, "ann", "cluster.admin", forGood, 0)
+			roles, err := h.authz.Grantable(ctx, ann, cluster)
+			if err != nil || !*ran || (len(roles) > 0) != !forGood {
+				t.Errorf("Grantable = %d roles, %v", len(roles), err)
+			}
+		})
+	}
+}

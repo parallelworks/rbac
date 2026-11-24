@@ -18147,3 +18147,61 @@ func TestEachCallReadsTheClockOnceAndAChangeAgainUnderItsLocks(t *testing.T) {
 		}
 	}
 }
+
+// replacing has the first read of grants with their custom roles (SetReadingRoles) after the first
+// skip followed, before a condition of them is read, by id's grants of role replaced in one
+// statement as a change granting them anew stores them: each revoked, and granted again as it was
+// by a new grant, so every moment allows what one did before. With forGood, they are revoked
+// alone. It reports whether the hook ran.
+func replacing(t *testing.T, h *harness, id string, role rbac.Role, forGood bool, skip int) *bool {
+	t.Helper()
+	ran := new(bool)
+	again := `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+		SELECT tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at FROM gone`
+	if forGood {
+		again = `SELECT FROM gone`
+	}
+	rbac.SetReadingRoles(t, func() {
+		if skip--; *ran || skip >= 0 {
+			return
+		}
+		*ran = true
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = $1 AND role = $2 RETURNING *) `+again, id, role); err != nil {
+			t.Error(err)
+		}
+	})
+	return ran
+}
+
+// A check on a pool reads a subject's grants in one statement and, where only a conditional grant
+// gives the permission, its condition in another: one replaced between them, as a change extending
+// it replaces it, was read as a condition nothing meets, so Authorize denied and Permissions left
+// out what every moment allowed. The grant is read again, as its replacement; and one revoked for
+// good gives nothing.
+func TestAConditionalGrantReplacedAsACheckReadsItIsReadAsItsReplacement(t *testing.T) {
+	for _, forGood := range []bool{false, true} {
+		t.Run(fmt.Sprintf("forGood=%t", forGood), func(t *testing.T) {
+			h := setup(t)
+			ctx := t.Context()
+			g := grant(cluster.Scope(), "cluster.admin", rbac.User, "u")
+			g.Condition = rbac.Condition{Expression: `resource.id == "c1"`}
+			h.seed(t, g)
+			u := h.as(t, "u")
+			ran := replacing(t, h, "u", "cluster.admin", forGood, 0)
+			err := h.authz.Authorize(ctx, u, view, cluster)
+			switch {
+			case !*ran:
+				t.Fatal("Authorize read the grants without reaching the hook")
+			case forGood && !errors.Is(err, rbac.ErrDenied):
+				t.Errorf("Authorize by a grant revoked for good: %v", err)
+			case !forGood && err != nil:
+				t.Errorf("Authorize by a grant replaced: %v", err)
+			}
+			ran = replacing(t, h, "u", "cluster.admin", forGood, 0)
+			perms, err := h.authz.Permissions(ctx, u, cluster)
+			if err != nil || !*ran || slices.Contains(perms, view) != !forGood {
+				t.Errorf("Permissions = %v, %v", perms, err)
+			}
+		})
+	}
+}
