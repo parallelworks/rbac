@@ -485,3 +485,74 @@ func TestConditionsHashedThroughAWrapperSettingAnotherClientEncodingAreThoseStor
 		t.Errorf("the grants stored conditions %q, not %q", stored, conditions)
 	}
 }
+
+// accentedSchema is a pool whose sessions' search_path names only a new schema named "tést_…", and
+// that schema's name, with mode for its statements, as many name a schema in their own language.
+func accentedSchema(t *testing.T, mode pgx.QueryExecMode) (*pgxpool.Pool, string) {
+	t.Helper()
+	ctx := t.Context()
+	cfg, err := pgxpool.ParseConfig(pgtest.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "tést_" + strings.ToLower(rand.Text())
+	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.WithoutCancel(ctx)) })
+	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := conn.Exec(context.WithoutCancel(ctx), "DROP SCHEMA IF EXISTS "+pgtest.WithViews(name)+" CASCADE"); err != nil {
+			t.Errorf("drop schema %s: %v", name, err)
+		}
+	})
+	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{name}.Sanitize()
+	cfg.ConnConfig.DefaultQueryExecMode = mode
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool, name
+}
+
+// A change, or a migration, through a wrapper setting another encoding before each statement
+// takes the locks a session in UTF8 takes for the same tables, named by a schema's name in UTF-8:
+// in WIN1252, "tést_…" read as other bytes keyed other locks, so a process behind the wrapper and
+// one without never waited for each other, and in one process the second failed on the first's
+// name, which isn't UTF-8.
+func TestLocksThroughAWrapperSettingAnotherClientEncodingAreAPlainSessions(t *testing.T) {
+	ctx := t.Context()
+	pool, _ := accentedSchema(t, pgx.QueryExecModeCacheStatement)
+	h := harnessOn(t, pool)
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "tenant.roles", rbac.User, "admin"), grant(root, "cluster.admin", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	wa := reencoded(t, h)
+	waits := func(what string, held func(pgx.Tx) error, then func(context.Context) error) {
+		t.Helper()
+		host, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+		if err := held(reencodingTx{host}); err != nil {
+			t.Fatal(err)
+		}
+		wait, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := then(wait); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s while the wrapper's held its locks: %v, not waiting for them", what, err)
+		}
+	}
+	r := rbac.RoleDefinition{ID: "custom.x", Name: "x", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	waits("a plain session's Apply", func(tx pgx.Tx) error { return wa.WithTx(tx).SetRole(ctx, admin, "t1", r) }, func(ctx context.Context) error {
+		return h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("bob")}}})
+	})
+	waits("a plain session's Migrate", func(tx pgx.Tx) error { return rbac.Migrate(ctx, tx) }, func(ctx context.Context) error {
+		return rbac.Migrate(ctx, pool)
+	})
+}
