@@ -1118,6 +1118,14 @@ type heldIndex struct {
 	given  map[permissionOn]givenLasting
 	// powers are how long they give the power to change grants (under).
 	powers map[permissionOn]powersLasting
+	// latest is the latest end of each role's unread conditional grants that end, as found, some read
+	// since; and readTo, the soonest end readEnding has read for each role decided, as of which those
+	// a decision of it reads are: ends at or after it read nothing more. Without them, a change
+	// granting a role to 1,000 under a condition, each until its own time, by an actor holding a
+	// grant ending before them of each of 300 roles of 1,000 permissions, read every role's
+	// permissions for each, 8.2 s, where one without them took 0.2 s.
+	latest map[Role]time.Time
+	readTo map[Role]time.Time
 }
 
 // powersLasting is givenLasting of the power to change grants on scopes of a type (powerLasting).
@@ -1151,7 +1159,7 @@ func (au authority) indexed() *heldIndex {
 	walkingGrants(len(au.held))
 	ix.held, ix.kinds, ix.unread, ix.unreadN = au.held, map[roleCarrier][]int{}, map[Role][]int{}, 0
 	ix.read, ix.lasting, ix.giving, ix.given = map[string][]int{}, map[roleCarrier]lasting{}, map[permissionOn][]int{}, map[permissionOn]givenLasting{}
-	ix.powers = map[permissionOn]powersLasting{}
+	ix.powers, ix.latest, ix.readTo = map[permissionOn]powersLasting{}, map[Role]time.Time{}, map[Role]time.Time{}
 	for i, g := range au.held {
 		k := g.roleCarrier()
 		ix.kinds[k] = append(ix.kinds[k], i)
@@ -1161,6 +1169,9 @@ func (au authority) indexed() *heldIndex {
 		case g.Condition.Expression == "":
 			ix.unread[g.Role] = append(ix.unread[g.Role], i)
 			ix.unreadN++
+			if g.ends.After(ix.latest[g.Role]) {
+				ix.latest[g.Role] = g.ends
+			}
 		default:
 			ix.read[g.Condition.Expression] = append(ix.read[g.Condition.Expression], i)
 		}
@@ -2086,8 +2097,15 @@ type ending struct {
 
 // readEnding reads, in one statement, the unread conditional grants that deciding each of ends can
 // tell apart by their ends (decidedAs): those of roles giving what deciding a grant of its def can
-// ask about (asking) that end at or after its until.
+// ask about (asking) that end at or after its until. A change deciding many grants of a role, each
+// until its own time, reads for the soonest first (grantsDecided), so deciding each reads nothing
+// more, and finds so without walking anything.
 func (au authority) readEnding(ends []ending) {
+	ix := au.indexed()
+	ends = slices.DeleteFunc(slices.Clone(ends), func(e ending) bool {
+		to, ok := ix.readTo[e.def.ID]
+		return ok && !e.until.Before(to)
+	})
 	if len(ends) == 0 {
 		return
 	}
@@ -2095,8 +2113,8 @@ func (au authority) readEnding(ends []ending) {
 	for i, e := range ends {
 		asks[i] = au.asking(e.def)
 	}
-	// Walked by role, so the grants of roles giving nothing asked aren't, however many.
-	ix := au.indexed()
+	// Walked by role, so the grants of roles giving nothing asked aren't, however many, nor those of
+	// roles none of whose grants ends late enough to be read, whose permissions aren't either.
 	var at []int
 	for role, unread := range ix.unread {
 		unread = slices.DeleteFunc(unread, func(i int) bool { return au.held[i].Condition.Expression != "" })
@@ -2107,8 +2125,11 @@ func (au authority) readEnding(ends []ending) {
 		ix.unread[role] = unread
 		r, known := au.roles.role(role)
 		asked := make([]bool, len(ends))
-		for i := range ends {
-			asked[i] = known && slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[i][p] })
+		for i, e := range ends {
+			if known && !ix.latest[role].Before(e.until) {
+				readingEntries(len(r.Permissions))
+				asked[i] = slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[i][p] })
+			}
 		}
 		if !slices.Contains(asked, true) {
 			continue
@@ -2129,6 +2150,11 @@ func (au authority) readEnding(ends []ending) {
 	}
 	slices.Sort(at)
 	au.readAt(at)
+	for _, e := range ends {
+		if to, ok := ix.readTo[e.def.ID]; !ok || e.until.Before(to) {
+			ix.readTo[e.def.ID] = e.until
+		}
+	}
 }
 
 // kindsKey is what kindsLasting is asked, a condition, as of how many reads of conditions were made.
