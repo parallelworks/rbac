@@ -4164,6 +4164,7 @@ var drawnLeaves = []reflect.Type{
 	reflect.TypeFor[*dynamicpb.Message](), reflect.TypeFor[*wrapperspb.BytesValue](), reflect.TypeFor[*descriptorpb.FeatureSet](),
 	reflect.TypeFor[apart](), reflect.TypeFor[embeddingApart](), reflect.TypeFor[embeddingInner](), reflect.TypeFor[types.Timestamp](),
 	reflect.TypeFor[json.RawMessage](), reflect.TypeFor[*reflectionOf](), reflect.TypeFor[*big.Int](), reflect.TypeFor[*url.URL](),
+	reflect.TypeFor[valueMessage](), reflect.TypeFor[reflectedList](), reflect.TypeFor[reflectedMessage](),
 }
 
 var drawnKeys = []reflect.Type{
@@ -4172,7 +4173,8 @@ var drawnKeys = []reflect.Type{
 	reflect.TypeFor[chan int](), reflect.TypeFor[unsafe.Pointer](), reflect.TypeFor[byteLock](), reflect.TypeFor[*int](),
 	reflect.TypeFor[struct{ P *int }](), reflect.TypeFor[[1]*int](), reflect.TypeFor[struct{ A any }](), reflect.TypeFor[[1]any](),
 	reflect.TypeFor[struct{ T time.Time }](), reflect.TypeFor[time.Time](), reflect.TypeFor[struct{ t time.Time }](),
-	reflect.TypeFor[types.Timestamp](),
+	reflect.TypeFor[types.Timestamp](), reflect.TypeFor[time.Duration](), reflect.TypeFor[json.Number](),
+	reflect.TypeFor[structpb.NullValue](), reflect.TypeFor[valueMessage](), reflect.TypeFor[reflectedList](),
 }
 
 func (d *shapeDraw) typ(depth int) reflect.Type {
