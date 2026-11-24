@@ -29,6 +29,9 @@ type book struct {
 	// gives has read, each made the first time it does, where a decision keeps them: a role can
 	// give a thousand permissions, and a change asks of each it decides for each of its types.
 	sets, customSets map[Role]roleSet
+	// givers are the roles giving each permission, of those readEnding has asked about, kept with
+	// customSets, so every authority of a call shares them.
+	givers *givers
 }
 
 func (b book) role(id Role) (RoleDefinition, bool) {
@@ -82,11 +85,12 @@ func (b book) gives(id Role, def RoleDefinition, p Permission, resourceType stri
 	return s.types[resourceType] && s.permissions[p]
 }
 
-// keepingSets is b keeping the custom roles' sets as gives makes them, for a decision that asks
-// gives about them many times.
+// keepingSets is b keeping the custom roles' sets as gives makes them, and the roles giving each
+// permission as readEnding finds them, for decisions that ask about them many times.
 func (b book) keepingSets() book {
 	if b.customSets == nil {
 		b.customSets = map[Role]roleSet{}
+		b.givers = newGivers()
 	}
 	return b
 }

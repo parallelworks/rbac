@@ -1050,8 +1050,16 @@ sequenceDiagram
   grants each end before the one before it read them in a statement for each. The index keeps, for
   each role decided, the soonest end read for, so deciding each grant after that reads and walks
   nothing; and for each role of the unread grants, the latest any of them ends, so a role none of
-  whose grants ends late enough isn't asked what it gives. A read that fails leaves the grants it
-  was for met by nothing, and the change, or `Grantable`, returns its error.
+  whose grants ends late enough isn't asked what it gives. Which of the rest give what deciding a
+  grant can ask about is found from what it asks, through the roles giving each permission
+  (`givers`), each role's permissions read once for every authority of the call: the soonest end
+  first, so each permission is looked up once, as a role whose grants end late enough for an end
+  do for each sooner one. Asking each role whether it gave anything asked, for each role decided,
+  an actor holding conditional grants of 300 roles of 1,000 permissions, ending after what it
+  granted, read 601 million entries granting 1,000 roles of 20 of them, 4.5 s, and adding a member
+  to a group granted a role on 1,000 clusters asked each role for each, 10.1 s, against 0.1 s
+  without them. A read that fails leaves the grants it was for met by nothing, and the change, or
+  `Grantable`, returns its error.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
@@ -1140,6 +1148,10 @@ sequenceDiagram
   and give the power to change grants there, is found once for each read of conditions, the
   unconditional ones together and the others by condition (`givenFor`, `powersFor`), so `heldFor`
   and `under` under another condition look it up rather than walk the grants giving it (`giving`).
+  Of the grants giving a permission, those under the condition `heldFor` asks about are found from
+  the grants read under it, or those giving it where they are fewer: kept for every condition of
+  them, a change asking about 1,000 permissions, by an actor holding grants giving them under 300
+  conditions, kept 300 for each, twice, an eighth of its time.
   Walking every grant the actor held for each, a change granting a role under 1,000 conditions, by
   an actor whose groups held 8,000 conditional grants of a role giving nothing it asked, took
   2.6 s against 0.3 s without them, and adding a member to a group holding 1,000 such grants 1.8 s

@@ -77,8 +77,13 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   the roles of the actor's conditional grants: it finds which of those its grants' ends can tell
   apart once for each role it grants, where granting a role to 1,000 under a condition, each until
   its own time, by an actor holding a grant ending before them of each of 300 roles of 1,000
-  permissions, took 8.2 s, against 0.2 s without them. `Grantable` lists the roles a subject may
-  grant, unconditionally and for good, for an access screen.
+  permissions, took 8.2 s, against 0.2 s without them. Nor with the roles it grants, or the scopes
+  it reaches, times the roles of those grants and what they give: it finds which of them give what
+  it asks from the permissions it asks, once for all the scopes it reaches, where by an actor
+  holding such grants of 300 roles of 1,000 permissions, ending after what it granted, granting
+  1,000 roles of 20 of them took 4.5 s, and adding a member to a group granted a role on 1,000
+  clusters 10.1 s, against 0.1 s without them. `Grantable` lists the roles a subject may grant,
+  unconditionally and for good, for an access screen.
 - **Until when:** what the actor hands on it holds until the grant ends. What it holds only through
   grants that end, such as an activation, or through a membership or a place in a group that ends,
   it grants ending no later than the last of them, and never as an eligibility, a custom role's
