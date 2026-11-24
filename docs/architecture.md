@@ -1921,7 +1921,11 @@ flowchart LR
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
-  scope, as a check seeks them on its resource's path. A version counts by a time from its date, or
+  scope, as a check seeks them on its resource's path, and `Grants` and `Eligibilities` given both
+  scopes and principals each principal's on the scopes' types, which history's index of scopes,
+  holding no principal, would read every version on the scope for: a user's eligibilities on the
+  tenant's root, 427 pages beside 3,000 others' there, where so they read 9. A generic plan a host
+  forces inside the read can read them by the scope still. A version counts by a time from its date, or
   its transaction's commit record where that is later, looked up by its transaction in history's
   index of commit records for every version, as `History` reads `CommittedAt`, so what a time reads
   turns on nothing an export leaves out. Commit records held the oldest transaction then running,

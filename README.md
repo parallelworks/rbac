@@ -1129,7 +1129,12 @@ what it answers turns on nothing an export leaves out. Joined to a group's membe
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
 group of 4,000 took 52 seconds, and 90 ms looked up by key. A list counts
 the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
-which can offer any custom role, reads each version of every one once. It orders a row's changes
+which can offer any custom role, reads each version of every one once. `Grants` and
+`Eligibilities` given both scopes and principals read each principal's on the scopes' types, as
+history's index of scopes holds no principal: read by the scope, a user's eligibilities on the
+tenant's root read 427 pages beside 3,000 others' there, and 9 so. A host that forces generic plans
+inside a read (`plan_cache_mode`), which `AsOf` plans for their arguments, can have them read by the
+scope again: 312 pages for a user's grants there. It orders a row's changes
 by their ids in `rbac_history`, which sessions take out of order once that table's id sequence
 caches more than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds
 one of the pool's connections: a constraint there queries the `DB` it is given, as one that queries
