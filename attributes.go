@@ -77,7 +77,8 @@ import (
 //   - bytes ([]byte or an array of bytes), read as bytes;
 //   - a slice or an array of these, read as a list;
 //   - a map keyed by a bool, a string, an int or a uint, of a type of its own too, or by an
-//     interface holding one, but for a time.Duration or a json.Number, of these, read as a map;
+//     interface holding one, but for a time.Duration, a json.Number, a structpb.NullValue or a
+//     message, of these, read as a map;
 //   - a pointer to any of these, read as what it points to;
 //   - JSON text (json.RawMessage) and a JSON number (json.Number), parsed, a nil json.RawMessage
 //     read as null, as encoding/json writes it;
@@ -96,9 +97,11 @@ import (
 // reads none of, applied it. So are those holding a ref.Val of the host's own, though it says it is
 // of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
 // func, a complex number, a uintptr, a lock of the host's own, as an integer a pointer to which
-// spins, which no hook can be given either, any other message, a map keyed by any other value, as a
-// double, an array or a lock, or by a time.Duration or a json.Number, directly or in an interface,
-// whose keys CEL reads as a duration or a number where their kind is an int or a string, and a slice, a pointer or a map of any of these, or an array holding
+// spins, which no hook can be given either, any other message, a list or a message as protobuf
+// reflects one, which CEL reads as the one it reflects, a map keyed by any other value, as a
+// double, an array, a lock or a message, or by a time.Duration, a json.Number or a
+// structpb.NullValue, directly or in an interface, whose keys CEL reads as a duration, a number or
+// null where their kind is an int or a string, and a slice, a pointer or a map of any of these, or an array holding
 // one, empty or nil too, as one holding none, read as [], {} or null, left whether its kind could
 // be read to whether it held one at the time, a map holding two keys read as the same value, as 1
 // and 1u, or "a" twice of two string types, and so JSON text naming a member of an object twice, as
@@ -345,6 +348,8 @@ var (
 	nullType     = reflect.TypeFor[structpb.NullValue]()
 	refValType   = reflect.TypeFor[ref.Val]()
 	messageType  = reflect.TypeFor[proto.Message]()
+
+	reflectedListType, reflectedMessageType = reflect.TypeFor[protoreflect.List](), reflect.TypeFor[protoreflect.Message]()
 )
 
 // of is v as a condition reads it, one of CEL's own values, and how deep it nests, counting itself,
@@ -506,6 +511,10 @@ func methodsOf(t reflect.Type) methodsRead {
 		r = byItsMethods
 	case implements(t, messageType):
 		r = asMessage
+	// CEL reads a list or a message as protobuf reflects one as the list or the message it reflects:
+	// one of the host's int type was read as an int.
+	case implements(t, reflectedListType) || implements(t, reflectedMessageType):
+		r = byItsMethods
 	default:
 	}
 	methodTypes.Store(t, r)
@@ -824,7 +833,7 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 	if t.Implements(refValType) && (t.Kind() != reflect.Pointer || !t.Elem().Implements(refValType)) {
 		return !celScalar(t)
 	}
-	if t.Implements(messageType) || hostLock(t) {
+	if t.Implements(messageType) || t.Implements(reflectedListType) || t.Implements(reflectedMessageType) || hostLock(t) {
 		return true
 	}
 	outer = append(outer, t)
@@ -847,18 +856,21 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 }
 
 // keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too,
-// and so whether a key of type t an interface holds is one a condition reads. A time.Duration or a
-// json.Number isn't: read by its kind, an int or a string, where as a value it is a duration or a
-// parsed number, as CEL reads it as a key too, `k == duration("1h")` failed over its keys and
-// `k == 3600000000000` held.
+// and so whether a key of type t an interface holds is one a condition reads. A time.Duration, a
+// json.Number or a structpb.NullValue isn't: read by its kind, an int or a string, where as a value
+// it is a duration, a parsed number or null, as CEL reads it as a key too, `k == duration("1h")`
+// failed over its keys and `k == 3600000000000` and `0 in m` held. They are the only types of a
+// key's kinds CEL reads by their type. Nor is one of the host's own CEL reads by its methods, as a
+// message of an int, a value of which of refuses: read by its kind as a key, `1 in m` held where CEL
+// read the key as the message.
 func keyType(t reflect.Type) bool {
 	switch t {
 	case celBoolType, celIntType, celStringType, celUintType:
 		return true
-	case durationType, numberType:
+	case durationType, numberType, nullType:
 		return false
 	}
-	if hostLock(t) || t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) == byItsMethods) {
+	if hostLock(t) || t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) != byKind) {
 		return false
 	}
 	switch t.Kind() {
