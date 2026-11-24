@@ -1,8 +1,8 @@
 package rbac
 
 import (
-	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -31,7 +31,8 @@ type Decision struct {
 // Authorize returns nil when the subject may do p to r, and otherwise an error matching
 // ErrDenied, ErrInvalid for malformed input, such as a permission or resource type the host
 // doesn't check (Config.Permissions), which can only be a mistake, or ErrConflict for a race
-// PostgreSQL refused, which a retry may allow. Any error means no.
+// PostgreSQL refused, or one with changes replacing a grant it read lost every time it read again
+// (reread), which a retry may allow. Any error means no.
 func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) (err error) {
 	defer conflicting(&err)
 	a = a.still()
@@ -62,6 +63,12 @@ func (a *Authorizer) decide(ctx context.Context, s Subject, p Permission, r Reso
 	if err != nil || !d.Allowed || values == nil {
 		return d, err
 	}
+	return a.byLabel(ctx, s, p, r, d, values)
+}
+
+// byLabel is d, which s's grants allowed, decided by r's label against s's holding, decided by
+// values: what was read with the grants.
+func (a *Authorizer) byLabel(ctx context.Context, s Subject, p Permission, r Resource, d Decision, values *valuesRead) (Decision, error) {
 	r = a.decidedOn(p, r)
 	h, _, err := a.holdingFor(ctx, r.Tenant, s, values, r.Labels)
 	if err != nil {
@@ -112,7 +119,8 @@ func (a *Authorizer) decideGrants(ctx context.Context, s Subject, p Permission, 
 
 	counts, values := a.counting(p, r.Type), a.asksValues(p, r)
 	if !explain {
-		return a.decideHeld(ctx, s, p, r, counts, values)
+		d, err := a.decideHeld(ctx, s, p, r, counts, values)
+		return d, nil, err
 	}
 
 	// Explain reads the subject's groups apart from its grants and denies, so in one snapshot, as
@@ -138,15 +146,21 @@ var readingRoles = func() {}
 
 // decideHeld is Authorize's decision once no constraint removes p, from s's grants and denies and
 // the custom roles they name, read in one statement; with values, what its label values are decided
-// by, read in it too.
-func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r Resource, counts broad, values bool) (Decision, *valuesRead, error) {
-	got, err := a.readHeld(ctx, a.db, r.Tenant, s, counts, r.path(), p, namedRoles, alsoRead{values: values})
-	if err != nil {
-		return Decision{}, nil, err
-	}
-	readingRoles()
-	d, err := a.decideBy(ctx, s, p, r, got.held, got.ds, got.roles)
-	return d, got.values, err
+// by, read in it too, and the decision of r's label by them (byLabel). A grant read there that is gone
+// by the time its condition is read has both read again (reread).
+func (a *Authorizer) decideHeld(ctx context.Context, s Subject, p Permission, r Resource, counts broad, values bool) (Decision, error) {
+	return reread(func() (Decision, error) {
+		got, err := a.readHeld(ctx, a.db, r.Tenant, s, counts, r.path(), p, namedRoles, alsoRead{values: values})
+		if err != nil {
+			return Decision{}, err
+		}
+		readingRoles()
+		d, err := a.decideBy(ctx, s, p, r, got.held, got.ds, got.roles)
+		if err != nil || !d.Allowed || got.values == nil {
+			return d, err
+		}
+		return a.byLabel(ctx, s, p, r, d, got.values)
+	})
 }
 
 // decideBy is decideHeld's decision by what it read.
@@ -178,7 +192,8 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 		return Decision{Reason: "no grant gives it"}, nil
 	}
 	// Only now, with no unconditional grant to allow, are conditions read and evaluated.
-	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
+	gone, err := a.conditionsFound(ctx, a.db, r.Tenant, conditional)
+	if err != nil {
 		return Decision{}, err
 	}
 	if vars == nil {
@@ -190,6 +205,9 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 		if a.conds.holds(spend, h.Condition.Expression, vars) {
 			return Decision{Allowed: true}, nil
 		}
+	}
+	if len(gone) > 0 {
+		return Decision{}, errReplaced
 	}
 	return Decision{Reason: unmet(spend)}, nil
 }
@@ -345,6 +363,14 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
+	// A grant it reads that is gone by the time its condition is read has it all read again, asking
+	// the constraints through cs no more.
+	cs := a.constrain(ctx, s, r)
+	return reread(func() ([]Permission, error) { return a.permissionsRead(ctx, s, r, cs) })
+}
+
+// permissionsRead is Permissions once its input is checked, asking the constraints through cs.
+func (a *Authorizer) permissionsRead(ctx context.Context, s Subject, r Resource, cs *constrained) ([]Permission, error) {
 	// Its label values are those its grants on the tenant give, read with these, so a label is
 	// decided by what it held as it held them.
 	held, ds, roles, err := a.heldOrDenied(ctx, a.db, r.Tenant, s, all, r.path(), namedRoles)
@@ -352,7 +378,7 @@ func (a *Authorizer) Permissions(ctx context.Context, s Subject, r Resource) (_ 
 		return nil, err
 	}
 	readingRoles()
-	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, nil, a.constrain(ctx, s, r), held, ds, roles, nil)
+	perms, _, excluded, err := a.permissionsOf(ctx, a.db, s, r, nil, cs, held, ds, roles, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -550,7 +576,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	}
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
 	// cheapest first.
-	if err := a.conditionsOf(ctx, q, r.Tenant, conditional); err != nil {
+	gone, err := a.conditionsFound(ctx, q, r.Tenant, conditional)
+	if err != nil {
 		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)
@@ -588,6 +615,16 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			byCondition[p] = true
 			// A condition reads the action, so it is evaluated for each permission.
 			given[p] = !shared.unevaluated && a.conds.holds(spendOn(p), h.Condition.Expression, on(p).read(p))
+		}
+	}
+	// What a grant gone since its statement gave, where no other grant gives it, is read again
+	// (reread).
+	for _, h := range gone {
+		def, _ := roles.role(h.Role)
+		for _, p := range def.Permissions {
+			if kept(p) && h.carries(def, p) && !given[p] {
+				return nil, nil, nil, errReplaced
+			}
 		}
 	}
 	var perms []Permission
@@ -2537,8 +2574,22 @@ func (a *Authorizer) conditionsSQL() string {
 }
 
 // conditionsOf reads the conditions of the conditional grants among held not read already, in
-// place, those the call under way read before taken from it (Authorizer.conditions).
+// place, those the call under way read before taken from it (Authorizer.conditions), and returns
+// errReplaced where one is gone (conditionsFound).
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
+	gone, err := a.conditionsFound(ctx, q, tenant, held)
+	if err == nil && len(gone) > 0 {
+		return errReplaced
+	}
+	return err
+}
+
+// conditionsFound is conditionsOf, returning instead the grants gone since the statement that read
+// them, each left a condition nothing meets: what the others give was given at that statement's
+// moment, so a decision they allow stands, and only one they don't is read again (reread).
+// Returned as errReplaced alone, a grant replaced beside another that allowed had a check of it
+// refused as a conflict as a change kept replacing the first, though every moment allowed.
+func (a *Authorizer) conditionsFound(ctx context.Context, q DB, tenant string, held []holding) ([]holding, error) {
 	var ids, principals, scopes []string
 	for i, h := range held {
 		if !h.conditional || h.Condition.Expression != "" {
@@ -2553,11 +2604,11 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 		scopes = append(scopes, h.scope)
 	}
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	rows, err := a.queryIndexed(ctx, q, a.conditionsSQL(), ids, tenant, principals, scopes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	found := map[string]string{}
 	var expr string
@@ -2573,15 +2624,44 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var gone []holding
 	for i, h := range held {
 		if h.conditional && h.Condition.Expression == "" {
-			// One gone since is read as a condition nothing meets.
-			held[i].Condition.Expression = cmp.Or(found[h.ID], "false")
+			expr, ok := found[h.ID]
+			if !ok {
+				expr = "false"
+				gone = append(gone, h)
+			}
+			held[i].Condition.Expression = expr
 		}
 	}
-	return nil
+	return gone, nil
+}
+
+// errReplaced is conditionsOf's error for a grant gone since the statement that read it: revoked,
+// or replaced by a new grant, as a change extending a conditional grant stores one. Read as a
+// condition nothing meets, a check on a pool, whose statements each read their own moment, denied
+// where every state committed allowed, as the grant's replacement holds the same condition: so a
+// read that meets it reads again (reread), and only a race lost every time is a conflict.
+var errReplaced = fmt.Errorf("%w: a grant was revoked or replaced as its condition was read; try again", ErrConflict)
+
+// rereads is how many times reread reads, so a check racing a change that keeps replacing a grant
+// ends.
+const rereads = 3
+
+// reread is read, run again where it met a grant gone before its condition was read
+// (errReplaced): read again, a grant revoked for good is gone from the grants too, so decides
+// nothing, and one replaced is read as its replacement.
+func reread[T any](read func() (T, error)) (T, error) {
+	for tries := 1; ; tries++ {
+		v, err := read()
+		if tries < rereads && errors.Is(err, errReplaced) {
+			continue
+		}
+		return v, err
+	}
 }
 
 // heldGrants returns the grants held by any of principals on any of scopes, not expired, in the

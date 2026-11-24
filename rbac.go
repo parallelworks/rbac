@@ -1586,7 +1586,14 @@ func actorKey(p Principal) string {
 // wraps one, as isolated says; under WithTx, or on a DB whose Begin gives a savepoint, the host's
 // transaction, at its isolation. Constraints run before it, as their hooks may query the pool while
 // it holds a connection. A transaction that fails to commit answers nothing, as a failed read does.
+// Under WithTx at READ COMMITTED, each statement reads its own moment, so a grant read in one can be
+// gone by the time another reads its condition: read then runs again (reread).
 func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
+	return reread(func() (T, error) { return snapshotOnce(ctx, a, read) })
+}
+
+// snapshotOnce is snapshot, run once.
+func snapshotOnce[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
 	var v T
 	in := func(tx pgx.Tx) error {
 		var err error

@@ -410,13 +410,22 @@ func (a *Authorizer) holdingRead(ctx context.Context, q DB, s Subject, cs *const
 		return h, byCondition, grantsRead{}, err
 	}
 	tenant := cs.on.Tenant
-	got, err := a.readHeld(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, "", namedRoles, with)
-	if err != nil {
-		return Holding{}, nil, grantsRead{}, err
+	// A grant read here that is gone by the time its condition is read has it all read again.
+	type read struct {
+		h           Holding
+		byCondition map[Permission]bool
+		got         grantsRead
 	}
-	readingRoles()
-	h, byCondition, err := a.holdingFrom(ctx, q, s, cs, a.labeling(&valuesRead{held: got.held, ds: got.ds, roles: got.roles}), a.labelPermission, nil)
-	return h, byCondition, got, err
+	r, err := reread(func() (read, error) {
+		got, err := a.readHeld(ctx, q, tenant, s, all, []string{TenantRoot(tenant).Key()}, "", namedRoles, with)
+		if err != nil {
+			return read{}, err
+		}
+		readingRoles()
+		h, byCondition, err := a.holdingFrom(ctx, q, s, cs, a.labeling(&valuesRead{held: got.held, ds: got.ds, roles: got.roles}), a.labelPermission, nil)
+		return read{h, byCondition, got}, err
+	})
+	return r.h, r.byCondition, r.got, err
 }
 
 // valuesOn reads on q what s's label values in a tenant are decided by, narrowed to what gives
@@ -432,6 +441,7 @@ func (a *Authorizer) valuesOn(ctx context.Context, q DB, tenant string, s Subjec
 	if err != nil {
 		return nil, err
 	}
+	readingRoles()
 	v := a.labeling(&valuesRead{held: held, ds: ds, roles: roles})
 	if err := a.conditionsOf(ctx, q, tenant, v.held); err != nil {
 		return nil, err

@@ -4262,3 +4262,48 @@ func searchConditionPages(t *testing.T, plan, condition string) map[string]int64
 	}
 	return pages
 }
+
+// A label value given by a conditional grant replaced between the statement reading the grants and
+// the one reading its condition, as a change extending it replaces it, was read as held under a
+// condition nothing meets, so Holding left it out and a check refused the resource it labels, on
+// a pool and under WithTx at READ COMMITTED, where Explain reads too in statements of their own
+// moments. The grant is read again, as its replacement; and one revoked for good gives nothing.
+func TestALabelValuesConditionalGrantReplacedAsACheckReadsItIsReadAsItsReplacement(t *testing.T) {
+	for _, forGood := range []bool{false, true} {
+		t.Run(fmt.Sprintf("forGood=%t", forGood), func(t *testing.T) {
+			h := labeled(t)
+			ctx := t.Context()
+			high := grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "u")
+			high.Condition = rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+			h.seed(t, high, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"))
+			u := h.as(t, "u")
+			secret := cluster
+			secret.Labels = rbac.Label{"level": {"high"}}
+			ran := replacing(t, h, "u", "level.high", forGood, 0)
+			held, err := h.authz.Holding(ctx, "t1", u)
+			if err != nil || !*ran || slices.Contains(held.Values(), "level:high") != !forGood {
+				t.Errorf("Holding = %v, %v", held.Values(), err)
+			}
+			ran = replacing(t, h, "u", "level.high", forGood, 0)
+			if err := h.authz.Authorize(ctx, u, view, secret); !*ran || (err == nil) != !forGood {
+				t.Errorf("Authorize: %v", err)
+			}
+			ran = replacing(t, h, "u", "level.high", forGood, 0)
+			perms, err := h.authz.Permissions(ctx, u, secret)
+			if err != nil || !*ran || slices.Contains(perms, view) != !forGood {
+				t.Errorf("Permissions = %v, %v", perms, err)
+			}
+			tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			// After the read of the grants giving the permission, at the read of the values.
+			ran = replacing(t, h, "u", "level.high", forGood, 1)
+			d, err := h.authz.WithTx(tx).Explain(ctx, u, view, secret)
+			if err != nil || !*ran || d.Allowed != !forGood {
+				t.Errorf("Explain under WithTx = %+v, %v", d, err)
+			}
+		})
+	}
+}
