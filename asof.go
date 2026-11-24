@@ -158,7 +158,7 @@ func (a *Authorizer) stoodBy(ctx context.Context, stood standIns) error {
 // historySchema returns the schema tx reads history in, as packageSchema does, refusing it where
 // history's ids can't order a row's changes.
 func historySchema(ctx context.Context, tx pgx.Tx) (string, error) {
-	schema, err := packageSchema(ctx, tx)
+	schema, _, err := packageSchema(ctx, tx)
 	if err != nil {
 		return "", err
 	}

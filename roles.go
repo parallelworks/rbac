@@ -594,7 +594,9 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 		for i, g := range r.GrantableRoles {
 			grantable[i] = string(g)
 		}
-		tag, err := tx.Exec(ctx, `
+		// In a batch, as recording's, so a wrapper's client_encoding doesn't convert the name.
+		var written bool
+		err = planned(ctx, tx, nil, into(&written), `
 			INSERT INTO rbac_roles (tenant, id, name, description, permissions, resource_types, privileged, public, grantable_roles, updated_by)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			ON CONFLICT (tenant, id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description,
@@ -604,9 +606,10 @@ func (a *Authorizer) SetRole(ctx context.Context, actor Subject, tenant string, 
 			WHERE (rbac_roles.name, rbac_roles.description, `+canonicalSQL("rbac_roles.permissions")+`, `+canonicalSQL("rbac_roles.resource_types")+`,
 			  rbac_roles.privileged, rbac_roles.public, `+canonicalSQL("rbac_roles.grantable_roles")+`) IS DISTINCT FROM
 			  (EXCLUDED.name, EXCLUDED.description, EXCLUDED.permissions, EXCLUDED.resource_types,
-			  EXCLUDED.privileged, EXCLUDED.public, EXCLUDED.grantable_roles)`,
+			  EXCLUDED.privileged, EXCLUDED.public, EXCLUDED.grantable_roles)
+			RETURNING true`,
 			tenant, r.ID, r.Name, r.Description, perms, r.ResourceTypes, r.Privileged, r.Public, grantable, actorKey(actor.Principal))
-		if err != nil || tag.RowsAffected() == 0 {
+		if err != nil || !written {
 			return ChangeEvent{}, gains{}, err
 		}
 		if err := a.conditionsBounded(ctx, tx, tenant, buckets, before); err != nil {

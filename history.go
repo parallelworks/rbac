@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -77,7 +78,10 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
+	// In a batch (planned), which sends it in UTF8 whatever the session's client_encoding: a host's
+	// DB wrapper can set another before each statement, after the change's transaction set UTF8
+	// (inUTF8), and history would then name another actor.
+	if err := planned(ctx, tx, nil, nil, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
 		return nil, err
 	}
 	// In a transaction of its own that hands nothing to OnChange, nothing writes after the change,
@@ -96,25 +100,27 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 // reads before every schema, and a pooled connection keeps, so one named as history's would stand
 // in for it, and Export would sign what it holds. A temporary type is read before pg_catalog's
 // too, so those reads name their types by pg_catalog's. It refuses the session's temporary schema,
-// which a search_path naming pg_temp first makes the current one.
-func packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
-	var schema string
+// which a search_path naming pg_temp first makes the current one. named is the schema's name in
+// UTF-8, read as bytes, which no client_encoding converts, as a host's DB wrapper can set one
+// before each statement.
+func packageSchema(ctx context.Context, tx pgx.Tx) (schema, named string, err error) {
 	var temporary bool
-	if err := tx.QueryRow(ctx, `SELECT n.nspname, n.oid = pg_catalog.pg_my_temp_schema()
-		FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema()`).Scan(&schema, &temporary); err != nil {
-		return "", err
+	var utf8Name []byte
+	if err := tx.QueryRow(ctx, `SELECT n.nspname, n.oid = pg_catalog.pg_my_temp_schema(), pg_catalog.convert_to(n.nspname::pg_catalog.text, 'UTF8')
+		FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema()`).Scan(&schema, &temporary, &utf8Name); err != nil {
+		return "", "", err
 	}
 	if temporary {
-		return "", fmt.Errorf("%w: the search_path names pg_temp first, where any role may make tables named as the package's", ErrInvalid)
+		return "", "", fmt.Errorf("%w: the search_path names pg_temp first, where any role may make tables named as the package's", ErrInvalid)
 	}
-	return schema, nil
+	return schema, string(utf8Name), nil
 }
 
 // packageSchema is packageSchema of tx, but as of a time the package's schema, as the current one
-// is then that of history's views (AsOf).
-func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
+// is then that of history's views (AsOf), which AsOf reads in UTF8.
+func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (schema, named string, err error) {
 	if a.schema != "" {
-		return a.schema, nil
+		return a.schema, a.schema, nil
 	}
 	return packageSchema(ctx, tx)
 }
@@ -122,6 +128,33 @@ func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (string, erro
 // historyTable is history's table in schema, as packageSchema returns it.
 func historyTable(schema string) string {
 	return pgx.Identifier{schema, "rbac_history"}.Sanitize()
+}
+
+// historyTableNamed is historyTable of a schema named in UTF-8 (packageSchema), in ASCII alone, each
+// character past it, and any backslash, written by its code point (U&"…"): so it names the table
+// whatever client_encoding a statement is parsed in, as pgx parses a batch's statements before the
+// batch sets UTF8 in one query mode, and after it in the others. For a name in ASCII, it is
+// historyTable's.
+func historyTableNamed(named string) string {
+	if !strings.ContainsFunc(named, func(r rune) bool { return r >= utf8.RuneSelf || r == '\\' }) {
+		return historyTable(named)
+	}
+	var b strings.Builder
+	b.WriteString(`U&"`)
+	for _, r := range strings.ReplaceAll(named, "\x00", "") {
+		switch {
+		case r == '"':
+			b.WriteString(`""`)
+		case r < utf8.RuneSelf && r != '\\':
+			b.WriteRune(r)
+		case r <= 0xFFFF:
+			fmt.Fprintf(&b, `\%04X`, r)
+		default:
+			fmt.Fprintf(&b, `\+%06X`, r)
+		}
+	}
+	b.WriteString(`".rbac_history`)
+	return b.String()
 }
 
 // followable refuses, on tx, a cursor of another generation, whose last record history in schema
@@ -667,7 +700,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	// reach both an old primary and the new one. Not a.begin, which refuses changes as of a time:
 	// this only reads.
 	err := begin(ctx, a.db, func(tx pgx.Tx) error {
-		schema, err := a.packageSchema(ctx, tx)
+		schema, named, err := a.packageSchema(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -693,12 +726,18 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		// read that finds no record chains nothing, and the next refuses the cursor in followable. An
 		// export begins with the oldest transaction it sees running as its Horizon, and while a prune
 		// it sees is of one no older, reads nothing (unsettled).
-		rows, err := tx.Query(ctx, `
+		//
+		// In a batch (plannedQuery), which reads the records in UTF8 whatever the session's
+		// client_encoding, as a host's DB wrapper can set another before each statement; naming
+		// history's table in ASCII (historyTableNamed), as the batch's statement may be parsed in
+		// either encoding.
+		table := historyTableNamed(named)
+		rows, err := plannedQuery(ctx, tx, nil, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
-			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid
+			  (SELECT max(c.effective_at) FROM `+table+` c WHERE c.entity = 'commit' AND c.txid = p.txid
 			    AND c.cluster IS NOT DISTINCT FROM p.cluster), coalesce(p.cluster::pg_catalog.text, ''),
-			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
+			  $6::boolean AND `+prunedPast(table, "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
 			  pg_snapshot_xmin(pg_current_snapshot())
 			FROM (
 			  SELECT h.*, row_number() OVER w AS n,
@@ -713,9 +752,9 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			  FROM (
 			    SELECT h.*, count(*) FILTER (WHERE h.bytes IS NULL) OVER (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING) AS unsized
 			    FROM (
-			      SELECT * FROM `+historyTable(schema)+`
+			      SELECT * FROM `+table+`
 			      WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot()) AND entity <> 'commit'
-			        AND ($6::boolean OR NOT `+unsettled(historyTable(schema))+`)
+			        AND ($6::boolean OR NOT `+unsettled(table)+`)
 			      ORDER BY txid, id LIMIT $3
 			    ) h
 			  ) h

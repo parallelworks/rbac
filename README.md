@@ -1860,9 +1860,17 @@ the package's uses foreign data, so none of the roles needs any.
   same round trip; a change, `History`, `Export`, `Migrate` and `AsOf` set it in their transaction,
   or under `WithTx` in their savepoint, and put the host's back, which on a session already in UTF8,
   as most are, costs nothing. So a hook that runs in a change's transaction, as `OnChange`, runs in
-  UTF8 too. `Filter`'s condition keeps no row in a session in another (Lists). Under pgx's simple
-  protocol (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments
-  on such a session, every call fails there instead.
+  UTF8 too. A host's DB wrapper can set it again before each statement, in the package's
+  transaction too: so every statement sending the host's text, or reading it back, is in such a
+  batch, as the one recording who made a change, `SetRole`'s write and `History`'s read of records,
+  and the rest send the package's own text, or names of schemas and roles they read back in the
+  same encoding. The schema's name is read as UTF-8 bytes where it keys the locks of changes and
+  `Migrate`, and `History` names it in ASCII, so a schema named past ASCII works behind such a
+  wrapper too, unless the wrapper's encoding has no character for its name. Behind such a wrapper
+  `AsOf` fails as its read returns. `Filter`'s condition keeps
+  no row in a session in another (Lists). Under pgx's simple protocol
+  (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments on such
+  a session, every call fails there instead.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
