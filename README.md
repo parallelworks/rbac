@@ -1650,11 +1650,23 @@ the package's uses foreign data, so none of the roles needs any.
   once it is applied. Their checks, searches and changes run beside each other, applied or not.
   `0034_giving_role_seeks` adds `rbac_grants_principal_role`, which leads to a grant's principal,
   tenant and role before its scope, so where one of their subject's keys, or its groups', the
-  tenant's members' or the public's, holds more than 64 grants on scopes of the listed type, `Filter`
-  and `Reachable` seek those of each role giving the permission alone: they read every grant of
-  those keys on scopes of the listed type, of any role, so beside a viewer's
-  grants to the tenant's members on 20,000 clusters a member's `Reachable` read 4,700 pages and a
-  query of `Filter`'s condition 14,000, against 41 for `Authorize`. Building it keeps every write to
+  tenant's members' or the public's, holds more than 64 grants on scopes of the listed type, and 4
+  or more for each built-in role giving the permission there, `Filter` and `Reachable` seek those of
+  each such role alone, and of its grants of custom roles there, past 64 naming 16 roles or fewer,
+  those of each custom role giving the permission that the key holds, where it holds 16 or fewer
+  custom roles, found a seek each: they read every grant
+  of those keys on scopes of the listed type, of any role, so beside a viewer's grants to the
+  tenant's members on 20,000 clusters a member's `Reachable` read 4,700 pages and a query of
+  `Filter`'s condition 14,000, against 41 for `Authorize`; beside a custom viewer's, 8,900 and
+  17,900, against 160 and 380 now. A key holding fewer they read by the scope, as before, so beside
+  a catalog of 1,000 roles giving the permission, a subject in 20 groups holding 100 grants each
+  reads 700 pages, not the 60,000 a seek for each role cost. As of a time they read by the scope,
+  every grant of the keys on the type, of any role, as before it. A search reads a key's grants of
+  custom roles on the type by the scope up to 64 first, in the statement reading the rest, as
+  before, and only for a key holding more reads them again as above, in a second statement, which
+  costs that subject's call about 1.5ms to plan: such a subject's `Reachable` takes 4.9ms and its
+  `Filter` 7.8, where before they took 2.9 and 3.3; a subject whose keys hold fewer takes 3.0 and
+  3.6, about a tenth more than before. Building it keeps every write to
   `rbac_grants` waiting until migrating commits, though checks and searches go on.
   Code from before it reads as it did, by the scope, so replicas of either release run side by side.
   Code from before advisory locks were keyed by SHA-256 must not run beside code after it, so a
@@ -1761,10 +1773,12 @@ the package's uses foreign data, so none of the roles needs any.
   planned for its arguments over history: `AsOf` turns JIT off in its own transaction, which the
   rollback puts back, whatever the role's setting.
 - **Planner settings:** every statement a check, list or change sends to read the package's tables,
-  but as of a time, turns sequential scans off for itself, as `Holders`' read of label values and
-  `Conflicts` turn JIT off for theirs; and each that finds rows by where they are stored, as places
-  in groups, which have no id, turns TID scans on, should the host's session have them off, as with
-  them off too a plan read every place to remove one. Each sets them in the round trip that sends
+  but as of a time, turns sequential scans off for itself, as `Holders`' read of label values,
+  `Conflicts`, `Reachable`'s reads of its subject's grants and `Filter`'s counts of them turn JIT off
+  for theirs; and each that
+  finds rows by where they are stored, as places in groups, which have no id, turns TID scans on,
+  should the host's session have them off, as with them off too a plan read every place to remove
+  one. Each sets them in the round trip that sends
   the statement, several of a change's together, and puts the session's back after it, keeping each
   meanwhile in a variable of the package's own named for it, as `rbac.enable_seqscan` and
   `rbac.jit`: a connection plans a statement once for all its runs, and one planned while a table

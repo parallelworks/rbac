@@ -4485,6 +4485,18 @@ func unvacuumed(t *testing.T, h *harness, tables ...string) {
 	}
 }
 
+// filled puts a grant, in a tenant of its own, in each of rbac_grants' partial indexes: PostgreSQL
+// keeps no height of an empty btree, so planning a statement reads the metapage of each empty one for
+// each reference to the table, pages a count of what a search reads takes as its own, again wherever
+// a statement is planned again, as a session does after another changes a schema.
+func filled(t *testing.T, h *harness) {
+	t.Helper()
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, condition)
+		VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 'activation', now() + interval '1 year', 'true')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // crowdedTables are the tables crowd writes, history last, as it records the others.
 var crowdedTables = []string{
 	"rbac_grants", "rbac_roles", "rbac_groups", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies", "rbac_history",
@@ -5406,6 +5418,8 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 		} {
 			t.Run(plan+"/"+other.what, func(t *testing.T) {
 				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+				unvacuumed(t, h, "rbac_grants")
+				filled(t, h)
 				ctx := t.Context()
 				c0 := hostTable(t, h)[0]
 				m := h.as(t, "m", "g")
@@ -5442,29 +5456,15 @@ func TestSearchesReadOnlyTheGrantsOfRolesGivingThePermission(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				read := func() map[string]int64 {
-					t.Helper()
-					pages := map[string]int64{}
-					for what, f := range searches {
-						func() {
-							tx, err := h.pool.Begin(ctx)
-							if err != nil {
-								t.Fatal(err)
-							}
-							defer func() { _ = tx.Rollback(ctx) }()
-							start := pagesRead(ctx, t, tx, "rbac_grants")
-							if err := f(tx, h.authz.WithTx(tx)); err != nil {
-								t.Fatalf("%s: %v", what, err)
-							}
-							pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
-						}()
-					}
-					return pages
-				}
+				// Under a generic plan, Filter's statements are planned on whichever search runs them first
+				// after ANALYZE, Filter or a query of its condition, in the map's order, which read 80 pages
+				// more: so each is counted on its second run (searchPages), with autovacuum kept off the
+				// grants, whose vacuum between the two had them planned again, and the grants' partial
+				// indexes filled, so a statement planned again all the same reads nothing for it.
 				more(500)
-				few := read()
+				few := searchPages(ctx, t, h, plan, searches)
 				more(5000)
-				for what, many := range read() {
+				for what, many := range searchPages(ctx, t, h, plan, searches) {
 					if many > few[what]*3/2+deeper {
 						t.Errorf("%s read %d pages beside 500 grants that are %s, and %d beside 5000", what, few[what], other.what, many)
 					}
@@ -5544,6 +5544,512 @@ func TestSearchesSeekFewGrantsOnceWhateverTheRolesGivingThePermission(t *testing
 			for what, many := range read(40) {
 				if many > few[what]*3/2+deeper {
 					t.Errorf("%s read %d pages of grants beside the catalog's roles giving the permission, and %d beside 40 more", what, few[what], many)
+				}
+			}
+		})
+	}
+}
+
+// searchPages are the pages of rbac_grants each of searches reads on tx's own transaction, counted
+// under a generic plan on the run after the one that builds it: building it read some two dozen
+// pages of the indexes on whichever run built it.
+func searchPages(ctx context.Context, t *testing.T, h *harness, plan string, searches map[string]func(pgx.Tx, *rbac.Authorizer) error) map[string]int64 {
+	t.Helper()
+	pages := map[string]int64{}
+	for what, f := range searches {
+		func() {
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if plan == "force_generic_plan" {
+				if err := f(tx, h.authz.WithTx(tx)); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+			}
+			start := pagesRead(ctx, t, tx, "rbac_grants")
+			if err := f(tx, h.authz.WithTx(tx)); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			pages[what] = pagesRead(ctx, t, tx, "rbac_grants") - start
+		}()
+	}
+	return pages
+}
+
+// loginSearches are Reachable, Filter and a host's query of Filter's condition, for m's login to
+// clusters, which keeps c0 alone.
+func loginSearches(ctx context.Context, m rbac.Subject) map[string]func(pgx.Tx, *rbac.Authorizer) error {
+	cols := rbac.Columns{Tenant: "tenant", Path: "path"}
+	return map[string]func(pgx.Tx, *rbac.Authorizer) error{
+		"Reachable": func(_ pgx.Tx, a *rbac.Authorizer) error { return second(a.Reachable(ctx, m, login, "t1", "cluster")) },
+		"Filter": func(_ pgx.Tx, a *rbac.Authorizer) error {
+			return second(a.Filter(ctx, m, login, "t1", "cluster", cols, 1))
+		},
+		"a query of Filter's condition": func(tx pgx.Tx, a *rbac.Authorizer) error {
+			pred, err := a.Filter(ctx, m, login, "t1", "cluster", cols, 1)
+			if err != nil {
+				return err
+			}
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
+				return err
+			}
+			if n != 1 {
+				return fmt.Errorf("kept %d clusters, not c0 alone", n)
+			}
+			return nil
+		},
+	}
+}
+
+// Filter and Reachable read, of the grants of custom roles to their subject, its groups and the
+// tenant's members on scopes of the listed type, only those of roles giving the permission there,
+// under a generic plan and one for their arguments: past 64 on the type, they read those of built-in
+// roles a role at a time but every grant of a custom role, so beside a tenant's viewer granted on
+// thousands of clusters, a member's Reachable read 8,900 pages and a host's query of Filter's
+// condition 17,900, where Authorize read 14.
+func TestSearchesReadOnlyTheCustomGrantsOfRolesGivingThePermission(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		for _, other := range []struct{ what, kind, id string }{
+			{"the members'", "members", "t1"},
+			{"its own", "user", "m"},
+			{"its group's", "group", "g"},
+		} {
+			t.Run(plan+"/"+other.what, func(t *testing.T) {
+				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+				unvacuumed(t, h, "rbac_grants")
+				filled(t, h)
+				ctx := t.Context()
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}')`); err != nil {
+					t.Fatal(err)
+				}
+				c0 := hostTable(t, h)[0]
+				m := h.as(t, "m", "g")
+				h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+				searches := loginSearches(ctx, m)
+				granted := 0
+				more := func(n int) {
+					t.Helper()
+					if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+						SELECT 't1', 'cluster', 'k' || i, $3, $4, 'custom.viewer', '' FROM generate_series($1::int + 1, $2::int) i`, granted, n, other.kind, other.id); err != nil {
+						t.Fatal(err)
+					}
+					granted = n
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				more(500)
+				few := searchPages(ctx, t, h, plan, searches)
+				more(5000)
+				for what, many := range searchPages(ctx, t, h, plan, searches) {
+					if many > few[what]*3/2+deeper {
+						t.Errorf("%s read %d pages beside 500 grants of a custom role giving nothing that are %s, and %d beside 5000", what, few[what], other.what, many)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Filter and Reachable step through a few of the custom roles a key holds at most, to find those
+// giving the permission, and only where its grants of custom roles on a type name few, under a
+// generic plan and one for their arguments: stepping through each, a seek each, whatever it gave and
+// wherever it was granted, the members' grants of 300 custom roles giving nothing, one on each of 300
+// clusters, cost a member's Reachable 1,900 pages where by the scope it read 210, and beside their
+// 100 grants of a custom viewer on clusters, each of 1,000 roles granted on another type cost a seek.
+func TestSearchesStepThroughFewOfTheCustomRolesAKeyHolds(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		for _, other := range []struct{ what, kind, id string }{
+			{"the members'", "members", "t1"},
+			{"its own", "user", "m"},
+		} {
+			t.Run(plan+"/"+other.what, func(t *testing.T) {
+				// read is the pages each search reads beside grants of roles custom roles, one on each of as
+				// many clusters, or with elsewhere, on as many buckets, beside 100 of a viewer on clusters.
+				read := func(roles int, elsewhere bool) map[string]int64 {
+					t.Helper()
+					h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan))
+					unvacuumed(t, h, "rbac_grants")
+					filled(t, h)
+					ctx := t.Context()
+					c0 := hostTable(t, h)[0]
+					m := h.as(t, "m", "g")
+					h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+					grants := `WITH r AS (INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+						SELECT 't1', 'custom.r' || i, '{cluster:view}', '{cluster}' FROM generate_series(1, $1::int) i RETURNING id)
+						INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+						SELECT 't1', 'cluster', 'k' || i, $2, $3, 'custom.r' || i, '' FROM generate_series(1, $1::int) i`
+					if elsewhere {
+						grants = `WITH r AS (INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
+							VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}') RETURNING id)
+							INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+							SELECT 't1', 'bucket', 'b' || i, $2, $3, 'custom.r' || i, '' FROM generate_series(1, $1::int) i
+							UNION ALL SELECT 't1', 'cluster', 'k' || i, $2, $3, 'custom.viewer', '' FROM generate_series(1, 100) i`
+					}
+					if _, err := h.pool.Exec(ctx, grants, roles, other.kind, other.id); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+						t.Fatal(err)
+					}
+					return searchPages(ctx, t, h, plan, loginSearches(ctx, m))
+				}
+				few := read(100, true)
+				for what, many := range read(1000, true) {
+					if many > few[what]*3/2+deeper {
+						t.Errorf("%s read %d pages beside grants of 100 custom roles elsewhere that are %s, and %d beside 1000", what, few[what], other.what, many)
+					}
+				}
+				stepped := read(300, false)
+				rbac.SetHeldByScope(t, 1<<30)
+				// Beside the pages of the first 64 of a key's grants of custom roles there, which a read
+				// reads by the scope before it reads a key holding more again.
+				const again = 16
+				for what, scoped := range read(300, false) {
+					if stepped[what] > scoped*3/2+deeper+again {
+						t.Errorf("%s read %d pages beside grants of 300 custom roles that are %s, and %d by the scope", what, stepped[what], other.what, scoped)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Reachable reads past the bound without JIT for a subject in many groups, one of which holds many
+// grants on the type: planned for its arguments, that read is costed for every key as for one
+// holding many, past jit_above_cost from 200 groups and past jit_optimize_above_cost from about
+// 900, and compiling it took a subject in 1,000 groups' call 555ms, where without JIT it takes 22.
+func TestReachableReadsPastTheBoundWithoutJIT(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "jit=on&plan_cache_mode=force_custom_plan"))
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	var groups []string
+	for i := range 1000 {
+		groups = append(groups, fmt.Sprint("g", i))
+	}
+	m := h.as(t, "m", groups...)
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'b' || i, 'group', 'g' || i, 'cluster.login' FROM generate_series(1, 999) i
+		UNION ALL SELECT 't1', 'cluster', 'a' || i, 'group', 'g0', 'cluster.login' FROM generate_series(1, 100) i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rec := recording(tx)
+	reach, err := h.authz.WithTx(rec).Reachable(ctx, m, login, "t1", "cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reach.Scopes) != 1100 {
+		t.Fatalf("Reachable found %d scopes, not 1100", len(reach.Scopes))
+	}
+	read := 0
+	for i, sql := range rec.sqls {
+		// The settings a batch plans its read with, and puts back, as it ran them.
+		if strings.HasPrefix(sql, "SELECT set_config(") {
+			if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if !strings.Contains(sql, "rbac_grants") {
+			continue
+		}
+		read++
+		var jit string
+		var threshold float64
+		if err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('jit_above_cost')::float8`).Scan(&jit, &threshold); err != nil {
+			t.Fatal(err)
+		}
+		var plan []struct {
+			Plan struct {
+				Cost float64 `json:"Total Cost"`
+			}
+		}
+		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, rec.args[i]...).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		if c := plan[0].Plan.Cost; jit == "on" && c >= threshold {
+			t.Errorf("Reachable's statement %d is costed at %.0f, past jit_above_cost, with JIT on", read, c)
+		}
+	}
+	if read == 0 {
+		t.Fatal("Reachable read no grant")
+	}
+}
+
+// Filter counts its subject's grants without JIT: planned for its arguments, the count reads the
+// grants of a key holding many on the type a role at a time, costed as a seek for every role giving
+// the permission, so beside a catalog of 1,000 such roles, past jit_above_cost, and compiling it took
+// a subject in 20 groups' call 123ms, where without JIT it takes 41.
+func TestFilterCountsWithoutJIT(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "jit=on&plan_cache_mode=force_custom_plan"), func(c *rbac.Config) {
+		for i := range 1000 {
+			c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+				ID:          rbac.Role(fmt.Sprint("cluster.operator", i)),
+				Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"},
+			})
+		}
+	})
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	var groups []string
+	for i := range 20 {
+		groups = append(groups, fmt.Sprint("g", i))
+	}
+	m := h.as(t, "m", groups...)
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'z' || i, 'group', 'g' || j, 'cluster.viewer' FROM generate_series(1, 100) i, generate_series(0, 19) j`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rec := recording(tx)
+	pred, err := h.authz.WithTx(rec).Filter(ctx, m, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := 0
+	for i, sql := range rec.sqls {
+		// The settings a batch plans its read with, and puts back, as it ran them.
+		if strings.HasPrefix(sql, "SELECT set_config(") {
+			if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if !strings.Contains(sql, "rbac_grants") {
+			continue
+		}
+		read++
+		var jit string
+		var threshold float64
+		if err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('jit_above_cost')::float8`).Scan(&jit, &threshold); err != nil {
+			t.Fatal(err)
+		}
+		var plan []struct {
+			Plan struct {
+				Cost float64 `json:"Total Cost"`
+			}
+		}
+		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, rec.args[i]...).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		if c := plan[0].Plan.Cost; jit == "on" && c >= threshold {
+			t.Errorf("Filter's statement %d is costed at %.0f, past jit_above_cost, with JIT on", read, c)
+		}
+	}
+	if read == 0 {
+		t.Fatal("Filter read no grant")
+	}
+	var n int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("Filter's condition kept %d clusters, not c0 alone", n)
+	}
+}
+
+// Filter, Reachable and a host's query of Filter's condition plan, for a subject whose keys hold few
+// grants of custom roles on the type, none of the reads of a key holding many of those there:
+// planning each read of rbac_grants costs about 0.15ms, and reads the metapage of each of its
+// partial indexes that is empty, which a plan for their arguments does on each call. Planned with
+// them, a subject's Reachable took 4.2ms where without them it takes 3.0, and with those indexes
+// empty read 63 pages more than with them filled, its Filter 103 and the query 173, where without
+// them about 30, 45 and 70.
+func TestSearchesPlanNoReadPastTheBoundForAKeyHoldingFew(t *testing.T) {
+	read := func(fill bool) map[string]int64 {
+		t.Helper()
+		h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"))
+		unvacuumed(t, h, "rbac_grants")
+		if fill {
+			filled(t, h)
+		}
+		ctx := t.Context()
+		c0 := hostTable(t, h)[0]
+		m := h.as(t, "m", "g0", "g1", "g2", "g3", "g4")
+		h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+			t.Fatal(err)
+		}
+		return searchPages(ctx, t, h, "force_custom_plan", loginSearches(ctx, m))
+	}
+	full := read(true)
+	planned := map[string]int64{"Reachable": 40, "Filter": 60, "a query of Filter's condition": 100}
+	for what, empty := range read(false) {
+		if empty-full[what] > planned[what] {
+			t.Errorf("%s read %d pages with rbac_grants' partial indexes empty, %d more than with them filled", what, empty, empty-full[what])
+		}
+	}
+}
+
+// Filter and Reachable read the grants of a subject one of whose groups holds many on the type, of
+// built-in roles or of fewer than 64 custom ones, in as many statements as those of a subject whose
+// groups hold few: read first only as far as the bound, and then again past it, its Reachable took
+// 4.3ms and its Filter 6.8 to 11.6, where in one statement they take 3.2 and 3.8. Where the tenant's members
+// hold more, which the read of the broad principals' roles reads again, its grants are read past
+// the bound at once, not first as far as it too.
+func TestSearchesReadAKeyHoldingManyGrantsOfBuiltInRolesOnce(t *testing.T) {
+	sent := func(t *testing.T, grants string) map[string]int {
+		t.Helper()
+		h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"))
+		ctx := t.Context()
+		c0 := hostTable(t, h)[0]
+		m := h.as(t, "m", "g0", "g1")
+		h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.login', '{cluster:login}', '{cluster}')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, grants); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+			t.Fatal(err)
+		}
+		cols := rbac.Columns{Tenant: "tenant", Path: "path"}
+		statements := map[string]int{}
+		for what, f := range map[string]func(*rbac.Authorizer) error{
+			"Reachable": func(a *rbac.Authorizer) error { return second(a.Reachable(ctx, m, login, "t1", "cluster")) },
+			"Filter":    func(a *rbac.Authorizer) error { return second(a.Filter(ctx, m, login, "t1", "cluster", cols, 1)) },
+		} {
+			func() {
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				rec := recording(tx)
+				if err := f(h.authz.WithTx(rec)); err != nil {
+					t.Fatal(err)
+				}
+				for _, sql := range rec.sqls {
+					if strings.Contains(sql, "rbac_grants") {
+						statements[what]++
+					}
+				}
+			}()
+		}
+		return statements
+	}
+	few := sent(t, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'a' || i, 'group', 'g0', 'cluster.login' FROM generate_series(1, 10) i`)
+	for _, many := range []struct {
+		what, grants string
+		again        int
+	}{
+		{"the members' of a custom role", `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'a' || i, 'members', 't1', 'custom.login' FROM generate_series(1, 100) i`, 1},
+		{"of a built-in role", `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'a' || i, 'group', 'g0', 'cluster.login' FROM generate_series(1, 100) i`, 0},
+		{"of built-in and custom roles", `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'a' || i, 'group', 'g0', CASE WHEN i % 2 = 0 THEN 'custom.login' ELSE 'cluster.login' END FROM generate_series(1, 120) i`, 0},
+	} {
+		t.Run(many.what, func(t *testing.T) {
+			for what, n := range sent(t, many.grants) {
+				if n != few[what]+many.again {
+					t.Errorf("%s sent %d statements reading grants beside many grants %s, and %d beside a group holding few", what, n, many.what, few[what])
+				}
+			}
+		})
+	}
+}
+
+// Filter counts its subject's grants on resources of the type only as far as its form needs, as
+// where they are many it stops at the first few: testing first whether a key held more than the
+// bound, it read every group's grants, so for a subject in 200 groups 2,660 pages where it reads
+// 1,880.
+func TestFilterCountsAsFarAsItsFormNeeds(t *testing.T) {
+	read := func(role string) int64 {
+		t.Helper()
+		h := crowded(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan"))
+		unvacuumed(t, h, "rbac_grants")
+		filled(t, h)
+		ctx := t.Context()
+		var groups []string
+		for i := range 200 {
+			groups = append(groups, fmt.Sprint("g", i))
+		}
+		m := h.as(t, "m", groups...)
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'u' || i, 'user', 'm', 'cluster.login' FROM generate_series(1, 20) i
+			UNION ALL SELECT 't1', 'cluster', 'b' || j, 'group', 'g' || j, $1 FROM generate_series(0, 199) j`, role); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+			t.Fatal(err)
+		}
+		cols := rbac.Columns{Tenant: "tenant", Path: "path"}
+		return searchPages(ctx, t, h, "force_custom_plan", map[string]func(pgx.Tx, *rbac.Authorizer) error{
+			"Filter": func(_ pgx.Tx, a *rbac.Authorizer) error {
+				return second(a.Filter(ctx, m, login, "t1", "cluster", cols, 1))
+			},
+		})["Filter"]
+	}
+	// Beside the groups' grants of a role not giving the permission, the count reads them all.
+	counted, uncounted := read("cluster.login"), read("cluster.viewer")
+	if counted > uncounted*4/5 {
+		t.Errorf("Filter read %d pages beside its groups' grants giving the permission, and %d beside those of a role giving nothing", counted, uncounted)
+	}
+}
+
+// Filter and Reachable read a subject's groups' grants of a type by the scope while each holds
+// fewer than a few for each role giving the permission, under a generic plan and one for their
+// arguments: past 64 they sought each role giving it, so beside a catalog of 1,000 such roles, 20
+// groups holding 100 grants each read 60,000 pages, where by the scope they read 700.
+func TestSearchesReadByTheScopeBesideManyRolesGivingThePermission(t *testing.T) {
+	for _, plan := range []string{"force_custom_plan", "force_generic_plan"} {
+		t.Run(plan, func(t *testing.T) {
+			read := func(roles int) map[string]int64 {
+				t.Helper()
+				h := crowded(t, pgtest.Open(t, "plan_cache_mode="+plan), func(c *rbac.Config) {
+					for i := range roles {
+						c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+							ID:          rbac.Role(fmt.Sprint("cluster.operator", i)),
+							Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"},
+						})
+					}
+				})
+				unvacuumed(t, h, "rbac_grants")
+				filled(t, h)
+				ctx := t.Context()
+				c0 := hostTable(t, h)[0]
+				var groups []string
+				for i := range 20 {
+					groups = append(groups, fmt.Sprint("g", i))
+				}
+				m := h.as(t, "m", groups...)
+				h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+				if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+					SELECT 't1', 'cluster', 'z' || i, 'group', 'g' || j, 'cluster.viewer', '' FROM generate_series(1, 100) i, generate_series(0, 19) j`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+					t.Fatal(err)
+				}
+				return searchPages(ctx, t, h, plan, loginSearches(ctx, m))
+			}
+			few := read(0)
+			for what, many := range read(200) {
+				if many > few[what]*3/2+deeper {
+					t.Errorf("%s read %d pages of grants beside the catalog's roles giving the permission, and %d beside 200 more", what, few[what], many)
 				}
 			}
 		})

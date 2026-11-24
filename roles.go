@@ -193,6 +193,55 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids stri
 	return fmt.Sprintf(`(%s::text[] || ARRAY(%s))`, builtin, byKey(ids, "rbac_roles cr", "cr.id", "cr.id", where))
 }
 
+// givingCustomSQL is SQL for an array of the custom roles of a tenant giving perm on a resource type
+// that the principal whose key is principal holds a grant of there, as givingSQL tests a custom role,
+// of which it keeps those it is given: so a search reading grants a role at a time (heldByType,
+// broadOn) reads every grant givingSQL can keep, in the same statement, which sees each role as it
+// does. It finds the roles the principal holds by stepping from one to the next in
+// rbac_grants_principal_role, a seek each, and looks each up by its key: read by the tenant, a plan
+// made while the tables were small read every custom role of it, of which a tenant can hold
+// MaxCustomRoles. It steps through scannedRoles of them at most, and is NULL for a principal holding
+// more, whose grants a search reads by the scope: each step costs about what reading a few grants
+// does, whatever the role gives or wherever it is granted, so beside the members' 100 grants of a
+// custom viewer on clusters, their grants of 1,000 roles on another type cost a member's Reachable
+// 8,200 pages where those of 100 cost 720. Empty without custom, for none.
+func givingCustomSQL(custom bool, tenant, perm, resourceType, principal string) string {
+	if !custom {
+		return ""
+	}
+	// Each step is the next entry of rbac_grants_principal_role after the last, a row comparison in
+	// its order, which only an index leading to the principal, the tenant and the role reads in order,
+	// and ended past the principal's custom roles after it. Bounded by the principal, the tenant and
+	// the role apart, as each a plan counts a key holding one row or so, a plan read and sorted every
+	// grant of the principal by an index leading to the scope after them, its 10,000 of a built-in
+	// role, or bounded by the prefix too, every grant of a custom role it held, by
+	// rbac_grants_custom_principal, whose predicate that implies.
+	next := func(after string) string {
+		return fmt.Sprintf(`SELECT g.principal, g.tenant, g.role FROM rbac_grants g WHERE (g.principal, g.tenant, g.role) %s
+			ORDER BY g.principal, g.tenant, g.role LIMIT 1`, after)
+	}
+	mine := fmt.Sprintf(`h.principal = %s AND h.tenant = %s::text AND h.role < 'custom/'`, principal, tenant)
+	// One step past the last it keeps tells a principal holding more from one holding that many.
+	return fmt.Sprintf(`(WITH RECURSIVE held(principal, tenant, role, n) AS ((SELECT f.*, 1 FROM (%[1]s) f)
+		  UNION ALL SELECT x.*, h.n + 1 FROM held h CROSS JOIN LATERAL (%[2]s) x WHERE %[3]s AND h.n <= %[7]d)
+		SELECT CASE WHEN count(*) <= %[7]d THEN coalesce(array_agg(cr.id) FILTER (WHERE cr.id IS NOT NULL), '{}') END
+		FROM held h LEFT JOIN LATERAL (SELECT cr.id FROM rbac_roles cr WHERE cr.tenant = %[4]s::text AND cr.id = h.role
+		  AND %[5]s::text = ANY(cr.permissions) AND %[6]s::text = ANY(cr.resource_types) OFFSET 0) cr ON true WHERE %[3]s)`,
+		next(fmt.Sprintf(">= (%s, %s::text, 'custom.')", principal, tenant)), next("> (h.principal, h.tenant, h.role)"), mine, tenant, perm, resourceType,
+		scannedRoles())
+}
+
+// scannedRoles is how many custom roles of a key givingCustomSQL steps through, and how many its
+// first grants on a type may name for byScopeOrRole to step through them: as many as the grants
+// heldByType reads by the scope before it seeks roles, heldPerRole for each, or, with heldPerRole 0,
+// as a test sets it, every one a tenant can hold.
+func scannedRoles() int {
+	if heldPerRole == 0 {
+		return MaxCustomRoles
+	}
+	return heldByScope / heldPerRole
+}
+
 // broadArgs are a search's arguments for the roles giving p on a resource type that give it
 // through grants to the public and the tenant's members: the custom ones that are public, NULL
 // where no grant to the public gives p, as Filter and Reachable then read none and Holders drops
@@ -207,14 +256,16 @@ func givingSQL(builtin, tenant, perm, resourceType string, custom bool, ids stri
 // the tenant $1 to the principal whose key is the SQL it is given there, on is the array $4
 // (Authorizer.broadOn, Authorizer.broadAt). They are decided as Authorizer.current reads them, as
 // checks read them; pairing each one's permissions and types with the catalog's in SQL took a
-// search seconds.
+// search seconds. Where few isn't nil, it reads first by few, SQL as grants up to a bound, and a
+// NULL role for a principal holding more, and only then by grants (pastCapped), and more reports
+// that one did, which the search's own read of its keys would find too.
 func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permission, resourceType string, roles []string, custom bool,
-	grants func(principal string) string, on, keys []string, identity string, now time.Time,
-) ([]any, error) {
+	grants, few func(principal string) string, on, keys []string, identity string, now time.Time,
+) (_ []any, more bool, err error) {
 	unprivileged := slices.DeleteFunc(slices.Clone(roles), func(id string) bool { return a.roles[Role(id)].Privileged })
 	// A grant to either never gives a permission to change access, so no search counts one for it.
 	if !custom || p.managesAccess() || len(keys) == 0 {
-		return []any{nil, unprivileged, nil}, nil
+		return []any{nil, unprivileged, nil}, false, nil
 	}
 	in, args := "$5::text[]", []any{tenant, string(p), resourceType, on, keys}
 	// The subject's membership is looked up by a key no plan sees, as groupExists looks a group up:
@@ -230,16 +281,27 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	// keys at once, a generic plan read the grants by the custom roles' index on the tenant alone,
 	// every grant of one in the tenant for each scope or type; and as of a time, roles tested
 	// against the ids rather than read by them are each read at its newest version.
-	rows, err := a.queryIndexed(ctx, q, `SELECT `+roleColumns+` FROM (`+byKey(namedCustom(`SELECT g.role FROM unnest(`+in+`) AS b(k)
-		CROSS JOIN LATERAL (`+grants("b.k")+`) g`), "rbac_roles", "id", roleColumns,
-		"tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")+`) r
-		ORDER BY id`, args...)
+	named := func(grants string) string {
+		return byKey(namedCustom(grants), "rbac_roles", "id", roleColumns, "tenant = $1 AND $2::text = ANY(permissions) AND $3::text = ANY(resource_types)")
+	}
+	from := `SELECT g.role FROM unnest(` + in + `) AS b(k) CROSS JOIN LATERAL (`
+	sql := `SELECT ` + roleColumns + ` FROM (` + named(from+grants("b.k")+`) g`) + `) r ORDER BY id`
+	if few != nil {
+		// A principal holding more than few reads is told by a row of no id, which no role has.
+		sql = `WITH held AS MATERIALIZED (` + from + few("b.k") + `) g) SELECT ` + roleColumns + ` FROM (` + named("SELECT role FROM held") + `) r
+			WHERE NOT EXISTS (SELECT FROM held WHERE role IS NULL) UNION ALL SELECT '', '', '', '{}', '{}', false, false, '{}' WHERE EXISTS (SELECT FROM held WHERE role IS NULL) ORDER BY id`
+	}
+	rows, err := a.queryIndexed(ctx, q, sql, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defs, err := collectRoles(rows)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if few != nil && len(defs) > 0 && defs[0].ID == "" {
+		args, _, err := a.broadArgs(ctx, q, tenant, p, resourceType, roles, custom, grants, nil, on, keys, identity, now)
+		return args, true, err
 	}
 	var public, unprivilegedCustom []string
 	for _, r := range a.current(defs) {
@@ -253,7 +315,7 @@ func (a *Authorizer) broadArgs(ctx context.Context, q DB, tenant string, p Permi
 	if !a.publicGives(p, resourceType) {
 		public = nil
 	}
-	return []any{public, unprivileged, unprivilegedCustom}, nil
+	return []any{public, unprivileged, unprivilegedCustom}, false, nil
 }
 
 // broadKeys are the keys of a tenant's broad principals, the public and its members, whose grants a

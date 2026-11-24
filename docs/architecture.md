@@ -286,16 +286,58 @@ erDiagram
   principal and scope, and reads only those its subject counts: the anonymous and a guest read none
   of the members', and a search of a permission no public role gives none of the public's, so their
   grants of built-in roles on thousands of resources cost it nothing. It reads a key's grants on a
-  type's scopes by the scope, of any role, up to 64 of them (`heldByScope`), and a key holding that
-  many there, those of each role giving the permission alone, by `rbac_grants_principal_role`
+  type's scopes by the scope, of any role, up to 64 of them (`heldByScope`), or 4 for each built-in
+  role giving the permission (`heldPerRole`) where that is more, and a key holding that many there,
+  those of each built-in role giving the permission alone, by `rbac_grants_principal_role`
   (0034), which leads to the role before the scope: sought by the scope and tested for the role
   after, every grant of a key on the type's scopes, of a viewer on thousands of resources to the
   members, the public, the subject or its group, cost a page or more, and tested as `= ANY` of the
   roles, a generic plan still read them by `rbac_grants_principal`. A role at a time for every key,
   each seek a descent of the index, cost a key holding a grant or two a seek for each role giving
   the permission: beside 40 such roles, a subject in 200 groups read 72,000 pages where by the
-  scope it read 3,300. Each key is read one way, once: both ways count what the first read, held
-  apart (`few`). A key's conditional grants of a
+  scope it read 3,300, and the bound alone, 64, left a catalog of 1,000 roles giving it costing 20
+  groups holding 100 grants each 60,000 pages where by the scope they read 700: so the bound grows
+  with the built-in roles giving the permission. Such a key's grants of custom roles on the type it
+  reads apart: by the scope up to 64 of them, and past that, where those 64 name 16 roles or fewer,
+  those of each custom role giving the permission there that the key holds, found by stepping from
+  one custom role of the key to the next in `rbac_grants_principal_role`, a seek each, and looked up
+  by key, while it holds 4 grants there for each, and by the scope below that. A key holding more than 16 custom roles, or whose 64 name
+  more, it reads by the scope, as before: each step costs about what reading a few grants does,
+  whatever the role gives or wherever it is granted, so stepping through the members' grants of 300
+  custom roles, one on each of 300 clusters, cost a member's `Reachable` 1,900 pages where by the
+  scope it read 210, and read by the tenant, a plan made while the tables were small read every
+  custom role of it. A key's every grant of a custom role, as a tenant's viewer's to the members on
+  20,000 clusters, read whatever the role gave, cost a member's `Reachable` 8,900 pages, as did
+  deciding which custom roles the members' grants name (`broadOn`), which tests each giving custom
+  role alike. Each key is read one way, once: both ways count what the first read, held
+  apart (`few`, and `more` up to the grown bound). Yet a search plans the custom roles' reads only
+  for a subject a key of which holds 64 grants of custom roles on the type: each statement reads a
+  key's grants past the bound as before them, those of built-in roles a role at a time, and of custom
+  roles by the scope, but only up to 64 of those, and a row of NULLs in place of a key holding that
+  many (`pastCapped`), and only where it finds one is it run again as above, and at once where the
+  members or the public hold that many, which `broadArgs` reads first. Planning each read of
+  `rbac_grants` costs about 0.15ms, as a plan for the arguments, which each call makes, also reads
+  the metapage of each of its empty partial indexes: planned whole, an ordinary subject's
+  `Reachable` took 4.2ms and its `Filter` 5.5ms, where they take 3.0 and 3.6, against 2.7 and 3.1
+  before 0034; read first only as far as the bound, a subject one of whose groups held 100 grants
+  of a built-in role on the type paid both statements, 4.3 and 6.8 to 11.6, where in one it pays 3.2
+  and 3.8. A subject with a key holding 64 of custom roles pays both, 4.9 and 7.8, against 2.9 and
+  3.3 before 0034. `Reachable`'s run without JIT: planned for its arguments, each is costed for
+  every key as for one holding many grants on the type, so compiling took a subject in 1,000
+  groups 44ms where running takes 20, and its second, in 1,000 groups one of which held many, 555ms
+  where it takes 22. `Filter`'s counts run without JIT too: each reads a key holding many grants on
+  the type a role at a time, costed as a seek for every role giving the permission, so beside a
+  catalog of 1,000 such roles compiling took a subject in 20 groups 123ms where running takes 41.
+  `Filter`'s count tests for a key holding more only where it falls short of its
+  limit, having then read every grant: tested first, a subject in 1,000 groups read every group's
+  grants, 13,070 pages, where it reads 9,110, as before 0034. `Filter`'s condition, which the host's query can't run again, reads past the bound as
+  it did before searches stepped through custom roles, those of built-in roles a role at a time and
+  every one of a custom role by the scope (`pastCustomByScope`), unless the count `Filter` reads
+  first finds a key holding 64 grants of custom roles there, or `broadArgs` the members or the
+  public holding as many. The count looks for one only where it falls short of its limit, so where
+  it reaches it first, as for a subject holding a dozen grants of built-in roles there, the condition
+  reads the custom roles' grants of its subject and its groups by the scope, as before 0034. As of a time it reads every grant of a key on the
+  type by the scope, of any role, as before 0034. A key's conditional grants of a
   role giving the permission it still reads, from that index alone, though `Filter` counts none:
   holding whether a grant is conditional before the scope, the index was costed as the scope's by a
   generic plan, which then read every grant of the key there. It names a custom role as that
