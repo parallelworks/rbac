@@ -8783,13 +8783,43 @@ func TestAChangeReadsThePermissionsOfTheRolesOfTheActorsGrantsOnceWhateverRolesI
 	}
 }
 
+// Nor does a change read the permissions of those roles where they give what it asks: it reads
+// their grants, ending after what it grants, as its decisions can tell them apart by their ends,
+// but a role giving what it asks mostly gives the first permission it asks, which settles it.
+// Asking them what each gives, Apply granting 1,000 roles of 20 permissions by an actor holding
+// such grants of 300 roles of 1,000 permissions giving them read 600,000 entries, a twentieth of its
+// time.
+func TestAChangeReadsNoPermissionsOfTheRolesOfTheActorsGrantsGivingWhatItAsks(t *testing.T) {
+	const r, p = 20, 200
+	var catalog []rbac.RoleDefinition
+	for i := range r {
+		wide := rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.wide", i)), Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+		for j := range p - 2 {
+			wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", j)))
+		}
+		catalog = append(catalog, wide)
+	}
+	h, granting, holding := endingSetup(t, catalog...)
+	for _, role := range catalog {
+		holding(role.ID, 1, h.now.Add(3*time.Hour))
+	}
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	granting("a", []rbac.Role{"cluster.login"})
+	t.Logf("read %d entries granting a role", entries)
+	if entries >= r*p {
+		t.Errorf("granting a role read %d entries of roles and what the constraints answered, beside grants of %d roles of %d permissions giving it, ending after it",
+			entries, r, p)
+	}
+}
+
 // A change to members reads the permissions of the roles of the actor's conditional grants, unread,
 // once for all the scopes it reaches, not once for each: adding a member to a group granted a role
 // under a condition on 1,000 clusters, by an actor holding such grants of 300 roles of 1,000
 // permissions ending after them, read every role's permissions for each, 10.1 s, where one without
 // them took 0.1 s.
 func TestAChangeToMembersReadsThePermissionsOfTheRolesOfTheActorsGrantsOnceWhateverScopesItReaches(t *testing.T) {
-	const r, p, s = 20, 200, 50
+	const r, p, s = 20, 500, 50
 	const cond = `resource.id != "z"`
 	// Custom roles giving what it gives, which the change asks nothing about, so their grants stay
 	// unread.

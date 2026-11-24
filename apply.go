@@ -1668,6 +1668,10 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 	// change reaching many, as one to the members of a group granted a role on each, walks the roles
 	// a role lists once.
 	proven := map[string]*checked{}
+	// What each condition was found to read of the subject holds on every scope: parsed for each, a
+	// change to members reaching 1,000 scopes under a condition parsed it 2,000 times, a third of
+	// its time.
+	parsed := subjects{}
 	b = b.keepingSets()
 	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
 	values := onTenant(tenant, held, ds, b)
@@ -1689,7 +1693,7 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 			excluded = excludedOf(of, heldOn)
 		}
 		aus[i] = a.authorityOf(ctx, q, actor, r, heldOn, deniedOn[i], exemptOn[i], b, excluded)
-		aus[i].values = values
+		aus[i].values, aus[i].subjects = values, parsed
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 || len(exemptOn[i]) > 0 {
 			continue
 		}
@@ -2137,8 +2141,13 @@ func (au authority) readEnding(ends []ending) {
 	if gv == nil {
 		gv = newGivers()
 	}
-	// left is how many roles of the unread grants some end could still read: known, with a grant
-	// ending at or after the soonest.
+	// Each role of the unread grants that some end could read, with a grant ending at or after the
+	// soonest, is asked first whether it gives the first permission the soonest end's role gives,
+	// as a role giving what a change asks mostly does: those that do are read from it, and only
+	// the others are found through the roles giving each permission (givers), so where they give
+	// what it asks, their permissions aren't read. left is how many are left to find.
+	from, looked := map[Role]time.Time{}, map[Permission]bool{}
+	first := ends[0].def.Permissions
 	left := 0
 	for role, unread := range ix.unread {
 		unread = slices.DeleteFunc(unread, func(i int) bool { return au.held[i].Condition.Expression != "" })
@@ -2147,13 +2156,18 @@ func (au authority) readEnding(ends []ending) {
 			continue
 		}
 		ix.unread[role] = unread
-		if gv.add(au.roles, role) && !ix.latest[role].Before(ends[0].until) {
+		r, known := au.roles.role(role)
+		switch {
+		case !known || ix.latest[role].Before(ends[0].until):
+		case len(first) > 0 && au.roles.givesAny(role, r, first[0]):
+			from[role] = ends[0].until
+		default:
+			gv.add(au.roles, role)
 			left++
 		}
 	}
 	// Found from what each end asks, so the roles giving nothing asked aren't asked, however many,
 	// nor those none of whose grants ends late enough to be read, nor any role for each end again.
-	from, looked := map[Role]time.Time{}, map[Permission]bool{}
 	for _, e := range ends {
 		if left == 0 {
 			break
@@ -2211,18 +2225,17 @@ type givers struct {
 
 func newGivers() *givers { return &givers{of: map[Permission][]Role{}, read: map[Role]bool{}} }
 
-// add reads what role gives, the first time it is asked, and reports whether b resolves it.
-func (g *givers) add(b book, role Role) bool {
+// add reads what role, as b defines it, gives, the first time it is asked.
+func (g *givers) add(b book, role Role) {
 	r, known := b.role(role)
 	if !known || g.read[role] {
-		return known
+		return
 	}
 	g.read[role] = true
 	readingEntries(len(r.Permissions))
 	for _, p := range r.Permissions {
 		g.of[p] = append(g.of[p], role)
 	}
-	return true
 }
 
 // kindsKey is what kindsLasting is asked, a condition, as of how many reads of conditions were made.

@@ -9130,8 +9130,8 @@ func TestGrantsEndingApartAreDecidedInTimeAsTheyAreMany(t *testing.T) {
 // What the actor's conditional grants give is found for the conditions a change decides by, not
 // kept for each condition they have: by an actor holding conditional grants of 300 roles of 1,000
 // permissions, each under its own condition, Apply granting roles giving those permissions kept, for
-// each permission, how long the grants under each of the 300 conditions last, twice, and took more
-// than one before them did.
+// each permission, how long the grants under each of the 300 conditions last, twice, an eighth of
+// its time.
 func TestAChangeKeepsNothingOfEachConditionOfTheActorsGrantsGivingWhatItAsks(t *testing.T) {
 	const m, p = 100, 200
 	wide := rbac.RoleDefinition{ID: "cluster.wide", ResourceTypes: []string{"cluster"}}

@@ -70,6 +70,28 @@ func setsOf(roles map[Role]RoleDefinition) map[Role]roleSet {
 
 // gives reports whether role id, defined as def, gives p on a resource type.
 func (b book) gives(id Role, def RoleDefinition, p Permission, resourceType string) bool {
+	s, ok := b.set(id, def)
+	if !ok {
+		readingEntries(len(def.Permissions) + len(def.ResourceTypes))
+		return def.GrantableOn(resourceType) && def.Gives(p)
+	}
+	readingEntries(1)
+	return s.types[resourceType] && s.permissions[p]
+}
+
+// givesAny reports whether role id, defined as def, gives p on any type.
+func (b book) givesAny(id Role, def RoleDefinition, p Permission) bool {
+	s, ok := b.set(id, def)
+	if !ok {
+		readingEntries(len(def.Permissions))
+		return def.Gives(p)
+	}
+	readingEntries(1)
+	return s.permissions[p]
+}
+
+// set is the sets of role id, defined as def, where b has them or keeps them.
+func (b book) set(id Role, def RoleDefinition) (roleSet, bool) {
 	s, ok := b.sets[id]
 	if _, builtin := b.builtin[id]; !builtin && b.customSets != nil {
 		if s, ok = b.customSets[id]; !ok {
@@ -77,12 +99,7 @@ func (b book) gives(id Role, def RoleDefinition, p Permission, resourceType stri
 			b.customSets[id] = s
 		}
 	}
-	if !ok {
-		readingEntries(len(def.Permissions) + len(def.ResourceTypes))
-		return def.GrantableOn(resourceType) && def.Gives(p)
-	}
-	readingEntries(1)
-	return s.types[resourceType] && s.permissions[p]
+	return s, ok
 }
 
 // keepingSets is b keeping the custom roles' sets as gives makes them, and the roles giving each
