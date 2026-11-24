@@ -4502,10 +4502,19 @@ var crowdedTables = []string{
 	"rbac_grants", "rbac_roles", "rbac_groups", "rbac_memberships", "rbac_members", "rbac_eligibilities", "rbac_denies", "rbac_history",
 }
 
-// crowd writes what crowded holds, as setupOn and crowding do.
+// crowd writes what crowded holds, as setupOn and crowding do. Autovacuum is off for the template's
+// tables: a VACUUM of history while a statement writes it records the free space of earlier pages,
+// where the writer then puts a small record, and the next, not fitting there, begins a page past the
+// last one, leaving that page's room unused. The template would then hold a page more than its copy
+// and every later record at another place. Copies are tables of their own, as migrating made them.
 func crowd(ctx context.Context, pool *pgxpool.Pool) error {
 	if err := rbac.Migrate(ctx, pool); err != nil {
 		return err
+	}
+	for _, table := range crowdedTables {
+		if _, err := pool.Exec(ctx, `ALTER TABLE `+table+` SET (autovacuum_enabled = off)`); err != nil {
+			return err
+		}
 	}
 	for _, q := range append([]string{creatorGrant}, crowding...) {
 		if _, err := pool.Exec(ctx, q); err != nil {
