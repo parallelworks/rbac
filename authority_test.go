@@ -69,6 +69,30 @@ func TestAConditionReadingTheSubjectIsNoAuthorityToHandItOn(t *testing.T) {
 	}
 }
 
+// The power to grant an actor holds under a condition counts once a change reads the condition,
+// even where the change found its power before, deciding a grant under no condition, which reads
+// none: what it found then is of its unconditional grants alone.
+func TestAPowerHeldUnderAConditionCountsOnceReadAfterAGrantUnderNone(t *testing.T) {
+	lister2 := rbac.RoleDefinition{ID: "cluster.lister2", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), lister, lister2) })
+	mfa := rbac.Condition{Expression: `request.attributes.mfa == true`}
+	w := workspace.Scope()
+	admin := grant(w, "cluster.admin", rbac.User, "bob")
+	admin.Condition = mfa
+	h.seed(t, grant(w, "workspace.admin", rbac.User, "bob"), grant(w, "cluster.lister2", rbac.User, "bob"), admin)
+	h.join(t, "carol", "dan")
+	plain := rbac.Binding{Role: "cluster.lister2", Principal: identity("carol")}
+	under := rbac.Binding{Role: "cluster.lister", Principal: identity("dan"), Condition: mfa}
+	for _, bs := range [][]rbac.Binding{{plain, under}, {under, plain}} {
+		if err := h.authz.Apply(t.Context(), h.as(t, "bob"), workspace, rbac.Change{Grant: bs}); err != nil {
+			t.Errorf("granting %s, then %s under the condition bob holds the power to grant under: %v", bs[0].Role, bs[1].Role, err)
+		}
+		if err := h.authz.Apply(t.Context(), h.as(t, "bob"), workspace, rbac.Change{Revoke: bs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestAnActivationLastsNoLongerThanThePlaceThatMakesItsSubjectEligible(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
@@ -8453,6 +8477,148 @@ func TestAChangeReadsNoConditionOfTheMembersGrantsGivingNothingItAsks(t *testing
 		if conditions != 0 || pages > n/4 {
 			t.Errorf("under %s, Apply read %d pages of grants and %d conditions", plans, pages, conditions)
 		}
+	}
+}
+
+// walkingSetup is an actor, ann, who may change g's members and grant custom.viewer, custom.other
+// and custom.granter on the tenant, beside g's k grants of custom.viewer there, each under a
+// condition of its own, and walked, which counts the actor's grants a change's decisions walk; more
+// stores m conditional grants of a role, as of custom.other, giving nothing a change of
+// custom.viewer asks about, to a group the actor is in, each ending in 30 days.
+func walkingSetup(t *testing.T, k int) (h *harness, ann rbac.Subject, walked func(change func() error) int, more func(role rbac.Role, m int)) {
+	t.Helper()
+	h = setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), groupMembers) })
+	ctx := t.Context()
+	ann = h.as(t, "ann", "mine")
+	h.groups(t, "g")
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.viewer', '{cluster:view}', '{cluster}'),
+		('t1', 'custom.other', '{workspace:view}', '{workspace}'), ('t1', 'custom.granter', '{cluster:grant}', '{cluster}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
+		SELECT 't1', 'tenant', 't1', 'group', 'g', 'custom.viewer', 'resource.id == "x' || i || '"' FROM generate_series(1, $1) AS i`, k); err != nil {
+		t.Fatal(err)
+	}
+	tenant := rbac.Scope{Type: rbac.TenantScope, ID: "t1"}
+	h.seed(t, grant(tenant, "group.members", rbac.User, "ann"), grant(tenant, "tenant.admin", rbac.User, "ann"), grant(tenant, "cluster.admin", rbac.User, "ann"),
+		grant(tenant, "workspace.admin", rbac.User, "ann"))
+	n := 0
+	rbac.SetWalkingGrants(t, func(w int) { n += w })
+	walked = func(change func() error) int {
+		t.Helper()
+		n = 0
+		if err := change(); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	more = func(role rbac.Role, m int) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'tenant', 't1', 'group', 'mine', $3, 'resource.id == "' || $3 || i || '"', $2
+			FROM generate_series(1, $1) AS i`, m, h.now.Add(30*24*time.Hour), role); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return h, ann, walked, more
+}
+
+// A change to members walks the actor's grants once, not once for each condition of the grants the
+// members it adds gain: a member gaining 1,000 grants of a role, each under a condition of its own,
+// had a change by an actor whose groups held 8,000 conditional grants of a role giving nothing it
+// asked walk them for each, 1.8 s, where one without them took 40 ms.
+func TestAChangeToMembersWalksTheActorsGrantsOnceWhateverTheConditionsItDecides(t *testing.T) {
+	const k, m = 200, 1000
+	h, ann, walked, more := walkingSetup(t, k)
+	ctx := t.Context()
+	adding := func(id string) func() error {
+		h.as(t, id)
+		return func() error {
+			return h.authz.ChangeMembers(ctx, ann, "t1", []rbac.Member{{Group: "g", Principal: identity(id)}}, nil)
+		}
+	}
+	before := walked(adding("dan"))
+	more("custom.other", m)
+	after := walked(adding("eve"))
+	t.Logf("walked %d, then %d", before, after)
+	if after-before > 10*m {
+		t.Errorf("adding a member walked %d of the actor's grants, and %d once it held %d more", before, after, m)
+	}
+}
+
+// A change walks the actor's grants once, not once for each condition it decides by, whether its
+// grants end or not, and whether the actor's conditional grants are read or not: granting a role to
+// 1,000 under a condition each had an actor whose groups held 8,000 conditional grants of a role
+// giving nothing it asked walk them for each, 2.6 s, where one without them took 0.3 s.
+func TestAChangeWalksTheActorsGrantsOnceWhateverTheConditionsItDecides(t *testing.T) {
+	const k, m = 200, 1000
+	h, ann, walked, more := walkingSetup(t, 1)
+	ctx := t.Context()
+	on := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	granting := func(prefix string, role rbac.Role, ends bool) func() error {
+		bs := make([]rbac.Binding, k)
+		for i := range bs {
+			bs[i] = rbac.Binding{Role: role, Principal: identity(fmt.Sprint(prefix, i)), Condition: rbac.Condition{Expression: fmt.Sprintf(`resource.id == "%s%d"`, prefix, i)}}
+			if ends {
+				bs[i].ExpiresAt = h.now.Add(time.Hour + time.Duration(i)*time.Minute)
+			}
+		}
+		return func() error { return h.authz.Apply(ctx, ann, on, rbac.Change{Grant: bs}) }
+	}
+	before, beforeEnding := walked(granting("a", "custom.viewer", false)), walked(granting("b", "custom.viewer", true))
+	beforeRead := walked(granting("c", "custom.other", true))
+	more("custom.other", m)
+	after, afterEnding := walked(granting("d", "custom.viewer", false)), walked(granting("e", "custom.viewer", true))
+	// Each of its grants of custom.other ends after those it grants, so the change reads them all.
+	afterRead := walked(granting("f", "custom.other", true))
+	t.Logf("walked %d, %d and %d, then %d, %d and %d", before, beforeEnding, beforeRead, after, afterEnding, afterRead)
+	if after-before > 10*m {
+		t.Errorf("Apply walked %d of the actor's grants, and %d once it held %d more", before, after, m)
+	}
+	if afterEnding-beforeEnding > 10*m {
+		t.Errorf("Apply of grants that end walked %d of the actor's grants, and %d once it held %d more", beforeEnding, afterEnding, m)
+	}
+	if afterRead-beforeRead > 10*m {
+		t.Errorf("Apply of grants that end of a role the actor's conditional grants give walked %d of its grants, and %d once it held %d more", beforeRead, afterRead, m)
+	}
+}
+
+// A change finds how long the actor's grants giving what it asks last once, not once for each
+// condition it decides by: adding a member to a group holding 4,000 conditional grants of a role,
+// by an actor whose groups held 4,000 conditional grants of a role giving what it asked, copied all
+// of them for each condition, 6.5 s, where with 1,000 of each it took 0.45 s.
+func TestAChangeFindsHowLongTheGrantsGivingWhatItAsksLastOnceWhateverTheConditionsItDecides(t *testing.T) {
+	const k, m = 200, 1000
+	h, ann, walked, more := walkingSetup(t, k)
+	ctx := t.Context()
+	adding := func(id string) func() error {
+		h.as(t, id)
+		return func() error {
+			return h.authz.ChangeMembers(ctx, ann, "t1", []rbac.Member{{Group: "g", Principal: identity(id)}}, nil)
+		}
+	}
+	on := rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"}
+	granting := func(prefix string, role rbac.Role) func() error {
+		bs := make([]rbac.Binding, k)
+		for i := range bs {
+			bs[i] = rbac.Binding{Role: role, Principal: identity(fmt.Sprint(prefix, i)), Condition: rbac.Condition{Expression: fmt.Sprintf(`resource.id == "%s%d"`, prefix, i)}}
+		}
+		return func() error { return h.authz.Apply(ctx, ann, on, rbac.Change{Grant: bs}) }
+	}
+	before, beforeApply, beforePower := walked(adding("dan")), walked(granting("a", "custom.viewer")), walked(granting("b", "custom.granter"))
+	more("custom.viewer", m)
+	more("custom.granter", m)
+	after, afterApply, afterPower := walked(adding("eve")), walked(granting("c", "custom.viewer")), walked(granting("d", "custom.granter"))
+	t.Logf("walked %d, %d and %d, then %d, %d and %d", before, beforeApply, beforePower, after, afterApply, afterPower)
+	// It holds 2m more, each walked a few times, where walked for each condition, each k times.
+	if after-before > 20*m {
+		t.Errorf("adding a member walked %d of the actor's grants, and %d once it held %d more giving what it asked", before, after, 2*m)
+	}
+	if afterApply-beforeApply > 20*m {
+		t.Errorf("Apply walked %d of the actor's grants, and %d once it held %d more giving what it asked", beforeApply, afterApply, 2*m)
+	}
+	if afterPower-beforePower > 20*m {
+		t.Errorf("Apply of a role giving the power to change grants walked %d of the actor's grants, and %d once it held %d more giving that power", beforePower, afterPower, 2*m)
 	}
 }
 
