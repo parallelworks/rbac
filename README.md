@@ -926,14 +926,33 @@ cursor was read, leaves nothing the database can tell from recovering from a cra
 nothing that committed, so its export would read on: restore by recovering to a point in time, which
 starts a new generation, or export each generation from the start again after a restore. Move
 history with physical backups and replicas; a logical dump restored into another cluster numbers its
-transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
-dates only changes of its own cluster, and a restored change whose commit record is gone counts from
-its own date; a transaction this cluster gives a restored change's txid is another, which commits,
-and whose changes `AsOf` counts apart from the restored one's. `pg_upgrade` gives the cluster a new
-identifier and keeps its transaction ids, so `AsOf` answers as before. Never bring back rows of a
-timeline a recovery to a point in time left behind: they keep the cluster's identifier while the new
-timeline numbers their transactions again, so `AsOf` would date such a change by another
-transaction's commit.
+transactions anew. Its records keep the transaction ids of the cluster that wrote them, and
+`History` reads a record only once every transaction still running is later, so a record restored
+from a cluster whose ids ran ahead of this one's, as a new cluster's are behind those of one that
+has run a while, would come after every change this cluster makes until its ids pass it, which can
+take as many transactions as the source ran. While history holds one, `History`, and `Export` and
+`PruneHistory` with it, refuses as an `*rbac.AheadError`, which names the last such transaction,
+rather than export none of the restore. Before restoring such a dump, or after but before any
+export of the restore begins, commit or roll back every prepared transaction in the new cluster, as
+`pg_prepared_xacts` lists them, stop it cleanly and raise its transaction id epoch past the
+source's with `pg_resetwal -e`, to one more than the source's
+`floor(pg_current_xact_id()::text::numeric / 4294967296)`, or the `AheadError`'s `TxID` divided
+so, before taking its backups or making its replicas: every restored record is then of an earlier
+transaction than any this cluster makes, and `History` reads them at once, in order, exported from
+`Genesis` as a new generation. A transaction left prepared keeps the id it took in the old epoch,
+which the cluster's snapshots read in the new one, so `History` reads past it while it is open,
+and once it commits, its records are behind the cursor of every export in the cluster, never read,
+and a prune through that cursor deletes them. A cluster that can't be stopped so, as one a
+provider runs, can't follow history restored ahead of it: move history there by a physical copy.
+Restore a dump only into a new database, a new generation: a record restored behind the cursor of an
+export that already follows the database is never read. `AsOf` still dates a restored change by its
+own commit record, as a commit record dates only changes of its own cluster, and a restored change
+whose commit record is gone counts from its own date; a transaction this cluster gives a restored
+change's txid is another, which commits, and whose changes `AsOf` counts apart from the restored
+one's. `pg_upgrade` gives the cluster a new identifier and keeps its transaction ids, so `AsOf`
+answers as before. Never bring back rows of a timeline a recovery to a point in time left behind:
+they keep the cluster's identifier while the new timeline numbers their transactions again, so
+`AsOf` would date such a change by another transaction's commit.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the

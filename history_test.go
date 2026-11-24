@@ -4992,6 +4992,242 @@ func TestHistoryRefusesAnExportBegunAsAPrunesTransactionRan(t *testing.T) {
 	}
 }
 
+// txidAhead is a txid by past the next the cluster numbers, as a dump from a cluster whose
+// transaction ids ran ahead of this one's carries.
+func txidAhead(t *testing.T, h *harness, by uint64) string {
+	t.Helper()
+	var txid string
+	if err := h.pool.QueryRow(t.Context(), `SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::numeric + $1)::text`, by).Scan(&txid); err != nil {
+		t.Fatal(err)
+	}
+	return txid
+}
+
+// fakePrune is SQL inserting the record of a prune of txid, dated in 2000, that deleted a record of
+// the transaction before it, as every pruning cluster's history holds one.
+func fakePrune(txid string) string {
+	return fmt.Sprintf(`INSERT INTO rbac_history (txid, effective_at, tenant, entity, key, op, after, how)
+		VALUES ('%[1]s'::xid8, timestamptz '2000-01-01 00:00:01+00', '', 'history', '2000-01-01T00:00:00.000000Z', 'prune',
+		  jsonb_build_object('before', timestamptz '2000-01-01 00:00:00+00', 'through', jsonb_build_object('txid', ('%[1]s'::numeric - 1)::text, 'id', 1),
+		    'deleted', 1, 'reached', 1, 'last', jsonb_build_object('txid', ('%[1]s'::numeric - 1)::text, 'id', 1)), 'PruneHistory')`, txid)
+}
+
+// refusedAhead checks that History, from the start and from cursor, Export from the start, and
+// PruneHistory through cursor each refuse history holding records of transactions up to txid, which
+// the cluster has yet to number, saying so.
+func refusedAhead(t *testing.T, h *harness, cursor rbac.Cursor, txid string) {
+	t.Helper()
+	ctx := t.Context()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := dbNow(t, h)
+	read := func(got []rbac.Record, err error) error {
+		if err == nil {
+			return fmt.Errorf("read %d records, and no error", len(got))
+		}
+		return err
+	}
+	for _, call := range []struct {
+		name string
+		call func() error
+	}{
+		{"History from the start", func() error {
+			got, _, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory)
+			return read(got, err)
+		}},
+		{"History from an export's cursor", func() error {
+			got, _, err := h.authz.History(ctx, cursor, rbac.MaxHistory)
+			return read(got, err)
+		}},
+		{"Export from the start", func() error {
+			got, _, err := h.authz.Export(ctx, rbac.Checkpoint{}, rbac.MaxHistory, key)
+			return read(got, err)
+		}},
+		{"PruneHistory through an export's cursor", func() error {
+			n, err := rbac.PruneHistory(ctx, h.pool, now, cursor)
+			if err == nil {
+				return fmt.Errorf("deleted %d records, and no error", n)
+			}
+			return err
+		}},
+	} {
+		var ahead *rbac.AheadError
+		if err := call.call(); !errors.As(err, &ahead) || fmt.Sprint(ahead.TxID) != txid {
+			t.Errorf("%s, history holding records of transactions up to %s, which the cluster has yet to number: %v", call.name, txid, err)
+		}
+	}
+}
+
+// A logical dump restored from a cluster whose transaction ids ran ahead of this one's carries
+// records of transactions this cluster has yet to number. History reads one only once every
+// transaction running is later, so that every change this cluster makes until then is read before
+// it, as it would be one of its own: AsOf read the restored grant, but History returned none of
+// the restored records, and no export of the restore held them, while nothing said so. It refuses
+// instead, and Export and PruneHistory with it, naming the last of them.
+func TestHistoryRefusesRecordsOfTransactionsTheClusterHasYetToNumber(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	_, theirs := otherCluster(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, n)
+	ahead := txidAhead(t, h, 1_000_000_000_000)
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	restoreRows(t, h,
+		fakeGrant(old.Format("2006-01-02 15:04:05"), theirs, ahead),
+		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, ahead),
+	)
+	if err := h.authz.AsOf(ctx, "t1", dbNow(t, h), func(a *rbac.Authorizer) error {
+		grants, err := a.Grants(ctx, "t1", rbac.GrantFilter{Principals: []rbac.Principal{identity("restored")}})
+		if err == nil && len(grants) != 1 {
+			t.Errorf("as of now, a grant restored from a cluster ahead of this one reads as %+v", grants)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refusedAhead(t, h, cursor, ahead)
+}
+
+// A dump of a cluster that has pruned its history carries the record of each prune, which, from a
+// cluster ahead of this one, is of a transaction this cluster has yet to number: History counted
+// it as one still running, and no read from the start returned anything, not even the changes made
+// since the restore, while a read from an export's cursor was refused as one a prune since its
+// export began went past. It refuses both as history ahead of the cluster.
+func TestHistoryRefusesAPruneOfATransactionTheClusterHasYetToNumber(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	var n int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM rbac_history WHERE entity <> 'commit'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	var cursor rbac.Cursor
+	drain(t, h, &cursor, n)
+	ahead := txidAhead(t, h, 1_000_000_000_000)
+	restoreRows(t, h, fakePrune(ahead))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'since')`); err != nil {
+		t.Fatal(err)
+	}
+	refusedAhead(t, h, cursor, ahead)
+}
+
+// History refuses history holding a record of a transaction the cluster has yet to number by its
+// snapshot, but a host's transaction at REPEATABLE READ takes its own id after its snapshot, and
+// so records its own changes under one no snapshot it reads by has numbered: History on it is
+// refused for none of them.
+func TestHistoryOnAHostsTransactionIsRefusedForNoneOfItsOwnChanges(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'host')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.authz.WithTx(tx).History(ctx, rbac.Cursor{}, rbac.MaxHistory); err != nil {
+		t.Fatalf("History on a host's transaction at REPEATABLE READ after a change of its own: %v", err)
+	}
+}
+
+// Records a dump carried from a cluster just ahead of this one are read once this cluster's
+// transaction ids pass theirs and every transaction of its own that took an earlier id has ended:
+// a change of a transaction that took its id before then, and commits after History could first
+// read them, is read before them, and one made after them is read after, so an export that read
+// them skips no change of this cluster's. Read as settled once restored, they would have put an
+// export's cursor past every change this cluster made until its ids caught up.
+func TestHistoryReadsRecordsOfAClusterAheadOnceItsOwnIdsPassThem(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	_, theirs := otherCluster(t, h)
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "tmpl"))
+	ahead := txidAhead(t, h, 20000)
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	restoreRows(t, h,
+		fakeGrant(old.Format("2006-01-02 15:04:05"), theirs, ahead),
+		fakeCommit(old.Add(time.Second).Format("2006-01-02 15:04:05"), theirs, ahead),
+	)
+	var refused *rbac.AheadError
+	if _, _, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory); !errors.As(err, &refused) {
+		t.Fatalf("History from the start, history holding a record of a transaction the cluster has yet to number: %v", err)
+	}
+	// The cluster numbers transactions up to just short of theirs, then one of its own takes its
+	// id, before theirs, and holds it while the cluster numbers past them: only then, as held open,
+	// it holds back every read of history in the cluster, other tests' too.
+	burn, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	burnTo := func(until string) {
+		t.Helper()
+		if _, err := h.pool.Exec(burn, fmt.Sprintf(`DO $$ BEGIN LOOP
+			PERFORM set_config('synchronous_commit', 'off', true);
+			EXIT WHEN %s;
+			COMMIT; END LOOP; END $$`, until)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	burnTo(fmt.Sprintf(`pg_current_xact_id()::text::numeric >= '%s'::numeric - 2000`, ahead))
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := held.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'held')`); err != nil {
+		t.Fatal(err)
+	}
+	var before bool
+	if err := held.QueryRow(ctx, `SELECT pg_current_xact_id() < $1::text::pg_catalog.xid8`, ahead).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if !before {
+		t.Fatalf("held took its id after the restored records' %s: other sessions took 2000 ids as it began", ahead)
+	}
+	burnTo(fmt.Sprintf(`pg_current_xact_id() > '%s'::xid8`, ahead))
+	// The cluster has numbered past theirs, but held, of an earlier id, runs: neither is read.
+	got, cursor, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory)
+	if err != nil {
+		t.Fatalf("History from the start once the cluster numbered past the restored records: %v", err)
+	}
+	for _, r := range got {
+		if r.Principal == identity("restored") || r.Principal == identity("held") {
+			t.Fatalf("History read %+v while a transaction that took its id before the restored records' runs", r)
+		}
+	}
+	if err := held.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'after')`); err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	if err := h.pool.QueryRow(ctx, `SELECT array_agg(id ORDER BY txid, id) FROM rbac_history WHERE entity <> 'commit'`).Scan(&ids); err != nil {
+		t.Fatal(err)
+	}
+	all := slices.Concat(got, drain(t, h, &cursor, len(ids)-len(got)))
+	var read []int64
+	order := map[string]int{}
+	for i, r := range all {
+		read = append(read, r.ID)
+		order[r.Principal.ID] = i
+	}
+	if !slices.Equal(read, ids) {
+		t.Fatalf("an export read records %v, history holding %v", read, ids)
+	}
+	if order["held"] >= order["restored"] || order["restored"] >= order["after"] {
+		t.Errorf("an export read held's change at %d, the restored grant at %d, and after's change at %d", order["held"], order["restored"], order["after"])
+	}
+}
+
 // exporter is an export in TestHistoryRefusesExactlyTheExportsAPruneDeletedFrom: where it stands,
 // whether it has begun, by a read from the start that found records, whether a prune has since
 // deleted a record after its cursor, which it then never reads, and whether one deleted the
