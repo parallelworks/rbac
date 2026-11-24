@@ -616,6 +616,9 @@ sequenceDiagram
     A->>E: deny conditions, within a deny budget
     A->>A: an unconditional grant, of a built-in or custom role, that gives it?
     A->>DB: conditionsOf (only where a conditional grant is all that's left)
+    opt a grant readHeld read is gone, and none found allows: revoked, or replaced as a change extending it replaces it
+        A->>DB: readHeld and decide again (reread), at most 3 reads, then ErrConflict
+    end
     A->>E: grant conditions, cheapest first, within a budget
     opt labeled resource or exclusive value
         A->>A: the values the label asks for, from what it read (holdingFor)
@@ -1052,8 +1055,11 @@ sequenceDiagram
   members put that on every member's change. The conditions read in a call are kept by grant id
   for the rest of it, so the read under the locks takes them from there: a grant's condition never
   changes in place, as `Apply` and `Import` replace a grant only under an equal condition, and a
-  grant made again has a new id. A grant whose condition isn't read never changes a decision, as
-  its role gives nothing the change asks, or a grant read already gives it for good; but a grant
+  grant made again has a new id. One gone by the time its condition is read, revoked or replaced
+  since the statement reading the actor's grants, refuses the change as `ErrConflict`, not as one
+  its actor lacks the power for: no moment had it lack it, and a retry reads the grants again. A
+  grant whose condition isn't read never changes a decision, as its role gives nothing the change
+  asks, or a grant read already gives it for good; but a grant
   made until a time is decided with the others its actor's grants can't tell apart, so under a
   condition, the unread grants of roles giving what deciding it can ask about that end at or after
   it are read first (`decidedAs`): standing in unread by their ends, 64 grants of a role giving
@@ -1529,7 +1535,21 @@ flowchart TB
   it, and decide them after it, as the constraints are asked outside it. Under `WithTx` they read on
   the host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement
   reads a moment of its own, so a change committing between two can mix two states, and for AsOf,
-  history of a time not yet final. Conflicts reads in one statement, the custom roles with their
+  history of a time not yet final. A check on a pool, which reads the grants in one statement and,
+  only where a conditional grant is all that gives something, their conditions in another
+  (`conditionsOf`), as a snapshot's transaction would cost every check two round trips more, can
+  find a grant read in the first gone by the second: revoked, or replaced by a new grant as a
+  change extending a conditional grant stores one. Read as a condition nothing meets, a grant
+  replaced by one under the same condition denied what every moment allowed, and Authorize
+  disagreed with Explain. So the check reads the grants again and decides again (`reread`):
+  `Authorize`, with the label values read with them, `Permissions`, `Holding`, `Filter`'s holding,
+  `Grantable`, and a read of one snapshot under `WithTx` at READ COMMITTED. The first four do only
+  where the grants found don't give what one gone gave (`conditionsFound`): a grant found, under
+  the condition it has for good, gave it at the first statement's moment, so that decision stands,
+  and a check beside a grant a change kept replacing doesn't lose the race every time. Read
+  again, a grant revoked for good is no longer read, and one replaced is read as its replacement;
+  a race lost three times in a row is `ErrConflict`. Nothing is read twice unless a grant is found
+  gone, so an ordinary check costs what it did. Conflicts reads in one statement, the custom roles with their
   grants, as a check and `broadExcludes` read them, so it lists what one moment held under `WithTx`
   too, with JIT off for it (`withoutJIT`). A read that sets planner settings for its own statements
   alone (`planned`, `plannedSteps`, `plannedQuery`), as that, `Holders`' read of label values, every

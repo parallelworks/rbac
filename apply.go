@@ -2586,6 +2586,13 @@ func (a *Authorizer) Grantable(ctx context.Context, s Subject, r Resource) (_ []
 	if err := a.subject(s); err != nil {
 		return nil, err
 	}
+	// A grant it reads that is gone by the time its condition is read has it all read again.
+	return reread(func() ([]RoleDefinition, error) { return a.grantable(ctx, s, r) })
+}
+
+// grantable is Grantable once its input is checked. It asks the constraints through a constrained
+// of its own, which keeps a failed read of conditions as its error.
+func (a *Authorizer) grantable(ctx context.Context, s Subject, r Resource) ([]RoleDefinition, error) {
 	// Every custom role, read once: the candidates, and those their GrantableRoles name. In the
 	// statement that reads the grants, as a check reads them: read apart, a grant revoked and its
 	// role widened meanwhile could offer what no moment would. Its label values too, which its
