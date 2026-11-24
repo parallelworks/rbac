@@ -1086,7 +1086,7 @@ func (au authority) readAt(at []int) {
 	for j, i := range at {
 		expr := gs[j].Condition.Expression
 		au.held[i].Condition.Expression = expr
-		if ix != nil && ix.built && expr != "" {
+		if ix.of(au.held) && expr != "" {
 			ix.read[expr] = append(ix.read[expr], i)
 			ix.unreadN--
 		}
@@ -1099,12 +1099,14 @@ func (au authority) readAt(at []int) {
 // held 8,000 conditional grants of a role giving nothing it asked, walk all of them for each, twice,
 // 2.6 s, where one without them took 0.3 s.
 type heldIndex struct {
-	// built reports whether the rest is found: kinds, the positions of the grants of each kind,
-	// which give alike (givesOnce); unread, those of the conditional grants whose conditions aren't
-	// read, by role, some read since, and unreadN how many aren't; read, those of the conditional
-	// grants whose conditions are, by condition; and lasting, how long the unconditional grants of
-	// each kind last (kindsLasting).
-	built   bool
+	// held is the grants the rest is found of, nil until it is: kinds, the positions of the grants of
+	// each kind, which give alike (givesOnce); unread, those of the conditional grants whose
+	// conditions aren't read, by role, some read since, and unreadN how many aren't; read, those of
+	// the conditional grants whose conditions are, by condition; and lasting, how long the
+	// unconditional grants of each kind last (kindsLasting). Positions in other grants are none of
+	// theirs, so an authority whose grants are replaced, as a test deciding each grant alone narrows
+	// them to those lasting until it ends, finds them again.
+	held    []holding
 	kinds   map[roleCarrier][]int
 	unread  map[Role][]int
 	unreadN int
@@ -1121,11 +1123,11 @@ func (au authority) indexed() *heldIndex {
 	if ix == nil {
 		ix = &heldIndex{}
 	}
-	if ix.built {
+	if ix.of(au.held) {
 		return ix
 	}
 	walkingGrants(len(au.held))
-	ix.built, ix.kinds, ix.unread, ix.unreadN = true, map[roleCarrier][]int{}, map[Role][]int{}, 0
+	ix.held, ix.kinds, ix.unread, ix.unreadN = au.held, map[roleCarrier][]int{}, map[Role][]int{}, 0
 	ix.read, ix.lasting, ix.giving = map[string][]int{}, map[roleCarrier]lasting{}, map[permissionOn][]int{}
 	for i, g := range au.held {
 		k := g.roleCarrier()
@@ -1141,6 +1143,11 @@ func (au authority) indexed() *heldIndex {
 		}
 	}
 	return ix
+}
+
+// of reports whether ix is found of held: the same grants, read into in place.
+func (ix *heldIndex) of(held []holding) bool {
+	return ix != nil && ix.held != nil && len(ix.held) == len(held) && (len(held) == 0 || &ix.held[0] == &held[0])
 }
 
 // giving is the grants au holds that give p on a resource type, their conditions read where read
