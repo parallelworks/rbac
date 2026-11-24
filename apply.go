@@ -996,6 +996,8 @@ type authority struct {
 	given  map[heldKey][]lasting
 	powers map[heldKey]powerLasting
 	kinds  map[kindsKey][]lasting
+	// index is where in held the grants each decision walks are.
+	index *heldIndex
 	// asks are the permissions deciding a grant of each role can ask about (asking).
 	asks map[Role]map[Permission]bool
 	// values is what the actor's label values are decided by, read with its grants, so a change
@@ -1058,16 +1060,11 @@ func (r *conditionReads) failed() error {
 	return r.err
 }
 
-// read reads, in one statement, the conditions of the conditional grants au holds that keeps
-// keeps, not read already. One that fails leaves each a condition nothing meets, so a decision
+// readAt reads, in one statement, the conditions of the conditional grants at positions at in held,
+// in order, not read already. One that fails leaves each a condition nothing meets, so a decision
 // refuses rather than allows, and keeps the error for the change to return, with the constraints'.
-func (au authority) read(keeps func(holding) bool) {
-	var at []int
-	for i, h := range au.held {
-		if h.conditional && h.Condition.Expression == "" && keeps(h) {
-			at = append(at, i)
-		}
-	}
+func (au authority) readAt(at []int) {
+	at = slices.DeleteFunc(slices.Clone(at), func(i int) bool { return !au.held[i].conditional || au.held[i].Condition.Expression != "" })
 	if len(at) == 0 || au.reads == nil {
 		return
 	}
@@ -1085,30 +1082,101 @@ func (au authority) read(keeps func(holding) bool) {
 			gs[j].Condition.Expression = "false"
 		}
 	}
+	ix := au.index
 	for j, i := range at {
-		au.held[i].Condition.Expression = gs[j].Condition.Expression
+		expr := gs[j].Condition.Expression
+		au.held[i].Condition.Expression = expr
+		if ix != nil && ix.built && expr != "" {
+			ix.read[expr] = append(ix.read[expr], i)
+			ix.unreadN--
+		}
 	}
+}
+
+// heldIndex is where in an authority's grants (held) those each of its decisions walks are, found
+// once for the authority: a decision walking every grant the actor holds, for each condition a
+// change decides by, had a change granting a role under 1,000 conditions, by an actor whose groups
+// held 8,000 conditional grants of a role giving nothing it asked, walk all of them for each, twice,
+// 2.6 s, where one without them took 0.3 s.
+type heldIndex struct {
+	// built reports whether the rest is found: kinds, the positions of the grants of each kind,
+	// which give alike (givesOnce); unread, those of the conditional grants whose conditions aren't
+	// read, by role, some read since, and unreadN how many aren't; read, those of the conditional
+	// grants whose conditions are, by condition; and lasting, how long the unconditional grants of
+	// each kind last (kindsLasting).
+	built   bool
+	kinds   map[roleCarrier][]int
+	unread  map[Role][]int
+	unreadN int
+	read    map[string][]int
+	lasting map[roleCarrier]lasting
+	// giving are the positions of the grants giving each permission on a type, in order (giving).
+	giving map[permissionOn][]int
+}
+
+// indexed is au's index, found the first time a decision needs it; one for this call alone where
+// au has none.
+func (au authority) indexed() *heldIndex {
+	ix := au.index
+	if ix == nil {
+		ix = &heldIndex{}
+	}
+	if ix.built {
+		return ix
+	}
+	walkingGrants(len(au.held))
+	ix.built, ix.kinds, ix.unread, ix.unreadN = true, map[roleCarrier][]int{}, map[Role][]int{}, 0
+	ix.read, ix.lasting, ix.giving = map[string][]int{}, map[roleCarrier]lasting{}, map[permissionOn][]int{}
+	for i, g := range au.held {
+		k := g.roleCarrier()
+		ix.kinds[k] = append(ix.kinds[k], i)
+		switch {
+		case !g.conditional:
+			ix.lasting[k] = ix.lasting[k].with(g)
+		case g.Condition.Expression == "":
+			ix.unread[g.Role] = append(ix.unread[g.Role], i)
+			ix.unreadN++
+		default:
+			ix.read[g.Condition.Expression] = append(ix.read[g.Condition.Expression], i)
+		}
+	}
+	return ix
 }
 
 // giving is the grants au holds that give p on a resource type, their conditions read where read
 // says, cheapest first, the order checks evaluate them in (cheapestFirst), so a budget run out
-// decides what it would for a check of p.
+// decides what it would for a check of p. Which give it is found once for the authority, from what
+// each kind of its grants gives, so a decision under another condition walks only those.
 func (au authority) giving(p Permission, resourceType string, read bool) []holding {
-	givesP := func(g holding) bool { return gives(au.roles, g, p, resourceType) }
-	if read {
-		au.read(givesP)
-	}
-	var gs []holding
-	for _, g := range au.held {
-		if givesP(g) {
-			gs = append(gs, g)
+	ix, k := au.indexed(), permissionOn{p, resourceType}
+	at, ok := ix.giving[k]
+	if !ok {
+		for _, of := range ix.kinds {
+			if gives(au.roles, au.held[of[0]], p, resourceType) {
+				at = append(at, of...)
+			}
 		}
+		// In the order held is, as cheapestFirst keeps the order of those it can't tell apart.
+		slices.Sort(at)
+		ix.giving[k] = at
+	}
+	if read {
+		au.readAt(at)
+	}
+	walkingGrants(len(at))
+	var gs []holding
+	for _, i := range at {
+		gs = append(gs, au.held[i])
 	}
 	if read {
 		cheapestFirst(gs, holding.expression)
 	}
 	return gs
 }
+
+// walkingGrants runs as a decision walks n of the actor's grants, as a test counts how many a change
+// walks.
+var walkingGrants = func(int) {}
 
 // lasts reports whether one of the grants l is of lasts until until, zero for never: the one that
 // lasts longest does, if any.
@@ -1668,7 +1736,7 @@ func (a *Authorizer) authorityOf(ctx context.Context, q DB, actor Subject, on Re
 	}
 	return authority{
 		held: held, reads: &conditionReads{load: func(gs []holding) error { return a.conditionsOf(ctx, q, on.Tenant, gs) }}, roles: b.keepingSets(), given: map[heldKey][]lasting{}, powers: map[heldKey]powerLasting{}, kinds: map[kindsKey][]lasting{},
-		asks: map[Role]map[Permission]bool{},
+		index: &heldIndex{}, asks: map[Role]map[Permission]bool{},
 		allows: func(h holding, action Permission) bool {
 			return !h.conditional || a.conds.holds(spend(action), h.Condition.Expression, with(vars, action))
 		},
@@ -1869,9 +1937,10 @@ func (au authority) decidedAs(def RoleDefinition, condition string, until time.T
 // kept is the condition a grant made under condition is decided under (decidedAs): it, or none
 // where none of the actor's conditional grants has it, nor is unread.
 func (au authority) kept(condition string) string {
-	if condition != "" && !slices.ContainsFunc(au.held, func(g holding) bool {
-		return g.conditional && (g.Condition.Expression == condition || g.Condition.Expression == "")
-	}) {
+	if condition == "" {
+		return ""
+	}
+	if ix := au.indexed(); ix.unreadN == 0 && len(ix.read[condition]) == 0 {
 		return ""
 	}
 	return condition
@@ -1894,32 +1963,40 @@ func (au authority) readEnding(ends []ending) {
 	for i, e := range ends {
 		asks[i] = au.asking(e.def)
 	}
-	type roleFor struct {
-		held Role
-		i    int
-	}
-	gives := map[roleFor]bool{}
-	au.read(func(g holding) bool {
-		if g.ends.IsZero() {
-			return false
+	// Walked by role, so the grants of roles giving nothing asked aren't, however many.
+	ix := au.indexed()
+	var at []int
+	for role, unread := range ix.unread {
+		unread = slices.DeleteFunc(unread, func(i int) bool { return au.held[i].Condition.Expression != "" })
+		if len(unread) == 0 {
+			delete(ix.unread, role)
+			continue
 		}
-		for i, e := range ends {
-			if g.ends.Before(e.until) {
+		ix.unread[role] = unread
+		r, known := au.roles.role(role)
+		asked := make([]bool, len(ends))
+		for i := range ends {
+			asked[i] = known && slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[i][p] })
+		}
+		if !slices.Contains(asked, true) {
+			continue
+		}
+		walkingGrants(len(unread))
+		for _, i := range unread {
+			g := au.held[i]
+			if g.ends.IsZero() {
 				continue
 			}
-			k := roleFor{g.Role, i}
-			given, ok := gives[k]
-			if !ok {
-				r, known := au.roles.role(g.Role)
-				given = known && slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[i][p] })
-				gives[k] = given
-			}
-			if given {
-				return true
+			for j, e := range ends {
+				if asked[j] && !g.ends.Before(e.until) {
+					at = append(at, i)
+					break
+				}
 			}
 		}
-		return false
-	})
+	}
+	slices.Sort(at)
+	au.readAt(at)
 }
 
 // kindsKey is what kindsLasting is asked, a condition, as of how many reads of conditions were made.
@@ -1958,17 +2035,14 @@ func (au authority) asking(def RoleDefinition) map[Permission]bool {
 // of a role through principals of one carrier, which carry what it gives alike (Principal.carrier).
 // One whose condition isn't read counts under none.
 func (au authority) kindsLasting(condition string) []lasting {
-	type kind struct {
-		role    Role
-		carrier PrincipalKind
-	}
-	by := map[kind]lasting{}
-	for _, g := range au.held {
-		if !g.under(au.subjects, condition) {
-			continue
+	ix := au.indexed()
+	by := maps.Clone(ix.lasting)
+	if under := ix.read[condition]; condition != "" && len(under) > 0 && au.subjects.sameFor(condition, condition) {
+		walkingGrants(len(under))
+		for _, i := range under {
+			g := au.held[i]
+			by[g.roleCarrier()] = by[g.roleCarrier()].with(g)
 		}
-		k := kind{g.Role, g.Principal.carrier()}
-		by[k] = by[k].with(g)
 	}
 	return slices.Collect(maps.Values(by))
 }
