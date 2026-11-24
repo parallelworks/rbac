@@ -77,7 +77,10 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
+	// In a batch (planned), which sends it in UTF8 whatever the session's client_encoding: a host's
+	// DB wrapper can set another before each statement, after the change's transaction set UTF8
+	// (inUTF8), and history would then name another actor.
+	if err := planned(ctx, tx, nil, nil, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
 		return nil, err
 	}
 	// In a transaction of its own that hands nothing to OnChange, nothing writes after the change,
@@ -693,7 +696,10 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		// read that finds no record chains nothing, and the next refuses the cursor in followable. An
 		// export begins with the oldest transaction it sees running as its Horizon, and while a prune
 		// it sees is of one no older, reads nothing (unsettled).
-		rows, err := tx.Query(ctx, `
+		//
+		// In a batch (plannedQuery), which reads the records in UTF8 whatever the session's
+		// client_encoding, as a host's DB wrapper can set another before each statement.
+		rows, err := plannedQuery(ctx, tx, nil, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
 			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid

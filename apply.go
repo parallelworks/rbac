@@ -2972,7 +2972,9 @@ func conditionsApart(ctx context.Context, q DB, grants []Grant) error {
 	if len(at) == 0 {
 		return nil
 	}
-	rows, err := q.Query(ctx, `SELECT length(c), hashtextextended(c COLLATE "C", 0) FROM unnest($1::text[]) WITH ORDINALITY AS t(c, i) ORDER BY i`, conditions)
+	// In a batch (plannedQuery), so the conditions are hashed as stored, in UTF8, whatever
+	// client_encoding a host's DB wrapper sets before each statement.
+	rows, err := plannedQuery(ctx, q, nil, `SELECT length(c), hashtextextended(c COLLATE "C", 0) FROM unnest($1::text[]) WITH ORDINALITY AS t(c, i) ORDER BY i`, conditions)
 	if err != nil {
 		return err
 	}
