@@ -1639,6 +1639,13 @@ var (
 	// approvers and exemptions DeletePrincipalEverywhere reads by a range of every ctid, which with
 	// them off too a plan read through the whole table, or through a whole index in its order.
 	indexed = []setting{{"enable_seqscan", "off"}, {"enable_tidscan", "on"}}
+	// exactly has a GIN index's scans return every row they find, which settingBatch sets for every
+	// statement it sends. Any role may set gin_fuzzy_search_limit, as a host's session can for its own
+	// text searches, and past it a GIN scan returns a random part of what matches: the denies,
+	// exemptions and approvers found by the keys they name (naming) would be read in part, so a list
+	// would keep what a deny removes, a change lift a deny its actor may not, and a deletion leave a
+	// principal exempt, for a later one of its id.
+	exactly = setting{"gin_fuzzy_search_limit", "0"}
 )
 
 // unjitted is withoutJIT, with sequential scans off and TID scans on too as indexed has them, but as
@@ -1869,16 +1876,17 @@ func plannedSteps(ctx context.Context, q DB, settings []setting, stmts ...statem
 }
 
 // unconverted has PostgreSQL take the text a statement is sent as UTF-8, as pgx sends it, and send
-// back what it reads so, whatever the session's client_encoding: a host's session can set another
-// (any role may), which pgx doesn't check again after its connection starts, and in which
-// PostgreSQL converts every argument it is sent, so a deny naming "josé" stored and compared
-// another id, which Authorize, on a session in UTF8, never matched.
+// back what it reads so, whatever the session's client_encoding: a host's session can be in another
+// (any role may set it, and a role's, the database's or the connection's settings can name it),
+// which pgx neither sets nor checks, and in which PostgreSQL converts every argument it is sent, so
+// a deny naming "josé" stored and compared another id, which Authorize, on a session in UTF8, never
+// matched.
 var unconverted = setting{"client_encoding", "UTF8"}
 
-// settingBatch is a batch setting settings, and unconverted, keeping each one's value in a variable
-// of the package's own, running stmts, and putting each back.
+// settingBatch is a batch setting settings, exactly and unconverted, keeping each one's value in a
+// variable of the package's own, running stmts, and putting each back.
 func settingBatch(settings []setting, stmts ...statement) *pgx.Batch {
-	settings = append([]setting{unconverted}, settings...)
+	settings = append(slices.Clone(settings), exactly, unconverted)
 	set, put, names := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, len(settings))
 	values := make([]any, 0, 2*len(settings))
 	for i, s := range settings {

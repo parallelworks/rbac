@@ -369,7 +369,14 @@ erDiagram
   those an identity or group leaving the tenant is taken out of, and the denies naming a list's
   subject or its groups, which `Filter` and `Reachable` read, are found through GIN indexes on
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
-  tenant's other rows nor another tenant's group of the same id are read. The tenant's keys are
+  tenant's other rows nor another tenant's group of the same id are read. Past a session's
+  `gin_fuzzy_search_limit`, which any role may set, a GIN scan returns a random part of what it
+  finds, so every statement the package sends with its planner settings sets it to 0 for itself
+  (`exactly`, `settingBatch`), as `AsOf` does for its read's transaction, and `Filter`'s condition keeps no row in a host's query where it isn't
+  0: with it at 1, `Reachable` listed one of 200 denies binding its subject, the host's query kept
+  198 of 200 rows those denies removed, deleting a group left it exempt from 199 of 200 denies, as
+  a later group of its id then was, and a change to members lifted 200 denies its actor may not
+  lift. The tenant's keys are
   built in a subquery, whose value no plan sees (`naming`), so every plan costs the search as one
   of a key: planned for an array a statement is given, as a connection's first five runs of a
   statement and every one as of a time are, a search for each of a few hundred keys cost more than
@@ -417,8 +424,9 @@ erDiagram
   square of their number.
 
 The text a statement is sent and reads back is in the session's client_encoding, which any role may
-set, as a host's pool can for each connection it opens: pgx sends every argument as UTF-8 and
-checks the setting only as the connection starts, so in another one PostgreSQL converts what it is
+set, as a host's pool can for each connection it opens, and a role's, the database's or the
+connection's settings can name: pgx sends every argument as UTF-8 and neither sets the setting nor
+checks it, so in another one PostgreSQL converts what it is
 sent, and a deny naming "josé" was stored as naming "josÃ©", which Authorize on a session in UTF8
 never matched; a key was looked up as another, so a check missed the deny binding it; and what was
 read back, as history's records, was converted too, which Export then chained. So the first
@@ -1234,7 +1242,11 @@ flowchart LR
 - **Filter** returns a condition for the host's own query, which reads the grants in the same
   statement as the rows, so sorting and pagination work and nothing changes between deciding and
   reading, for the query it was built for: build one for each. It never keeps a row Authorize would
-  refuse. It keeps only the rows whose own key is of the listed type, as a grant on a container
+  refuse, and none where the query's session limits GIN scans (`gin_fuzzy_search_limit` other than
+  0), as the denies naming the subject are found through GIN indexes, which then return part of
+  them, and the package doesn't set the host's session: a test of no row, which the plan makes once.
+  Nor where its client_encoding isn't UTF8, in which PostgreSQL converts the condition's arguments,
+  the subject's keys among them, which would then match none of the denies naming it. It keeps only the rows whose own key is of the listed type, as a grant on a container
   reaches every row under it, of any type, so one table can hold several. The planner has no
   statistics of a path's first key and counts a test of it alone as keeping one row in 200, which
   would turn a sorted page of a table of one type, whose condition no index serves, into a read and
@@ -1462,8 +1474,9 @@ flowchart TB
   too, with JIT off for it (`withoutJIT`). A read that sets planner settings for its own statements
   alone (`planned`, `plannedSteps`, `plannedQuery`), as that, `Holders`' read of label values, every
   read and change of the tables (`indexed`) and a change bounding a scope's conditions (`seeking`)
-  do, sends them in one batch between a statement setting them, which keeps each one's value in a
-  variable of the package's own, and one putting them back, so the server puts the host's back
+  do, sends them in one batch between a statement setting them, and `gin_fuzzy_search_limit` to 0
+  (`exactly`), whatever the read's settings, which keeps each one's value in a variable of the
+  package's own, and one putting them back, so the server puts the host's back
   however the call ends once it has sent the batch: where the statement fails, nothing after it
   runs, and the rollback puts them back; and the batch is read to its end where the call's reading
   of its rows fails or panics, so the pool, or a host recovering in its transaction, has the
@@ -1900,7 +1913,9 @@ flowchart LR
   drops the session's plans (`DISCARD PLANS`), under `WithTx` the host's too: with the search_path
   alike in every read, a generic plan a host forced in an earlier one, made for its time and tenant,
   would stand. Every statement is planned for its arguments and runs without JIT, which such plans
-  over history cost past `jit_above_cost` for any subject. It takes a time from PostgreSQL's
+  over history cost past `jit_above_cost` for any subject, and with `gin_fuzzy_search_limit` 0, as
+  history's GIN index finds the denies naming a key; AsOf fails where a statement of the read left
+  it otherwise, as for the search_path. It takes a time from PostgreSQL's
   earliest to 9999-12-30, to the microsecond, rounded down, as pgx sends it, and a later one as
   another.
   Each statement reads history by the rows it names, through

@@ -408,14 +408,16 @@ type asOfSet struct {
 // their schema, as a SET ROLE can make the session's, or once another session revokes it, reads by
 // it the tables as they are now, as it does one whose view is dropped. So each table's name is
 // looked up as a statement of the read looks it up, by the catalog as it is, whatever tx's
-// snapshot, and must name the view it named as the read began. client_encoding must still be UTF8,
-// as the read's statements of history's views run outside a batch (readIndexed), and in another
-// PostgreSQL converts the keys they look up.
+// snapshot, and must name the view it named as the read began. gin_fuzzy_search_limit must still be
+// 0, as the read's statements find the denies naming a key by history's GIN index.
+// client_encoding must still be UTF8, as the read's statements of history's views run outside a
+// batch (readIndexed), and in another PostgreSQL converts the keys they look up.
 func (s asOfSet) kept(ctx context.Context, tx pgx.Tx) error {
 	var kept bool
 	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_setting('rbac.as_of_tenant') = $1 AND pg_catalog.current_setting('rbac.as_of') = $2
 		AND pg_catalog.current_setting('rbac.as_of_cluster') = $3 AND pg_catalog.current_setting('search_path') = $4
 		AND pg_catalog.current_schema() IS NOT DISTINCT FROM $5::pg_catalog.text
+		AND pg_catalog.current_setting('gin_fuzzy_search_limit') = '0'
 		AND pg_catalog.current_setting('client_encoding') = 'UTF8'
 		AND NOT EXISTS (SELECT FROM ROWS FROM (pg_catalog.unnest($6::pg_catalog.text[]), pg_catalog.unnest($7::pg_catalog.oid[])) AS v(name, oid)
 		  WHERE pg_catalog.to_regclass(pg_catalog.quote_ident(v.name))::pg_catalog.oid IS DISTINCT FROM v.oid)`,
@@ -423,7 +425,7 @@ func (s asOfSet) kept(ctx context.Context, tx pgx.Tx) error {
 		return err
 	}
 	if !kept {
-		return fmt.Errorf("%w: a statement of the read set the search_path, the role, client_encoding, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, the tables as they are now, or by converted keys", ErrInvalid)
+		return fmt.Errorf("%w: a statement of the read set the search_path, the role, gin_fuzzy_search_limit, client_encoding, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, the tables as they are now, part of what history's GIN index finds, or by converted keys", ErrInvalid)
 	}
 	return nil
 }
@@ -461,7 +463,8 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 	// (inUTC), and the format reads the era as its own field. JIT is off: planned for their
 	// arguments over history's views, statements cost past jit_above_cost though they read little,
 	// and a host's query of a Filter condition for a subject of a few hundred grants spent most of
-	// its time compiling. Read only, so no statement of read writes, or takes the transaction id a
+	// its time compiling. A GIN index's scans return every row they find (exactly), whatever the
+	// session set, as history's index of the principals a deny names finds them. Read only, so no statement of read writes, or takes the transaction id a
 	// write would, but to a session's temporary table, and none can set the transaction to write
 	// again; under WithTx the savepoint's rollback leaves the host's as writable as it was. A
 	// statement the session prepared earlier is parsed again, as PostgreSQL does once the
@@ -478,10 +481,10 @@ func (a *Authorizer) readAsOf(ctx context.Context, tx pgx.Tx, tenant string, at 
 		set_config('rbac.as_of', pg_catalog.to_char($2::pg_catalog.timestamptz `+inUTC+`, '`+asOfTime+`'), true),
 		set_config('rbac.as_of_cluster', (pg_catalog.pg_control_system()).system_identifier::pg_catalog.text, true),
 		set_config('plan_cache_mode', 'force_custom_plan', true), set_config('jit', 'off', true),
-		set_config('transaction_read_only', 'on', true),
+		set_config('gin_fuzzy_search_limit', '0', true), set_config('transaction_read_only', 'on', true),
 		set_config('search_path', pg_catalog.quote_ident($3) || ', pg_temp, ' || pg_catalog.current_setting('search_path'), true),
 		pg_catalog.current_schema()`,
-		tenant, at, views.views).Scan(&set.tenant, &set.at, &set.cluster, nil, nil, nil, &set.path, &current); err != nil {
+		tenant, at, views.views).Scan(&set.tenant, &set.at, &set.cluster, nil, nil, nil, nil, &set.path, &current); err != nil {
 		return standIns{}, err
 	}
 	if current != views.views {

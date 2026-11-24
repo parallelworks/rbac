@@ -135,9 +135,17 @@ as the transaction had it; not `RESET enable_seqscan` after it, which sets the s
 it started with, dropping a value the session set, as a pool can for each connection it opens. Or
 plan it again once the tables have grown, as an analysis of them does: under a plan cached while
 they held a few rows, a list read 43,736 pages of grants and 4,502 of denies beside 20,000 of each.
-Run it in a session whose client_encoding is UTF8, as pgx's connections start: in another,
-PostgreSQL converts the condition's arguments, the subject's keys among them, which would then
-match none of the denies naming it, so the condition keeps no row there.
+The condition finds the denies naming the subject or its groups through GIN indexes, which return
+only a random part of what they find where the session sets `gin_fuzzy_search_limit`, as any role
+may, for its own full-text searches: so the condition keeps no row unless that is 0 in the query's
+session, a test of no row the plan makes once. A session with it at 1 kept 198 of 200 resources
+that denies removed. A host that sets it sets it for its own statements alone, as `SET LOCAL` in their
+transaction or a savepoint of theirs, not for the session, as a pool's connection goes on to run
+other queries.
+Run it in a session whose client_encoding is UTF8, which pgx neither sets nor checks: a role's, the
+database's or the connection's settings can name another. In another, PostgreSQL converts the
+condition's arguments, the subject's keys among them, which would then match none of the denies
+naming it, so the condition keeps no row there.
 
 ## Policies
 
@@ -1104,7 +1112,10 @@ every statement in its transaction for its arguments, the host's too, since a co
 plan of a statement it has run often counts any tenant as an average one, and without JIT, as so
 planned over history, they cost past `jit_above_cost` for an ordinary subject: a host's query of a
 `Filter` condition for a subject of 249 grants on containers took 760 ms with JIT, almost all of it
-compiling, and 110 ms without. It tests each version a statement reads for a later one by its
+compiling, and 110 ms without. Its statements run with `gin_fuzzy_search_limit` 0, as they find
+the denies naming a key through history's GIN index, which a session's limit has return only part
+of them, so `AsOf` fails where a statement of its read left it otherwise, as it does for the
+search_path. It tests each version a statement reads for a later one by its
 row's key, and `Holders` looks each identity's membership of the tenant up by its key, so
 history's statistics, which autovacuum leaves until a tenth of it is new, change no read's cost by
 much: a read of thousands of rows costs a few pages for each version. The test names the version's
@@ -1781,7 +1792,14 @@ the package's uses foreign data, so none of the roles needs any.
   for theirs; and each that
   finds rows by where they are stored, as places in groups, which have no id, turns TID scans on,
   should the host's session have them off, as with them off too a plan read every place to remove
-  one. Each sets them in the round trip that sends
+  one. Every statement the package sends so sets `gin_fuzzy_search_limit` to 0 for itself, and
+  `AsOf` for its read's transaction, whatever the session set, as any role may for its own
+  full-text searches: past it a
+  GIN index's scan returns a random part of what it finds, and the denies, exemptions and approvers
+  naming a key are found by GIN indexes, so `Reachable` listed one of 200 denies binding its
+  subject, deleting a group left 199 of 200 denies exempting it, which a later group of its id then
+  was, and a change to members lifted 200 denies its actor had no power over.
+  Each sets them in the round trip that sends
   the statement, several of a change's together, and puts the session's back after it, keeping each
   meanwhile in a variable of the package's own named for it, as `rbac.enable_seqscan` and
   `rbac.jit`: a connection plans a statement once for all its runs, and one planned while a table
@@ -1804,15 +1822,15 @@ the package's uses foreign data, so none of the roles needs any.
   while the places were few, leaves a plan that reads every one. `Filter`'s condition runs in the
   host's statement, which the host plans (Lists).
 - **Client encoding:** the package's statements send and read their text in UTF8 whatever the
-  session's client_encoding, which any role may set, as a pool's `AfterConnect` can, and which pgx
-  checks only as a connection starts: in another, PostgreSQL would convert each id it is sent, so a
-  deny naming `josé` named another principal, and history recorded, and an export chained, what was
-  converted. Each batch it sends sets it for its own statements, beside the planner settings, and
-  puts the session's back, in the same round trip; a change, `History`, `Export`, `Migrate` and
-  `AsOf` set it in their transaction, or under `WithTx` in their savepoint, and put the host's back,
-  which on a session already in UTF8, as most are, costs nothing. So a hook that runs in a change's
-  transaction, as `OnChange`, runs in UTF8 too. `Filter`'s condition keeps no row in a session in
-  another (Lists).
+  session's client_encoding, which any role may set, as a pool's `AfterConnect` can, which a role's,
+  the database's or the connection's settings can name, and which pgx neither sets nor checks: in
+  another, PostgreSQL would convert each id it is sent, so a deny naming `josé` named another
+  principal, and history recorded, and an export chained, what was converted. Each batch it sends
+  sets it for its own statements, beside the planner settings, and puts the session's back, in the
+  same round trip; a change, `History`, `Export`, `Migrate` and `AsOf` set it in their transaction,
+  or under `WithTx` in their savepoint, and put the host's back, which on a session already in UTF8,
+  as most are, costs nothing. So a hook that runs in a change's transaction, as `OnChange`, runs in
+  UTF8 too. `Filter`'s condition keeps no row in a session in another (Lists).
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
