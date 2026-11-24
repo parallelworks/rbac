@@ -437,7 +437,20 @@ sent outside a batch run in a transaction or savepoint that sets it first (`inUT
 `History`'s and `Migrate`'s (`beginOwn`), and `AsOf`'s reads of history's views; where pgx was
 last told UTF8, as on most sessions, that sets nothing and costs no round trip, and under `WithTx`
 it puts the host's setting back once the call succeeds, while a failure's rollback, a
-transaction's or a savepoint's, puts it back too. `AsOf`'s check of its views' schema after its
+transaction's or a savepoint's, puts it back too. A host's DB wrapper can set the encoding again
+before each statement it is given, in the package's transaction too, which `inUTF8` set once: the
+change then recorded its actor, reason and request converted, so history and the chain named
+another principal, and `SetRole` stored a name converted. So every statement that sends the host's
+text, or reads it back, is in a batch, whichever transaction it runs in: the one recording who made
+a change (`recording`), `SetRole`'s write, the hashes of conditions a change tells apart
+(`conditionsApart`) and `History`'s read of records. Those left outside one send the package's own
+text, or the names of schemas and roles they read back, which behind such a wrapper they read and
+send in its encoding alike. But a schema's name read so keyed the locks of changes and `Migrate`
+(`lockName`) by other bytes than a session in UTF8 reads, so neither waited for the other: they
+read it as UTF-8 bytes (`convert_to`), which no encoding converts. And `History`'s batch, which pgx
+parses before its setting in one query mode and after it in the others, names history's table in
+ASCII (`historyTableNamed`), by the name's code points. `AsOf` checks the setting once its read
+returns (`kept`), so it fails there. `AsOf`'s check of its views' schema after its
 transaction runs in a batch (`stand`). `Filter`'s condition runs in the host's statement, in the
 host's session, whose setting the package can't set, so it keeps no row where client_encoding
 isn't UTF8, tested once for the statement, rather than look the subject's keys up converted.
