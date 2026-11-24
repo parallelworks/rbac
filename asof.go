@@ -131,6 +131,11 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 			err = finish(ctx, func(c context.Context) error { return a.stoodBy(c, stood) })
 		}
 	}()
+	// Its reads of history's views run outside a batch (readIndexed); rolled back, the transaction
+	// or savepoint puts the session's client_encoding back.
+	if _, err = inUTF8(ctx, tx); err != nil {
+		return err
+	}
 	stood, err = a.readAsOf(ctx, tx, tenant, at, read, host)
 	return err
 }
@@ -334,10 +339,13 @@ func noViews(ctx context.Context, q DB, schema string) error {
 // that looked a name up since could have found. It reads the catalog as of q's snapshot, which in a
 // transaction at REPEATABLE READ is that of its first statement, whereas a name is looked up by the
 // catalog as it is (stoodBy). A view dropped, or the schema left off the search_path, kept refuses.
+// In a batch (planned), which reads the names in UTF8 whatever the session's client_encoding: on
+// AsOf's DB, after its transaction, a session in another would compare a name that isn't ASCII
+// converted, find no such schema, and refuse every read.
 func (s standIns) stand(ctx context.Context, q DB) error {
 	var refused bool
-	if err := q.QueryRow(ctx, `SELECT coalesce((SELECT `+planted("n", "(SELECT h.oid FROM pg_catalog.pg_namespace h WHERE h.nspname = $2)")+`
-		FROM pg_catalog.pg_namespace n WHERE n.oid = $1), true)`, s.id, s.schema).Scan(&refused); err != nil {
+	if err := planned(ctx, q, nil, into(&refused), `SELECT coalesce((SELECT `+planted("n", "(SELECT h.oid FROM pg_catalog.pg_namespace h WHERE h.nspname = $2)")+`
+		FROM pg_catalog.pg_namespace n WHERE n.oid = $1), true)`, s.id, s.schema); err != nil {
 		return err
 	}
 	if refused {

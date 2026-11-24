@@ -1868,9 +1868,17 @@ func plannedSteps(ctx context.Context, q DB, settings []setting, stmts ...statem
 	return err
 }
 
-// settingBatch is a batch setting settings, keeping each one's value in a variable of the package's
-// own, running stmts, and putting each back.
+// unconverted has PostgreSQL take the text a statement is sent as UTF-8, as pgx sends it, and send
+// back what it reads so, whatever the session's client_encoding: a host's session can set another
+// (any role may), which pgx doesn't check again after its connection starts, and in which
+// PostgreSQL converts every argument it is sent, so a deny naming "josé" stored and compared
+// another id, which Authorize, on a session in UTF8, never matched.
+var unconverted = setting{"client_encoding", "UTF8"}
+
+// settingBatch is a batch setting settings, and unconverted, keeping each one's value in a variable
+// of the package's own, running stmts, and putting each back.
 func settingBatch(settings []setting, stmts ...statement) *pgx.Batch {
+	settings = append([]setting{unconverted}, settings...)
 	set, put, names := make([]string, len(settings)), make([]string, len(settings)), make([]any, 0, len(settings))
 	values := make([]any, 0, 2*len(settings))
 	for i, s := range settings {

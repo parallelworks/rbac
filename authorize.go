@@ -1673,7 +1673,11 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		pred.SQL, pred.Args = pred.SQL+" AND "+labels, append(pred.Args, args...)
 	}
 	kept, args := a.filterHolding(arg, len(pred.Args), held.lapses)
-	pred.SQL = "(" + pred.SQL + kept + ")"
+	// The host's query runs in the host's session, whose client_encoding the package can't set: in
+	// another, PostgreSQL converts the arguments, so the subject's keys match none of its denies, and
+	// the condition would keep what they deny. So it keeps no row there. Tested once for the query,
+	// as no row is read for it.
+	pred.SQL = "(current_setting('client_encoding') = 'UTF8' AND " + pred.SQL + kept + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
 }
