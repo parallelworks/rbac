@@ -1872,9 +1872,11 @@ flowchart LR
   them by their cluster would reorder the history of a `pg_upgrade`, whose records are another
   cluster's too but numbered in this one's order. Raising a stopped cluster's transaction id epoch
   past the source's with `pg_resetwal -e` puts every restored record before every change it
-  makes, read at once, as a restore from a cluster behind is. A record restored behind a cursor of
-  the same generation, as by restoring a dump's rows into a database an export follows, is never
-  read: a restore goes into a new database, a new generation.
+  makes, read at once, as a restore from a cluster behind is: but not one of a transaction left
+  prepared across the stop, whose id is of the old epoch, which snapshots read in the new one, so
+  every export reads past it while it is open; so none is left. A record restored behind a cursor
+  of the same generation, as by restoring a dump's rows into a database an export follows, is
+  never read: a restore goes into a new database, a new generation.
 - **No record goes from under a cursor.** A prune records, for each of its transactions that
   deleted any, the last record it deleted in `History`'s order, and `History` refuses the cursor
   of an export that began before the prune where it is before that record, in the statement that

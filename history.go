@@ -248,13 +248,14 @@ func errPrunedPast() error {
 // whose transaction ids ran ahead of this one's carries. Read in the order of transactions, every
 // change this cluster makes until its ids pass them comes before them, so no export can read them
 // and still read those. TxID is the last of them: once a stopped cluster's transaction id epoch is
-// raised past it, as the README's History says, History reads them, in order, at once.
+// raised past TxID's, TxID>>32, with no transaction left prepared, as the README's History says,
+// History reads them, in order, at once.
 type AheadError struct {
 	TxID uint64
 }
 
 func (e *AheadError) Error() string {
-	return fmt.Sprintf("rbac: history holds records of transactions up to %d, which this database cluster has yet to number, as a logical dump restored from a cluster ahead of it carries: no export can read them in order until its transaction ids pass them, so raise its transaction id epoch past %d with pg_resetwal -e while it is stopped, then export history from the start", e.TxID, e.TxID>>32)
+	return fmt.Sprintf("rbac: history holds records of transactions up to %d, which this database cluster has yet to number, as a logical dump restored from a cluster ahead of it carries: no export can read them in order until its transaction ids pass them, so, with no transaction left prepared, raise its transaction id epoch past %d with pg_resetwal -e while it is stopped, then export history from the start", e.TxID, e.TxID>>32)
 }
 
 // followed runs in History once followable has checked the cursor, on its transaction, which a
