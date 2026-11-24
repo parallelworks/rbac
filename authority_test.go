@@ -4485,15 +4485,28 @@ func unvacuumed(t *testing.T, h *harness, tables ...string) {
 	}
 }
 
-// filled puts a grant, in a tenant of its own, in each of rbac_grants' partial indexes: PostgreSQL
-// keeps no height of an empty btree, so planning a statement reads the metapage of each empty one for
-// each reference to the table, pages a count of what a search reads takes as its own, again wherever
-// a statement is planned again, as a session does after another changes a schema.
+// filled puts a grant, in a tenant of its own, in each of rbac_grants' partial indexes, an
+// eligibility in each of rbac_eligibilities', and a group's member and a deny, whose records with
+// theirs fill rbac_history's: PostgreSQL keeps no height of an empty btree, so planning a statement
+// reads the metapage of each empty one for each reference to the table, pages a count of what a
+// search reads takes as its own, again wherever a statement is planned again, as a session does
+// after another changes a schema.
 func filled(t *testing.T, h *harness) {
 	t.Helper()
-	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, condition)
-		VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 'activation', now() + interval '1 year', 'true')`); err != nil {
-		t.Fatal(err)
+	for _, q := range []string{
+		`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, source, expires_at, condition)
+		 VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 'activation', now() + interval '1 year', 'true')`,
+		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at, requires)
+		 VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 3600, now() + interval '1 year', 'true')`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('filled', 'user', 'f')`,
+		`INSERT INTO rbac_groups (tenant, id) VALUES ('filled', 'f')`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('filled', 'f', 'user', 'f')`,
+		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
+		 VALUES ('filled', 'cluster', 'f', 'f', '{user:f}', '{}', '{cluster:root}')`,
+	} {
+		if _, err := h.pool.Exec(t.Context(), q); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -5330,6 +5343,7 @@ func TestSearchesReadTheirSubjectsGrantsAsMuchWithoutStatistics(t *testing.T) {
 // for the first, as EXISTS is, every grant in the table.
 func TestWhetherTheMembersHoldARoleReadsOnlyTheirGrantsOfCustomRoles(t *testing.T) {
 	h := growing(t, false, "rbac_grants")
+	filled(t, h)
 	ctx := t.Context()
 	exec := func(q string) {
 		t.Helper()
@@ -6194,6 +6208,7 @@ func TestSearchesReadOnlyTheBroadGrantsTheyCount(t *testing.T) {
 // count read all of them, as many as the condition then reads.
 func TestFilterCountsAFewOfItsSubjectsGrantsOfBuiltInRoles(t *testing.T) {
 	h := crowded(t, pgtest.Open(t, ""))
+	filled(t, h)
 	ctx := t.Context()
 	c0 := hostTable(t, h)[0]
 	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_roles (tenant, id, permissions, resource_types)
@@ -6259,6 +6274,7 @@ func TestRevokingAGrantOnABusyScopeReadsOnlyItsPrincipals(t *testing.T) {
 			} else {
 				h = setup(t)
 			}
+			filled(t, h)
 			ctx := t.Context()
 			admin := h.as(t, "admin")
 			ann := h.as(t, "ann")
@@ -6782,6 +6798,7 @@ func TestDeletingGroupsReadsOnlyWhatNamesThem(t *testing.T) {
 			} else {
 				h = setupOn(t, pgtest.Open(t, "plan_cache_mode=force_custom_plan&pool_max_conns=1"), roles)
 			}
+			filled(t, h)
 			ctx := t.Context()
 			h.groups(t, "oncall", "pager", "spare", "everyone")
 			h.seed(t, grant(rbac.TenantRoot("t1"), "tenant.groups", rbac.User, "admin"))

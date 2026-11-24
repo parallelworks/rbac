@@ -1231,11 +1231,12 @@ func TestActivationsUnderAGenericPlanReadOnlyTheirHoldersPaths(t *testing.T) {
 func TestLeavingUnderAGenericPlanReadsOnlyTheLeaversActivations(t *testing.T) {
 	// On one connection, which keeps the plan of each statement it has run: planning one reads its
 	// indexes' metapages, as again once the tables are analyzed, and that of an index holding no row
-	// each time, as the custom roles' and the conditional grants' are here, which counts as pages
-	// read. So a change counts the least of a few runs (least): the first plans its statements, as
-	// does a run after another session makes or drops a schema in the database, which has the
-	// connection plan every statement it keeps again. On a database other tests shared, one run in
-	// seven was planned again, reading some 30 pages more, past the limit at a later size. And
+	// each time, which counts as pages read, so filled leaves none empty, as the custom roles' and the
+	// conditional grants' were here. So a change counts the least of a few runs (least): the first
+	// plans its statements, as does a run after another session makes or drops a schema in the
+	// database, which has the connection plan every statement it keeps again. On a database other
+	// tests shared, one run in seven was planned again, reading some 30 pages more, past the limit at
+	// a later size, and where another session made and dropped schemas often, every run was. And
 	// autovacuum leaves the copy's tables alone: at its next visit to the database it would analyze
 	// and vacuum them, planning the statements again too, by statistics the earlier sizes weren't
 	// planned by.
@@ -1243,6 +1244,7 @@ func TestLeavingUnderAGenericPlanReadsOnlyTheLeaversActivations(t *testing.T) {
 		c.Catalog = append(slices.Clone(c.Catalog), groupMembers)
 	})
 	unvacuumed(t, h, crowdedTables...)
+	filled(t, h)
 	ctx := t.Context()
 	h.seed(t, grant(rbac.TenantRoot("t1"), "group.members", rbac.User, "admin"))
 	h.groups(t, "oncall")
