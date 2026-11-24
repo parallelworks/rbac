@@ -654,6 +654,7 @@ func TestHoldersLeaveOutTheMembersWhoseGrantsGiveTwoExclusiveValues(t *testing.T
 // hold one.
 func TestAChangeReadsOnlyTheValuesOfWhomItReaches(t *testing.T) {
 	h := labeled(t, banks)
+	filled(t, h)
 	ctx := t.Context()
 	others := func(n int) {
 		t.Helper()
@@ -1103,6 +1104,7 @@ func TestHoldersOfAnExclusivelyLabeledResourceReadOnlyTheBroadGrantsOnTheTenant(
 			} else {
 				h = custom(t, banks)
 			}
+			filled(t, h)
 			ctx := t.Context()
 			h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.Members, "t1"), grant(rbac.TenantRoot("t1"), "bank.a", rbac.Members, "t1"))
 			labeled := cluster

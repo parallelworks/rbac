@@ -13561,6 +13561,7 @@ func TestAConditionalGrantToAGroupReadsOnlyTheConditionalGrantsThere(t *testing.
 		for _, beside := range []string{"alone", "crowded"} {
 			t.Run(analyzed+"/"+beside, func(t *testing.T) {
 				h := growing(t, beside == "crowded", "rbac_grants", "rbac_groups")
+				filled(t, h)
 				ctx := t.Context()
 				analyze := func() {
 					t.Helper()

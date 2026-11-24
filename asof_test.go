@@ -1364,12 +1364,27 @@ func least[K comparable, V cmp.Ordered](f func() (map[K]V, error)) (map[K]V, err
 	return fewest, nil
 }
 
+// prunedLongAgo records a prune of history before 2000, which deleted nothing an as-of read reads,
+// so history's indexes of prunes aren't empty: planning reads the metapage of each empty index of
+// history for each time a statement names it, and where another session makes and drops schemas
+// often, every run of a read is planned again, so leastPages counted those reads too: 679 pages of
+// a Reachable that reads 184.
+func prunedLongAgo(t *testing.T, h *harness) {
+	t.Helper()
+	if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_history (effective_at, tenant, entity, key, op, after, how)
+		VALUES (now(), '', 'history', '2000-01-01T00:00:00.000000Z', 'prune', jsonb_build_object('before', '2000-01-01T00:00:00Z',
+		  'through', jsonb_build_object('txid', '1', 'id', 1), 'last', jsonb_build_object('txid', '1', 'id', 1)), 'PruneHistory')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // customRolesAsOf is how many pages of history each of reads reads as of now, beside many tenants'
 // history, before the tenant has other custom roles and once it has 200, each defined four times.
 // With plans, the reads set their transaction's plan_cache_mode to it first.
 func customRolesAsOf(t *testing.T, h *harness, plans string, reads map[string]func(tx pgx.Tx, a *rbac.Authorizer) error) (few, many map[string]int64) {
 	t.Helper()
 	ctx := t.Context()
+	prunedLongAgo(t, h)
 	read := func(at time.Time) map[string]int64 {
 		t.Helper()
 		tx, err := h.pool.Begin(ctx)

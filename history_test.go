@@ -4533,6 +4533,8 @@ func TestHistoryChecksACursorAsFastWhateverPrunesWentThroughIt(t *testing.T) {
 			catching := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:b'`)
 			behind := catching
 			catching.Horizon, behind.Horizon = c.TxID+1, catching.TxID
+			// After the cursors, so no prune through them or read from them reaches what it records.
+			filled(t, h)
 			// n prunes through b's membership, each deleting up to a's, and then statistics as
 			// autovacuum's analyses keep them.
 			prune := func(n int) {
@@ -4608,6 +4610,8 @@ func TestReadingPrunesCostsAsMuchWhateverHistorysStatisticsCount(t *testing.T) {
 			a := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:a'`)
 			behind := cursorAt(t, h, `SELECT txid, id, recorded_at FROM rbac_history WHERE principal = 'user:b'`)
 			behind.Horizon = behind.TxID
+			// After the cursors, so no prune through them or read from them reaches what it records.
+			filled(t, h)
 			// The application's records after the cursor; and after history's last analysis, a change
 			// to a's membership, which supersedes the version before the cursor.
 			for _, sql := range []string{
