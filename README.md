@@ -1650,9 +1650,9 @@ the package's uses foreign data, so none of the roles needs any.
   once it is applied. Their checks, searches and changes run beside each other, applied or not.
   `0034_giving_role_seeks` adds `rbac_grants_principal_role`, which leads to a grant's principal,
   tenant and role before its scope, so where one of their subject's keys, or its groups', the
-  tenant's members' or the public's, holds more than 64 grants on scopes of the listed type, and 4
-  or more for each built-in role giving the permission there, `Filter` and `Reachable` seek those of
-  each such role alone, and of its grants of custom roles there, past 64 naming 16 roles or fewer,
+  tenant's members' or the public's, holds 64 or more grants on scopes of the listed type, and 4 or
+  more for each built-in role giving the permission there, `Filter` and `Reachable` seek those of
+  each such role alone, and of its grants of custom roles there, from 64 on naming 16 roles or fewer,
   those of each custom role giving the permission that the key holds, where it holds 16 or fewer
   custom roles, found a seek each: they read every grant
   of those keys on scopes of the listed type, of any role, so beside a viewer's grants to the
