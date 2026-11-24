@@ -364,20 +364,23 @@ func TestAMapTheHostPassesKeyedByADoubleOrAnArrayFailsItsConditions(t *testing.T
 	}
 }
 
-// A map the host passes keyed by a time.Duration or a json.Number, directly or in a map of Go's,
-// fails every condition reading its kind, empty too: its keys were read by their kind, an int or a
-// string, where the same value as a map's value is a duration or a parsed number, as CEL reads the
-// key, so `exists(k, k == duration("1h"))` failed where CEL found it true, and
-// `exists(k, k == 3600000000000)` held where CEL found it false.
-func TestAMapTheHostPassesKeyedByADurationOrAJSONNumberFailsItsConditions(t *testing.T) {
+// A map the host passes keyed by a time.Duration, a json.Number or a structpb.NullValue, directly
+// or in a map of Go's, fails every condition reading its kind, empty too: its keys were read by
+// their kind, an int or a string, where the same value as a map's value is a duration, a parsed
+// number or null, as CEL reads the key, so `exists(k, k == duration("1h"))` failed where CEL found
+// it true, and `exists(k, k == 3600000000000)` and `0 in m` held where CEL found them false.
+func TestAMapTheHostPassesKeyedByADurationAJSONNumberOrANullValueFailsItsConditions(t *testing.T) {
 	for name, m := range map[string]any{
 		"a duration": map[time.Duration]int{time.Hour: 1}, "no duration": map[time.Duration]int{},
 		"a number": map[json.Number]int{"2": 1}, "no number": map[json.Number]int{},
+		"a null": map[structpb.NullValue]int{structpb.NullValue_NULL_VALUE: 1}, "no null": map[structpb.NullValue]int{},
 		"a duration in a map of Go's": map[any]int{time.Hour: 1}, "a number in a map of Go's": map[any]int{json.Number("2"): 1},
+		"a null in a map of Go's": map[any]int{structpb.NullValue_NULL_VALUE: 1},
 	} {
 		for _, expr := range []string{
-			`request.attributes.m.exists(k, k == duration("1h") || k == 3600000000000 || k == 2 || k == "2")`,
-			`!request.attributes.m.exists(k, k == duration("1h") || k == 3600000000000 || k == 2 || k == "2")`,
+			`request.attributes.m.exists(k, k == duration("1h") || k == 3600000000000 || k == 2 || k == "2" || k == 0)`,
+			`!request.attributes.m.exists(k, k == duration("1h") || k == 3600000000000 || k == 2 || k == "2" || k == 0)`,
+			`0 in request.attributes.m`, `!(0 in request.attributes.m)`,
 			`size(request.attributes.m) >= 0`, `request.attributes.m == request.attributes.m`,
 		} {
 			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m}); err != nil || evaluated {
