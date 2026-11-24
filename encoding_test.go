@@ -486,9 +486,9 @@ func TestConditionsHashedThroughAWrapperSettingAnotherClientEncodingAreThoseStor
 	}
 }
 
-// accentedSchema is a pool whose sessions' search_path names only a new schema named "tést_…", and
-// that schema's name, with mode for its statements, as many name a schema in their own language.
-func accentedSchema(t *testing.T, mode pgx.QueryExecMode) (*pgxpool.Pool, string) {
+// accentedSchema is a pool whose sessions' search_path names only a new schema named "tést_…", with
+// mode for its statements, as many name a schema in their own language.
+func accentedSchema(t *testing.T, mode pgx.QueryExecMode) *pgxpool.Pool {
 	t.Helper()
 	ctx := t.Context()
 	cfg, err := pgxpool.ParseConfig(pgtest.URL(t))
@@ -516,7 +516,7 @@ func accentedSchema(t *testing.T, mode pgx.QueryExecMode) (*pgxpool.Pool, string
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	return pool, name
+	return pool
 }
 
 // A change, or a migration, through a wrapper setting another encoding before each statement
@@ -526,7 +526,7 @@ func accentedSchema(t *testing.T, mode pgx.QueryExecMode) (*pgxpool.Pool, string
 // name, which isn't UTF-8.
 func TestLocksThroughAWrapperSettingAnotherClientEncodingAreAPlainSessions(t *testing.T) {
 	ctx := t.Context()
-	pool, _ := accentedSchema(t, pgx.QueryExecModeCacheStatement)
+	pool := accentedSchema(t, pgx.QueryExecModeCacheStatement)
 	h := harnessOn(t, pool)
 	root := rbac.TenantRoot("t1")
 	h.seed(t, grant(root, "tenant.roles", rbac.User, "admin"), grant(root, "cluster.admin", rbac.User, "admin"))
@@ -563,7 +563,7 @@ func TestLocksThroughAWrapperSettingAnotherClientEncodingAreAPlainSessions(t *te
 func TestHistoryThroughAWrapperSettingAnotherClientEncodingReadsAnAccentedSchemaInEveryMode(t *testing.T) {
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe, pgx.QueryExecModeDescribeExec, pgx.QueryExecModeExec} {
 		t.Run(mode.String(), func(t *testing.T) {
-			pool, _ := accentedSchema(t, mode)
+			pool := accentedSchema(t, mode)
 			h := harnessOn(t, pool)
 			if _, _, err := reencoded(t, h).History(t.Context(), rbac.Cursor{}, rbac.MaxHistory); err != nil {
 				t.Errorf("History: %v", err)
