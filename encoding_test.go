@@ -556,3 +556,18 @@ func TestLocksThroughAWrapperSettingAnotherClientEncodingAreAPlainSessions(t *te
 		return rbac.Migrate(ctx, pool)
 	})
 }
+
+// History through a wrapper setting another encoding before each statement reads a schema named
+// "tést_…" in every query mode: its read of records, in a batch that sets UTF8, named the schema
+// as read in WIN1252, which pgx's modes but one parse in UTF8, after the batch set it.
+func TestHistoryThroughAWrapperSettingAnotherClientEncodingReadsAnAccentedSchemaInEveryMode(t *testing.T) {
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe, pgx.QueryExecModeDescribeExec, pgx.QueryExecModeExec} {
+		t.Run(mode.String(), func(t *testing.T) {
+			pool, _ := accentedSchema(t, mode)
+			h := harnessOn(t, pool)
+			if _, _, err := reencoded(t, h).History(t.Context(), rbac.Cursor{}, rbac.MaxHistory); err != nil {
+				t.Errorf("History: %v", err)
+			}
+		})
+	}
+}
