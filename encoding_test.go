@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/rbac"
@@ -318,5 +319,255 @@ func TestASchemaNamedInAnotherClientEncodingMigratesAndIsReadAsOfATime(t *testin
 		return nil
 	}); err != nil {
 		t.Errorf("AsOf on a LATIN1 session in %s: %v", name, err)
+	}
+}
+
+// reencoding is a host's wrapper around a pool whose transactions set client_encoding to WIN1252
+// before each statement, as one putting a connection's settings back before each might: pgx sends
+// text as UTF-8 all the same, so PostgreSQL converts what a statement outside a batch is sent,
+// "josé" into "josÃ©", fails on text holding a byte WIN1252 has no character for, and sends back
+// what it reads in WIN1252. It has no BeginTx, so the package begins its transactions by Begin.
+type reencoding struct{ pool *pgxpool.Pool }
+
+func (d reencoding) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return d.pool.Exec(ctx, sql, args...)
+}
+
+func (d reencoding) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return d.pool.Query(ctx, sql, args...)
+}
+
+func (d reencoding) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return d.pool.QueryRow(ctx, sql, args...)
+}
+
+func (d reencoding) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return reencodingTx{tx}, nil
+}
+
+type reencodingTx struct{ pgx.Tx }
+
+const win1252 = `SET LOCAL client_encoding = 'WIN1252'`
+
+func (tx reencodingTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if _, err := tx.Tx.Exec(ctx, win1252); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	return tx.Tx.Exec(ctx, sql, args...)
+}
+
+func (tx reencodingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if _, err := tx.Tx.Exec(ctx, win1252); err != nil {
+		return nil, err
+	}
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx reencodingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if _, err := tx.Tx.Exec(ctx, win1252); err != nil {
+		return failedRow{err}
+	}
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (tx reencodingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	// Failing, it aborts the transaction, which fails the batch.
+	_, _ = tx.Tx.Exec(ctx, win1252)
+	return tx.Tx.SendBatch(ctx, b)
+}
+
+func (tx reencodingTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	inner, err := tx.Tx.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return reencodingTx{inner}, nil
+}
+
+type failedRow struct{ err error }
+
+func (r failedRow) Scan(...any) error { return r.err }
+
+// reencoded is an Authorizer like h's on a reencoding wrapper around h's pool.
+func reencoded(t *testing.T, h *harness) *rbac.Authorizer {
+	t.Helper()
+	a, err := rbac.New(reencoding{h.pool}, h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// A change's statements each set UTF8 themselves, so one recording who made it and SetRole's
+// write store what they were given, and History reads it so, through a wrapper setting another
+// encoding before each statement.
+func TestAChangeThroughAWrapperSettingAnotherClientEncodingRecordsWhatItWasGiven(t *testing.T) {
+	h := setup(t)
+	ctx := rbac.WithAudit(t.Context(), rbac.Audit{Reason: "für", Request: "réq"})
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "tenant.roles", rbac.User, "josé"), grant(root, "cluster.admin", rbac.User, "josé"))
+	jose := h.as(t, "josé")
+	wa := reencoded(t, h)
+	r := rbac.RoleDefinition{ID: "custom.cafe", Name: "café", Description: "naïve", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	if err := wa.SetRole(ctx, jose, "t1", r); err != nil {
+		t.Fatal(err)
+	}
+	var name, description string
+	if err := h.pool.QueryRow(ctx, `SELECT name, description FROM rbac_roles WHERE tenant = 't1' AND id = 'custom.cafe'`).Scan(&name, &description); err != nil {
+		t.Fatal(err)
+	}
+	if name != r.Name || description != r.Description {
+		t.Errorf("SetRole stored name %q description %q, not %q %q", name, description, r.Name, r.Description)
+	}
+	if err := wa.Apply(ctx, jose, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("bob")}}}); err != nil {
+		t.Fatal(err)
+	}
+	var actor, reason, request string
+	if err := h.pool.QueryRow(ctx, `SELECT actor, reason, request FROM rbac_history
+		WHERE tenant = 't1' AND entity = 'grant' AND principal = 'user:bob'`).Scan(&actor, &reason, &request); err != nil {
+		t.Fatal(err)
+	}
+	if actor != "user:josé" || reason != "für" || request != "réq" {
+		t.Errorf("history recorded the grant by %q for %q in %q, not by user:josé for für in réq", actor, reason, request)
+	}
+	// Another session's open transaction can hold the record back from History a while.
+	wait, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		records, _, err := wa.History(wait, rbac.Cursor{}, rbac.MaxHistory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(records, func(r rbac.Record) bool { return r.Entity == "grant" && r.Principal == identity("bob") })
+		if i >= 0 {
+			if got := records[i]; got.Actor != jose.Principal || got.Reason != "für" || got.Request != "réq" {
+				t.Errorf("History read the grant by %+v for %q in %q, not by user:josé for für in réq", got.Actor, got.Reason, got.Request)
+			}
+			if j := slices.IndexFunc(records, func(r rbac.Record) bool { return r.Entity == "role" }); j < 0 || !strings.Contains(string(records[j].After), `"café"`) {
+				t.Errorf("History read no record of the role named café")
+			}
+			return
+		}
+		select {
+		case <-wait.Done():
+			t.Fatal("History read no record of the grant")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// Grants differing only in their conditions have the conditions hashed as stored, in UTF8,
+// through a wrapper setting another encoding before each statement: in WIN1252, which has no
+// character for byte 0x81, "с" (U+0441, d1 81) failed the change.
+func TestConditionsHashedThroughAWrapperSettingAnotherClientEncodingAreThoseStored(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	admin := h.as(t, "admin")
+	h.seed(t, grant(rbac.TenantRoot("t1"), "cluster.admin", rbac.User, "admin"))
+	wa := reencoded(t, h)
+	conditions := []string{`resource.id == "с1"`, `resource.id == "с2"`}
+	change := rbac.Change{}
+	for _, c := range conditions {
+		change.Grant = append(change.Grant, rbac.Binding{Role: "cluster.login", Principal: identity("bob"), Condition: rbac.Condition{Expression: c}})
+	}
+	if err := wa.Apply(ctx, admin, cluster, change); err != nil {
+		t.Fatal(err)
+	}
+	var stored []string
+	if err := h.pool.QueryRow(ctx, `SELECT array_agg(condition ORDER BY condition) FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'bob'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(stored, conditions) {
+		t.Errorf("the grants stored conditions %q, not %q", stored, conditions)
+	}
+}
+
+// accentedSchema is a pool whose sessions' search_path names only a new schema named "tést_…", with
+// mode for its statements, as many name a schema in their own language.
+func accentedSchema(t *testing.T, mode pgx.QueryExecMode) *pgxpool.Pool {
+	t.Helper()
+	ctx := t.Context()
+	cfg, err := pgxpool.ParseConfig(pgtest.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "tést_" + strings.ToLower(rand.Text())
+	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.WithoutCancel(ctx)) })
+	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := conn.Exec(context.WithoutCancel(ctx), "DROP SCHEMA IF EXISTS "+pgtest.WithViews(name)+" CASCADE"); err != nil {
+			t.Errorf("drop schema %s: %v", name, err)
+		}
+	})
+	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{name}.Sanitize()
+	cfg.ConnConfig.DefaultQueryExecMode = mode
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// A change, or a migration, through a wrapper setting another encoding before each statement
+// takes the locks a session in UTF8 takes for the same tables, named by a schema's name in UTF-8:
+// in WIN1252, "tést_…" read as other bytes keyed other locks, so a process behind the wrapper and
+// one without never waited for each other, and in one process the second failed on the first's
+// name, which isn't UTF-8.
+func TestLocksThroughAWrapperSettingAnotherClientEncodingAreAPlainSessions(t *testing.T) {
+	ctx := t.Context()
+	pool := accentedSchema(t, pgx.QueryExecModeCacheStatement)
+	h := harnessOn(t, pool)
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "tenant.roles", rbac.User, "admin"), grant(root, "cluster.admin", rbac.User, "admin"))
+	admin := h.as(t, "admin")
+	wa := reencoded(t, h)
+	waits := func(what string, held func(pgx.Tx) error, then func(context.Context) error) {
+		t.Helper()
+		host, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = host.Rollback(context.WithoutCancel(ctx)) }()
+		if err := held(reencodingTx{host}); err != nil {
+			t.Fatal(err)
+		}
+		wait, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := then(wait); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s while the wrapper's held its locks: %v, not waiting for them", what, err)
+		}
+	}
+	r := rbac.RoleDefinition{ID: "custom.x", Name: "x", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	waits("a plain session's Apply", func(tx pgx.Tx) error { return wa.WithTx(tx).SetRole(ctx, admin, "t1", r) }, func(ctx context.Context) error {
+		return h.authz.Apply(ctx, admin, cluster, rbac.Change{Grant: []rbac.Binding{{Role: "cluster.login", Principal: identity("bob")}}})
+	})
+	waits("a plain session's Migrate", func(tx pgx.Tx) error { return rbac.Migrate(ctx, tx) }, func(ctx context.Context) error {
+		return rbac.Migrate(ctx, pool)
+	})
+}
+
+// History through a wrapper setting another encoding before each statement reads a schema named
+// "tést_…" in every query mode: its read of records, in a batch that sets UTF8, named the schema
+// as read in WIN1252, which pgx's modes but one parse in UTF8, after the batch set it.
+func TestHistoryThroughAWrapperSettingAnotherClientEncodingReadsAnAccentedSchemaInEveryMode(t *testing.T) {
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeCacheDescribe, pgx.QueryExecModeDescribeExec, pgx.QueryExecModeExec} {
+		t.Run(mode.String(), func(t *testing.T) {
+			pool := accentedSchema(t, mode)
+			h := harnessOn(t, pool)
+			if _, _, err := reencoded(t, h).History(t.Context(), rbac.Cursor{}, rbac.MaxHistory); err != nil {
+				t.Errorf("History: %v", err)
+			}
+		})
 	}
 }
