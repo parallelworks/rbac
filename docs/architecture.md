@@ -423,6 +423,25 @@ erDiagram
   tenant's records of the entity, so a statement writing many would take time growing with the
   square of their number.
 
+The text a statement is sent and reads back is in the session's client_encoding, which any role may
+set, as a host's pool can for each connection it opens, and a role's, the database's or the
+connection's settings can name: pgx sends every argument as UTF-8 and neither sets the setting nor
+checks it, so in another one PostgreSQL converts what it is
+sent, and a deny naming "josé" was stored as naming "josÃ©", which Authorize on a session in UTF8
+never matched; a key was looked up as another, so a check missed the deny binding it; and what was
+read back, as history's records, was converted too, which Export then chained. So the first
+statement of every batch the package sends (`settingBatch`) sets client_encoding to UTF8 for the
+batch's statements alone (`unconverted`), with the planner settings, keeping the session's in
+`rbac.client_encoding` and putting it back after them, in the same round trip. The statements
+sent outside a batch run in a transaction or savepoint that sets it first (`inUTF8`): a change's,
+`History`'s and `Migrate`'s (`beginOwn`), and `AsOf`'s reads of history's views; where pgx was
+last told UTF8, as on most sessions, that sets nothing and costs no round trip, and under `WithTx`
+it puts the host's setting back once the call succeeds, while a failure's rollback, a
+transaction's or a savepoint's, puts it back too. `AsOf`'s check of its views' schema after its
+transaction runs in a batch (`stand`). `Filter`'s condition runs in the host's statement, in the
+host's session, whose setting the package can't set, so it keeps no row where client_encoding
+isn't UTF8, tested once for the statement, rather than look the subject's keys up converted.
+
 ## Principals, groups and keys
 
 A check counts what the subject's principals hold. They are found in the same statement as the
@@ -1226,7 +1245,8 @@ flowchart LR
   refuse, and none where the query's session limits GIN scans (`gin_fuzzy_search_limit` other than
   0), as the denies naming the subject are found through GIN indexes, which then return part of
   them, and the package doesn't set the host's session: a test of no row, which the plan makes once.
-  It keeps only the rows whose own key is of the listed type, as a grant on a container
+  Nor where its client_encoding isn't UTF8, in which PostgreSQL converts the condition's arguments,
+  the subject's keys among them, which would then match none of the denies naming it. It keeps only the rows whose own key is of the listed type, as a grant on a container
   reaches every row under it, of any type, so one table can hold several. The planner has no
   statistics of a path's first key and counts a test of it alone as keeping one row in 200, which
   would turn a sorted page of a table of one type, whose condition no index serves, into a read and
