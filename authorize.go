@@ -1675,9 +1675,11 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 	kept, args := a.filterHolding(arg, len(pred.Args), held.lapses)
 	// The host's query runs in its own session, which can set gin_fuzzy_search_limit, as for its own
 	// text searches: then the GIN indexes find only part of the denies binding the subject, and the
-	// condition would keep what they remove. So it keeps no row unless it is 0, a test of no row's
-	// columns, which a plan evaluates once.
-	pred.SQL = "(pg_catalog.current_setting('gin_fuzzy_search_limit') = '0' AND " + pred.SQL + kept + ")"
+	// condition would keep what they remove. Nor can the package set its client_encoding: in another
+	// than UTF8, PostgreSQL converts the arguments, so the subject's keys match none of its denies.
+	// So it keeps no row unless the one is 0 and the other UTF8, tests of no row's columns, which a
+	// plan evaluates once.
+	pred.SQL = "(pg_catalog.current_setting('gin_fuzzy_search_limit') = '0' AND pg_catalog.current_setting('client_encoding') = 'UTF8' AND " + pred.SQL + kept + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
 }

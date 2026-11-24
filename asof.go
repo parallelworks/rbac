@@ -131,6 +131,11 @@ func (a *Authorizer) AsOf(ctx context.Context, tenant string, at time.Time, read
 			err = finish(ctx, func(c context.Context) error { return a.stoodBy(c, stood) })
 		}
 	}()
+	// Its reads of history's views run outside a batch (readIndexed); rolled back, the transaction
+	// or savepoint puts the session's client_encoding back.
+	if _, err = inUTF8(ctx, tx); err != nil {
+		return err
+	}
 	stood, err = a.readAsOf(ctx, tx, tenant, at, read, host)
 	return err
 }
@@ -334,10 +339,13 @@ func noViews(ctx context.Context, q DB, schema string) error {
 // that looked a name up since could have found. It reads the catalog as of q's snapshot, which in a
 // transaction at REPEATABLE READ is that of its first statement, whereas a name is looked up by the
 // catalog as it is (stoodBy). A view dropped, or the schema left off the search_path, kept refuses.
+// In a batch (planned), which reads the names in UTF8 whatever the session's client_encoding: on
+// AsOf's DB, after its transaction, a session in another would compare a name that isn't ASCII
+// converted, find no such schema, and refuse every read.
 func (s standIns) stand(ctx context.Context, q DB) error {
 	var refused bool
-	if err := q.QueryRow(ctx, `SELECT coalesce((SELECT `+planted("n", "(SELECT h.oid FROM pg_catalog.pg_namespace h WHERE h.nspname = $2)")+`
-		FROM pg_catalog.pg_namespace n WHERE n.oid = $1), true)`, s.id, s.schema).Scan(&refused); err != nil {
+	if err := planned(ctx, q, nil, into(&refused), `SELECT coalesce((SELECT `+planted("n", "(SELECT h.oid FROM pg_catalog.pg_namespace h WHERE h.nspname = $2)")+`
+		FROM pg_catalog.pg_namespace n WHERE n.oid = $1), true)`, s.id, s.schema); err != nil {
 		return err
 	}
 	if refused {
@@ -402,19 +410,22 @@ type asOfSet struct {
 // looked up as a statement of the read looks it up, by the catalog as it is, whatever tx's
 // snapshot, and must name the view it named as the read began. gin_fuzzy_search_limit must still be
 // 0, as the read's statements find the denies naming a key by history's GIN index.
+// client_encoding must still be UTF8, as the read's statements of history's views run outside a
+// batch (readIndexed), and in another PostgreSQL converts the keys they look up.
 func (s asOfSet) kept(ctx context.Context, tx pgx.Tx) error {
 	var kept bool
 	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_setting('rbac.as_of_tenant') = $1 AND pg_catalog.current_setting('rbac.as_of') = $2
 		AND pg_catalog.current_setting('rbac.as_of_cluster') = $3 AND pg_catalog.current_setting('search_path') = $4
 		AND pg_catalog.current_schema() IS NOT DISTINCT FROM $5::pg_catalog.text
 		AND pg_catalog.current_setting('gin_fuzzy_search_limit') = '0'
+		AND pg_catalog.current_setting('client_encoding') = 'UTF8'
 		AND NOT EXISTS (SELECT FROM ROWS FROM (pg_catalog.unnest($6::pg_catalog.text[]), pg_catalog.unnest($7::pg_catalog.oid[])) AS v(name, oid)
 		  WHERE pg_catalog.to_regclass(pg_catalog.quote_ident(v.name))::pg_catalog.oid IS DISTINCT FROM v.oid)`,
 		s.tenant, s.at, s.cluster, s.path, s.views, s.names, s.oids).Scan(&kept); err != nil {
 		return err
 	}
 	if !kept {
-		return fmt.Errorf("%w: a statement of the read set the search_path, the role, gin_fuzzy_search_limit, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, the tables as they are now, or part of what history's GIN index finds", ErrInvalid)
+		return fmt.Errorf("%w: a statement of the read set the search_path, the role, gin_fuzzy_search_limit, client_encoding, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, the tables as they are now, part of what history's GIN index finds, or by converted keys", ErrInvalid)
 	}
 	return nil
 }

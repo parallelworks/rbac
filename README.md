@@ -142,6 +142,10 @@ session, a test of no row the plan makes once. A session with it at 1 kept 198 o
 that denies removed. A host that sets it sets it for its own statements alone, as `SET LOCAL` in their
 transaction or a savepoint of theirs, not for the session, as a pool's connection goes on to run
 other queries.
+Run it in a session whose client_encoding is UTF8, which pgx neither sets nor checks: a role's, the
+database's or the connection's settings can name another. In another, PostgreSQL converts the
+condition's arguments, the subject's keys among them, which would then match none of the denies
+naming it, so the condition keeps no row there.
 
 ## Policies
 
@@ -1066,11 +1070,11 @@ its statements plan again at their next run. The views read the tenant, the time
 `AsOf` sets for its transaction (`rbac.as_of_tenant`, `rbac.as_of`, `rbac.as_of_cluster`), with the
 rights of whoever reads them, so a session that sets those itself reads through the views only what
 it may read of history, and outside a read they read nothing, or fail, never the tables. A statement
-of the read that leaves the search_path, the role, or one of those settings, set otherwise, or
-another session revoking the role's `USAGE` on the views' schema, which the search_path then leaves
-out, or dropping one of the views, would read another tenant or time, or the tables as they are now,
-so `AsOf` fails once its read returns where one did: what the read answered stands only where `AsOf`
-returns nil. One made and undone within the read it can't tell, and the package's statements run
+of the read that leaves the search_path, the role, one of those settings, or client_encoding, set
+otherwise, or another session revoking the role's `USAGE` on the views' schema, which the
+search_path then leaves out, or dropping one of the views, would read another tenant or time, the
+tables as they are now, or by keys PostgreSQL converted (Client encoding), so `AsOf` fails once its
+read returns where one did: what the read answered stands only where `AsOf` returns nil. One made and undone within the read it can't tell, and the package's statements run
 between the two read by it: a call the read makes meanwhile, and those of a call after a hook of it
 that made it. So set them, or the role, in a read or a hook only within a savepoint rolled back
 before the package's next statement. The search_path it reads by names the views' schema, then
@@ -1817,6 +1821,18 @@ the package's uses foreign data, so none of the roles needs any.
   in a session runs it and keeps: a host's own deletion of a group, planned with sequential scans on
   while the places were few, leaves a plan that reads every one. `Filter`'s condition runs in the
   host's statement, which the host plans (Lists).
+- **Client encoding:** the package's statements send and read their text in UTF8 whatever the
+  session's client_encoding, which any role may set, as a pool's `AfterConnect` can, which a role's,
+  the database's or the connection's settings can name, and which pgx neither sets nor checks: in
+  another, PostgreSQL would convert each id it is sent, so a deny naming `josé` named another
+  principal, and history recorded, and an export chained, what was converted. Each batch it sends
+  sets it for its own statements, beside the planner settings, and puts the session's back, in the
+  same round trip; a change, `History`, `Export`, `Migrate` and `AsOf` set it in their transaction,
+  or under `WithTx` in their savepoint, and put the host's back, which on a session already in UTF8,
+  as most are, costs nothing. So a hook that runs in a change's transaction, as `OnChange`, runs in
+  UTF8 too. `Filter`'s condition keeps no row in a session in another (Lists). Under pgx's simple
+  protocol (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments
+  on such a session, every call fails there instead.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

@@ -2461,8 +2461,22 @@ func begin(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 // beginOwn is begin, telling fn whether tx is a transaction of its own, which frees all it holds
 // as it rolls back, rather than a savepoint of the host's.
 func beginOwn(ctx context.Context, db DB, fn func(tx pgx.Tx, own bool) error) error {
-	own := func(tx pgx.Tx) error { return fn(tx, true) }
-	host := func(tx pgx.Tx) error { return fn(tx, false) }
+	own := func(tx pgx.Tx) error {
+		if _, err := inUTF8(ctx, tx); err != nil {
+			return err
+		}
+		return fn(tx, true)
+	}
+	host := func(tx pgx.Tx) error {
+		restore, err := inUTF8(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if err := fn(tx, false); err != nil {
+			return err
+		}
+		return restore()
+	}
 	var err error
 	switch conn := db.(type) {
 	case ownTx:
@@ -2476,6 +2490,19 @@ func beginOwn(ctx context.Context, db DB, fn func(tx pgx.Tx, own bool) error) er
 		}
 	}
 	return conflicted(err)
+}
+
+// inUTF8 sets unconverted for the statements tx runs until restore, which puts the session's
+// client_encoding back, for a host's transaction that goes on past them; a transaction of the
+// package's own, or a savepoint rolled back, puts it back as it ends. Statements a change runs
+// outside a batch (settingBatch), as the one recording who made it, would be converted otherwise.
+// It reads the encoding pgx was last told, which costs no round trip, so a session in UTF8, as
+// most are, runs no statement more.
+func inUTF8(ctx context.Context, tx pgx.Tx) (restore func() error, err error) {
+	if c := tx.Conn(); c != nil && c.PgConn().ParameterStatus(unconverted.name) == unconverted.value {
+		return func() error { return nil }, nil
+	}
+	return planning(ctx, tx, []setting{unconverted})
 }
 
 // ownTx is a DB that begin runs fn in a transaction of its own on, as a pool or a connection.
