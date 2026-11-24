@@ -1788,8 +1788,9 @@ the package's uses foreign data, so none of the roles needs any.
   for theirs; and each that
   finds rows by where they are stored, as places in groups, which have no id, turns TID scans on,
   should the host's session have them off, as with them off too a plan read every place to remove
-  one. Every statement the package sends so, as of a time too, sets `gin_fuzzy_search_limit` to 0
-  for itself, whatever the session set, as any role may for its own full-text searches: past it a
+  one. Every statement the package sends so sets `gin_fuzzy_search_limit` to 0 for itself, and
+  `AsOf` for its read's transaction, whatever the session set, as any role may for its own
+  full-text searches: past it a
   GIN index's scan returns a random part of what it finds, and the denies, exemptions and approvers
   naming a key are found by GIN indexes, so `Reachable` listed one of 200 denies binding its
   subject, deleting a group left 199 of 200 denies exempting it, which a later group of its id then

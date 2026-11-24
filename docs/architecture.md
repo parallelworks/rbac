@@ -371,8 +371,8 @@ erDiagram
   those arrays of keys, each key prefixed by its tenant (`rbac_tenant_keys`), so neither the
   tenant's other rows nor another tenant's group of the same id are read. Past a session's
   `gin_fuzzy_search_limit`, which any role may set, a GIN scan returns a random part of what it
-  finds, so every statement the package sends sets it to 0 for itself (`exactly`, `settingBatch`),
-  as `AsOf` does for its read, and `Filter`'s condition keeps no row in a host's query where it isn't
+  finds, so every statement the package sends with its planner settings sets it to 0 for itself
+  (`exactly`, `settingBatch`), as `AsOf` does for its read's transaction, and `Filter`'s condition keeps no row in a host's query where it isn't
   0: with it at 1, `Reachable` listed one of 200 denies binding its subject, the host's query kept
   198 of 200 rows those denies removed, deleting a group left it exempt from 199 of 200 denies, as
   a later group of its id then was, and a change to members lifted 200 denies its actor may not
