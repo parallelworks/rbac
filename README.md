@@ -1830,7 +1830,9 @@ the package's uses foreign data, so none of the roles needs any.
   same round trip; a change, `History`, `Export`, `Migrate` and `AsOf` set it in their transaction,
   or under `WithTx` in their savepoint, and put the host's back, which on a session already in UTF8,
   as most are, costs nothing. So a hook that runs in a change's transaction, as `OnChange`, runs in
-  UTF8 too. `Filter`'s condition keeps no row in a session in another (Lists).
+  UTF8 too. `Filter`'s condition keeps no row in a session in another (Lists). Under pgx's simple
+  protocol (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments
+  on such a session, every call fails there instead.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a
