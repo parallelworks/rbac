@@ -69,6 +69,30 @@ func TestAConditionReadingTheSubjectIsNoAuthorityToHandItOn(t *testing.T) {
 	}
 }
 
+// The power to grant an actor holds under a condition counts once a change reads the condition,
+// even where the change found its power before, deciding a grant under no condition, which reads
+// none: what it found then is of its unconditional grants alone.
+func TestAPowerHeldUnderAConditionCountsOnceReadAfterAGrantUnderNone(t *testing.T) {
+	lister2 := rbac.RoleDefinition{ID: "cluster.lister2", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{"cluster.login"}}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), lister, lister2) })
+	mfa := rbac.Condition{Expression: `request.attributes.mfa == true`}
+	w := workspace.Scope()
+	admin := grant(w, "cluster.admin", rbac.User, "bob")
+	admin.Condition = mfa
+	h.seed(t, grant(w, "workspace.admin", rbac.User, "bob"), grant(w, "cluster.lister2", rbac.User, "bob"), admin)
+	h.join(t, "carol", "dan")
+	plain := rbac.Binding{Role: "cluster.lister2", Principal: identity("carol")}
+	under := rbac.Binding{Role: "cluster.lister", Principal: identity("dan"), Condition: mfa}
+	for _, bs := range [][]rbac.Binding{{plain, under}, {under, plain}} {
+		if err := h.authz.Apply(t.Context(), h.as(t, "bob"), workspace, rbac.Change{Grant: bs}); err != nil {
+			t.Errorf("granting %s, then %s under the condition bob holds the power to grant under: %v", bs[0].Role, bs[1].Role, err)
+		}
+		if err := h.authz.Apply(t.Context(), h.as(t, "bob"), workspace, rbac.Change{Revoke: bs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestAnActivationLastsNoLongerThanThePlaceThatMakesItsSubjectEligible(t *testing.T) {
 	h := grouped(t)
 	ctx := t.Context()
