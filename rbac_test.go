@@ -18205,3 +18205,46 @@ func TestAConditionalGrantReplacedAsACheckReadsItIsReadAsItsReplacement(t *testi
 		})
 	}
 }
+
+// A conditional grant held all along, beside another of the same subject a change replaces each
+// time a check reads them, as one extending it does: every moment allows by the first, but the
+// check found the second gone each time it read again, and refused as a conflict. A grant gone
+// since is read again only where the grants found don't allow.
+func TestAConditionalGrantBesideOneReplacedEachTimeItIsReadAllows(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	always := `request.time > timestamp("2000-01-01T00:00:00Z")`
+	var grants []rbac.Grant
+	for _, g := range []rbac.Grant{
+		grant(cluster.Scope(), "cluster.admin", rbac.User, "u"), grant(cluster.Scope(), "cluster.login", rbac.User, "u"),
+		grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "u"),
+	} {
+		g.Condition = rbac.Condition{Expression: always + strings.Repeat(" && true", len(grants)%2)}
+		grants = append(grants, g)
+	}
+	h.seed(t, grants...)
+	u := h.as(t, "u")
+	// The replaced grants are cluster.login's and level.high's under the longer condition.
+	reads := 0
+	rbac.SetReadingRoles(t, func() {
+		reads++
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'u' AND condition LIKE '%&& true' RETURNING *)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at FROM gone`); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := h.authz.Authorize(ctx, u, view, cluster); err != nil || reads == 0 {
+		t.Errorf("Authorize after %d reads: %v", reads, err)
+	}
+	reads = 0
+	perms, err := h.authz.Permissions(ctx, u, cluster)
+	if err != nil || !slices.Contains(perms, view) || reads == 0 {
+		t.Errorf("Permissions after %d reads = %v, %v", reads, perms, err)
+	}
+	reads = 0
+	held, err := h.authz.Holding(ctx, "t1", u)
+	if err != nil || !slices.Contains(held.Values(), "level:high") || reads == 0 {
+		t.Errorf("Holding after %d reads = %v, %v", reads, held.Values(), err)
+	}
+}

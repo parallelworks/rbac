@@ -192,7 +192,8 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 		return Decision{Reason: "no grant gives it"}, nil
 	}
 	// Only now, with no unconditional grant to allow, are conditions read and evaluated.
-	if err := a.conditionsOf(ctx, a.db, r.Tenant, conditional); err != nil {
+	gone, err := a.conditionsFound(ctx, a.db, r.Tenant, conditional)
+	if err != nil {
 		return Decision{}, err
 	}
 	if vars == nil {
@@ -204,6 +205,9 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 		if a.conds.holds(spend, h.Condition.Expression, vars) {
 			return Decision{Allowed: true}, nil
 		}
+	}
+	if len(gone) > 0 {
+		return Decision{}, errReplaced
 	}
 	return Decision{Reason: unmet(spend)}, nil
 }
@@ -572,7 +576,8 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	}
 	// Conditions are evaluated only for what no unconditional grant gives, as checks do, the
 	// cheapest first.
-	if err := a.conditionsOf(ctx, q, r.Tenant, conditional); err != nil {
+	gone, err := a.conditionsFound(ctx, q, r.Tenant, conditional)
+	if err != nil {
 		return nil, nil, nil, err
 	}
 	cheapestFirst(conditional, holding.expression)
@@ -610,6 +615,16 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 			byCondition[p] = true
 			// A condition reads the action, so it is evaluated for each permission.
 			given[p] = !shared.unevaluated && a.conds.holds(spendOn(p), h.Condition.Expression, on(p).read(p))
+		}
+	}
+	// What a grant gone since its statement gave, where no other grant gives it, is read again
+	// (reread).
+	for _, h := range gone {
+		def, _ := roles.role(h.Role)
+		for _, p := range def.Permissions {
+			if kept(p) && h.carries(def, p) && !given[p] {
+				return nil, nil, nil, errReplaced
+			}
 		}
 	}
 	var perms []Permission
@@ -2559,8 +2574,22 @@ func (a *Authorizer) conditionsSQL() string {
 }
 
 // conditionsOf reads the conditions of the conditional grants among held not read already, in
-// place, those the call under way read before taken from it (Authorizer.conditions).
+// place, those the call under way read before taken from it (Authorizer.conditions), and returns
+// errReplaced where one is gone (conditionsFound).
 func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held []holding) error {
+	gone, err := a.conditionsFound(ctx, q, tenant, held)
+	if err == nil && len(gone) > 0 {
+		return errReplaced
+	}
+	return err
+}
+
+// conditionsFound is conditionsOf, returning instead the grants gone since the statement that read
+// them, each left a condition nothing meets: what the others give was given at that statement's
+// moment, so a decision they allow stands, and only one they don't is read again (reread).
+// Returned as errReplaced alone, a grant replaced beside another that allowed had a check of it
+// refused as a conflict as a change kept replacing the first, though every moment allowed.
+func (a *Authorizer) conditionsFound(ctx context.Context, q DB, tenant string, held []holding) ([]holding, error) {
 	var ids, principals, scopes []string
 	for i, h := range held {
 		if !h.conditional || h.Condition.Expression != "" {
@@ -2575,11 +2604,11 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 		scopes = append(scopes, h.scope)
 	}
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	rows, err := a.queryIndexed(ctx, q, a.conditionsSQL(), ids, tenant, principals, scopes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	found := map[string]string{}
 	var expr string
@@ -2595,19 +2624,20 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, h := range held {
-		if _, ok := found[h.ID]; h.conditional && h.Condition.Expression == "" && !ok {
-			return errReplaced
-		}
-	}
+	var gone []holding
 	for i, h := range held {
 		if h.conditional && h.Condition.Expression == "" {
-			held[i].Condition.Expression = found[h.ID]
+			expr, ok := found[h.ID]
+			if !ok {
+				expr = "false"
+				gone = append(gone, h)
+			}
+			held[i].Condition.Expression = expr
 		}
 	}
-	return nil
+	return gone, nil
 }
 
 // errReplaced is conditionsOf's error for a grant gone since the statement that read it: revoked,
