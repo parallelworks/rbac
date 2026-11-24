@@ -302,8 +302,9 @@ const (
 // refused as the transaction commits, and that role can delete otherwise only by disabling
 // history's triggers. Keep at least as much as the host's audit retention requires. It refuses a
 // before yet to come or before year 1, earlier than history dates anything, a through History
-// would refuse, as one whose export an earlier prune went past, and, like AsOf, history whose ids
-// can't order a row's changes. It deletes at most MaxPrune records: call it again while it deletes
+// would refuse, as one whose export an earlier prune went past, or while history holds records of
+// transactions the cluster has yet to number (AheadError), and, like AsOf, history whose ids can't
+// order a row's changes. It deletes at most MaxPrune records: call it again while it deletes
 // as many, and it goes on from where the last prune of the same before and through stopped. It
 // reads history MaxPrune records at a time, on a pool or a connection each in a transaction of its
 // own, so none holds exports back for long, and on an error what those before deleted stays
@@ -681,6 +682,10 @@ var maxUnsized = 100
 // nothing that committed: restore by recovering to a point in time, which starts a generation, or
 // export from the start after one. A logical dump restored into another cluster numbers its
 // transactions anew, which a cursor can't follow: move history with physical backups and replicas.
+// Its records keep their own cluster's transaction ids, and one of a cluster that ran ahead of this
+// one would be read only after every change this cluster makes until its ids pass it, so History
+// refuses, as an AheadError, while history holds one: raise a stopped cluster's transaction id
+// epoch past them, as the README says.
 //
 // It reads history in the current schema by name, so a session's temporary table or type named
 // as history's or a catalog's stands in for none of it, and refuses a search_path that names

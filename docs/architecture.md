@@ -1857,7 +1857,24 @@ flowchart LR
   from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
   refuses that cursor, and history is exported again from the start. Where it kept that record
   and lost what came after, nothing in the database tells it from recovering from a crash, so a
-  restore that should start a generation is a recovery to a point in time.
+  restore that should start a generation is a recovery to a point in time. A logical dump keeps
+  each record's transaction id from its own cluster, and `History` reads only records of
+  transactions older than every one running, so a record restored from a cluster that ran ahead
+  comes after every change the restoring cluster makes until its ids pass it. Read as settled, it
+  would put the cursor of an export that read it past those changes, which commit later with lower
+  ids; left unread, it kept the restore out of every export with no word, and a prune it records
+  read as one still running, which held every read from the start back. So `History`, and `Export`
+  and `PruneHistory` through it, refuses (`AheadError`) while history holds a record, but a
+  commit's, which `History` returns none of, of a transaction its snapshot hasn't numbered: no
+  transaction of the cluster's own is so, but the reading one's, which a host's transaction at
+  REPEATABLE READ takes after its snapshot, and which it passes over. Ordering such records before
+  the cluster's own changes would need an order a cursor's txid and id can't hold, and telling
+  them by their cluster would reorder the history of a `pg_upgrade`, whose records are another
+  cluster's too but numbered in this one's order. Raising a stopped cluster's transaction id epoch
+  past the source's with `pg_resetwal -e` puts every restored record before every change it
+  makes, read at once, as a restore from a cluster behind is. A record restored behind a cursor of
+  the same generation, as by restoring a dump's rows into a database an export follows, is never
+  read: a restore goes into a new database, a new generation.
 - **No record goes from under a cursor.** A prune records, for each of its transactions that
   deleted any, the last record it deleted in `History`'s order, and `History` refuses the cursor
   of an export that began before the prune where it is before that record, in the statement that

@@ -926,7 +926,22 @@ cursor was read, leaves nothing the database can tell from recovering from a cra
 nothing that committed, so its export would read on: restore by recovering to a point in time, which
 starts a new generation, or export each generation from the start again after a restore. Move
 history with physical backups and replicas; a logical dump restored into another cluster numbers its
-transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
+transactions anew. Its records keep the transaction ids of the cluster that wrote them, and
+`History` reads a record only once every transaction still running is later, so a record restored
+from a cluster whose ids ran ahead of this one's, as a new cluster's are behind those of one that
+has run a while, would come after every change this cluster makes until its ids pass it, which can
+take as many transactions as the source ran. While history holds one, `History`, and `Export` and
+`PruneHistory` with it, refuses as an `*rbac.AheadError`, which names the last such transaction,
+rather than export none of the restore. Before restoring such a dump, or after but before any
+export of the restore begins, stop the new cluster cleanly and raise its transaction id epoch past
+the source's with `pg_resetwal -e`, to one more than the source's
+`floor(pg_current_xact_id()::text::numeric / 4294967296)`, before taking its backups or making
+its replicas: every restored record is then of an earlier transaction than any this cluster makes,
+and `History` reads them at once, in order, exported from `Genesis` as a new generation. A cluster
+that can't be stopped so, as one a provider runs, can't follow history restored ahead of it: move
+history there by a physical copy. Restore a dump only into a new database, a new generation: a
+record restored behind the cursor of an export that already follows the database is never read.
+`AsOf` still dates a restored change by its own commit record, as a commit record
 dates only changes of its own cluster, and a restored change whose commit record is gone counts from
 its own date; a transaction this cluster gives a restored change's txid is another, which commits,
 and whose changes `AsOf` counts apart from the restored one's. `pg_upgrade` gives the cluster a new
