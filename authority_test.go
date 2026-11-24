@@ -8622,6 +8622,122 @@ func TestAChangeFindsHowLongTheGrantsGivingWhatItAsksLastOnceWhateverTheConditio
 	}
 }
 
+// endingSetup is an actor, ann, who holds cluster.admin on the tenant for good, and granting, which
+// grants each of roles on c1 to one, each under one condition until its own time after an hour;
+// holding stores m grants to ann of a role on c1, each under a condition of its own, ending at a
+// time.
+func endingSetup(t *testing.T, catalog ...rbac.RoleDefinition) (h *harness, granting func(prefix string, roles []rbac.Role), holding func(role rbac.Role, m int, ends time.Time)) {
+	t.Helper()
+	h = setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), catalog...) })
+	ctx := t.Context()
+	ann := h.as(t, "ann")
+	h.seed(t, grant(rbac.Scope{Type: rbac.TenantScope, ID: "t1"}, "cluster.admin", rbac.User, "ann"))
+	granting = func(prefix string, roles []rbac.Role) {
+		t.Helper()
+		bs := make([]rbac.Binding, len(roles))
+		for i, role := range roles {
+			bs[i] = rbac.Binding{
+				Role: role, Principal: identity(fmt.Sprint(prefix, i)), ExpiresAt: h.now.Add(time.Hour + time.Duration(i)*time.Second),
+				Condition: rbac.Condition{Expression: `request.attributes.x == true`},
+			}
+		}
+		if err := h.authz.Apply(ctx, ann, cluster, rbac.Change{Grant: bs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held := 0
+	holding = func(role rbac.Role, m int, ends time.Time) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c1', 'user', 'ann', $1, 'request.attributes.n == ' || i, $4 FROM generate_series($2::int + 1, $2::int + $3) AS i`,
+			role, held, m, ends); err != nil {
+			t.Fatal(err)
+		}
+		held += m
+	}
+	return h, granting, holding
+}
+
+// A change reads the permissions of the roles of the actor's conditional grants, unread, only where
+// one of their grants ends late enough to count, and once: by an actor holding a grant, ending
+// before what it granted, of each of 300 roles of 1,000 permissions, a change granting a role to
+// 1,000, under a condition and each until its own time, read every role's permissions for each,
+// 8.2 s, where one by an actor without them took 0.2 s.
+func TestAChangeReadsNoPermissionsOfTheRolesOfTheActorsGrantsEndingBeforeWhatItGrants(t *testing.T) {
+	const r, p, n = 20, 200, 100
+	wide := rbac.RoleDefinition{ID: "cluster.wide", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	for i := range p - 1 {
+		wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	h, granting, holding := endingSetup(t, wide)
+	defining := func(role rbac.Role, ps []rbac.Permission) {
+		t.Helper()
+		if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', $1, $2, '{cluster}')`, role, ps); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range r {
+		role := rbac.Role(fmt.Sprint("custom.wide", i))
+		defining(role, wide.Permissions)
+		holding(role, 1, h.now.Add(30*time.Minute))
+	}
+	apart := make([]rbac.Role, n)
+	for i := range apart {
+		apart[i] = rbac.Role(fmt.Sprint("custom.login", i))
+		defining(apart[i], []rbac.Permission{view, login})
+	}
+	entries, walked := 0, 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	rbac.SetWalkingGrants(t, func(k int) { walked += k })
+	read := func(prefix string, roles []rbac.Role) (int, int) {
+		t.Helper()
+		entries, walked = 0, 0
+		granting(prefix, roles)
+		return entries, walked
+	}
+	one, oneWalked := read("a", []rbac.Role{"cluster.login"})
+	same, sameWalked := read("b", slices.Repeat([]rbac.Role{"cluster.login"}, n))
+	many, manyWalked := read("c", apart)
+	t.Logf("read %d entries granting a role to one, %d granting it to %d, and %d granting %d roles", one, same, n, many, n)
+	t.Logf("walked %d grants granting a role to one, %d granting it to %d, and %d granting %d roles", oneWalked, sameWalked, n, manyWalked, n)
+	if same-one >= r*p {
+		t.Errorf("granting a role to one read %d entries of roles and what the constraints answered, and %d granting it to %d, beside a grant of %d roles of %d permissions ending before them",
+			one, same, n, r, p)
+	}
+	if many-one >= r*p {
+		t.Errorf("granting a role to one read %d entries of roles and what the constraints answered, and %d granting %d roles, beside a grant of %d roles of %d permissions ending before them",
+			one, many, n, r, p)
+	}
+	// Nor walks their grants for each: they stay unread.
+	if sameWalked-oneWalked >= r*n || manyWalked-oneWalked >= r*n {
+		t.Errorf("granting a role to one walked %d of the actor's grants, %d granting it to %d, and %d granting %d roles, beside a grant of %d roles ending before them",
+			oneWalked, sameWalked, n, manyWalked, n, r)
+	}
+}
+
+// A change walks the actor's conditional grants, unread, that end before what it grants once, not
+// once for each grant it decides: they stay unread, as none can count.
+func TestAChangeWalksTheActorsGrantsEndingBeforeWhatItGrantsOnce(t *testing.T) {
+	const g, n = 1000, 100
+	h, granting, holding := endingSetup(t)
+	// One ending after what it grants, which it reads, beside them.
+	holding("cluster.login", 1, h.now.Add(2*time.Hour))
+	holding("cluster.login", g, h.now.Add(30*time.Minute))
+	walked := 0
+	rbac.SetWalkingGrants(t, func(k int) { walked += k })
+	walking := func(prefix string, n int) int {
+		t.Helper()
+		walked = 0
+		granting(prefix, slices.Repeat([]rbac.Role{"cluster.login"}, n))
+		return walked
+	}
+	one, many := walking("a", 1), walking("b", n)
+	t.Logf("walked %d granting a role to one, %d granting it to %d", one, many, n)
+	if many-one > 10*g {
+		t.Errorf("granting a role to one walked %d of the actor's grants, and %d granting it to %d", one, many, n)
+	}
+}
+
 // A change reads each condition it decides by once, before its transaction, not again under its
 // locks: a grant's condition never changes, as changing it stores a new grant. An actor whose power
 // to change grants is 2,000 conditional grants decides by all of them, and read them again in the
