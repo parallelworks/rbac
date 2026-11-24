@@ -31,7 +31,8 @@ type Decision struct {
 // Authorize returns nil when the subject may do p to r, and otherwise an error matching
 // ErrDenied, ErrInvalid for malformed input, such as a permission or resource type the host
 // doesn't check (Config.Permissions), which can only be a mistake, or ErrConflict for a race
-// PostgreSQL refused, which a retry may allow. Any error means no.
+// PostgreSQL refused, or one with changes replacing a grant it read lost every time it read again
+// (reread), which a retry may allow. Any error means no.
 func (a *Authorizer) Authorize(ctx context.Context, s Subject, p Permission, r Resource) (err error) {
 	defer conflicting(&err)
 	a = a.still()

@@ -1752,7 +1752,11 @@ the package's uses foreign data, so none of the roles needs any.
   change refused because what it rests on changed while it waited: try it again. It does wherever in
   the call PostgreSQL refused it: in a change's transaction or the reads it makes before it, in a
   read, or in a statement a hook ran, where the hook's error wraps PostgreSQL's, alone or beside
-  other errors, as `errors.Join` holds them, or holds it as `errors.As` reads it. Under `WithTx`,
+  other errors, as `errors.Join` holds them, or holds it as `errors.As` reads it. A check, list or
+  change reads a conditional grant's condition after the statement reading its grants, so it can
+  find the grant revoked or replaced meanwhile, as a change extending one replaces it: a check or
+  list then reads its grants again, and a change, or a check finding that three times running, is
+  refused as `rbac.ErrConflict`. Under `WithTx`,
   roll the host's transaction back and run it again from its start, not the call alone in it: a
   statement refused on that transaction itself, as most reads', a hook's or one a change makes
   before its savepoint, aborts it, and one refused in a savepoint, as a change's, `AsOf`'s or
