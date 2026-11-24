@@ -449,8 +449,8 @@ send in its encoding alike. But a schema's name read so keyed the locks of chang
 (`lockName`) by other bytes than a session in UTF8 reads, so neither waited for the other: they
 read it as UTF-8 bytes (`convert_to`), which no encoding converts. And `History`'s batch, which pgx
 parses before its setting in one query mode and after it in the others, names history's table in
-ASCII (`historyTableNamed`), by the name's code points. `AsOf` checks the setting once its read returns (`kept`), so it fails
-there. `AsOf`'s check of its views' schema after its
+ASCII (`historyTableNamed`), by the name's code points. `AsOf` checks the setting once its read
+returns (`kept`), so it fails there. `AsOf`'s check of its views' schema after its
 transaction runs in a batch (`stand`). `Filter`'s condition runs in the host's statement, in the
 host's session, whose setting the package can't set, so it keeps no row where client_encoding
 isn't UTF8, tested once for the statement, rather than look the subject's keys up converted.
