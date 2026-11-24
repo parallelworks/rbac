@@ -1046,8 +1046,11 @@ sequenceDiagram
   nothing asked, ending between those of a change's 64 grants, split it into 64 decisions, each
   walking every role the role granted lists. Those are read for all of a change's grants at once,
   of each role until the soonest it is granted until: read for each grant in turn, a change whose
-  grants each end before the one before it read them in a statement for each. A read that fails
-  leaves the grants it was for met by nothing, and the change, or `Grantable`, returns its error.
+  grants each end before the one before it read them in a statement for each. The index keeps, for
+  each role decided, the soonest end read for, so deciding each grant after that reads and walks
+  nothing; and for each role of the unread grants, the latest any of them ends, so a role none of
+  whose grants ends late enough isn't asked what it gives. A read that fails leaves the grants it
+  was for met by nothing, and the change, or `Grantable`, returns its error.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
@@ -1131,16 +1134,21 @@ sequenceDiagram
   authority; its conditional grants unread by role and read by condition; and how long its
   unconditional grants of each kind last. So a decision under another condition walks only the
   grants whose condition is the same (`kindsLasting`) and the unread ones of roles giving what it
-  can ask (`readEnding`), and whether a condition is kept (`kept`) is a lookup. How long the
-  grants giving a permission on a type last, and give the power to change grants there, is found
-  once for each read of conditions, the unconditional ones together and the others by condition
-  (`givenFor`, `powersFor`), so `heldFor` and `under` under another condition look it up rather
-  than walk the grants giving it (`giving`). Walking every grant the actor held for each, a change
-  granting a role under 1,000 conditions, by an actor whose groups held 8,000 conditional grants of
-  a role giving nothing it asked, took 2.6 s against 0.3 s without them, and adding a member to a
-  group holding 1,000 such grants 1.8 s against 40 ms, both before the transaction and again under
-  its locks; and walking those giving what it asked, adding a member to a group holding 4,000,
-  where the tenant's members held 4,000 of a role giving it, 6.5 s, against 0.2 s.
+  can ask (`readEnding`), once for each role decided rather than for each grant, and whether a
+  condition is kept (`kept`) is a lookup. How long the grants giving a permission on a type last,
+  and give the power to change grants there, is found once for each read of conditions, the
+  unconditional ones together and the others by condition (`givenFor`, `powersFor`), so `heldFor`
+  and `under` under another condition look it up rather than walk the grants giving it (`giving`).
+  Walking every grant the actor held for each, a change granting a role under 1,000 conditions, by
+  an actor whose groups held 8,000 conditional grants of a role giving nothing it asked, took
+  2.6 s against 0.3 s without them, and adding a member to a group holding 1,000 such grants 1.8 s
+  against 40 ms, both before the transaction and again under its locks; and walking those giving
+  what it asked, adding a member to a group holding 4,000, where the tenant's members held 4,000
+  of a role giving it, 6.5 s, against 0.2 s. Reading for each grant again which unread grants it
+  could tell apart by their ends, a change granting a role to 1,000 under a condition, each until
+  its own time, by an actor holding a grant ending before them of each of 300 roles of 1,000
+  permissions, asked every role what it gives for each, 8.2 s against 0.2 s without them, and
+  walked 16,000 grants of a role giving what it asked, ending before them, for each, 1.7 s.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks. Only memberships in force at the call's time count,
