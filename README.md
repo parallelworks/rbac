@@ -1062,11 +1062,11 @@ its statements plan again at their next run. The views read the tenant, the time
 `AsOf` sets for its transaction (`rbac.as_of_tenant`, `rbac.as_of`, `rbac.as_of_cluster`), with the
 rights of whoever reads them, so a session that sets those itself reads through the views only what
 it may read of history, and outside a read they read nothing, or fail, never the tables. A statement
-of the read that leaves the search_path, the role, or one of those settings, set otherwise, or
-another session revoking the role's `USAGE` on the views' schema, which the search_path then leaves
-out, or dropping one of the views, would read another tenant or time, or the tables as they are now,
-so `AsOf` fails once its read returns where one did: what the read answered stands only where `AsOf`
-returns nil. One made and undone within the read it can't tell, and the package's statements run
+of the read that leaves the search_path, the role, one of those settings, or client_encoding, set
+otherwise, or another session revoking the role's `USAGE` on the views' schema, which the
+search_path then leaves out, or dropping one of the views, would read another tenant or time, the
+tables as they are now, or by keys PostgreSQL converted (Client encoding), so `AsOf` fails once its
+read returns where one did: what the read answered stands only where `AsOf` returns nil. One made and undone within the read it can't tell, and the package's statements run
 between the two read by it: a call the read makes meanwhile, and those of a call after a hook of it
 that made it. So set them, or the role, in a read or a hook only within a savepoint rolled back
 before the package's next statement. The search_path it reads by names the views' schema, then

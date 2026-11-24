@@ -408,19 +408,22 @@ type asOfSet struct {
 // their schema, as a SET ROLE can make the session's, or once another session revokes it, reads by
 // it the tables as they are now, as it does one whose view is dropped. So each table's name is
 // looked up as a statement of the read looks it up, by the catalog as it is, whatever tx's
-// snapshot, and must name the view it named as the read began.
+// snapshot, and must name the view it named as the read began. client_encoding must still be UTF8,
+// as the read's statements of history's views run outside a batch (readIndexed), and in another
+// PostgreSQL converts the keys they look up.
 func (s asOfSet) kept(ctx context.Context, tx pgx.Tx) error {
 	var kept bool
 	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_setting('rbac.as_of_tenant') = $1 AND pg_catalog.current_setting('rbac.as_of') = $2
 		AND pg_catalog.current_setting('rbac.as_of_cluster') = $3 AND pg_catalog.current_setting('search_path') = $4
 		AND pg_catalog.current_schema() IS NOT DISTINCT FROM $5::pg_catalog.text
+		AND pg_catalog.current_setting('client_encoding') = 'UTF8'
 		AND NOT EXISTS (SELECT FROM ROWS FROM (pg_catalog.unnest($6::pg_catalog.text[]), pg_catalog.unnest($7::pg_catalog.oid[])) AS v(name, oid)
 		  WHERE pg_catalog.to_regclass(pg_catalog.quote_ident(v.name))::pg_catalog.oid IS DISTINCT FROM v.oid)`,
 		s.tenant, s.at, s.cluster, s.path, s.views, s.names, s.oids).Scan(&kept); err != nil {
 		return err
 	}
 	if !kept {
-		return fmt.Errorf("%w: a statement of the read set the search_path, the role, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, or the tables as they are now", ErrInvalid)
+		return fmt.Errorf("%w: a statement of the read set the search_path, the role, client_encoding, or what the views read the tenant, the time or the cluster by, or the role lost USAGE on the views' schema, or one of the views was dropped, so those after it read another tenant or time, the tables as they are now, or by converted keys", ErrInvalid)
 	}
 	return nil
 }

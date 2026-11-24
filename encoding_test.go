@@ -212,6 +212,31 @@ func TestHistoryAndAsOfOnASessionInAnotherClientEncodingReadWhatIsStored(t *test
 	}
 }
 
+// AsOf's reads of history's views run outside a batch, in the encoding its transaction set: a read
+// that sets another, as the host's statement on its transaction under WithTx can, has the reads
+// after it look josé up converted and miss the deny, so AsOf fails as the read returns.
+func TestAnAsOfReadThatSetsAnotherClientEncodingFails(t *testing.T) {
+	h, jose, guardian := accented(t)
+	ctx := t.Context()
+	if err := h.authz.SetDeny(ctx, guardian, cluster, rbac.Deny{ID: "d", Principals: []rbac.Principal{jose.Principal}, Permissions: []rbac.Permission{login}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, set := range []string{`SET LOCAL client_encoding = 'LATIN1'`, `SET client_encoding = 'LATIN1'`} {
+		err := pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+			return h.authz.WithTx(tx).AsOf(ctx, "t1", time.Now(), func(a *rbac.Authorizer) error {
+				if _, err := tx.Exec(ctx, set); err != nil {
+					return err
+				}
+				_ = a.Authorize(ctx, jose, login, cluster)
+				return nil
+			})
+		})
+		if !errors.Is(err, rbac.ErrInvalid) {
+			t.Errorf("a read ran %s, and AsOf returned %v, not ErrInvalid", set, err)
+		}
+	}
+}
+
 // Filter's condition runs in the host's session, whose arguments PostgreSQL converts: in another
 // encoding than UTF8 it keeps no row.
 func TestFiltersConditionInAnotherClientEncodingKeepsNoRow(t *testing.T) {
