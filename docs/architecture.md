@@ -943,7 +943,11 @@ sequenceDiagram
   change bounding what a check reads together counts such a condition at all a condition may cost
   (`conditions.limit`), as it is one: counted nothing, a change could add another past the bound. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
-  as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
+  as CEL charges a call only once it has run; a conversion or `size()` of a string or bytes is
+  charged so (`costs.CallCost`), and runs whole first, at 1.5 MB, as much as a check converts,
+  about 18 ms for `timestamp()` of control or invalid bytes, which its error quotes, 15 ms for
+  `duration()`, and 5 to 9 ms for `double()`, `size()` and `timestamp()` of other text, once for
+  each condition reading one; and a program in which CEL plans one, a literal, a
   key, a loop's condition or a variable named from the root past a loop's variable of its name
   where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
   `.request` in `l.all(request, ...)`, from what the check passed, outside the evaluation, and
