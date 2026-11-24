@@ -4486,11 +4486,11 @@ func unvacuumed(t *testing.T, h *harness, tables ...string) {
 }
 
 // filled puts a grant, in a tenant of its own, in each of rbac_grants' partial indexes, an
-// eligibility in each of rbac_eligibilities', and a group's member and a deny, whose records with
-// theirs fill rbac_history's: PostgreSQL keeps no height of an empty btree, so planning a statement
-// reads the metapage of each empty one for each reference to the table, pages a count of what a
-// search reads takes as its own, again wherever a statement is planned again, as a session does
-// after another changes a schema.
+// eligibility, a membership and a group's member in each of their tables', and a deny, whose records
+// with theirs fill rbac_history's but for those of prunes: PostgreSQL keeps no height of an empty
+// btree, so planning a statement reads the metapage of each empty one for each reference to the
+// table, pages a count of what a search reads takes as its own, again wherever a statement is
+// planned again, as a session does after another changes a schema.
 func filled(t *testing.T, h *harness) {
 	t.Helper()
 	for _, q := range []string{
@@ -4498,9 +4498,9 @@ func filled(t *testing.T, h *harness) {
 		 VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 'activation', now() + interval '1 year', 'true')`,
 		`INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds, expires_at, requires)
 		 VALUES ('filled', 'cluster', 'f', 'user', 'f', 'custom.f', 3600, now() + interval '1 year', 'true')`,
-		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('filled', 'user', 'f')`,
+		`INSERT INTO rbac_memberships (tenant, principal_kind, principal_id, expires_at) VALUES ('filled', 'user', 'f', now() + interval '1 year')`,
 		`INSERT INTO rbac_groups (tenant, id) VALUES ('filled', 'f')`,
-		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id) VALUES ('filled', 'f', 'user', 'f')`,
+		`INSERT INTO rbac_members (tenant, group_id, principal_kind, principal_id, expires_at) VALUES ('filled', 'f', 'user', 'f', now() + interval '1 year')`,
 		`INSERT INTO rbac_denies (tenant, scope_type, scope_id, id, principals, exempt, permissions)
 		 VALUES ('filled', 'cluster', 'f', 'f', '{user:f}', '{}', '{cluster:root}')`,
 	} {
