@@ -141,15 +141,32 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
 	// would otherwise share a generation, and with one key, checkpoints. The catalogs by schema
 	// too, as a temporary table is read before them.
+	//
+	// And the last record, by the order History reads, of a transaction the cluster has yet to
+	// number, but for the reading one's, which a host's at REPEATABLE READ takes after its snapshot:
+	// no transaction of the cluster's own a snapshot sees committed is, so it is another cluster's,
+	// as a logical dump restored from one that ran ahead carries. History reads it only once every
+	// transaction running is later, as it would one of this cluster's, so it never goes from under
+	// a cursor, but until then every change this cluster makes is read before it, and a prune it
+	// records reads as one still running (unsettled), so that no export from the start reads
+	// anything: read as settled, a cursor past it would be past what this cluster commits next,
+	// with the ids it gives until then. That can take as many transactions as the other cluster
+	// ran, so History refuses rather than leave the export behind with no word.
 	var held, pruned bool
+	var ahead *uint64
 	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::pg_catalog.text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
 		    || '/' || d.oid::pg_catalog.text || '/' || c.relnamespace::pg_catalog.text,
 		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::pg_catalog.xid8 AND id = $2 AND recorded_at = $3),
-		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2", "$6::pg_catalog.xid8")+`
+		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2", "$6::pg_catalog.xid8")+`,
+		  (SELECT a.txid FROM `+history+` a WHERE a.txid >= pg_snapshot_xmax(pg_current_snapshot()) AND a.entity <> 'commit'
+		    AND a.txid IS DISTINCT FROM pg_current_xact_id_if_assigned() ORDER BY a.txid DESC LIMIT 1)
 		FROM pg_control_system() s, pg_catalog.pg_database d, pg_catalog.pg_class c
 		WHERE d.datname = current_database() AND c.oid = $4::pg_catalog.text::pg_catalog.regclass`,
-		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following(), after.prunesFrom()).Scan(&generation, &held, &pruned); err != nil {
+		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following(), after.prunesFrom()).Scan(&generation, &held, &pruned, &ahead); err != nil {
 		return "", err
+	}
+	if ahead != nil {
+		return "", &AheadError{TxID: *ahead}
 	}
 	if after != (Cursor{}) && after.Generation != generation {
 		return "", fmt.Errorf("%w: the cursor is another generation's, as before a failover or a pg_upgrade: export this one from the start", ErrInvalid)
@@ -224,6 +241,20 @@ func unsettled(history string) string {
 // errPrunedPast is why History refuses a cursor after which a prune deleted records.
 func errPrunedPast() error {
 	return fmt.Errorf("%w: a prune deleted records after the cursor, which an export from it hasn't read, as one through the cursor of an export further on does: export it again from the start", ErrInvalid)
+}
+
+// AheadError is History's refusal, and so Export's and PruneHistory's, while history holds records
+// of transactions the database cluster has yet to number, as a logical dump restored from a cluster
+// whose transaction ids ran ahead of this one's carries. Read in the order of transactions, every
+// change this cluster makes until its ids pass them comes before them, so no export can read them
+// and still read those. TxID is the last of them: once a stopped cluster's transaction id epoch is
+// raised past it, as the README's History says, History reads them, in order, at once.
+type AheadError struct {
+	TxID uint64
+}
+
+func (e *AheadError) Error() string {
+	return fmt.Sprintf("rbac: history holds records of transactions up to %d, which this database cluster has yet to number, as a logical dump restored from a cluster ahead of it carries: no export can read them in order until its transaction ids pass them, so raise its transaction id epoch past %d with pg_resetwal -e while it is stopped, then export history from the start", e.TxID, e.TxID>>32)
 }
 
 // followed runs in History once followable has checked the cursor, on its transaction, which a
