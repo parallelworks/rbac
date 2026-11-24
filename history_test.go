@@ -5162,7 +5162,21 @@ func TestHistoryReadsRecordsOfAClusterAheadOnceItsOwnIdsPassThem(t *testing.T) {
 	if _, _, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory); !errors.As(err, &refused) {
 		t.Fatalf("History from the start, history holding a record of a transaction the cluster has yet to number: %v", err)
 	}
-	// A transaction of this cluster's takes its id, before theirs, and holds it.
+	// The cluster numbers transactions up to just short of theirs, then one of its own takes its
+	// id, before theirs, and holds it while the cluster numbers past them: only then, as held open,
+	// it holds back every read of history in the cluster, other tests' too.
+	burn, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	burnTo := func(until string) {
+		t.Helper()
+		if _, err := h.pool.Exec(burn, fmt.Sprintf(`DO $$ BEGIN LOOP
+			PERFORM set_config('synchronous_commit', 'off', true);
+			EXIT WHEN %s;
+			COMMIT; END LOOP; END $$`, until)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	burnTo(fmt.Sprintf(`pg_current_xact_id()::text::numeric >= '%s'::numeric - 2000`, ahead))
 	held, err := h.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -5171,14 +5185,14 @@ func TestHistoryReadsRecordsOfAClusterAheadOnceItsOwnIdsPassThem(t *testing.T) {
 	if _, err := held.Exec(ctx, `INSERT INTO rbac_memberships (tenant, principal_kind, principal_id) VALUES ('t1', 'user', 'held')`); err != nil {
 		t.Fatal(err)
 	}
-	burn, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	if _, err := h.pool.Exec(burn, fmt.Sprintf(`DO $$ BEGIN LOOP
-		PERFORM set_config('synchronous_commit', 'off', true);
-		EXIT WHEN pg_current_xact_id() > '%s'::xid8;
-		COMMIT; END LOOP; END $$`, ahead)); err != nil {
+	var before bool
+	if err := held.QueryRow(ctx, `SELECT pg_current_xact_id() < $1::text::pg_catalog.xid8`, ahead).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
+	if !before {
+		t.Fatalf("held took its id after the restored records' %s: other sessions took 2000 ids as it began", ahead)
+	}
+	burnTo(fmt.Sprintf(`pg_current_xact_id() > '%s'::xid8`, ahead))
 	// The cluster has numbered past theirs, but held, of an earlier id, runs: neither is read.
 	got, cursor, err := h.authz.History(ctx, rbac.Cursor{}, rbac.MaxHistory)
 	if err != nil {
