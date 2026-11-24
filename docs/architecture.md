@@ -722,7 +722,8 @@ sequenceDiagram
   host's own, a list, map or optional of CEL's a host makes, a struct, a lock of the host's own, as
   no hook can be given it (`hostLock`), one that is a byte too, in an array or a slice, which is
   read as a list of them rather than as bytes (`byteKind`), another message, a map keyed by a
-  double or a lock or
+  double, a lock, a `time.Duration` or a `json.Number`, which CEL reads as a duration or a number
+  where its kind is an int or a string (`keyType`), or
   holding two keys read as the same value, and so JSON text naming a member twice
   once unescaped, read by the package's own parser as `encoding/json` reads it (`parseJSON`), or a
   packed message setting a
@@ -942,7 +943,11 @@ sequenceDiagram
   change bounding what a check reads together counts such a condition at all a condition may cost
   (`conditions.limit`), as it is one: counted nothing, a change could add another past the bound. A
   comparison, a search or a match that would cost more than a condition may fails before it runs,
-  as CEL charges a call only once it has run, and a program in which CEL plans one, a literal, a
+  as CEL charges a call only once it has run; a conversion or `size()` of a string or bytes is
+  charged so (`costs.CallCost`), and runs whole first, at 1.5 MB, as much as a check converts,
+  about 18 ms for `timestamp()` of control bytes, which its error quotes, 11 ms of invalid UTF-8,
+  15 ms for `duration()`, and up to 9 ms for `double()`, `size()` and `timestamp()` of other text, once for
+  each condition reading one; and a program in which CEL plans one, a literal, a
   key, a loop's condition or a variable named from the root past a loop's variable of its name
   where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
   `.request` in `l.all(request, ...)`, from what the check passed, outside the evaluation, and
@@ -1921,7 +1926,14 @@ flowchart LR
   Each statement reads history by the rows it names, through
   history's indexes, as a search the custom roles its grants name, by their ids, and its principals'
   grants by principal and type, which history's index of a principal's versions holds beside the
-  scope, as a check seeks them on its resource's path. A version counts by a time from its date, or
+  scope, as a check seeks them on its resource's path, and `Grants` and `Eligibilities` given both
+  scopes and principals each principal's on the scopes' types, which history's index of scopes,
+  holding no principal, would read every version on the scope for: a user's eligibilities on the
+  tenant's root, 427 pages beside 3,000 others' there, where so they read 14; but only where history
+  holds `versionsBySeek` versions on the scopes for each principal and scope, counted up to that, as
+  a seek costs a few pages however few the scopes hold: seeking, 3,000 principals' on a path of 4
+  read 36,000 pages, by the scope 600. A generic plan a host forces inside the read can read them by
+  the scope still, once for each of the scopes' types. A version counts by a time from its date, or
   its transaction's commit record where that is later, looked up by its transaction in history's
   index of commit records for every version, as `History` reads `CommittedAt`, so what a time reads
   turns on nothing an export leaves out. Commit records held the oldest transaction then running,
