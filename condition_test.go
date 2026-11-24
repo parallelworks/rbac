@@ -33,6 +33,7 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/runtime/protoiface"
 	"google.golang.org/protobuf/runtime/protoimpl"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
@@ -385,6 +386,89 @@ func TestAMapTheHostPassesKeyedByADurationAJSONNumberOrANullValueFailsItsConditi
 		} {
 			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, map[string]any{"m": m}); err != nil || evaluated {
 				t.Errorf("%s of a map keyed by %s: evaluated %t, %v", expr, name, evaluated, err)
+			}
+		}
+	}
+}
+
+// valueMessage is a host's own message of an int, a value of which is the message it reflects.
+type valueMessage int32
+
+func (m valueMessage) ProtoReflect() protoreflect.Message {
+	return wrapperspb.Int64(int64(m) + 1).ProtoReflect()
+}
+
+// reflectedList is a host's own int that is a list as protobuf reflects one, which CEL reads as the
+// list it reflects.
+type reflectedList int32
+
+func (l reflectedList) Len() int                          { return 1 }
+func (l reflectedList) Get(int) protoreflect.Value        { return protoreflect.ValueOfInt64(int64(l) + 1) }
+func (l reflectedList) Set(int, protoreflect.Value)       {}
+func (l reflectedList) Append(protoreflect.Value)         {}
+func (l reflectedList) AppendMutable() protoreflect.Value { return protoreflect.Value{} }
+func (l reflectedList) Truncate(int)                      {}
+func (l reflectedList) NewElement() protoreflect.Value    { return protoreflect.ValueOfInt64(0) }
+func (l reflectedList) IsValid() bool                     { return true }
+
+// reflectedMessage is a host's own int that is a message as protobuf reflects one, which CEL reads
+// as the message it reflects.
+type reflectedMessage int32
+
+func (m reflectedMessage) of() protoreflect.Message {
+	return wrapperspb.Int64(int64(m) + 1).ProtoReflect()
+}
+func (m reflectedMessage) Descriptor() protoreflect.MessageDescriptor { return m.of().Descriptor() }
+func (m reflectedMessage) Type() protoreflect.MessageType             { return m.of().Type() }
+func (m reflectedMessage) New() protoreflect.Message                  { return m.of().New() }
+func (m reflectedMessage) Interface() protoreflect.ProtoMessage       { return m.of().Interface() }
+func (m reflectedMessage) Range(f func(protoreflect.FieldDescriptor, protoreflect.Value) bool) {
+	m.of().Range(f)
+}
+func (m reflectedMessage) Has(f protoreflect.FieldDescriptor) bool { return m.of().Has(f) }
+func (m reflectedMessage) Clear(protoreflect.FieldDescriptor)      {}
+func (m reflectedMessage) Get(f protoreflect.FieldDescriptor) protoreflect.Value {
+	return m.of().Get(f)
+}
+func (m reflectedMessage) Set(protoreflect.FieldDescriptor, protoreflect.Value) {}
+func (m reflectedMessage) Mutable(f protoreflect.FieldDescriptor) protoreflect.Value {
+	return m.of().Mutable(f)
+}
+
+func (m reflectedMessage) NewField(f protoreflect.FieldDescriptor) protoreflect.Value {
+	return m.of().NewField(f)
+}
+
+func (m reflectedMessage) WhichOneof(o protoreflect.OneofDescriptor) protoreflect.FieldDescriptor {
+	return m.of().WhichOneof(o)
+}
+func (m reflectedMessage) GetUnknown() protoreflect.RawFields { return nil }
+func (m reflectedMessage) SetUnknown(protoreflect.RawFields)  {}
+func (m reflectedMessage) IsValid() bool                      { return true }
+func (m reflectedMessage) ProtoMethods() *protoiface.Methods  { return nil }
+
+// A value of the host's own int type that is a message, or a list or a message as protobuf reflects
+// one, CEL reads by its methods, as the message or the list it reflects: as a value, one reflecting
+// a list or a message was read by its kind, as an int, and as a map's key, each was, directly or in
+// an interface, so `1 in m` held where CEL found the key 2, or a list. Each fails every condition
+// reading its kind, as a key too, empty too.
+func TestAValueOfAHostsOwnTypeProtobufReflectsFailsItsConditions(t *testing.T) {
+	for name, attributes := range map[string]map[string]any{
+		"a message": {"v": valueMessage(1)}, "a reflected list": {"v": reflectedList(1)},
+		"a reflected message":      {"v": reflectedMessage(1)},
+		"a map keyed by a message": {"m": map[valueMessage]int{1: 1}}, "a map keyed by no message": {"m": map[valueMessage]int{}},
+		"a map keyed by a reflected list":      {"m": map[reflectedList]int{1: 1}},
+		"a map keyed by a reflected message":   {"m": map[reflectedMessage]int{1: 1}},
+		"a message in a map of Go's":           {"m": map[any]int{valueMessage(1): 1}},
+		"a reflected list in a map of Go's":    {"m": map[any]int{reflectedList(1): 1}},
+		"a reflected message in a map of Go's": {"m": map[any]int{reflectedMessage(1): 1}},
+	} {
+		for _, expr := range []string{
+			`request.attributes.v == 1`, `request.attributes.v != 1`, `1 in request.attributes.m`, `!(1 in request.attributes.m)`,
+			`size(request.attributes.m) >= 0`, `request.attributes.m == request.attributes.m`,
+		} {
+			if _, evaluated, _, err := rbac.EvaluateCondition(t, expr, attributes); err != nil || evaluated {
+				t.Errorf("%s of %s: evaluated %t, %v", expr, name, evaluated, err)
 			}
 		}
 	}

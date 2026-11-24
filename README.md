@@ -315,7 +315,7 @@ naming it, so the condition keeps no row there.
   reads, or to a `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any`, below; maps of these keyed
   by a bool, a
   string, an int or a uint, or by an interface holding one, but for a `time.Duration`, a
-  `json.Number` or a `structpb.NullValue`; JSON text (`json.RawMessage`, a nil
+  `json.Number`, a `structpb.NullValue` or a message; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them, a `Value` holding a nil `Struct`
   or `ListValue` read as an empty one, as CEL reads it and protobuf writes it; and CEL's own scalar
@@ -338,8 +338,10 @@ naming it, so the condition keeps no row there.
   lifted. So do those holding a `ref.Val` of the host's
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
   struct, a channel, a func, a lock of the host's own, as an integer a pointer to which locks and
-  unlocks, which no hook can be given either, below, any other message, a map keyed by anything
-  else, as a double, an array or a lock, or by a `time.Duration`, a `json.Number` or a
+  unlocks, which no hook can be given either, below, any other message, a list or a message as
+  protobuf reflects one (`protoreflect.List`, `protoreflect.Message`), which CEL reads as the one
+  it reflects, a map keyed by anything else, as a double, an array, a lock or a message, or by a
+  `time.Duration`, a `json.Number` or a
   `structpb.NullValue`, directly or in an interface, whose keys were read by their kind, an int or a
   string, where CEL reads them as a duration, a number or null, so `k == duration("1h")` failed over
   them and `0 in m` held, and a slice, a pointer or a map of any of these, or an
