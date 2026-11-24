@@ -135,6 +135,9 @@ as the transaction had it; not `RESET enable_seqscan` after it, which sets the s
 it started with, dropping a value the session set, as a pool can for each connection it opens. Or
 plan it again once the tables have grown, as an analysis of them does: under a plan cached while
 they held a few rows, a list read 43,736 pages of grants and 4,502 of denies beside 20,000 of each.
+Run it in a session whose client_encoding is UTF8, as pgx's connections start: in another,
+PostgreSQL converts the condition's arguments, the subject's keys among them, which would then
+match none of the denies naming it, so the condition keeps no row there.
 
 ## Policies
 
@@ -1800,6 +1803,16 @@ the package's uses foreign data, so none of the roles needs any.
   in a session runs it and keeps: a host's own deletion of a group, planned with sequential scans on
   while the places were few, leaves a plan that reads every one. `Filter`'s condition runs in the
   host's statement, which the host plans (Lists).
+- **Client encoding:** the package's statements send and read their text in UTF8 whatever the
+  session's client_encoding, which any role may set, as a pool's `AfterConnect` can, and which pgx
+  checks only as a connection starts: in another, PostgreSQL would convert each id it is sent, so a
+  deny naming `josé` named another principal, and history recorded, and an export chained, what was
+  converted. Each batch it sends sets it for its own statements, beside the planner settings, and
+  puts the session's back, in the same round trip; a change, `History`, `Export`, `Migrate` and
+  `AsOf` set it in their transaction, or under `WithTx` in their savepoint, and put the host's back,
+  which on a session already in UTF8, as most are, costs nothing. So a hook that runs in a change's
+  transaction, as `OnChange`, runs in UTF8 too. `Filter`'s condition keeps no row in a session in
+  another (Lists).
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

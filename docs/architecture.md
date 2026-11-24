@@ -416,6 +416,24 @@ erDiagram
   tenant's records of the entity, so a statement writing many would take time growing with the
   square of their number.
 
+The text a statement is sent and reads back is in the session's client_encoding, which any role may
+set, as a host's pool can for each connection it opens: pgx sends every argument as UTF-8 and
+checks the setting only as the connection starts, so in another one PostgreSQL converts what it is
+sent, and a deny naming "josé" was stored as naming "josÃ©", which Authorize on a session in UTF8
+never matched; a key was looked up as another, so a check missed the deny binding it; and what was
+read back, as history's records, was converted too, which Export then chained. So the first
+statement of every batch the package sends (`settingBatch`) sets client_encoding to UTF8 for the
+batch's statements alone (`unconverted`), with the planner settings, keeping the session's in
+`rbac.client_encoding` and putting it back after them, in the same round trip. The statements
+sent outside a batch run in a transaction or savepoint that sets it first (`inUTF8`): a change's,
+`History`'s and `Migrate`'s (`beginOwn`), and `AsOf`'s reads of history's views; where pgx was
+last told UTF8, as on most sessions, that sets nothing and costs no round trip, and under `WithTx`
+it puts the host's setting back once the call succeeds, while a failure's rollback, a
+transaction's or a savepoint's, puts it back too. `AsOf`'s check of its views' schema after its
+transaction runs in a batch (`stand`). `Filter`'s condition runs in the host's statement, in the
+host's session, whose setting the package can't set, so it keeps no row where client_encoding
+isn't UTF8, tested once for the statement, rather than look the subject's keys up converted.
+
 ## Principals, groups and keys
 
 A check counts what the subject's principals hold. They are found in the same statement as the
