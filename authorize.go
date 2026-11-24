@@ -1673,7 +1673,11 @@ func (a *Authorizer) Filter(ctx context.Context, s Subject, p Permission, tenant
 		pred.SQL, pred.Args = pred.SQL+" AND "+labels, append(pred.Args, args...)
 	}
 	kept, args := a.filterHolding(arg, len(pred.Args), held.lapses)
-	pred.SQL = "(" + pred.SQL + kept + ")"
+	// The host's query runs in its own session, which can set gin_fuzzy_search_limit, as for its own
+	// text searches: then the GIN indexes find only part of the denies binding the subject, and the
+	// condition would keep what they remove. So it keeps no row unless it is 0, a test of no row's
+	// columns, which a plan evaluates once.
+	pred.SQL = "(pg_catalog.current_setting('gin_fuzzy_search_limit') = '0' AND " + pred.SQL + kept + ")"
 	pred.Args = append(pred.Args, args...)
 	return pred, nil
 }
