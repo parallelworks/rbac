@@ -846,11 +846,16 @@ func refusedType(t reflect.Type, outer []reflect.Type) bool {
 }
 
 // keyType reports whether a map keyed by values of type t is keyed as Attributes names, empty too,
-// and so whether a key of type t an interface holds is one a condition reads.
+// and so whether a key of type t an interface holds is one a condition reads. A time.Duration or a
+// json.Number isn't: read by its kind, an int or a string, where as a value it is a duration or a
+// parsed number, as CEL reads it as a key too, `k == duration("1h")` failed over its keys and
+// `k == 3600000000000` held.
 func keyType(t reflect.Type) bool {
 	switch t {
 	case celBoolType, celIntType, celStringType, celUintType:
 		return true
+	case durationType, numberType:
+		return false
 	}
 	if hostLock(t) || t.NumMethod() > 0 && (celScalar(t) || methodsOf(t) == byItsMethods) {
 		return false

@@ -308,7 +308,8 @@ naming it, so the condition keeps no row there.
   of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
   reads, or to a `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any`, below; maps of these keyed
   by a bool, a
-  string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
+  string, an int or a uint, or by an interface holding one, but for a `time.Duration` or a
+  `json.Number`; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them, a `Value` holding a nil `Struct`
   or `ListValue` read as an empty one, as CEL reads it and protobuf writes it; and CEL's own scalar
@@ -332,7 +333,9 @@ naming it, so the condition keeps no row there.
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
   struct, a channel, a func, a lock of the host's own, as an integer a pointer to which locks and
   unlocks, which no hook can be given either, below, any other message, a map keyed by anything
-  else, as a double, an array or a lock, and a slice, a pointer or a map of any of these, or an
+  else, as a double, an array or a lock, or by a `time.Duration` or a `json.Number`, directly or in
+  an interface, whose keys were read by their kind, an int or a string, where CEL reads them as a
+  duration or a number, so `k == duration("1h")` failed over them, and a slice, a pointer or a map of any of these, or an
   array holding one, holding none too, as an empty slice of structs or a nil pointer to one, read as
   `[]` or `null`, left a kind
   readable until it held one, a map holding two keys read as the same value, as `1`

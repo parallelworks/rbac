@@ -722,7 +722,8 @@ sequenceDiagram
   host's own, a list, map or optional of CEL's a host makes, a struct, a lock of the host's own, as
   no hook can be given it (`hostLock`), one that is a byte too, in an array or a slice, which is
   read as a list of them rather than as bytes (`byteKind`), another message, a map keyed by a
-  double or a lock or
+  double, a lock, a `time.Duration` or a `json.Number`, which CEL reads as a duration or a number
+  where its kind is an int or a string (`keyType`), or
   holding two keys read as the same value, and so JSON text naming a member twice
   once unescaped, read by the package's own parser as `encoding/json` reads it (`parseJSON`), or a
   packed message setting a
