@@ -538,9 +538,13 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 	err = beginOwn(ctx, db, func(tx pgx.Tx, fresh bool) error {
 		own = fresh
 		var schema *string
+		var named []byte
 		var level, conforming, path string
+		// And the schema's name as UTF-8 bytes, which no client_encoding converts, for the lock's key,
+		// as takeLocks reads it.
 		if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_schema(), pg_catalog.current_setting('transaction_isolation'),
-			pg_catalog.current_setting('standard_conforming_strings'), pg_catalog.current_setting('search_path')`).Scan(&schema, &level, &conforming, &path); err != nil {
+			pg_catalog.current_setting('standard_conforming_strings'), pg_catalog.current_setting('search_path'),
+			pg_catalog.convert_to(pg_catalog.current_schema(), 'UTF8')`).Scan(&schema, &level, &conforming, &path, &named); err != nil {
 			return err
 		}
 		if err := readCommitted("Migrate", level); err != nil {
@@ -588,7 +592,7 @@ func migrateOnce(ctx context.Context, db DB, gaveWay bool) (own, more bool, err 
 		// One migration at a time in the schema, under a lock named and keyed as the changes' are: by
 		// the schema it migrates, as the tables may not exist yet, which is the one they are in once
 		// they do.
-		sql, args := advisory{kind: "migrate"}.taking(*schema)
+		sql, args := advisory{kind: "migrate"}.taking(string(named))
 		if _, err := tx.Exec(ctx, sql, args...); err != nil {
 			return fmt.Errorf("%w: %w", errReplica, err)
 		}

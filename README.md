@@ -931,14 +931,33 @@ cursor was read, leaves nothing the database can tell from recovering from a cra
 nothing that committed, so its export would read on: restore by recovering to a point in time, which
 starts a new generation, or export each generation from the start again after a restore. Move
 history with physical backups and replicas; a logical dump restored into another cluster numbers its
-transactions anew. `AsOf` still dates a restored change by its own commit record, as a commit record
-dates only changes of its own cluster, and a restored change whose commit record is gone counts from
-its own date; a transaction this cluster gives a restored change's txid is another, which commits,
-and whose changes `AsOf` counts apart from the restored one's. `pg_upgrade` gives the cluster a new
-identifier and keeps its transaction ids, so `AsOf` answers as before. Never bring back rows of a
-timeline a recovery to a point in time left behind: they keep the cluster's identifier while the new
-timeline numbers their transactions again, so `AsOf` would date such a change by another
-transaction's commit.
+transactions anew. Its records keep the transaction ids of the cluster that wrote them, and
+`History` reads a record only once every transaction still running is later, so a record restored
+from a cluster whose ids ran ahead of this one's, as a new cluster's are behind those of one that
+has run a while, would come after every change this cluster makes until its ids pass it, which can
+take as many transactions as the source ran. While history holds one, `History`, and `Export` and
+`PruneHistory` with it, refuses as an `*rbac.AheadError`, which names the last such transaction,
+rather than export none of the restore. Before restoring such a dump, or after but before any
+export of the restore begins, commit or roll back every prepared transaction in the new cluster, as
+`pg_prepared_xacts` lists them, stop it cleanly and raise its transaction id epoch past the
+source's with `pg_resetwal -e`, to one more than the source's
+`floor(pg_current_xact_id()::text::numeric / 4294967296)`, or the `AheadError`'s `TxID` divided
+so, before taking its backups or making its replicas: every restored record is then of an earlier
+transaction than any this cluster makes, and `History` reads them at once, in order, exported from
+`Genesis` as a new generation. A transaction left prepared keeps the id it took in the old epoch,
+which the cluster's snapshots read in the new one, so `History` reads past it while it is open,
+and once it commits, its records are behind the cursor of every export in the cluster, never read,
+and a prune through that cursor deletes them. A cluster that can't be stopped so, as one a
+provider runs, can't follow history restored ahead of it: move history there by a physical copy.
+Restore a dump only into a new database, a new generation: a record restored behind the cursor of an
+export that already follows the database is never read. `AsOf` still dates a restored change by its
+own commit record, as a commit record dates only changes of its own cluster, and a restored change
+whose commit record is gone counts from its own date; a transaction this cluster gives a restored
+change's txid is another, which commits, and whose changes `AsOf` counts apart from the restored
+one's. `pg_upgrade` gives the cluster a new identifier and keeps its transaction ids, so `AsOf`
+answers as before. Never bring back rows of a timeline a recovery to a point in time left behind:
+they keep the cluster's identifier while the new timeline numbers their transactions again, so
+`AsOf` would date such a change by another transaction's commit.
 
 A change refused, as `ErrDenied` or `ErrInvalid`, writes nothing, so history doesn't record it:
 `Config.OnRefused` is told of each, with its actor, the call and the host's audit, to record the
@@ -1865,9 +1884,17 @@ the package's uses foreign data, so none of the roles needs any.
   same round trip; a change, `History`, `Export`, `Migrate` and `AsOf` set it in their transaction,
   or under `WithTx` in their savepoint, and put the host's back, which on a session already in UTF8,
   as most are, costs nothing. So a hook that runs in a change's transaction, as `OnChange`, runs in
-  UTF8 too. `Filter`'s condition keeps no row in a session in another (Lists). Under pgx's simple
-  protocol (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments
-  on such a session, every call fails there instead.
+  UTF8 too. A host's DB wrapper can set it again before each statement, in the package's
+  transaction too: so every statement sending the host's text, or reading it back, is in such a
+  batch, as the one recording who made a change, `SetRole`'s write and `History`'s read of records,
+  and the rest send the package's own text, or names of schemas and roles they read back in the
+  same encoding. The schema's name is read as UTF-8 bytes where it keys the locks of changes and
+  `Migrate`, and `History` names it in ASCII, so a schema named past ASCII works behind such a
+  wrapper too, unless the wrapper's encoding has no character for its name. Behind such a wrapper
+  `AsOf` fails as its read returns. `Filter`'s condition keeps
+  no row in a session in another (Lists). Under pgx's simple protocol
+  (`QueryExecModeSimpleProtocol`), in which pgx refuses to send a statement with arguments on such
+  a session, every call fails there instead.
 - **Expiry:** expired grants give nothing at once; `DeleteExpired` clears them a batch at a time,
   to run on a schedule, passing over what a change holds until the next run. A call reads
   `Config.Now` once, which every expiry it compares and every condition's `request.time` read, so a

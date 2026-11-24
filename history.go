@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -77,7 +78,10 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
+	// In a batch (planned), which sends it in UTF8 whatever the session's client_encoding: a host's
+	// DB wrapper can set another before each statement, after the change's transaction set UTF8
+	// (inUTF8), and history would then name another actor.
+	if err := planned(ctx, tx, nil, nil, `SELECT set_config('rbac.change', $1, true)`, string(b)); err != nil {
 		return nil, err
 	}
 	// In a transaction of its own that hands nothing to OnChange, nothing writes after the change,
@@ -96,25 +100,27 @@ func (a *Authorizer) recording(ctx context.Context, tx pgx.Tx, actor Principal, 
 // reads before every schema, and a pooled connection keeps, so one named as history's would stand
 // in for it, and Export would sign what it holds. A temporary type is read before pg_catalog's
 // too, so those reads name their types by pg_catalog's. It refuses the session's temporary schema,
-// which a search_path naming pg_temp first makes the current one.
-func packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
-	var schema string
+// which a search_path naming pg_temp first makes the current one. named is the schema's name in
+// UTF-8, read as bytes, which no client_encoding converts, as a host's DB wrapper can set one
+// before each statement.
+func packageSchema(ctx context.Context, tx pgx.Tx) (schema, named string, err error) {
 	var temporary bool
-	if err := tx.QueryRow(ctx, `SELECT n.nspname, n.oid = pg_catalog.pg_my_temp_schema()
-		FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema()`).Scan(&schema, &temporary); err != nil {
-		return "", err
+	var utf8Name []byte
+	if err := tx.QueryRow(ctx, `SELECT n.nspname, n.oid = pg_catalog.pg_my_temp_schema(), pg_catalog.convert_to(n.nspname::pg_catalog.text, 'UTF8')
+		FROM pg_catalog.pg_namespace n WHERE n.nspname = pg_catalog.current_schema()`).Scan(&schema, &temporary, &utf8Name); err != nil {
+		return "", "", err
 	}
 	if temporary {
-		return "", fmt.Errorf("%w: the search_path names pg_temp first, where any role may make tables named as the package's", ErrInvalid)
+		return "", "", fmt.Errorf("%w: the search_path names pg_temp first, where any role may make tables named as the package's", ErrInvalid)
 	}
-	return schema, nil
+	return schema, string(utf8Name), nil
 }
 
 // packageSchema is packageSchema of tx, but as of a time the package's schema, as the current one
-// is then that of history's views (AsOf).
-func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (string, error) {
+// is then that of history's views (AsOf), which AsOf reads in UTF8.
+func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (schema, named string, err error) {
 	if a.schema != "" {
-		return a.schema, nil
+		return a.schema, a.schema, nil
 	}
 	return packageSchema(ctx, tx)
 }
@@ -122,6 +128,33 @@ func (a *Authorizer) packageSchema(ctx context.Context, tx pgx.Tx) (string, erro
 // historyTable is history's table in schema, as packageSchema returns it.
 func historyTable(schema string) string {
 	return pgx.Identifier{schema, "rbac_history"}.Sanitize()
+}
+
+// historyTableNamed is historyTable of a schema named in UTF-8 (packageSchema), in ASCII alone, each
+// character past it, and any backslash, written by its code point (U&"…"): so it names the table
+// whatever client_encoding a statement is parsed in, as pgx parses a batch's statements before the
+// batch sets UTF8 in one query mode, and after it in the others. For a name in ASCII, it is
+// historyTable's.
+func historyTableNamed(named string) string {
+	if !strings.ContainsFunc(named, func(r rune) bool { return r >= utf8.RuneSelf || r == '\\' }) {
+		return historyTable(named)
+	}
+	var b strings.Builder
+	b.WriteString(`U&"`)
+	for _, r := range strings.ReplaceAll(named, "\x00", "") {
+		switch {
+		case r == '"':
+			b.WriteString(`""`)
+		case r < utf8.RuneSelf && r != '\\':
+			b.WriteRune(r)
+		case r <= 0xFFFF:
+			fmt.Fprintf(&b, `\%04X`, r)
+		default:
+			fmt.Fprintf(&b, `\+%06X`, r)
+		}
+	}
+	b.WriteString(`".rbac_history`)
+	return b.String()
 }
 
 // followable refuses, on tx, a cursor of another generation, whose last record history in schema
@@ -141,15 +174,32 @@ func followable(ctx context.Context, tx pgx.Tx, schema string, after Cursor) (ge
 	// history read, by OIDs, which a physical copy keeps: every database and schema in a cluster
 	// would otherwise share a generation, and with one key, checkpoints. The catalogs by schema
 	// too, as a temporary table is read before them.
+	//
+	// And the last record, by the order History reads, of a transaction the cluster has yet to
+	// number, but for the reading one's, which a host's at REPEATABLE READ takes after its snapshot:
+	// no transaction of the cluster's own a snapshot sees committed is, so it is another cluster's,
+	// as a logical dump restored from one that ran ahead carries. History reads it only once every
+	// transaction running is later, as it would one of this cluster's, so it never goes from under
+	// a cursor, but until then every change this cluster makes is read before it, and a prune it
+	// records reads as one still running (unsettled), so that no export from the start reads
+	// anything: read as settled, a cursor past it would be past what this cluster commits next,
+	// with the ids it gives until then. That can take as many transactions as the other cluster
+	// ran, so History refuses rather than leave the export behind with no word.
 	var held, pruned bool
+	var ahead *uint64
 	if err := tx.QueryRow(ctx, `SELECT s.system_identifier::pg_catalog.text || '/' || left(pg_walfile_name(pg_current_wal_lsn()), 8)
 		    || '/' || d.oid::pg_catalog.text || '/' || c.relnamespace::pg_catalog.text,
 		  EXISTS (SELECT 1 FROM `+history+` WHERE txid = $1::pg_catalog.xid8 AND id = $2 AND recorded_at = $3),
-		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2", "$6::pg_catalog.xid8")+`
+		  $5::boolean AND `+prunedPast(history, "$1::pg_catalog.xid8", "$2", "$6::pg_catalog.xid8")+`,
+		  (SELECT a.txid FROM `+history+` a WHERE a.txid >= pg_snapshot_xmax(pg_current_snapshot()) AND a.entity <> 'commit'
+		    AND a.txid IS DISTINCT FROM pg_current_xact_id_if_assigned() ORDER BY a.txid DESC LIMIT 1)
 		FROM pg_control_system() s, pg_catalog.pg_database d, pg_catalog.pg_class c
 		WHERE d.datname = current_database() AND c.oid = $4::pg_catalog.text::pg_catalog.regclass`,
-		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following(), after.prunesFrom()).Scan(&generation, &held, &pruned); err != nil {
+		after.TxID, after.ID, storedTime(after.RecordedAt), history, after.following(), after.prunesFrom()).Scan(&generation, &held, &pruned, &ahead); err != nil {
 		return "", err
+	}
+	if ahead != nil {
+		return "", &AheadError{TxID: *ahead}
 	}
 	if after != (Cursor{}) && after.Generation != generation {
 		return "", fmt.Errorf("%w: the cursor is another generation's, as before a failover or a pg_upgrade: export this one from the start", ErrInvalid)
@@ -226,6 +276,21 @@ func errPrunedPast() error {
 	return fmt.Errorf("%w: a prune deleted records after the cursor, which an export from it hasn't read, as one through the cursor of an export further on does: export it again from the start", ErrInvalid)
 }
 
+// AheadError is History's refusal, and so Export's and PruneHistory's, while history holds records
+// of transactions the database cluster has yet to number, as a logical dump restored from a cluster
+// whose transaction ids ran ahead of this one's carries. Read in the order of transactions, every
+// change this cluster makes until its ids pass them comes before them, so no export can read them
+// and still read those. TxID is the last of them: once a stopped cluster's transaction id epoch is
+// raised past TxID's, TxID>>32, with no transaction left prepared, as the README's History says,
+// History reads them, in order, at once.
+type AheadError struct {
+	TxID uint64
+}
+
+func (e *AheadError) Error() string {
+	return fmt.Sprintf("rbac: history holds records of transactions up to %d, which this database cluster has yet to number, as a logical dump restored from a cluster ahead of it carries: no export can read them in order until its transaction ids pass them, so, with no transaction left prepared, raise its transaction id epoch past %d with pg_resetwal -e while it is stopped, then export history from the start", e.TxID, e.TxID>>32)
+}
+
 // followed runs in History once followable has checked the cursor, on its transaction, which a
 // test sets.
 var followed = func(pgx.Tx) {}
@@ -271,8 +336,9 @@ const (
 // refused as the transaction commits, and that role can delete otherwise only by disabling
 // history's triggers. Keep at least as much as the host's audit retention requires. It refuses a
 // before yet to come or before year 1, earlier than history dates anything, a through History
-// would refuse, as one whose export an earlier prune went past, and, like AsOf, history whose ids
-// can't order a row's changes. It deletes at most MaxPrune records: call it again while it deletes
+// would refuse, as one whose export an earlier prune went past, or while history holds records of
+// transactions the cluster has yet to number (AheadError), and, like AsOf, history whose ids can't
+// order a row's changes. It deletes at most MaxPrune records: call it again while it deletes
 // as many, and it goes on from where the last prune of the same before and through stopped. It
 // reads history MaxPrune records at a time, on a pool or a connection each in a transaction of its
 // own, so none holds exports back for long, and on an error what those before deleted stays
@@ -650,6 +716,10 @@ var maxUnsized = 100
 // nothing that committed: restore by recovering to a point in time, which starts a generation, or
 // export from the start after one. A logical dump restored into another cluster numbers its
 // transactions anew, which a cursor can't follow: move history with physical backups and replicas.
+// Its records keep their own cluster's transaction ids, and one of a cluster that ran ahead of this
+// one would be read only after every change this cluster makes until its ids pass it, so History
+// refuses, as an AheadError, while history holds one: raise a stopped cluster's transaction id
+// epoch past them, as the README says.
 //
 // It reads history in the current schema by name, so a session's temporary table or type named
 // as history's or a catalog's stands in for none of it, and refuses a search_path that names
@@ -667,7 +737,7 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 	// reach both an old primary and the new one. Not a.begin, which refuses changes as of a time:
 	// this only reads.
 	err := begin(ctx, a.db, func(tx pgx.Tx) error {
-		schema, err := a.packageSchema(ctx, tx)
+		schema, named, err := a.packageSchema(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -693,12 +763,18 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 		// read that finds no record chains nothing, and the next refuses the cursor in followable. An
 		// export begins with the oldest transaction it sees running as its Horizon, and while a prune
 		// it sees is of one no older, reads nothing (unsettled).
-		rows, err := tx.Query(ctx, `
+		//
+		// In a batch (plannedQuery), which reads the records in UTF8 whatever the session's
+		// client_encoding, as a host's DB wrapper can set another before each statement; naming
+		// history's table in ASCII (historyTableNamed), as the batch's statement may be parsed in
+		// either encoding.
+		table := historyTableNamed(named)
+		rows, err := plannedQuery(ctx, tx, nil, `
 			SELECT id, txid, recorded_at, effective_at, tenant, entity, key, op, coalesce(principal, ''), coalesce(role, ''),
 			  coalesce(scope, ''), coalesce(group_id, ''), expires_at, before, after, actor, on_behalf_of, how, request, reason, db_user,
-			  (SELECT max(c.effective_at) FROM `+historyTable(schema)+` c WHERE c.entity = 'commit' AND c.txid = p.txid
+			  (SELECT max(c.effective_at) FROM `+table+` c WHERE c.entity = 'commit' AND c.txid = p.txid
 			    AND c.cluster IS NOT DISTINCT FROM p.cluster), coalesce(p.cluster::pg_catalog.text, ''),
-			  $6::boolean AND `+prunedPast(historyTable(schema), "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
+			  $6::boolean AND `+prunedPast(table, "$1::pg_catalog.xid8", "$2", "$7::pg_catalog.xid8")+`,
 			  pg_snapshot_xmin(pg_current_snapshot())
 			FROM (
 			  SELECT h.*, row_number() OVER w AS n,
@@ -713,9 +789,9 @@ func (a *Authorizer) History(ctx context.Context, after Cursor, limit int) ([]Re
 			  FROM (
 			    SELECT h.*, count(*) FILTER (WHERE h.bytes IS NULL) OVER (ORDER BY h.txid, h.id ROWS UNBOUNDED PRECEDING) AS unsized
 			    FROM (
-			      SELECT * FROM `+historyTable(schema)+`
+			      SELECT * FROM `+table+`
 			      WHERE (txid, id) > ($1::pg_catalog.xid8, $2) AND txid < pg_snapshot_xmin(pg_current_snapshot()) AND entity <> 'commit'
-			        AND ($6::boolean OR NOT `+unsettled(historyTable(schema))+`)
+			        AND ($6::boolean OR NOT `+unsettled(table)+`)
 			      ORDER BY txid, id LIMIT $3
 			    ) h
 			  ) h

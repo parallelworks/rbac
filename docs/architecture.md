@@ -437,7 +437,20 @@ sent outside a batch run in a transaction or savepoint that sets it first (`inUT
 `History`'s and `Migrate`'s (`beginOwn`), and `AsOf`'s reads of history's views; where pgx was
 last told UTF8, as on most sessions, that sets nothing and costs no round trip, and under `WithTx`
 it puts the host's setting back once the call succeeds, while a failure's rollback, a
-transaction's or a savepoint's, puts it back too. `AsOf`'s check of its views' schema after its
+transaction's or a savepoint's, puts it back too. A host's DB wrapper can set the encoding again
+before each statement it is given, in the package's transaction too, which `inUTF8` set once: the
+change then recorded its actor, reason and request converted, so history and the chain named
+another principal, and `SetRole` stored a name converted. So every statement that sends the host's
+text, or reads it back, is in a batch, whichever transaction it runs in: the one recording who made
+a change (`recording`), `SetRole`'s write, the hashes of conditions a change tells apart
+(`conditionsApart`) and `History`'s read of records. Those left outside one send the package's own
+text, or the names of schemas and roles they read back, which behind such a wrapper they read and
+send in its encoding alike. But a schema's name read so keyed the locks of changes and `Migrate`
+(`lockName`) by other bytes than a session in UTF8 reads, so neither waited for the other: they
+read it as UTF-8 bytes (`convert_to`), which no encoding converts. And `History`'s batch, which pgx
+parses before its setting in one query mode and after it in the others, names history's table in
+ASCII (`historyTableNamed`), by the name's code points. `AsOf` checks the setting once its read
+returns (`kept`), so it fails there. `AsOf`'s check of its views' schema after its
 transaction runs in a batch (`stand`). `Filter`'s condition runs in the host's statement, in the
 host's session, whose setting the package can't set, so it keeps no row where client_encoding
 isn't UTF8, tested once for the statement, rather than look the subject's keys up converted.
@@ -1875,7 +1888,26 @@ flowchart LR
   from a disk snapshot, keeps the generation: where it lost a cursor's last record, `History`
   refuses that cursor, and history is exported again from the start. Where it kept that record
   and lost what came after, nothing in the database tells it from recovering from a crash, so a
-  restore that should start a generation is a recovery to a point in time.
+  restore that should start a generation is a recovery to a point in time. A logical dump keeps
+  each record's transaction id from its own cluster, and `History` reads only records of
+  transactions older than every one running, so a record restored from a cluster that ran ahead
+  comes after every change the restoring cluster makes until its ids pass it. Read as settled, it
+  would put the cursor of an export that read it past those changes, which commit later with lower
+  ids; left unread, it kept the restore out of every export with no word, and a prune it records
+  read as one still running, which held every read from the start back. So `History`, and `Export`
+  and `PruneHistory` through it, refuses (`AheadError`) while history holds a record, but a
+  commit's, which `History` returns none of, of a transaction its snapshot hasn't numbered: no
+  transaction of the cluster's own is so, but the reading one's, which a host's transaction at
+  REPEATABLE READ takes after its snapshot, and which it passes over. Ordering such records before
+  the cluster's own changes would need an order a cursor's txid and id can't hold, and telling
+  them by their cluster would reorder the history of a `pg_upgrade`, whose records are another
+  cluster's too but numbered in this one's order. Raising a stopped cluster's transaction id epoch
+  past the source's with `pg_resetwal -e` puts every restored record before every change it
+  makes, read at once, as a restore from a cluster behind is: but not one of a transaction left
+  prepared across the stop, whose id is of the old epoch, which snapshots read in the new one, so
+  every export reads past it while it is open; so none is left. A record restored behind a cursor
+  of the same generation, as by restoring a dump's rows into a database an export follows, is
+  never read: a restore goes into a new database, a new generation.
 - **No record goes from under a cursor.** A prune records, for each of its transactions that
   deleted any, the last record it deleted in `History`'s order, and `History` refuses the cursor
   of an export that began before the prune where it is before that record, in the statement that

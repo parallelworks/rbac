@@ -473,24 +473,30 @@ var lockSchema atomic.Pointer[string]
 func takeLocks(ctx context.Context, tx pgx.Tx, locks ...advisory) error {
 	guess := lockSchema.Load()
 	b := &pgx.Batch{}
-	b.Queue(`SELECT current_setting('transaction_isolation'), ` + tablesSchema)
+	// The schema's name as UTF-8 bytes, read and compared as bytea, which no client_encoding
+	// converts: these statements set none, and a host's DB wrapper can set another before each, in
+	// which a name read as text would key another lock than a session in UTF8 takes for the same
+	// tables, so their changes would never wait for each other.
+	named := `pg_catalog.convert_to(` + tablesSchema + `, 'UTF8')`
+	b.Queue(`SELECT current_setting('transaction_isolation'), ` + named)
 	taken := 0
 	if guess != nil {
 		for _, l := range locks {
 			sql, args := l.taking(*guess)
-			b.Queue(sql+` WHERE `+tablesSchema+` = $`+strconv.Itoa(len(args)+1), append(args, *guess)...).Exec(func(tag pgconn.CommandTag) error {
+			b.Queue(sql+` WHERE `+named+` = $`+strconv.Itoa(len(args)+1), append(args, []byte(*guess))...).Exec(func(tag pgconn.CommandTag) error {
 				taken += int(tag.RowsAffected())
 				return nil
 			})
 		}
 	}
-	var schema string
-	if err := locked(tx.SendBatch(ctx, b), &schema); err != nil {
+	var name []byte
+	if err := locked(tx.SendBatch(ctx, b), &name); err != nil {
 		return err
 	}
 	if guess != nil && taken == len(locks) {
 		return nil
 	}
+	schema := string(name)
 	lockSchema.Store(&schema)
 	b = &pgx.Batch{}
 	for _, l := range locks {
@@ -3053,7 +3059,9 @@ func conditionsApart(ctx context.Context, q DB, grants []Grant) error {
 	if len(at) == 0 {
 		return nil
 	}
-	rows, err := q.Query(ctx, `SELECT length(c), hashtextextended(c COLLATE "C", 0) FROM unnest($1::text[]) WITH ORDINALITY AS t(c, i) ORDER BY i`, conditions)
+	// In a batch (plannedQuery), so the conditions are hashed as stored, in UTF8, whatever
+	// client_encoding a host's DB wrapper sets before each statement.
+	rows, err := plannedQuery(ctx, q, nil, `SELECT length(c), hashtextextended(c COLLATE "C", 0) FROM unnest($1::text[]) WITH ORDINALITY AS t(c, i) ORDER BY i`, conditions)
 	if err != nil {
 		return err
 	}
