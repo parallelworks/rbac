@@ -2122,7 +2122,15 @@ func (a *Authorizer) grantCounts(ctx context.Context, custom, alone, container, 
 			query = fmt.Sprintf(`SELECT r, CASE WHEN r < 0 THEN -1 ELSE %s END FROM (SELECT %s AS r OFFSET 0) x`,
 				count(arg(16), max(maxOverlap, maxContainerOverlap)+1, past), onResources)
 		}
-		return a.queryRowIndexed(ctx, a.db, query, read...).Scan(&resources, &containers)
+		// Without JIT: planned for its arguments, each count reads built-in roles a role at a time for
+		// each key and type, costed as a seek for every role giving the permission, so beside a catalog
+		// of 1,000 such roles past jit_above_cost, and compiling took a call 123ms where without it it
+		// takes 41.
+		if a.history != "" {
+			return a.queryRowIndexed(ctx, a.db, query, read...).Scan(&resources, &containers)
+		}
+		rows, err := plannedQuery(ctx, a.db, a.unjitted(), query, read...)
+		return firstRow{rows: rows, err: err}.Scan(&resources, &containers)
 	}
 	if !more {
 		if err = counts(pastCapped); err != nil || resources >= 0 && containers >= 0 {

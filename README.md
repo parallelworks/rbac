@@ -1774,7 +1774,8 @@ the package's uses foreign data, so none of the roles needs any.
   rollback puts back, whatever the role's setting.
 - **Planner settings:** every statement a check, list or change sends to read the package's tables,
   but as of a time, turns sequential scans off for itself, as `Holders`' read of label values,
-  `Conflicts` and `Reachable`'s reads of its subject's grants turn JIT off for theirs; and each that
+  `Conflicts`, `Reachable`'s reads of its subject's grants and `Filter`'s counts of them turn JIT off
+  for theirs; and each that
   finds rows by where they are stored, as places in groups, which have no id, turns TID scans on,
   should the host's session have them off, as with them off too a plan read every place to remove
   one. Each sets them in the round trip that sends

@@ -325,7 +325,10 @@ erDiagram
   3.3 before 0034. `Reachable`'s run without JIT: planned for its arguments, each is costed for
   every key as for one holding many grants on the type, so compiling took a subject in 1,000
   groups 44ms where running takes 20, and its second, in 1,000 groups one of which held many, 555ms
-  where it takes 22. `Filter`'s count tests for a key holding more only where it falls short of its
+  where it takes 22. `Filter`'s counts run without JIT too: each reads a key holding many grants on
+  the type a role at a time, costed as a seek for every role giving the permission, so beside a
+  catalog of 1,000 such roles compiling took a subject in 20 groups 123ms where running takes 41.
+  `Filter`'s count tests for a key holding more only where it falls short of its
   limit, having then read every grant: tested first, a subject in 1,000 groups read every group's
   grants, 13,070 pages, where it reads 9,110, as before 0034. `Filter`'s condition, which the host's query can't run again, reads past the bound as
   it did before searches stepped through custom roles, those of built-in roles a role at a time and

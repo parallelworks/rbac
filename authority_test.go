@@ -5788,6 +5788,86 @@ func TestReachableReadsPastTheBoundWithoutJIT(t *testing.T) {
 	}
 }
 
+// Filter counts its subject's grants without JIT: planned for its arguments, the count reads the
+// grants of a key holding many on the type a role at a time, costed as a seek for every role giving
+// the permission, so beside a catalog of 1,000 such roles, past jit_above_cost, and compiling it took
+// a subject in 20 groups' call 123ms, where without JIT it takes 41.
+func TestFilterCountsWithoutJIT(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, "jit=on&plan_cache_mode=force_custom_plan"), func(c *rbac.Config) {
+		for i := range 1000 {
+			c.Catalog = append(c.Catalog, rbac.RoleDefinition{
+				ID:          rbac.Role(fmt.Sprint("cluster.operator", i)),
+				Permissions: []rbac.Permission{login}, ResourceTypes: []string{"cluster"},
+			})
+		}
+	})
+	ctx := t.Context()
+	c0 := hostTable(t, h)[0]
+	var groups []string
+	for i := range 20 {
+		groups = append(groups, fmt.Sprint("g", i))
+	}
+	m := h.as(t, "m", groups...)
+	h.seed(t, grant(c0.Scope(), "cluster.login", rbac.User, "m"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+		SELECT 't1', 'cluster', 'z' || i, 'group', 'g' || j, 'cluster.viewer' FROM generate_series(1, 100) i, generate_series(0, 19) j`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `ANALYZE rbac_grants`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rec := recording(tx)
+	pred, err := h.authz.WithTx(rec).Filter(ctx, m, login, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := 0
+	for i, sql := range rec.sqls {
+		// The settings a batch plans its read with, and puts back, as it ran them.
+		if strings.HasPrefix(sql, "SELECT set_config(") {
+			if _, err := tx.Exec(ctx, sql, rec.args[i]...); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if !strings.Contains(sql, "rbac_grants") {
+			continue
+		}
+		read++
+		var jit string
+		var threshold float64
+		if err := tx.QueryRow(ctx, `SELECT current_setting('jit'), current_setting('jit_above_cost')::float8`).Scan(&jit, &threshold); err != nil {
+			t.Fatal(err)
+		}
+		var plan []struct {
+			Plan struct {
+				Cost float64 `json:"Total Cost"`
+			}
+		}
+		if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+sql, rec.args[i]...).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		if c := plan[0].Plan.Cost; jit == "on" && c >= threshold {
+			t.Errorf("Filter's statement %d is costed at %.0f, past jit_above_cost, with JIT on", read, c)
+		}
+	}
+	if read == 0 {
+		t.Fatal("Filter read no grant")
+	}
+	var n int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM clusters WHERE `+pred.SQL, pred.Args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("Filter's condition kept %d clusters, not c0 alone", n)
+	}
+}
+
 // Filter, Reachable and a host's query of Filter's condition plan, for a subject whose keys hold few
 // grants of custom roles on the type, none of the reads of a key holding many of those there:
 // planning each read of rbac_grants costs about 0.15ms, and reads the metapage of each of its
