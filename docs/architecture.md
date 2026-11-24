@@ -1929,8 +1929,11 @@ flowchart LR
   scope, as a check seeks them on its resource's path, and `Grants` and `Eligibilities` given both
   scopes and principals each principal's on the scopes' types, which history's index of scopes,
   holding no principal, would read every version on the scope for: a user's eligibilities on the
-  tenant's root, 427 pages beside 3,000 others' there, where so they read 9. A generic plan a host
-  forces inside the read can read them by the scope still. A version counts by a time from its date, or
+  tenant's root, 427 pages beside 3,000 others' there, where so they read 14; but only where history
+  holds `versionsBySeek` versions on the scopes for each principal and scope, counted up to that, as
+  a seek costs a few pages however few the scopes hold: seeking, 3,000 principals' on a path of 4
+  read 36,000 pages, by the scope 600. A generic plan a host forces inside the read can read them by
+  the scope still, once for each of the scopes' types. A version counts by a time from its date, or
   its transaction's commit record where that is later, looked up by its transaction in history's
   index of commit records for every version, as `History` reads `CommittedAt`, so what a time reads
   turns on nothing an export leaves out. Commit records held the oldest transaction then running,

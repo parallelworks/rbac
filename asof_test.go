@@ -2229,6 +2229,86 @@ func TestAsOfListsAPrincipalsGrantsAndEligibilitiesOnAScopeAlone(t *testing.T) {
 	}
 }
 
+// As of a time, a list of many principals' grants or eligibilities on scopes holding few versions
+// reads the scopes, not each principal's history on each of them: seeking each, a list of 2,000
+// principals' on a path of 4 scopes read 24,000 pages of history, and of 200 2,400.
+func TestAsOfListsManyPrincipalsGrantsAndEligibilitiesOnScopesHoldingFew(t *testing.T) {
+	h := crowded(t, pgtest.Open(t, ""))
+	ctx := t.Context()
+	filled(t, h)
+	prunedLongAgo(t, h)
+	h.as(t, "u")
+	h.seed(t, grant(cluster.Scope(), "cluster.login", rbac.User, "u"))
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_eligibilities (tenant, scope_type, scope_id, principal_kind, principal_id, role, max_seconds)
+		VALUES ('t1', 'cluster', 'c1', 'user', 'u', 'cluster.sudo', 3600)`); err != nil {
+		t.Fatal(err)
+	}
+	f := rbac.GrantFilter{
+		Scopes:     []rbac.Scope{rbac.TenantRoot("t1"), {Type: "org", ID: "o1"}, workspace.Scope(), cluster.Scope()},
+		Principals: []rbac.Principal{identity("u")},
+	}
+	// Groups granted on other clusters.
+	groups := func(n int) {
+		t.Helper()
+		from := len(f.Principals)
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role)
+			SELECT 't1', 'cluster', 'k' || i, 'group', 'p' || i, 'cluster.login' FROM generate_series($1::int, $2::int) i`, from, n); err != nil {
+			t.Fatal(err)
+		}
+		for i := from; i <= n; i++ {
+			f.Principals = append(f.Principals, rbac.Principal{Kind: rbac.Group, ID: fmt.Sprint("p", i)})
+		}
+		if _, err := h.pool.Exec(ctx, `ANALYZE rbac_history, rbac_grants, rbac_eligibilities`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lists := map[string]func(a *rbac.Authorizer) (int, error){
+		"grants": func(a *rbac.Authorizer) (int, error) {
+			gs, err := a.Grants(ctx, "t1", f)
+			return len(gs), err
+		},
+		"eligibilities": func(a *rbac.Authorizer) (int, error) {
+			es, err := a.Eligibilities(ctx, "t1", f)
+			return len(es), err
+		},
+	}
+	read := func(at time.Time) map[string]int64 {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		pages := map[string]int64{}
+		if err := h.authz.WithTx(tx).AsOf(ctx, "t1", at, func(a *rbac.Authorizer) error {
+			for what, list := range lists {
+				if n, err := list(a); err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				} else if n != 1 {
+					return fmt.Errorf("%s: listed %d", what, n)
+				}
+				n, err := leastPages(ctx, t, tx, func() error { return second(list(a)) })
+				if err != nil {
+					return fmt.Errorf("%s: %w", what, err)
+				}
+				pages[what] = n
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return pages
+	}
+	groups(200)
+	few := read(dbNow(t, h))
+	groups(2000)
+	for what, many := range read(dbNow(t, h)) {
+		if many > few[what]*3/2+deeper {
+			t.Errorf("as of a time, u's and 200 groups' %s on a path of 4 read %d pages of history, and 2,000 groups' %d", what, few[what], many)
+		}
+	}
+}
+
 // As of a time, Filter and Reachable find the denies binding their subject by the keys those name,
 // as they do now, and count those on scopes of the types they read by the versions history holds of
 // them: thousands of denies naming others on other clusters cost them nothing, nor do thousands set

@@ -1140,9 +1140,13 @@ the denies on scopes of its types by history's versions of them, at most a few, 
 which can offer any custom role, reads each version of every one once. `Grants` and
 `Eligibilities` given both scopes and principals read each principal's on the scopes' types, as
 history's index of scopes holds no principal: read by the scope, a user's eligibilities on the
-tenant's root read 427 pages beside 3,000 others' there, and 9 so. A host that forces generic plans
-inside a read (`plan_cache_mode`), which `AsOf` plans for their arguments, can have them read by the
-scope again: 312 pages for a user's grants there. It orders a row's changes
+tenant's root read 427 pages beside 3,000 others' there, and 14 so. A seek costs a few pages however
+few versions the scopes hold, so they seek only where history holds 8 versions on the scopes for each
+principal and scope named, counted up to that, and read by the scope below it: seeking, 3,000
+principals' on a path of 4 scopes read 36,000 pages, and 600 by the scope. A host that forces generic
+plans inside a read (`plan_cache_mode`), which `AsOf` plans for their arguments, can have them read
+by the scope again, once for each of the scopes' types: 312 pages for a user's grants on the root,
+3,400 on it and 16 scopes of 8 types, where read by the scope 456. It orders a row's changes
 by their ids in `rbac_history`, which sessions take out of order once that table's id sequence
 caches more than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds
 one of the pool's connections: a constraint there queries the `DB` it is given, as one that queries
