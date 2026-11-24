@@ -1112,8 +1112,30 @@ type heldIndex struct {
 	unreadN int
 	read    map[string][]int
 	lasting map[roleCarrier]lasting
-	// giving are the positions of the grants giving each permission on a type, in order (giving).
+	// giving are the positions of the grants giving each permission on a type, in order (giving),
+	// and given how long they last (heldFor).
 	giving map[permissionOn][]int
+	given  map[permissionOn]givenLasting
+	// powers are how long they give the power to change grants (under).
+	powers map[permissionOn]powersLasting
+}
+
+// powersLasting is givenLasting of the power to change grants on scopes of a type (powerLasting).
+type powersLasting struct {
+	reads  int
+	always powerLasting
+	by     map[string]powerLasting
+}
+
+// givenLasting is how long the grants giving a permission on a type last, as of a number of reads
+// of conditions: the unconditional ones, and those whose conditions are read, by condition. Found
+// for each condition a change decides by, the grants of a role giving what it asked, held by the
+// tenant's members 4,000 times under a condition each, were copied for each of 4,000 conditions,
+// and adding a member to a group holding them took 6.5 s.
+type givenLasting struct {
+	reads  int
+	always lasting
+	by     map[string]lasting
 }
 
 // indexed is au's index, found the first time a decision needs it; one for this call alone where
@@ -1128,7 +1150,8 @@ func (au authority) indexed() *heldIndex {
 	}
 	walkingGrants(len(au.held))
 	ix.held, ix.kinds, ix.unread, ix.unreadN = au.held, map[roleCarrier][]int{}, map[Role][]int{}, 0
-	ix.read, ix.lasting, ix.giving = map[string][]int{}, map[roleCarrier]lasting{}, map[permissionOn][]int{}
+	ix.read, ix.lasting, ix.giving, ix.given = map[string][]int{}, map[roleCarrier]lasting{}, map[permissionOn][]int{}, map[permissionOn]givenLasting{}
+	ix.powers = map[permissionOn]powersLasting{}
 	for i, g := range au.held {
 		k := g.roleCarrier()
 		ix.kinds[k] = append(ix.kinds[k], i)
@@ -1155,18 +1178,7 @@ func (ix *heldIndex) of(held []holding) bool {
 // decides what it would for a check of p. Which give it is found once for the authority, from what
 // each kind of its grants gives, so a decision under another condition walks only those.
 func (au authority) giving(p Permission, resourceType string, read bool) []holding {
-	ix, k := au.indexed(), permissionOn{p, resourceType}
-	at, ok := ix.giving[k]
-	if !ok {
-		for _, of := range ix.kinds {
-			if gives(au.roles, au.held[of[0]], p, resourceType) {
-				at = append(at, of...)
-			}
-		}
-		// In the order held is, as cheapestFirst keeps the order of those it can't tell apart.
-		slices.Sort(at)
-		ix.giving[k] = at
-	}
+	at := au.givingAt(p, resourceType)
 	if read {
 		au.readAt(at)
 	}
@@ -1181,9 +1193,77 @@ func (au authority) giving(p Permission, resourceType string, read bool) []holdi
 	return gs
 }
 
+// givingAt is the positions in held of the grants that give p on a resource type, in order.
+func (au authority) givingAt(p Permission, resourceType string) []int {
+	ix, k := au.indexed(), permissionOn{p, resourceType}
+	at, ok := ix.giving[k]
+	if !ok {
+		for _, of := range ix.kinds {
+			if gives(au.roles, au.held[of[0]], p, resourceType) {
+				at = append(at, of...)
+			}
+		}
+		// In the order held is, as cheapestFirst keeps the order of those it can't tell apart.
+		slices.Sort(at)
+		ix.giving[k] = at
+	}
+	return at
+}
+
+// givenFor is how long the grants giving p on a resource type last (givenLasting), found again only
+// once a read of conditions has been made since.
+func (au authority) givenFor(p Permission, resourceType string) givenLasting {
+	at := au.givingAt(p, resourceType)
+	ix, k := au.indexed(), permissionOn{p, resourceType}
+	if gl, ok := ix.given[k]; ok && gl.reads == au.reads.count() {
+		return gl
+	}
+	walkingGrants(len(at))
+	gl := givenLasting{reads: au.reads.count(), by: map[string]lasting{}}
+	for _, i := range at {
+		switch g := au.held[i]; {
+		case !g.conditional:
+			gl.always = gl.always.with(g)
+		case g.Condition.Expression != "":
+			gl.by[g.Condition.Expression] = gl.by[g.Condition.Expression].with(g)
+		}
+	}
+	ix.given[k] = gl
+	return gl
+}
+
+// under is how long those of the conditional grants gl is of that give what they give under
+// condition last: those with the same condition, so a grant can't drop one its granter is bound by,
+// where holding under it is holding under it for whoever is granted it (subjects.sameFor).
+func (gl givenLasting) under(s subjects, condition string) lasting {
+	l, ok := gl.by[condition]
+	if condition == "" || !ok || !s.sameFor(condition, condition) {
+		return lasting{}
+	}
+	return l
+}
+
 // walkingGrants runs as a decision walks n of the actor's grants, as a test counts how many a change
 // walks.
 var walkingGrants = func(int) {}
+
+// forGood reports whether one of the grants l is of lasts for good.
+func (l lasting) forGood() bool { return l.held && l.until.IsZero() }
+
+// and is how long l's grants and o's give it, together.
+func (l lasting) and(o lasting) lasting {
+	switch {
+	case !o.held:
+		return l
+	case !l.held:
+		return o
+	case l.until.IsZero() || o.until.IsZero():
+		return lasting{held: true}
+	case o.until.After(l.until):
+		return o
+	}
+	return l
+}
 
 // lasts reports whether one of the grants l is of lasts until until, zero for never: the one that
 // lasts longest does, if any.
@@ -1797,7 +1877,14 @@ func (au authority) under(scopeType, condition string, until time.Time) power {
 	pl, ok := au.powers[k]
 	if !ok {
 		// Under no condition, no conditional grant counts, so none is read.
-		pl = powerOf(au.roles, au.giving(manage, scopeType, condition != ""), func(g holding) bool { return g.under(au.subjects, condition) })
+		if condition != "" {
+			au.readAt(au.givingAt(manage, scopeType))
+		}
+		ps := au.powersFor(manage, scopeType)
+		pl = ps.always
+		if under, ok := ps.by[condition]; ok && condition != "" && au.subjects.sameFor(condition, condition) {
+			pl = pl.and(under)
+		}
 		if au.powers != nil {
 			au.powers[k] = pl
 		}
@@ -1839,6 +1926,50 @@ func powerOf(roles book, giving []holding, counts func(holding) bool) powerLasti
 	return pl
 }
 
+// powersFor is how long the grants giving manage on scopes of a type give that power
+// (powersLasting), found again only once a read of conditions has been made since.
+func (au authority) powersFor(manage Permission, scopeType string) powersLasting {
+	at := au.givingAt(manage, scopeType)
+	ix, k := au.indexed(), permissionOn{manage, scopeType}
+	if ps, ok := ix.powers[k]; ok && ps.reads == au.reads.count() {
+		return ps
+	}
+	walkingGrants(len(at))
+	var always []holding
+	by := map[string][]holding{}
+	for _, i := range at {
+		switch g := au.held[i]; {
+		case !g.conditional:
+			always = append(always, g)
+		case g.Condition.Expression != "":
+			by[g.Condition.Expression] = append(by[g.Condition.Expression], g)
+		}
+	}
+	all := func(holding) bool { return true }
+	ps := powersLasting{reads: au.reads.count(), always: powerOf(au.roles, always, all), by: map[string]powerLasting{}}
+	for condition, gs := range by {
+		ps.by[condition] = powerOf(au.roles, gs, all)
+	}
+	ix.powers[k] = ps
+	return ps
+}
+
+// and is how long pl's grants and o's give the power, together.
+func (pl powerLasting) and(o powerLasting) powerLasting {
+	both := powerLasting{any: pl.any.and(o.any), listed: map[Role]map[string]lasting{}}
+	for _, of := range []powerLasting{pl, o} {
+		for r, by := range of.listed {
+			if both.listed[r] == nil {
+				both.listed[r] = map[string]lasting{}
+			}
+			for condition, l := range by {
+				both.listed[r][condition] = both.listed[r][condition].and(l)
+			}
+		}
+	}
+	return both
+}
+
 // power is the power pl gives where its grants last as lasts says.
 func (pl powerLasting) power(lasts func(lasting) bool) power {
 	pw := power{any: lasts(pl.any), listed: map[Role][]string{}}
@@ -1850,12 +1981,6 @@ func (pl powerLasting) power(lasts func(lasting) bool) power {
 		}
 	}
 	return pw
-}
-
-// under reports whether a grant gives what it gives under condition: unconditionally, or under
-// the same condition, so a grant can't drop one its granter is bound by.
-func (h holding) under(s subjects, condition string) bool {
-	return !h.conditional || condition != "" && s.sameFor(h.Condition.Expression, condition)
 }
 
 // subjects are what conditions were found to read of the subject: parsing one takes milliseconds,
@@ -2084,19 +2209,14 @@ func (au authority) heldFor(p Permission, types []string, typesKey, condition st
 		for i, rt := range types {
 			// Those whose conditions are read first: one held for good lasts as long as any can, so
 			// the rest needn't be read, nor their conditions.
-			gs := au.giving(p, rt, false)
-			if !slices.ContainsFunc(gs, func(g holding) bool {
-				return g.ends.IsZero() && (!g.conditional || g.Condition.Expression != "") && g.under(au.subjects, condition)
-			}) && condition != "" {
-				gs = au.giving(p, rt, true)
-			}
-			for _, g := range gs {
-				if !g.under(au.subjects, condition) {
-					continue
+			gl := au.givenFor(p, rt)
+			if given[i] = gl.always; !given[i].forGood() && condition != "" {
+				under := gl.under(au.subjects, condition)
+				if !under.forGood() {
+					au.readAt(au.givingAt(p, rt))
+					under = au.givenFor(p, rt).under(au.subjects, condition)
 				}
-				if given[i] = given[i].with(g); given[i].until.IsZero() {
-					break
-				}
+				given[i] = given[i].and(under)
 			}
 			// Nor the types after one none give it for, which no end gets past.
 			if !given[i].held {

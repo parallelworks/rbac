@@ -1125,12 +1125,17 @@ sequenceDiagram
   grants giving a permission on a type are found from what each kind gives, once for the
   authority; its conditional grants unread by role and read by condition; and how long its
   unconditional grants of each kind last. So a decision under another condition walks only the
-  grants giving what it asks (`giving`), those whose condition is the same (`kindsLasting`), and
-  the unread ones of roles giving what it can ask (`readEnding`), and whether a condition is kept
-  (`kept`) is a lookup. Walking every grant the actor held for each, a change granting a role under
-  1,000 conditions, by an actor whose groups held 8,000 conditional grants of a role giving
-  nothing it asked, took 2.6 s against 0.3 s without them, and adding a member to a group holding
-  1,000 such grants 1.8 s against 40 ms, both before the transaction and again under its locks.
+  grants whose condition is the same (`kindsLasting`) and the unread ones of roles giving what it
+  can ask (`readEnding`), and whether a condition is kept (`kept`) is a lookup. How long the
+  grants giving a permission on a type last, and give the power to change grants there, is found
+  once for each read of conditions, the unconditional ones together and the others by condition
+  (`givenFor`, `powersFor`), so `heldFor` and `under` under another condition look it up rather
+  than walk the grants giving it (`giving`). Walking every grant the actor held for each, a change
+  granting a role under 1,000 conditions, by an actor whose groups held 8,000 conditional grants of
+  a role giving nothing it asked, took 2.6 s against 0.3 s without them, and adding a member to a
+  group holding 1,000 such grants 1.8 s against 40 ms, both before the transaction and again under
+  its locks; and walking those giving what it asked, adding a member to a group holding 4,000,
+  where the tenant's members held 4,000 of a role giving it, 6.5 s, against 0.2 s.
 - **Standing.** The host's answers rest on who is a member of what. `stand` fingerprints the
   memberships behind them, and `stillStanding` refuses the change with `ErrConflict` if any changed
   while the change waited for its locks. Only memberships in force at the call's time count,

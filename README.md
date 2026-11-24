@@ -68,11 +68,13 @@ if err := authz.Authorize(ctx, subject, "cluster:login", cluster); err != nil {
   role whose every permission it holds, for every type the grant reaches, and revoke any. A
   role's power to change grants counts as part of what it gives, so a limited grant permission
   can't mint an unlimited one. A change finds which of the actor's grants give each permission it
-  asks about once, however many conditions it decides grants under, so its cost grows with the
-  grants giving what it asks, not with every grant the actor holds times every condition: granting
-  a role under 1,000 conditions, by an actor whose groups held 8,000 conditional grants of a role
-  giving nothing it asked, took 2.6 s, against 0.3 s without them. `Grantable` lists the roles a subject may grant, unconditionally and
-  for good, for an access screen.
+  asks about, and how long they give it under each condition, once, however many conditions it
+  decides grants under, so its cost grows with the grants the actor holds, not with them times
+  every condition: granting a role under 1,000 conditions, by an actor whose groups held 8,000
+  conditional grants of a role giving nothing it asked, took 2.6 s, against 0.3 s without them,
+  and adding a member to a group holding 4,000 conditional grants, where the tenant's members held
+  4,000 of a role giving what it asked, 6.5 s. `Grantable` lists the roles a subject may grant,
+  unconditionally and for good, for an access screen.
 - **Until when:** what the actor hands on it holds until the grant ends. What it holds only through
   grants that end, such as an activation, or through a membership or a place in a group that ends,
   it grants ending no later than the last of them, and never as an eligibility, a custom role's
