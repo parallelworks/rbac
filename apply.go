@@ -3303,8 +3303,16 @@ func (f GrantFilter) valid(tenant string) bool {
 // sql is SQL selecting cols, in order, of the rows of table in tenant $1 in force at $4 that the
 // filter matches, on $2 and $3, and their arguments: a statement of its own for each shape, so
 // each plans for the index it can use, reading the rows of each of its scopes, or with none of each
-// of its principals, in turn (byKey). from is cols as the rows hold them, and what order reads.
-func (f GrantFilter) sql(table, cols, from, order string) (query string, scopes, principals []string) {
+// of its principals, in turn (byKey). from is cols as the rows hold them, and what order reads. As
+// of a time, history being the table of it, a filter of both reads each principal's rows on each
+// of the scopes' types, an equality history's index of a principal's versions seeks, as byType
+// tests it, and then the scopes, which that index holds after the type: its index of scopes holds
+// no principal, so read by the scope, one principal's eligibilities on the tenant's root read every
+// version there, 83 pages beside 300 others' and 427 beside 3,000. A seek costs a few pages however
+// few versions the scopes hold, so 3,000 principals' on a path of 4 scopes read 36,000 pages where
+// the scopes' versions read 588: it seeks only once history holds versionsBySeek versions on the
+// scopes for each principal and scope, counted up to that, and reads by the scope below it.
+func (f GrantFilter) sql(history, table, cols, from, order string) (query string, scopes, principals []string) {
 	for _, s := range f.Scopes {
 		scopes = append(scopes, s.Key())
 	}
@@ -3316,10 +3324,31 @@ func (f GrantFilter) sql(table, cols, from, order string) (query string, scopes,
 		where = "$3::text[] IS NULL"
 	case len(scopes) == 0:
 		keys, col, where = "$3", "principal", "$2::text[] IS NULL"
+	case history != "":
+		limit := fmt.Sprintf("%d * cardinality($2::text[])::bigint * cardinality($3::text[])", versionsBySeek)
+		return `WITH counted(few) AS MATERIALIZED (SELECT count(*) < ` + limit + ` FROM (SELECT FROM ` + history + `
+			  WHERE tenant = $1 AND entity = '` + historyEntities[table] + `' AND scope = ANY($2::text[]) LIMIT ` + limit + `) c)
+			SELECT ` + cols + ` FROM (SELECT * FROM (` + byKey(keys, table, col, from, "tenant = $1 AND "+where+" AND (expires_at IS NULL OR expires_at > $4)") + `) s
+			  WHERE (SELECT few FROM counted)
+			UNION ALL
+			SELECT r.* FROM unnest($3::text[]) AS keyed(k)
+			CROSS JOIN (SELECT DISTINCT split_part(s.k, ':', 1) FROM unnest($2::text[]) AS s(k)) AS t(t) CROSS JOIN LATERAL (
+			SELECT ` + from + ` FROM ` + table + ` WHERE tenant = $1 AND principal = keyed.k AND split_part(scope, ':', 1) = t.t
+			  AND scope = ANY($2::text[]) AND (expires_at IS NULL OR expires_at > $4) OFFSET 0) r
+			  WHERE NOT (SELECT few FROM counted)) r ORDER BY ` + order, scopes, principals
 	}
 	return `SELECT ` + cols + ` FROM (` + byKey(keys, table, col, from, "tenant = $1 AND "+where+" AND (expires_at IS NULL OR expires_at > $4)") +
 		`) r ORDER BY ` + order, scopes, principals
 }
+
+// versionsBySeek is how many versions on its scopes history holds, for each principal and scope a
+// filter of both names, past which a list as of a time reads them by the principal: a seek costs
+// about three pages, and a version read by the scope a tenth or a fifth of one, so either read costs
+// at most a few times the other.
+const versionsBySeek = 8
+
+// historyEntities are the entities history records the rows of GrantFilter's tables as.
+var historyEntities = map[string]string{"rbac_grants": "grant", "rbac_eligibilities": "eligibility"}
 
 // Grants lists the grants in force that match the filter: who has access to a resource and
 // through which ancestor, or what a principal holds (RBAC's assigned roles). It lists them as
@@ -3333,7 +3362,7 @@ func (a *Authorizer) Grants(ctx context.Context, tenant string, f GrantFilter) (
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Grants needs a tenant and valid scopes or principals", ErrInvalid)
 	}
-	query, scopes, principals := f.sql("rbac_grants", grantColumns, grantColumns+", scope, principal",
+	query, scopes, principals := f.sql(a.history, "rbac_grants", grantColumns, grantColumns+", scope, principal",
 		"scope, principal, role, source, expires_at NULLS FIRST, condition, id")
 	rows, err := a.queryIndexed(ctx, a.db, query, tenant, scopes, principals, a.cfg.Now())
 	if err != nil {

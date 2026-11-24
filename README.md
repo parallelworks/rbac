@@ -314,7 +314,8 @@ naming it, so the condition keeps no row there.
   of bytes; slices, arrays and pointers of these, a nil pointer read as null but one to what none
   reads, or to a `Struct`, `ListValue`, `Timestamp`, `Duration` or `Any`, below; maps of these keyed
   by a bool, a
-  string, an int or a uint, or by an interface holding one; JSON text (`json.RawMessage`, a nil
+  string, an int or a uint, or by an interface holding one, but for a `time.Duration` or a
+  `json.Number`; JSON text (`json.RawMessage`, a nil
   one read as null, as `encoding/json` writes it) and `json.Number`, parsed; the protobuf `Struct`, `ListValue`, `Value`, `NullValue`, wrappers,
   `Timestamp` and `Duration`, and an `Any` packing one of them, a `Value` holding a nil `Struct`
   or `ListValue` read as an empty one, as CEL reads it and protobuf writes it; and CEL's own scalar
@@ -338,7 +339,9 @@ naming it, so the condition keeps no row there.
   own, though it says it is one of CEL's types, a list, map or optional of CEL's a host makes, a
   struct, a channel, a func, a lock of the host's own, as an integer a pointer to which locks and
   unlocks, which no hook can be given either, below, any other message, a map keyed by anything
-  else, as a double, an array or a lock, and a slice, a pointer or a map of any of these, or an
+  else, as a double, an array or a lock, or by a `time.Duration` or a `json.Number`, directly or in
+  an interface, whose keys were read by their kind, an int or a string, where CEL reads them as a
+  duration or a number, so `k == duration("1h")` failed over them, and a slice, a pointer or a map of any of these, or an
   array holding one, holding none too, as an empty slice of structs or a nil pointer to one, read as
   `[]` or `null`, left a kind
   readable until it held one, a map holding two keys read as the same value, as `1`
@@ -440,6 +443,11 @@ naming it, so the condition keeps no row there.
   smaller value, read once, in step with the other, and charged before it runs: measured again
   for each doubling of how far it read, again in search of a double that isn't finite and again
   for CEL's charge, comparing JSON nested 3,300 deep took twenty times what its cost implied.
+  A conversion, as `timestamp()`, `duration()` or `double()`, and `size()` cost reading the string
+  or bytes they're given, charged as CEL charges a call, once it has run: one of a string the
+  request passes, as large as a check converts, 1.5 MB, runs whole before its charge fails the
+  condition, about 18 ms for `timestamp()` of control bytes, 11 ms of invalid UTF-8, 15 ms for
+  `duration()`, and up to 9 ms for the others, once for each condition reading one.
   Reading a time in a zone costs 100, and 500 more where an attribute names the zone, at each read,
   whether or not the process has loaded it: charged only where it hadn't, the same check of the same
   request was refused the first time and allowed after, and decided by which zones each replica had
@@ -1135,7 +1143,16 @@ what it answers turns on nothing an export leaves out. Joined to a group's membe
 by such statistics, the tenant's memberships were read again for each member, so `Holders` of a
 group of 4,000 took 52 seconds, and 90 ms looked up by key. A list counts
 the denies on scopes of its types by history's versions of them, at most a few, and `Grantable`,
-which can offer any custom role, reads each version of every one once. It orders a row's changes
+which can offer any custom role, reads each version of every one once. `Grants` and
+`Eligibilities` given both scopes and principals read each principal's on the scopes' types, as
+history's index of scopes holds no principal: read by the scope, a user's eligibilities on the
+tenant's root read 427 pages beside 3,000 others' there, and 14 so. A seek costs a few pages however
+few versions the scopes hold, so they seek only where history holds 8 versions on the scopes for each
+principal and scope named, counted up to that, and read by the scope below it: seeking, 3,000
+principals' on a path of 4 scopes read 36,000 pages, and 600 by the scope. A host that forces generic
+plans inside a read (`plan_cache_mode`), which `AsOf` plans for their arguments, can have them read
+by the scope again, once for each of the scopes' types: 312 pages for a user's grants on the root,
+3,400 on it and 16 scopes of 8 types, where read by the scope 456. It orders a row's changes
 by their ids in `rbac_history`, which sessions take out of order once that table's id sequence
 caches more than one, so `AsOf` refuses that. Its read's hooks run in its transaction, which holds
 one of the pool's connections: a constraint there queries the `DB` it is given, as one that queries

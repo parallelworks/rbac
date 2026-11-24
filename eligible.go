@@ -833,7 +833,7 @@ func (a *Authorizer) Eligibilities(ctx context.Context, tenant string, f GrantFi
 	if !validID(tenant) || !f.valid(tenant) {
 		return nil, fmt.Errorf("%w: Eligibilities needs a tenant and valid scopes or principals", ErrInvalid)
 	}
-	query, scopes, principals := f.sql("rbac_eligibilities", eligibilityColumns, eligibilityColumns+", scope, principal", "scope, principal, role")
+	query, scopes, principals := f.sql(a.history, "rbac_eligibilities", eligibilityColumns, eligibilityColumns+", scope, principal", "scope, principal, role")
 	rows, err := a.queryIndexed(ctx, a.db, query, tenant, scopes, principals, a.cfg.Now())
 	if err != nil {
 		return nil, err
