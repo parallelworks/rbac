@@ -440,8 +440,8 @@ naming it, so the condition keeps no row there.
   A conversion, as `timestamp()`, `duration()` or `double()`, and `size()` cost reading the string
   or bytes they're given, charged as CEL charges a call, once it has run: one of a string the
   request passes, as large as a check converts, 1.5 MB, runs whole before its charge fails the
-  condition, about 18 ms for `timestamp()` of control or invalid bytes, 15 ms for `duration()`, and
-  5 to 9 ms for the others, once for each condition reading one.
+  condition, about 18 ms for `timestamp()` of control bytes, 11 ms of invalid UTF-8, 15 ms for
+  `duration()`, and up to 9 ms for the others, once for each condition reading one.
   Reading a time in a zone costs 100, and 500 more where an attribute names the zone, at each read,
   whether or not the process has loaded it: charged only where it hadn't, the same check of the same
   request was refused the first time and allowed after, and decided by which zones each replica had

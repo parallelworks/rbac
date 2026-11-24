@@ -77,7 +77,7 @@ import (
 //   - bytes ([]byte or an array of bytes), read as bytes;
 //   - a slice or an array of these, read as a list;
 //   - a map keyed by a bool, a string, an int or a uint, of a type of its own too, or by an
-//     interface holding one, of these, read as a map;
+//     interface holding one, but for a time.Duration or a json.Number, of these, read as a map;
 //   - a pointer to any of these, read as what it points to;
 //   - JSON text (json.RawMessage) and a JSON number (json.Number), parsed, a nil json.RawMessage
 //     read as null, as encoding/json writes it;
@@ -97,7 +97,8 @@ import (
 // of one of CEL's types, a list, a map or an optional of CEL's a host makes, a struct, a channel, a
 // func, a complex number, a uintptr, a lock of the host's own, as an integer a pointer to which
 // spins, which no hook can be given either, any other message, a map keyed by any other value, as a
-// double, an array or a lock, and a slice, a pointer or a map of any of these, or an array holding
+// double, an array or a lock, or by a time.Duration or a json.Number, directly or in an interface,
+// whose keys CEL reads as a duration or a number where their kind is an int or a string, and a slice, a pointer or a map of any of these, or an array holding
 // one, empty or nil too, as one holding none, read as [], {} or null, left whether its kind could
 // be read to whether it held one at the time, a map holding two keys read as the same value, as 1
 // and 1u, or "a" twice of two string types, and so JSON text naming a member of an object twice, as

@@ -945,8 +945,8 @@ sequenceDiagram
   comparison, a search or a match that would cost more than a condition may fails before it runs,
   as CEL charges a call only once it has run; a conversion or `size()` of a string or bytes is
   charged so (`costs.CallCost`), and runs whole first, at 1.5 MB, as much as a check converts,
-  about 18 ms for `timestamp()` of control or invalid bytes, which its error quotes, 15 ms for
-  `duration()`, and 5 to 9 ms for `double()`, `size()` and `timestamp()` of other text, once for
+  about 18 ms for `timestamp()` of control bytes, which its error quotes, 11 ms of invalid UTF-8,
+  15 ms for `duration()`, and up to 9 ms for `double()`, `size()` and `timestamp()` of other text, once for
   each condition reading one; and a program in which CEL plans one, a literal, a
   key, a loop's condition or a variable named from the root past a loop's variable of its name
   where the package can't charge or refuse it isn't a condition. CEL reads such a variable, as
