@@ -2267,10 +2267,15 @@ type givers struct {
 	read map[Role]bool
 	// none are the roles found to give nothing a grant of any of some roles asks, by endsKey.
 	none map[string]map[Role]bool
+	// asks are what deciding a grant of each role asks about (asking): a role listing 64 roles of
+	// 1,000 permissions has 64,000 to read, and found for each scope a change to members reached,
+	// adding a member to a group granted it on 1,000 clusters took 3.6 s, where one beside no
+	// grant left to find took 0.2 s.
+	asks map[Role]map[Permission]bool
 }
 
 func newGivers() *givers {
-	return &givers{of: map[Permission][]Role{}, read: map[Role]bool{}, none: map[string]map[Role]bool{}}
+	return &givers{of: map[Permission][]Role{}, read: map[Role]bool{}, none: map[string]map[Role]bool{}, asks: map[Role]map[Permission]bool{}}
 }
 
 // endsKey is the roles ends grant, which say what deciding them asks about, whatever their ends.
@@ -2309,13 +2314,20 @@ type kindsKey struct {
 // asking is every permission deciding whether the actor may grant def can ask about: what def
 // gives, and what each role it lists gives, through others too (holdsRole).
 func (au authority) asking(def RoleDefinition) map[Permission]bool {
-	if asks, ok := au.asks[def.ID]; ok {
+	// Kept for every authority of a call, which resolve roles alike, but one SetRole checks, which
+	// resolves the role it defines as it will be (named).
+	kept := au.asks
+	if au.defining == nil && au.roles.givers != nil {
+		kept = au.roles.givers.asks
+	}
+	if asks, ok := kept[def.ID]; ok {
 		return asks
 	}
 	asks, seen, next := map[Permission]bool{}, map[Role]bool{def.ID: true}, []RoleDefinition{def}
 	for len(next) > 0 {
 		r := next[len(next)-1]
 		next = next[:len(next)-1]
+		readingEntries(len(r.Permissions))
 		for _, p := range r.Permissions {
 			asks[p] = true
 		}
@@ -2326,8 +2338,8 @@ func (au authority) asking(def RoleDefinition) map[Permission]bool {
 			}
 		}
 	}
-	if au.asks != nil {
-		au.asks[def.ID] = asks
+	if kept != nil {
+		kept[def.ID] = asks
 	}
 	return asks
 }
