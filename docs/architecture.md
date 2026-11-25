@@ -1078,9 +1078,19 @@ sequenceDiagram
   for each sooner one. Asking each role whether it gave anything asked, for each role decided, an
   actor holding conditional grants of 300 roles of 1,000 permissions, ending after what it granted,
   read 601 million entries granting 1,000 roles of 20 of them, 4.5 s, and adding a member to a group
-  granted a role on 1,000 clusters asked each role for each, 10.1 s, against 0.1 s without them. A
-  read that fails leaves the grants it was for met by nothing, and the change, or `Grantable`,
-  returns its error.
+  granted a role on 1,000 clusters asked each role for each, 10.1 s, against 0.1 s without them.
+  The roles left to find are let go of as the ends pass the latest of their grants, each
+  permission is looked up among the roles giving it or those left, where they are fewer, and none
+  is looked up once none is left. One left after every permission is looked up gives nothing a
+  grant of the ends' roles asks, and is kept as such for every authority of the call
+  (`givers.none`), as is what deciding a grant of each role asks (`asking`), unless `SetRole`
+  checks a role it defines, which resolves it as it will be. Never found, one such role had every
+  scope a change to members reached look up every role giving each permission it asked: adding a
+  member to a group granted a role listing one of 1,000 permissions on 1,000 clusters, by an actor
+  holding conditional grants of 300 roles giving them and one of a role giving none, all ending
+  after, took 9.9 s, against 1.5 s without that one; and finding for each scope what a role
+  listing 64 roles of 1,000 permissions asks, 3.6 s, against 0.2 s. A read that fails leaves the
+  grants it was for met by nothing, and the change, or `Grantable`, returns its error.
 - **Freezes.** A constraint removing `<type>:grant` from the actor on a scope, as a host freezes
   changes under a container, or a deny on its path doing so, stops `Apply` changing grants there,
   revoking them too.
@@ -1165,7 +1175,16 @@ sequenceDiagram
   unconditional grants of each kind last. So a decision under another condition walks only the
   grants whose condition is the same (`kindsLasting`) and the unread ones of roles giving what it
   can ask (`readEnding`), once for each role decided rather than for each grant, and whether a
-  condition is kept (`kept`) is a lookup. How long the grants giving a permission on a type last,
+  condition is kept (`kept`) is a lookup. Authorities of a call holding the same grants, as on
+  every scope a change to members reaches where the actor holds them all on the tenant, share what
+  of the index turns on the grants alone (`heldCommon`): their kinds, how long the unconditional
+  ones last, the conditional ones by role and when each role's last ends, as first found, before
+  any condition is read, and the grants giving each permission on a type; and which grants
+  `readEnding` reads for each list of ends, as though none were read, so each reads of them those
+  it hasn't (`readAt`). What each has read, and what it found of that, stays its own. Indexed for
+  each, adding a member to a group granted a role on 5,000 clusters, by an actor holding
+  conditional grants of 300 roles on the tenant ending after, walked them for each, twice, 5.9 s,
+  against 0.4 s without them. How long the grants giving a permission on a type last,
   and give the power to change grants there, is found once for each read of conditions, the
   unconditional ones together, and of the power the others by condition (`givenFor`, `powersFor`),
   so `heldFor` and `under` under another condition look it up rather than walk the grants giving it
