@@ -18374,3 +18374,49 @@ func TestACostlyGrantReplacedAsACheckReadsItSpendsWhatItsConditionCould(t *testi
 		t.Errorf("Permissions by a cheaper grant after %d replacements = %v, %v", *replaced, perms, err)
 	}
 }
+
+// Within the bounds, a grant that holds beside many cheap ones a change kept replacing, as it read
+// each, allows at every moment. Each grant gone was charged what 2 KiB of condition can cost, so a
+// dozen on a cluster, or a few on the tenant, used up the budget at every read, and Authorize,
+// Permissions and Holding ended as a conflict.
+func TestAConditionalGrantBesideManyReplacedEachTimeTheyAreReadAllows(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	always := `request.time > timestamp("2000-01-01T00:00:00Z")`
+	var grants []rbac.Grant
+	add := func(on rbac.Scope, role rbac.Role, n int) {
+		g := grant(on, role, rbac.User, "u")
+		g.Condition = rbac.Condition{Expression: always}
+		grants = append(grants, g)
+		for i := range n {
+			g.Condition = rbac.Condition{Expression: fmt.Sprintf(`request.time < timestamp("2001-01-01T00:00:00Z") && %d == %d && false`, i, i)}
+			grants = append(grants, g)
+		}
+	}
+	add(cluster.Scope(), "cluster.login", 12)
+	add(rbac.TenantRoot("t1"), "level.high", 4)
+	h.seed(t, grants...)
+	u := h.as(t, "u")
+	reads := 0
+	rbac.SetReadingRoles(t, func() {
+		reads++
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'u' AND condition LIKE '%&& false' RETURNING *)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at FROM gone`); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := h.authz.Authorize(ctx, u, login, cluster); err != nil || reads == 0 {
+		t.Errorf("Authorize after %d reads: %v", reads, err)
+	}
+	reads = 0
+	perms, err := h.authz.Permissions(ctx, u, cluster)
+	if err != nil || !slices.Contains(perms, login) || reads == 0 {
+		t.Errorf("Permissions after %d reads = %v, %v", reads, perms, err)
+	}
+	reads = 0
+	held, err := h.authz.Holding(ctx, "t1", u)
+	if err != nil || !slices.Contains(held.Values(), "level:high") || reads == 0 {
+		t.Errorf("Holding after %d reads = %v, %v", reads, held.Values(), err)
+	}
+}

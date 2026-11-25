@@ -201,10 +201,8 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 	}
 	spend := a.grantBudget(r.path())
 	// A found grant allowing stands only if it did at the moment the grants were read, with the
-	// gone one's condition spent on too.
-	for range gone {
-		spend.gone()
-	}
+	// gone ones' conditions spent on too.
+	spend.gone = uint64(len(gone))
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		if a.conds.holds(spend, h.Condition.Expression, vars) {
@@ -590,7 +588,7 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 		def, _ := roles.role(h.Role)
 		for _, p := range def.Permissions {
 			if h.carries(def, p) {
-				spendOn(p).gone()
+				spendOn(p).gone++
 			}
 		}
 	}
@@ -2599,8 +2597,9 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 }
 
 // conditionsFound is conditionsOf, returning instead the grants gone since the statement that read
-// them, each left a condition nothing meets, for which a check spends the most one can cost before
-// the others (budget.gone): what the others give then was given at that statement's moment, so a
+// them, each left a condition nothing meets, for which a check spends, before each of the others,
+// the most one sorted before it can cost (budget.owe): what the others give then was given at that
+// statement's moment, so a
 // decision they allow stands, and only one they don't is read again (reread).
 // Returned as errReplaced alone, a grant replaced beside another that allowed had a check of it
 // refused as a conflict as a change kept replacing the first, though every moment allowed.
