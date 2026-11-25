@@ -9046,6 +9046,67 @@ func TestAChangeToMembersReadsWhatTheRolesItGrantsListOnceWhateverScopesItReache
 	}
 }
 
+// Where the actor holds the same grants on every scope a change to members reaches, as all on the
+// tenant, it walks them, and asks what each gives, once for all those scopes, not once for each:
+// adding a member to a group
+// granted a role under a condition on 5,000 clusters, by an actor holding conditional grants of 300
+// roles giving it on the tenant, ending after, walked them for each, twice, 5.9 s, where one without
+// them took 0.4 s.
+func TestAChangeToMembersWalksTheActorsGrantsOnceWhateverScopesItReaches(t *testing.T) {
+	const r, s = 100, 50
+	const cond = `resource.id != "z"`
+	var catalog []rbac.RoleDefinition
+	for i := range r {
+		catalog = append(catalog, rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.giving", i)), Permissions: []rbac.Permission{rbac.Permission(fmt.Sprintf("cluster:p%03d", i)), login}, ResourceTypes: []string{"cluster"}})
+	}
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), catalog...) })
+	ctx := t.Context()
+	mgr := h.as(t, "mgr")
+	h.join(t, "dan", "bob")
+	h.groups(t, "one", "many")
+	root := rbac.TenantRoot("t1")
+	power := grant(root, "cluster.admin", rbac.User, "mgr")
+	power.Condition = rbac.Condition{Expression: cond}
+	h.seed(t, grant(root, "group.members", rbac.User, "mgr"), power)
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'tenant', 't1', 'user', 'mgr', 'cluster.giving' || i, 'resource.id != "x' || i || '"', $2 FROM generate_series(0, $1::int - 1) AS i`,
+			[]any{r, h.now.Add(3 * time.Hour)},
+		},
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'cluster.login', $2, $3 FROM generate_series(0, $1::int) AS i`,
+			[]any{s, cond, h.now.Add(time.Hour)},
+		},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walked, entries := 0, 0
+	rbac.SetWalkingGrants(t, func(k int) { walked += k })
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	adding := func(group, id string) (int, int) {
+		t.Helper()
+		walked, entries = 0, 0
+		if err := h.authz.ChangeMembers(ctx, mgr, "t1", []rbac.Member{{Group: group, Principal: identity(id)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return walked, entries
+	}
+	one, oneRead := adding("one", "dan")
+	many, manyRead := adding("many", "bob")
+	t.Logf("walked %d grants and read %d entries adding a member to a group granted a role on one cluster, and %d and %d to one granted it on %d", one, oneRead, many, manyRead, s)
+	if many-one >= s*r || manyRead-oneRead >= s*r {
+		t.Errorf("adding a member to a group granted a role on one cluster walked %d grants and read %d entries of roles and what the constraints answered, and %d and %d to one granted it on %d, by an actor holding conditional grants of %d roles giving it on the tenant, ending after",
+			one, oneRead, many, manyRead, s, r)
+	}
+}
+
 // A change reads each condition it decides by once, before its transaction, not again under its
 // locks: a grant's condition never changes, as changing it stores a new grant. An actor whose power
 // to change grants is 2,000 conditional grants decides by all of them, and read them again in the
