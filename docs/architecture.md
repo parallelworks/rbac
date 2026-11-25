@@ -1535,12 +1535,12 @@ flowchart TB
   it, and decide them after it, as the constraints are asked outside it. Under `WithTx` they read on
   the host's transaction at its isolation, AsOf in a savepoint: at READ COMMITTED each statement
   reads a moment of its own, so a change committing between two can mix two states, and for AsOf,
-  history of a time not yet final. A read that fails returns nothing beside its error, on the
-  host's transaction as on a pool: what it had read by then, as Explain's grants allowing or
-  Reachable's scopes, is no answer, as any error means no. A check on a pool, which reads the grants in one statement and,
-  only where a conditional grant is all that gives something, their conditions in another
-  (`conditionsOf`), as a snapshot's transaction would cost every check two round trips more, can
-  find a grant read in the first gone by the second: revoked, or replaced by a new grant as a
+  history of a time not yet final. A read that fails returns nothing beside its error, on the host's
+  transaction as on a pool: what it had read by then, as Explain's grants allowing or Reachable's
+  scopes, is no answer, as any error means no. A check on a pool, which reads the grants in one
+  statement and, only where a conditional grant is all that gives something, their conditions in
+  another (`conditionsOf`), as a snapshot's transaction would cost every check two round trips more,
+  can find a grant read in the first gone by the second: revoked, or replaced by a new grant as a
   change extending a conditional grant stores one. Read as a condition nothing meets, a grant
   replaced by one under the same condition denied what every moment allowed, and Authorize
   disagreed with Explain. So the check reads the grants again and decides again (`reread`):
