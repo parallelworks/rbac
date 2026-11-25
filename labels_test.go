@@ -4405,7 +4405,8 @@ func TestHoldersWhoseReadFailsOnTheHostsTransactionReturnsNothing(t *testing.T) 
 // more than a check may spend on, beside a costly one replaced between the statement reading the
 // grants and the one reading their conditions, as extending it replaces it: read as a condition
 // that cost 41, the one replaced left what its own would have cost for the one that holds, so
-// Holding gave, and a check of a resource labeled with it allowed, what neither moment did.
+// Holding and Permissions on the tenant gave, and a check and Filter kept a resource labeled with
+// it, what neither moment did.
 func TestALabelValuesCostlyGrantReplacedAsItIsReadSpendsWhatItsConditionCould(t *testing.T) {
 	h := labeled(t)
 	ctx := t.Context()
@@ -4442,5 +4443,24 @@ func TestALabelValuesCostlyGrantReplacedAsItIsReadSpendsWhatItsConditionCould(t 
 	replaced = replacingUnder(t, h, spending(0), false)
 	if err := h.authz.Authorize(ctx, x, view, secret); *replaced == 0 || !errors.Is(err, rbac.ErrDenied) {
 		t.Errorf("Authorize as a grant is replaced: %v", err)
+	}
+	replaced = replacingUnder(t, h, spending(0), false)
+	perms, err := h.authz.Permissions(ctx, x, rbac.Resource{Tenant: "t1", Type: rbac.TenantScope, ID: "t1"})
+	if err != nil || *replaced == 0 || slices.Contains(perms, "level:high") {
+		t.Errorf("Permissions on the tenant as a grant is replaced = %v, %v", perms, err)
+	}
+	if _, err := h.pool.Exec(ctx, `CREATE TABLE points (tenant text NOT NULL, id text NOT NULL, path text[] NOT NULL, labels text[] NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `INSERT INTO points VALUES ('t1', 'p', $1, '{level:high}')`, h.path(t, cluster)); err != nil {
+		t.Fatal(err)
+	}
+	replaced = replacingUnder(t, h, spending(0), false)
+	pred, err := h.authz.Filter(ctx, x, view, "t1", "cluster", rbac.Columns{Tenant: "tenant", Path: "path", Labels: "labels"}, 1)
+	if err != nil || *replaced == 0 {
+		t.Fatalf("Filter after %d replacements: %v", *replaced, err)
+	}
+	if got := listPoints(t, h, pred.SQL, pred.Args...); len(got) > 0 {
+		t.Errorf("Filter as a grant is replaced = %v", got)
 	}
 }
