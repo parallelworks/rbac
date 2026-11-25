@@ -2151,10 +2151,17 @@ func (au authority) readEnding(ends []ending) {
 	// soonest, is asked first whether it gives the first permission the soonest end's role gives,
 	// as a role giving what a change asks mostly does: those that do are read from it, and only
 	// the others are found through the roles giving each permission (givers), so where they give
-	// what it asks, their permissions aren't read. left is how many are left to find.
+	// what it asks, their permissions aren't read. Nor are those another authority of the call
+	// found to give nothing the same roles ask (givers.none). left are those left to find.
 	from, looked := map[Role]time.Time{}, map[Permission]bool{}
 	first := ends[0].def.Permissions
-	left := 0
+	// Only where every authority of the call asks the same of a role: one SetRole checks names the
+	// role it defines as it will be.
+	keep, asked := au.roles.givers != nil && au.defining == nil, ""
+	if keep {
+		asked = endsKey(ends)
+	}
+	var left []Role
 	for role, unread := range ix.unread {
 		unread = slices.DeleteFunc(unread, func(i int) bool { return au.held[i].Condition.Expression != "" })
 		if len(unread) == 0 {
@@ -2167,15 +2174,31 @@ func (au authority) readEnding(ends []ending) {
 		case !known || ix.latest[role].Before(ends[0].until):
 		case len(first) > 0 && au.roles.givesAny(role, r, first[0]):
 			from[role] = ends[0].until
+		case keep && gv.none[asked][role]:
 		default:
 			gv.add(au.roles, role)
-			left++
+			left = append(left, role)
 		}
 	}
 	// Found from what each end asks, so the roles giving nothing asked aren't asked, however many,
 	// nor those none of whose grants ends late enough to be read, nor any role for each end again.
+	// Those whose grants all end before an end are found from no later one, so they are let go as
+	// the ends come, and once none is left to find, nothing more is looked up. Each permission is
+	// looked up among the roles giving it, or those left where they are fewer: one role giving
+	// nothing asked, never found, had each scope a change reached walk every role giving each
+	// permission it asked, and adding a member to a group granted a role on 1,000 clusters took
+	// 10.6 s, where one without it took 1.6 s.
+	slices.SortFunc(left, func(x, y Role) int { return ix.latest[x].Compare(ix.latest[y]) })
+	pending := make(map[Role]bool, len(left))
+	for _, role := range left {
+		pending[role] = true
+	}
+	gone := 0
 	for _, e := range ends {
-		if left == 0 {
+		for ; gone < len(left) && ix.latest[left[gone]].Before(e.until); gone++ {
+			delete(pending, left[gone])
+		}
+		if len(pending) == 0 {
 			break
 		}
 		for p := range au.asking(e.def) {
@@ -2183,19 +2206,34 @@ func (au authority) readEnding(ends []ending) {
 				continue
 			}
 			looked[p] = true
-			readingEntries(len(gv.of[p]))
-			for _, role := range gv.of[p] {
-				if _, ok := from[role]; ok {
-					continue
+			if of := gv.of[p]; len(of) <= len(pending) {
+				readingEntries(len(of))
+				for _, role := range of {
+					if pending[role] {
+						from[role] = e.until
+						delete(pending, role)
+					}
 				}
-				if _, unread := ix.unread[role]; unread && !ix.latest[role].Before(e.until) {
-					from[role] = e.until
-					left--
+			} else {
+				for role := range pending {
+					if r, _ := au.roles.role(role); au.roles.givesAny(role, r, p) {
+						from[role] = e.until
+						delete(pending, role)
+					}
 				}
 			}
-			if left == 0 {
+			if len(pending) == 0 {
 				break
 			}
+		}
+	}
+	// Those still left were asked about every permission each end asks, and give none.
+	if keep {
+		for role := range pending {
+			if gv.none[asked] == nil {
+				gv.none[asked] = map[Role]bool{}
+			}
+			gv.none[asked][role] = true
 		}
 	}
 	var at []int
@@ -2227,9 +2265,27 @@ func (au authority) readEnding(ends []ending) {
 type givers struct {
 	of   map[Permission][]Role
 	read map[Role]bool
+	// none are the roles found to give nothing a grant of any of some roles asks, by endsKey.
+	none map[string]map[Role]bool
 }
 
-func newGivers() *givers { return &givers{of: map[Permission][]Role{}, read: map[Role]bool{}} }
+func newGivers() *givers {
+	return &givers{of: map[Permission][]Role{}, read: map[Role]bool{}, none: map[string]map[Role]bool{}}
+}
+
+// endsKey is the roles ends grant, which say what deciding them asks about, whatever their ends.
+func endsKey(ends []ending) string {
+	if len(ends) == 1 {
+		return string(ends[0].def.ID)
+	}
+	ids := make([]string, len(ends))
+	for i, e := range ends {
+		ids[i] = string(e.def.ID)
+	}
+	slices.Sort(ids)
+	// No role id holds a space (roleID).
+	return strings.Join(ids, " ")
+}
 
 // add reads what role, as b defines it, gives, the first time it is asked.
 func (g *givers) add(b book, role Role) {
