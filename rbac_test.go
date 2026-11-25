@@ -9127,6 +9127,64 @@ func TestGrantsEndingApartAreDecidedInTimeAsTheyAreMany(t *testing.T) {
 	}
 }
 
+// What the actor's conditional grants give is found for the conditions a change decides by, not
+// kept for each condition they have: by an actor holding conditional grants of 300 roles of 1,000
+// permissions, each under its own condition, Apply granting roles giving those permissions kept, for
+// each permission, how long the grants under each of the 300 conditions last, twice, an eighth of
+// its time.
+func TestAChangeKeepsNothingOfEachConditionOfTheActorsGrantsGivingWhatItAsks(t *testing.T) {
+	const m, p = 100, 200
+	wide := rbac.RoleDefinition{ID: "cluster.wide", ResourceTypes: []string{"cluster"}}
+	for i := range p {
+		wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	catalog := []rbac.RoleDefinition{wide}
+	for i := range m {
+		r := wide
+		r.ID = rbac.Role(fmt.Sprint("cluster.wide", i))
+		catalog = append(catalog, r)
+	}
+	h := setup(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), catalog...) })
+	ctx := t.Context()
+	// Each holds what it grants for good; and "own" a grant of each role under a condition of its own,
+	// and "shared" under one they share, each ending after what they grant, so a change reads them all.
+	tenant := rbac.Scope{Type: rbac.TenantScope, ID: "t1"}
+	for actor, condition := range map[string]string{"own": `'request.attributes.n == ' || i`, "shared": `'request.attributes.n == 0'`} {
+		h.as(t, actor)
+		h.seed(t, grant(tenant, "cluster.admin", rbac.User, actor), grant(tenant, wide.ID, rbac.User, actor))
+		if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c1', 'user', $1, 'cluster.wide' || i, `+condition+`, $3 FROM generate_series(0, $2::int - 1) AS i`,
+			actor, m, h.now.Add(3*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var allocated uint64
+	rbac.SetDecidingGrants(t, func() func() {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		before := ms.TotalAlloc
+		return func() {
+			runtime.ReadMemStats(&ms)
+			allocated += ms.TotalAlloc - before
+		}
+	})
+	deciding := func(actor string) uint64 {
+		t.Helper()
+		allocated = 0
+		b := rbac.Binding{Role: wide.ID, Principal: identity("to-" + actor), ExpiresAt: h.now.Add(time.Hour), Condition: rbac.Condition{Expression: `request.attributes.x == true`}}
+		if err := h.authz.Apply(ctx, h.as(t, actor), cluster, rbac.Change{Grant: []rbac.Binding{b}}); err != nil {
+			t.Fatal(err)
+		}
+		return allocated
+	}
+	shared, own := deciding("shared"), deciding("own")
+	t.Logf("deciding a grant allocated %d bytes by an actor holding %d grants under one condition, and %d under one each", shared, m, own)
+	if own > shared*3/2 {
+		t.Errorf("deciding a grant of a role of %d permissions allocated %d bytes by an actor holding %d grants giving them under one condition, and %d under one each",
+			p, shared, m, own)
+	}
+}
+
 // Grants of a role each ending at its own time are decided once where what the actor holds until
 // each differs only in how many grants of one kind last: an actor in many groups, each granted the
 // same role until an hour of its own, granting a role that lists a chain of others to as many

@@ -29,6 +29,9 @@ type book struct {
 	// gives has read, each made the first time it does, where a decision keeps them: a role can
 	// give a thousand permissions, and a change asks of each it decides for each of its types.
 	sets, customSets map[Role]roleSet
+	// givers are the roles giving each permission, of those readEnding has asked about, kept with
+	// customSets, so every authority of a call shares them.
+	givers *givers
 }
 
 func (b book) role(id Role) (RoleDefinition, bool) {
@@ -67,13 +70,7 @@ func setsOf(roles map[Role]RoleDefinition) map[Role]roleSet {
 
 // gives reports whether role id, defined as def, gives p on a resource type.
 func (b book) gives(id Role, def RoleDefinition, p Permission, resourceType string) bool {
-	s, ok := b.sets[id]
-	if _, builtin := b.builtin[id]; !builtin && b.customSets != nil {
-		if s, ok = b.customSets[id]; !ok {
-			s, ok = setOf(def), true
-			b.customSets[id] = s
-		}
-	}
+	s, ok := b.set(id, def)
 	if !ok {
 		readingEntries(len(def.Permissions) + len(def.ResourceTypes))
 		return def.GrantableOn(resourceType) && def.Gives(p)
@@ -82,11 +79,35 @@ func (b book) gives(id Role, def RoleDefinition, p Permission, resourceType stri
 	return s.types[resourceType] && s.permissions[p]
 }
 
-// keepingSets is b keeping the custom roles' sets as gives makes them, for a decision that asks
-// gives about them many times.
+// givesAny reports whether role id, defined as def, gives p on any type.
+func (b book) givesAny(id Role, def RoleDefinition, p Permission) bool {
+	s, ok := b.set(id, def)
+	if !ok {
+		readingEntries(len(def.Permissions))
+		return def.Gives(p)
+	}
+	readingEntries(1)
+	return s.permissions[p]
+}
+
+// set is the sets of role id, defined as def, where b has them or keeps them.
+func (b book) set(id Role, def RoleDefinition) (roleSet, bool) {
+	s, ok := b.sets[id]
+	if _, builtin := b.builtin[id]; !builtin && b.customSets != nil {
+		if s, ok = b.customSets[id]; !ok {
+			s, ok = setOf(def), true
+			b.customSets[id] = s
+		}
+	}
+	return s, ok
+}
+
+// keepingSets is b keeping the custom roles' sets as gives makes them, and the roles giving each
+// permission as readEnding finds them, for decisions that ask about them many times.
 func (b book) keepingSets() book {
 	if b.customSets == nil {
 		b.customSets = map[Role]roleSet{}
+		b.givers = newGivers()
 	}
 	return b
 }

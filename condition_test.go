@@ -5854,6 +5854,42 @@ func TestAChangeHandingOnUnderAConditionParsesItOnce(t *testing.T) {
 	}
 }
 
+// Nor does a change to members parse it again for each scope it reaches: adding a member to a group
+// granted a role under the condition on 1,000 clusters parsed it 2,000 times.
+func TestAChangeToMembersParsesTheConditionItHandsOnUnderOnceWhateverScopesItReaches(t *testing.T) {
+	const s = 50
+	const cond = `resource.id != "z"`
+	h := grouped(t)
+	ctx := t.Context()
+	mgr := h.as(t, "mgr")
+	h.join(t, "dan", "bob")
+	h.groups(t, "one", "many")
+	root := rbac.TenantRoot("t1")
+	power := grant(root, "cluster.admin", rbac.User, "mgr")
+	power.Condition = rbac.Condition{Expression: cond}
+	h.seed(t, grant(root, "group.members", rbac.User, "mgr"), power)
+	// "one" holds cluster.login under it on c0, and "many" on s clusters more.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+		SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'cluster.login', $2, $3 FROM generate_series(0, $1::int) AS i`,
+		s, cond, h.now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	parsed := 0
+	rbac.SetParsingCondition(t, func() { parsed++ })
+	adding := func(group, id string) int {
+		t.Helper()
+		parsed = 0
+		if err := h.authz.ChangeMembers(ctx, mgr, "t1", []rbac.Member{{Group: group, Principal: identity(id)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	one, many := adding("one", "dan"), adding("many", "bob")
+	if one == 0 || many > one {
+		t.Errorf("adding a member to a group granted a role under a condition on one cluster parsed it %d times, and to one granted it on %d %d", one, s, many)
+	}
+}
+
 // The requirements of groups' eligibilities for a role on a scope are bounded together where they
 // are stored, as activating evaluates those of each group the subject is in: so an eligibility set
 // beside another, as by an actor who can't delete it, never changes what that one allows.

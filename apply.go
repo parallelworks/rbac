@@ -1142,14 +1142,16 @@ type powersLasting struct {
 }
 
 // givenLasting is how long the grants giving a permission on a type last, as of a number of reads
-// of conditions: the unconditional ones, and those whose conditions are read, by condition. Found
-// for each condition a change decides by, the grants of a role giving what it asked, held by the
-// tenant's members 4,000 times under a condition each, were copied for each of 4,000 conditions,
-// and adding a member to a group holding them took 6.5 s.
+// of conditions: the unconditional ones, and where they all are, so those under a condition are
+// found as a decision asks about it (under). Found for each condition a change decides by, the
+// grants of a role giving what it asked, held by the tenant's members 4,000 times under a condition
+// each, were copied for each of 4,000 conditions, and adding a member to a group holding them took
+// 6.5 s.
 type givenLasting struct {
 	reads  int
 	always lasting
-	by     map[string]lasting
+	// at are the positions of the grants giving it, in order (givingAt).
+	at []int
 }
 
 // indexed is au's index, found the first time a decision needs it; one for this call alone where
@@ -1236,13 +1238,10 @@ func (au authority) givenFor(p Permission, resourceType string) givenLasting {
 		return gl
 	}
 	walkingGrants(len(at))
-	gl := givenLasting{reads: au.reads.count(), by: map[string]lasting{}}
+	gl := givenLasting{reads: au.reads.count(), at: at}
 	for _, i := range at {
-		switch g := au.held[i]; {
-		case !g.conditional:
+		if g := au.held[i]; !g.conditional {
 			gl.always = gl.always.with(g)
-		case g.Condition.Expression != "":
-			gl.by[g.Condition.Expression] = gl.by[g.Condition.Expression].with(g)
 		}
 	}
 	ix.given[k] = gl
@@ -1251,10 +1250,31 @@ func (au authority) givenFor(p Permission, resourceType string) givenLasting {
 
 // under is how long those of the conditional grants gl is of that give what they give under
 // condition last: those with the same condition, so a grant can't drop one its granter is bound by,
-// where holding under it is holding under it for whoever is granted it (subjects.sameFor).
-func (gl givenLasting) under(s subjects, condition string) lasting {
-	l, ok := gl.by[condition]
-	if condition == "" || !ok || !s.sameFor(condition, condition) {
+// where holding under it is holding under it for whoever is granted it (subjects.sameFor). They are
+// found from those read under it, or those gl is of where they are fewer, rather than kept for every
+// condition: by an actor holding grants giving 1,000 permissions under 300 conditions, Apply asking
+// about them kept 300 for each, twice, an eighth of its time.
+func (gl givenLasting) under(au authority, condition string) lasting {
+	if condition == "" {
+		return lasting{}
+	}
+	var l lasting
+	if read := au.indexed().read[condition]; len(read) < len(gl.at) {
+		walkingGrants(len(read))
+		for _, i := range read {
+			if _, ok := slices.BinarySearch(gl.at, i); ok {
+				l = l.with(au.held[i])
+			}
+		}
+	} else {
+		walkingGrants(len(gl.at))
+		for _, i := range gl.at {
+			if g := au.held[i]; g.conditional && g.Condition.Expression == condition {
+				l = l.with(g)
+			}
+		}
+	}
+	if !l.held || !au.subjects.sameFor(condition, condition) {
 		return lasting{}
 	}
 	return l
@@ -1654,6 +1674,10 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 	// change reaching many, as one to the members of a group granted a role on each, walks the roles
 	// a role lists once.
 	proven := map[string]*checked{}
+	// What each condition was found to read of the subject holds on every scope: parsed for each, a
+	// change to members reaching 1,000 scopes under a condition parsed it 2,000 times, a third of
+	// its time.
+	parsed := subjects{}
 	b = b.keepingSets()
 	// Every path holds the tenant's scope, so the read holds what the actor's values are decided by.
 	values := onTenant(tenant, held, ds, b)
@@ -1675,7 +1699,7 @@ func (a *Authorizer) authoritiesIn(ctx context.Context, q DB, actor Subject, ten
 			excluded = excludedOf(of, heldOn)
 		}
 		aus[i] = a.authorityOf(ctx, q, actor, r, heldOn, deniedOn[i], exemptOn[i], b, excluded)
-		aus[i].values = values
+		aus[i].values, aus[i].subjects = values, parsed
 		if len(a.cfg.Constraints) > 0 || len(deniedOn[i]) > 0 || len(exemptOn[i]) > 0 {
 			continue
 		}
@@ -2115,13 +2139,22 @@ func (au authority) readEnding(ends []ending) {
 	if len(ends) == 0 {
 		return
 	}
-	asks := make([]map[Permission]bool, len(ends))
-	for i, e := range ends {
-		asks[i] = au.asking(e.def)
+	// The soonest first: a role with a grant ending late enough to be read for an end has one for
+	// each sooner end, so the roles giving a permission are read from the soonest end asking it, and
+	// each permission is looked up once.
+	ends = slices.SortedStableFunc(slices.Values(ends), func(x, y ending) int { return x.until.Compare(y.until) })
+	gv := au.roles.givers
+	if gv == nil {
+		gv = newGivers()
 	}
-	// Walked by role, so the grants of roles giving nothing asked aren't, however many, nor those of
-	// roles none of whose grants ends late enough to be read, whose permissions aren't either.
-	var at []int
+	// Each role of the unread grants that some end could read, with a grant ending at or after the
+	// soonest, is asked first whether it gives the first permission the soonest end's role gives,
+	// as a role giving what a change asks mostly does: those that do are read from it, and only
+	// the others are found through the roles giving each permission (givers), so where they give
+	// what it asks, their permissions aren't read. left is how many are left to find.
+	from, looked := map[Role]time.Time{}, map[Permission]bool{}
+	first := ends[0].def.Permissions
+	left := 0
 	for role, unread := range ix.unread {
 		unread = slices.DeleteFunc(unread, func(i int) bool { return au.held[i].Condition.Expression != "" })
 		if len(unread) == 0 {
@@ -2130,27 +2163,48 @@ func (au authority) readEnding(ends []ending) {
 		}
 		ix.unread[role] = unread
 		r, known := au.roles.role(role)
-		asked := make([]bool, len(ends))
-		for i, e := range ends {
-			if known && !ix.latest[role].Before(e.until) {
-				readingEntries(len(r.Permissions))
-				asked[i] = slices.ContainsFunc(r.Permissions, func(p Permission) bool { return asks[i][p] })
-			}
+		switch {
+		case !known || ix.latest[role].Before(ends[0].until):
+		case len(first) > 0 && au.roles.givesAny(role, r, first[0]):
+			from[role] = ends[0].until
+		default:
+			gv.add(au.roles, role)
+			left++
 		}
-		if !slices.Contains(asked, true) {
-			continue
+	}
+	// Found from what each end asks, so the roles giving nothing asked aren't asked, however many,
+	// nor those none of whose grants ends late enough to be read, nor any role for each end again.
+	for _, e := range ends {
+		if left == 0 {
+			break
 		}
-		walkingGrants(len(unread))
-		for _, i := range unread {
-			g := au.held[i]
-			if g.ends.IsZero() {
+		for p := range au.asking(e.def) {
+			if looked[p] {
 				continue
 			}
-			for j, e := range ends {
-				if asked[j] && !g.ends.Before(e.until) {
-					at = append(at, i)
-					break
+			looked[p] = true
+			readingEntries(len(gv.of[p]))
+			for _, role := range gv.of[p] {
+				if _, ok := from[role]; ok {
+					continue
 				}
+				if _, unread := ix.unread[role]; unread && !ix.latest[role].Before(e.until) {
+					from[role] = e.until
+					left--
+				}
+			}
+			if left == 0 {
+				break
+			}
+		}
+	}
+	var at []int
+	for role, until := range from {
+		unread := ix.unread[role]
+		walkingGrants(len(unread))
+		for _, i := range unread {
+			if g := au.held[i]; !g.ends.IsZero() && !g.ends.Before(until) {
+				at = append(at, i)
 			}
 		}
 	}
@@ -2160,6 +2214,33 @@ func (au authority) readEnding(ends []ending) {
 		if to, ok := ix.readTo[e.def.ID]; !ok || e.until.Before(to) {
 			ix.readTo[e.def.ID] = e.until
 		}
+	}
+}
+
+// givers are the roles giving each permission, of those a book resolves that readEnding has asked
+// about. Asking each role what it gives for each end, readEnding read every permission of every role
+// of the actor's unread conditional grants once for each role a change granted, for each scope it
+// reached: Apply granting 1,000 roles of 20 permissions under a condition, by an actor holding
+// conditional grants of 300 roles of 1,000 permissions, all ending after them, read 601 million,
+// 4.5 s, and adding a member to a group granted a role on 1,000 clusters, by one holding them, took
+// 10.1 s, where one without them took 0.1 s.
+type givers struct {
+	of   map[Permission][]Role
+	read map[Role]bool
+}
+
+func newGivers() *givers { return &givers{of: map[Permission][]Role{}, read: map[Role]bool{}} }
+
+// add reads what role, as b defines it, gives, the first time it is asked.
+func (g *givers) add(b book, role Role) {
+	r, known := b.role(role)
+	if !known || g.read[role] {
+		return
+	}
+	g.read[role] = true
+	readingEntries(len(r.Permissions))
+	for _, p := range r.Permissions {
+		g.of[p] = append(g.of[p], role)
 	}
 }
 
@@ -2243,10 +2324,10 @@ func (au authority) heldFor(p Permission, types []string, typesKey, condition st
 			// the rest needn't be read, nor their conditions.
 			gl := au.givenFor(p, rt)
 			if given[i] = gl.always; !given[i].forGood() && condition != "" {
-				under := gl.under(au.subjects, condition)
+				under := gl.under(au, condition)
 				if !under.forGood() {
 					au.readAt(au.givingAt(p, rt))
-					under = au.givenFor(p, rt).under(au.subjects, condition)
+					under = au.givenFor(p, rt).under(au, condition)
 				}
 				given[i] = given[i].and(under)
 			}

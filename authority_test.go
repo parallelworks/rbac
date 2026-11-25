@@ -8738,6 +8738,143 @@ func TestAChangeWalksTheActorsGrantsEndingBeforeWhatItGrantsOnce(t *testing.T) {
 	}
 }
 
+// A change reads the permissions of the roles of the actor's conditional grants, unread, once, not
+// once for each role it grants where their grants end after what it grants: by an actor holding
+// such grants of 300 roles of 1,000 permissions, Apply granting 1,000 roles of 20 permissions under
+// a condition read every role's permissions for each, 601 million entries, 4.5 s, where one before
+// them took 0.6 s.
+func TestAChangeReadsThePermissionsOfTheRolesOfTheActorsGrantsOnceWhateverRolesItGrants(t *testing.T) {
+	const r, p, n = 20, 200, 100
+	// Custom roles giving what it gives, which a change asks nothing about, so their grants stay unread.
+	wide := rbac.RoleDefinition{ID: "cluster.wide", ResourceTypes: []string{"cluster"}}
+	for i := range p {
+		wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	h, granting, holding := endingSetup(t, wide)
+	defining := func(role rbac.Role, ps []rbac.Permission) {
+		t.Helper()
+		if _, err := h.pool.Exec(t.Context(), `INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', $1, $2, '{cluster}')`, role, ps); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range r {
+		role := rbac.Role(fmt.Sprint("custom.wide", i))
+		defining(role, wide.Permissions)
+		holding(role, 1, h.now.Add(3*time.Hour))
+	}
+	apart := make([]rbac.Role, n)
+	for i := range apart {
+		apart[i] = rbac.Role(fmt.Sprint("custom.login", i))
+		defining(apart[i], []rbac.Permission{view, login})
+	}
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	read := func(prefix string, roles []rbac.Role) int {
+		t.Helper()
+		entries = 0
+		granting(prefix, roles)
+		return entries
+	}
+	one, many := read("a", apart[:1]), read("b", apart)
+	t.Logf("read %d entries granting one role, and %d granting %d", one, many, n)
+	if many-one >= r*p {
+		t.Errorf("granting one role read %d entries of roles and what the constraints answered, and %d granting %d, beside grants of %d roles of %d permissions ending after them",
+			one, many, n, r, p)
+	}
+}
+
+// Nor does a change read the permissions of those roles where they give what it asks: it reads
+// their grants, ending after what it grants, as its decisions can tell them apart by their ends,
+// but a role giving what it asks mostly gives the first permission it asks, which settles it.
+// Asking them what each gives, Apply granting 1,000 roles of 20 permissions by an actor holding
+// such grants of 300 roles of 1,000 permissions giving them read 600,000 entries, a twentieth of its
+// time.
+func TestAChangeReadsNoPermissionsOfTheRolesOfTheActorsGrantsGivingWhatItAsks(t *testing.T) {
+	const r, p = 20, 200
+	var catalog []rbac.RoleDefinition
+	for i := range r {
+		wide := rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.wide", i)), Permissions: []rbac.Permission{view, login}, ResourceTypes: []string{"cluster"}}
+		for j := range p - 2 {
+			wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", j)))
+		}
+		catalog = append(catalog, wide)
+	}
+	h, granting, holding := endingSetup(t, catalog...)
+	for _, role := range catalog {
+		holding(role.ID, 1, h.now.Add(3*time.Hour))
+	}
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	granting("a", []rbac.Role{"cluster.login"})
+	t.Logf("read %d entries granting a role", entries)
+	if entries >= r*p {
+		t.Errorf("granting a role read %d entries of roles and what the constraints answered, beside grants of %d roles of %d permissions giving it, ending after it",
+			entries, r, p)
+	}
+}
+
+// A change to members reads the permissions of the roles of the actor's conditional grants, unread,
+// once for all the scopes it reaches, not once for each: adding a member to a group granted a role
+// under a condition on 1,000 clusters, by an actor holding such grants of 300 roles of 1,000
+// permissions ending after them, read every role's permissions for each, 10.1 s, where one without
+// them took 0.1 s.
+func TestAChangeToMembersReadsThePermissionsOfTheRolesOfTheActorsGrantsOnceWhateverScopesItReaches(t *testing.T) {
+	const r, p, s = 20, 500, 50
+	const cond = `resource.id != "z"`
+	// Custom roles giving what it gives, which the change asks nothing about, so their grants stay
+	// unread.
+	wide := rbac.RoleDefinition{ID: "cluster.wide", ResourceTypes: []string{"cluster"}}
+	for i := range p {
+		wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), wide) })
+	ctx := t.Context()
+	mgr := h.as(t, "mgr")
+	h.join(t, "dan", "bob")
+	h.groups(t, "one", "many")
+	root := rbac.TenantRoot("t1")
+	power := grant(root, "cluster.admin", rbac.User, "mgr")
+	power.Condition = rbac.Condition{Expression: cond}
+	h.seed(t, grant(root, "group.members", rbac.User, "mgr"), power)
+	// "one" holds cluster.login on c0, and "many" on s clusters more.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) SELECT 't1', 'custom.wide' || i, $2, '{cluster}' FROM generate_series(1, $1::int) AS i`, []any{r, wide.Permissions}},
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'tenant', 't1', 'user', 'mgr', 'custom.wide' || i, 'resource.id != "x' || i || '"', $2 FROM generate_series(1, $1::int) AS i`,
+			[]any{r, h.now.Add(3 * time.Hour)},
+		},
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'cluster.login', $2, $3 FROM generate_series(0, $1::int) AS i`,
+			[]any{s, cond, h.now.Add(time.Hour)},
+		},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	adding := func(group, id string) int {
+		t.Helper()
+		entries = 0
+		if err := h.authz.ChangeMembers(ctx, mgr, "t1", []rbac.Member{{Group: group, Principal: identity(id)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+	one, many := adding("one", "dan"), adding("many", "bob")
+	t.Logf("read %d entries adding a member to a group granted a role on one cluster, and %d to one granted it on %d", one, many, s)
+	if many-one >= r*p {
+		t.Errorf("adding a member to a group granted a role on one cluster read %d entries of roles and what the constraints answered, and %d to one granted it on %d, beside grants of %d roles of %d permissions ending after",
+			one, many, s, r, p)
+	}
+}
+
 // A change reads each condition it decides by once, before its transaction, not again under its
 // locks: a grant's condition never changes, as changing it stores a new grant. An actor whose power
 // to change grants is 2,000 conditional grants decides by all of them, and read them again in the
