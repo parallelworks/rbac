@@ -8952,14 +8952,15 @@ func TestAChangeToMembersLooksUpTheRolesGivingWhatItAsksOnceWhateverScopesItReac
 		g.ExpiresAt = h.now.Add(3 * time.Hour)
 		gs = append(gs, g)
 	}
-	// "one" holds the lister on c0, and "many" on s clusters more.
+	// "one" holds the lister on c0, and "many" on s clusters more, each until its own time, so no
+	// scope reads what another found for the same end.
 	for i := range s + 1 {
 		g := grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("c", i)}, lister.ID, rbac.Group, "many")
 		if i == 0 {
 			g.Principal.ID = "one"
 		}
 		g.Condition = rbac.Condition{Expression: cond}
-		g.ExpiresAt = h.now.Add(time.Hour)
+		g.ExpiresAt = h.now.Add(time.Hour + time.Duration(i)*time.Second)
 		gs = append(gs, g)
 	}
 	h.seed(t, gs...)
@@ -9017,10 +9018,12 @@ func TestAChangeToMembersReadsWhatTheRolesItGrantsListOnceWhateverScopesItReache
 			VALUES ('t1', 'tenant', 't1', 'user', 'mgr', 'custom.x', 'request.attributes.n == 1', $1)`,
 			[]any{h.now.Add(3 * time.Hour)},
 		},
+		// Each until its own time, so no scope reads what another found for the same end.
 		{
-			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition)
-			SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'custom.r', $2 FROM generate_series(0, $1::int) AS i`,
-			[]any{s, cond},
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'custom.r', $2, $3::timestamptz + i * interval '1 second'
+			FROM generate_series(0, $1::int) AS i`,
+			[]any{s, cond, h.now.Add(time.Hour)},
 		},
 	} {
 		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
@@ -9048,10 +9051,9 @@ func TestAChangeToMembersReadsWhatTheRolesItGrantsListOnceWhateverScopesItReache
 
 // Where the actor holds the same grants on every scope a change to members reaches, as all on the
 // tenant, it walks them, and asks what each gives, once for all those scopes, not once for each:
-// adding a member to a group
-// granted a role under a condition on 5,000 clusters, by an actor holding conditional grants of 300
-// roles giving it on the tenant, ending after, walked them for each, twice, 5.9 s, where one without
-// them took 0.4 s.
+// adding a member to a group granted a role under a condition on 5,000 clusters, by an actor holding
+// conditional grants of 300 roles giving it on the tenant, ending after, walked them for each,
+// twice, 5.9 s, where one without them took 0.4 s.
 func TestAChangeToMembersWalksTheActorsGrantsOnceWhateverScopesItReaches(t *testing.T) {
 	const r, s = 100, 50
 	const cond = `resource.id != "z"`
