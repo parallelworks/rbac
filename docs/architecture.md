@@ -619,7 +619,7 @@ sequenceDiagram
     opt a grant readHeld read is gone, and none found allows: revoked, or replaced as a change extending it replaces it
         A->>DB: readHeld and decide again (reread), at most 3 reads, then ErrConflict
     end
-    A->>E: grant conditions, cheapest first, within a budget
+    A->>E: grant conditions, cheapest first, within a budget, a gone grant's charged the most one can cost first
     opt labeled resource or exclusive value
         A->>A: the values the label asks for, from what it read (holdingFor)
         A->>C: Deny(ConstraintInput), once for each of them its grants give
@@ -1567,7 +1567,15 @@ flowchart TB
   `Grantable`, and a read of one snapshot under `WithTx` at READ COMMITTED. The first four do only
   where the grants found don't give what one gone gave (`conditionsFound`): a grant found, under
   the condition it has for good, gave it at the first statement's moment, so that decision stands,
-  and a check beside a grant a change kept replacing doesn't lose the race every time. Read
+  and a check beside a grant a change kept replacing doesn't lose the race every time. It stands
+  only as that moment's check reached it: a grant gone is charged, on the budget of each
+  permission it gave, the most a stored condition can cost (`budget.gone`: compiling 2,048
+  characters of 4 bytes, as `rbac_grants` has never held a longer one, and `maxCost`), before the
+  others, as it can sort anywhere among them. Read as a condition nothing meets alone, it cost 41
+  and sorted first, so with conditions stored past their bounds, what its own would have spent was
+  left for the grants after it, and one past the budget at every moment allowed. Charged more than
+  its own cost, it can only deny, which has the check read again: within the bounds, a budget holds
+  it beside the conditions read unless nearly every scope's cost all they may together. Read
   again, a grant revoked for good is no longer read, and one replaced is read as its replacement;
   a race lost three times in a row is `ErrConflict`. Nothing is read twice unless a grant is found
   gone, so an ordinary check costs what it did. Conflicts reads in one statement, the custom roles with their
