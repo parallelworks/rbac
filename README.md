@@ -501,7 +501,10 @@ naming it, so the condition keeps no row there.
   that one decides. A change adding no condition isn't refused, so what was stored past a bound
   before there were bounds can be rewritten in place, as by a restore over the rows still stored,
   though not restored where they are gone, and a check may not reach all of it: it evaluates the
-  cheapest first within its budget. An upgrade of CEL, or of this package where it bounds a shape
+  cheapest first within its budget. A grant a check finds gone by the time it reads its condition,
+  as a change extending it replaces it, is charged, before each condition the check evaluates,
+  the most one sorted before it can cost, so it can't leave the budget its own would have spent
+  for a grant no moment's check reached. An upgrade of CEL, or of this package where it bounds a shape
   more, can leave conditions stored past a bound in the same way: each process bounds a stored
   condition again by what it and the CEL it is built with make of it, so another version can bound
   one more, and the package's tests pin the bounds of conditions of common shapes, so that one an
@@ -1789,8 +1792,9 @@ the package's uses foreign data, so none of the roles needs any.
   read, or in a statement a hook ran, where the hook's error wraps PostgreSQL's, alone or beside
   other errors, as `errors.Join` holds them, or holds it as `errors.As` reads it. A check, list or
   change reads a conditional grant's condition after the statement reading its grants, so it can
-  find the grant revoked or replaced meanwhile, as a change extending one replaces it: where the
-  grants it found don't allow, a check or list then reads its grants again, and a change, or a
+  find the grant revoked or replaced meanwhile, as a change extending one replaces it: the others
+  then decide with the most its condition could have cost before each spent first, and where they don't allow, a
+  check or list reads its grants again, and a change, or a
   check finding that three times running, is refused as `rbac.ErrConflict`. Under `WithTx`,
   roll the host's transaction back and run it again from its start, not the call alone in it: a
   statement refused on that transaction itself, as most reads', a hook's or one a change makes

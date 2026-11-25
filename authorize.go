@@ -200,6 +200,9 @@ func (a *Authorizer) decideBy(ctx context.Context, s Subject, p Permission, r Re
 		vars = a.vars(ctx, s, p, r)
 	}
 	spend := a.grantBudget(r.path())
+	// A found grant allowing stands only if it did at the moment the grants were read, with the
+	// gone ones' conditions spent on too.
+	spend.gone = uint64(len(gone))
 	cheapestFirst(conditional, holding.expression)
 	for _, h := range conditional {
 		if a.conds.holds(spend, h.Condition.Expression, vars) {
@@ -579,6 +582,15 @@ func (a *Authorizer) permissionsOf(ctx context.Context, q DB, s Subject, r Resou
 	gone, err := a.conditionsFound(ctx, q, r.Tenant, conditional)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	// As a check spends on one gone, each permission it gave spends on it.
+	for _, h := range gone {
+		def, _ := roles.role(h.Role)
+		for _, p := range def.Permissions {
+			if h.carries(def, p) {
+				spendOn(p).gone++
+			}
+		}
 	}
 	cheapestFirst(conditional, holding.expression)
 	// A grant of the role, carrier and condition of one before it decides nothing that one didn't:
@@ -2585,8 +2597,10 @@ func (a *Authorizer) conditionsOf(ctx context.Context, q DB, tenant string, held
 }
 
 // conditionsFound is conditionsOf, returning instead the grants gone since the statement that read
-// them, each left a condition nothing meets: what the others give was given at that statement's
-// moment, so a decision they allow stands, and only one they don't is read again (reread).
+// them, each left a condition nothing meets, for which a check spends, before each of the others,
+// the most one sorted before it can cost (budget.owe): what the others give then was given at that
+// statement's moment, so a
+// decision they allow stands, and only one they don't is read again (reread).
 // Returned as errReplaced alone, a grant replaced beside another that allowed had a check of it
 // refused as a conflict as a change kept replacing the first, though every moment allowed.
 func (a *Authorizer) conditionsFound(ctx context.Context, q DB, tenant string, held []holding) ([]holding, error) {

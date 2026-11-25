@@ -18306,3 +18306,117 @@ func TestAConditionalGrantBesideOneReplacedEachTimeItIsReadAllows(t *testing.T) 
 		t.Errorf("Holding after %d reads = %v, %v", reads, held.Values(), err)
 	}
 }
+
+// replacingUnder has every read of grants with their custom roles (SetReadingRoles) followed, before
+// a condition of them is read, by x's grants under condition replaced in one statement, as
+// replacing does, the first read alone unless every. It reports how many times it replaced them.
+func replacingUnder(t *testing.T, h *harness, condition string, every bool) *int {
+	t.Helper()
+	n := new(int)
+	rbac.SetReadingRoles(t, func() {
+		if *n > 0 && !every {
+			return
+		}
+		*n++
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'x' AND condition = $1 RETURNING *)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at FROM gone`, condition); err != nil {
+			t.Error(err)
+		}
+	})
+	return n
+}
+
+// longestTrue is a condition of the longest that holds, so a check evaluates it after every other.
+var longestTrue = `true && "` + strings.Repeat("z", rbac.MaxExpression-16) + `" != ""`
+
+// With conditional grants stored past the bounds, as before there were any, one that holds sorted
+// after more than a check may spend on, a costly one replaced between the statement reading the
+// grants and the one reading their conditions, as extending it replaces it, was read as a condition
+// that cost 41, so what its own would have cost was spent on the one that holds: Authorize allowed,
+// and Permissions listed, what neither moment did. A grant gone is charged the most a condition can
+// cost; and one cheaper than it that allows still does as it is replaced at every read.
+func TestACostlyGrantReplacedAsACheckReadsItSpendsWhatItsConditionCould(t *testing.T) {
+	h := setup(t)
+	ctx := t.Context()
+	x := h.as(t, "x")
+	store := func(role rbac.Role, condition string) {
+		t.Helper()
+		g := grant(cluster.Scope(), role, rbac.User, "x")
+		g.Condition = rbac.Condition{Expression: condition}
+		storeAround(t, h, g)
+	}
+	store("cluster.login", longestTrue)
+	store("cluster.login", spending(0))
+	for i := 1; allowed(t, h, x, login, cluster); i++ {
+		if i > 100 {
+			t.Fatal("no budget runs out")
+		}
+		store("cluster.sudo", spending(i))
+	}
+	replaced := replacingUnder(t, h, spending(0), false)
+	if err := h.authz.Authorize(ctx, x, login, cluster); *replaced == 0 || !errors.Is(err, rbac.ErrDenied) {
+		t.Errorf("Authorize as a grant is replaced: %v", err)
+	}
+	replaced = replacingUnder(t, h, spending(0), false)
+	perms, err := h.authz.Permissions(ctx, x, cluster)
+	if err != nil || *replaced == 0 || slices.Contains(perms, login) {
+		t.Errorf("Permissions as a grant is replaced = %v, %v", perms, err)
+	}
+	store("cluster.login", "true")
+	replaced = replacingUnder(t, h, spending(0), true)
+	if err := h.authz.Authorize(ctx, x, login, cluster); err != nil || *replaced == 0 {
+		t.Errorf("Authorize by a cheaper grant after %d replacements: %v", *replaced, err)
+	}
+	*replaced = 0
+	perms, err = h.authz.Permissions(ctx, x, cluster)
+	if err != nil || *replaced == 0 || !slices.Contains(perms, login) {
+		t.Errorf("Permissions by a cheaper grant after %d replacements = %v, %v", *replaced, perms, err)
+	}
+}
+
+// Within the bounds, a grant that holds beside many cheap ones a change kept replacing, as it read
+// each, allows at every moment. Each grant gone was charged what 2 KiB of condition can cost, so a
+// dozen on a cluster, or a few on the tenant, used up the budget at every read, and Authorize,
+// Permissions and Holding ended as a conflict.
+func TestAConditionalGrantBesideManyReplacedEachTimeTheyAreReadAllows(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	always := `request.time > timestamp("2000-01-01T00:00:00Z")`
+	var grants []rbac.Grant
+	add := func(on rbac.Scope, role rbac.Role, n int) {
+		g := grant(on, role, rbac.User, "u")
+		g.Condition = rbac.Condition{Expression: always}
+		grants = append(grants, g)
+		for i := range n {
+			g.Condition = rbac.Condition{Expression: fmt.Sprintf(`request.time < timestamp("2001-01-01T00:00:00Z") && %d == %d && false`, i, i)}
+			grants = append(grants, g)
+		}
+	}
+	add(cluster.Scope(), "cluster.login", 12)
+	add(rbac.TenantRoot("t1"), "level.high", 4)
+	h.seed(t, grants...)
+	u := h.as(t, "u")
+	reads := 0
+	rbac.SetReadingRoles(t, func() {
+		reads++
+		if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'u' AND condition LIKE '%&& false' RETURNING *)
+			INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at FROM gone`); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := h.authz.Authorize(ctx, u, login, cluster); err != nil || reads == 0 {
+		t.Errorf("Authorize after %d reads: %v", reads, err)
+	}
+	reads = 0
+	perms, err := h.authz.Permissions(ctx, u, cluster)
+	if err != nil || !slices.Contains(perms, login) || reads == 0 {
+		t.Errorf("Permissions after %d reads = %v, %v", reads, perms, err)
+	}
+	reads = 0
+	held, err := h.authz.Holding(ctx, "t1", u)
+	if err != nil || !slices.Contains(held.Values(), "level:high") || reads == 0 {
+		t.Errorf("Holding after %d reads = %v, %v", reads, held.Values(), err)
+	}
+}
