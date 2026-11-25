@@ -342,7 +342,7 @@ const (
 // as many, and it goes on from where the last prune of the same before and through stopped. It
 // reads history MaxPrune records at a time, on a pool or a connection each in a transaction of its
 // own, so none holds exports back for long, and on an error what those before deleted stays
-// deleted; on a host's transaction, all in it.
+// deleted, and it returns how many records they deleted; on a host's transaction, all in it.
 func PruneHistory(ctx context.Context, db DB, before time.Time, through Cursor) (int64, error) {
 	if through.TxID == 0 && through.ID == 0 {
 		return 0, fmt.Errorf("%w: a prune goes only as far as an export has read: through is the export's cursor", ErrInvalid)
@@ -677,7 +677,8 @@ var maxUnsized = 100
 // History reads up to limit records after a cursor, and the cursor after them, to export history
 // to storage of the host's own, but stops short of the record that would bring the bytes of their
 // rows' JSON and their text past MaxHistoryBytes, unless it is the first: a read of fewer than limit
-// records doesn't mean history holds no more, so read until one reads none. It orders records by
+// records doesn't mean history holds no more, so read until one reads none. On an error it returns
+// no records and after, so a read goes on from where it was. It orders records by
 // the transaction that wrote them, by the id each takes at its first write, and reads only those
 // of transactions older than any still running, so one that commits after a transaction that took
 // its id later is read before it all the same, never skipped. That is the order of transactions,

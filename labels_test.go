@@ -4307,3 +4307,96 @@ func TestALabelValuesConditionalGrantReplacedAsACheckReadsItIsReadAsItsReplaceme
 		})
 	}
 }
+
+// Explain and Reachable on the host's transaction at READ COMMITTED, where a change replaces the
+// subject's conditional grants each time they are read so the read gives up (reread), returned what
+// they had read before it did beside ErrConflict: Explain allowed, and Reachable listed scopes, as
+// a host reading the result past a logged error would act on. A read that fails returns nothing,
+// under WithTx and on a DB whose Begin gives a savepoint of the host's transaction alike.
+func TestAReadOfOneSnapshotThatGivesUpOnTheHostsTransactionReturnsNothing(t *testing.T) {
+	for name, db := range map[string]func(*harness, pgx.Tx) *rbac.Authorizer{
+		"WithTx": func(h *harness, tx pgx.Tx) *rbac.Authorizer { return h.authz.WithTx(tx) },
+		"a wrapper around the host's transaction": func(h *harness, tx pgx.Tx) *rbac.Authorizer {
+			authz, err := rbac.New(hostTx{tx}, h.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return authz
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := labeled(t)
+			ctx := t.Context()
+			always := rbac.Condition{Expression: `request.time > timestamp("2000-01-01T00:00:00Z")`}
+			admin, high := grant(cluster.Scope(), "cluster.admin", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "u")
+			admin.Condition, high.Condition = always, always
+			h.seed(t, admin, high)
+			u := h.as(t, "u")
+			secret := cluster
+			secret.Labels = rbac.Label{"level": {"high"}}
+			reads := 0
+			rbac.SetReadingRoles(t, func() {
+				reads++
+				if _, err := h.pool.Exec(h.ctx, `WITH gone AS (DELETE FROM rbac_grants WHERE tenant = 't1' AND principal_id = 'u' RETURNING *)
+					INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+					SELECT tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at FROM gone`); err != nil {
+					t.Error(err)
+				}
+			})
+			tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			authz := db(h, tx)
+			d, err := authz.Explain(ctx, u, view, secret)
+			if !errors.Is(err, rbac.ErrConflict) || reads == 0 || !reflect.DeepEqual(d, rbac.Decision{}) {
+				t.Errorf("Explain after %d reads = %+v, %v", reads, d, err)
+			}
+			reads = 0
+			reach, err := authz.Reachable(ctx, u, view, "t1", "cluster")
+			if !errors.Is(err, rbac.ErrConflict) || reads == 0 || !reflect.DeepEqual(reach, rbac.Reach{}) {
+				t.Errorf("Reachable after %d reads = %+v, %v", reads, reach, err)
+			}
+		})
+	}
+}
+
+// failingRoles is a host's transaction on which, once failing is set, a batch reading custom roles
+// fails, as one whose context ends as it is sent does.
+type failingRoles struct {
+	pgx.Tx
+	failing *bool
+}
+
+func (f failingRoles) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	if *f.failing && slices.ContainsFunc(b.QueuedQueries, func(q *pgx.QueuedQuery) bool { return strings.Contains(q.SQL, "rbac_roles") }) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		return f.Tx.SendBatch(canceled, b)
+	}
+	return f.Tx.SendBatch(ctx, b)
+}
+
+// Holders under WithTx, whose read of the holders' label values failed once it had listed them,
+// returned the list, not yet decided by the label, beside the error. It returns nothing.
+func TestHoldersWhoseReadFailsOnTheHostsTransactionReturnsNothing(t *testing.T) {
+	h := labeled(t)
+	ctx := t.Context()
+	h.seed(t, grant(cluster.Scope(), "cluster.admin", rbac.User, "u"), grant(rbac.TenantRoot("t1"), "level.high", rbac.User, "u"))
+	h.as(t, "u")
+	secret := cluster
+	secret.Labels = rbac.Label{"level": {"high"}}
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Set once the holders' grants are read, so the read failing is of their label values.
+	failing := false
+	rbac.SetReadingRoles(t, func() { failing = true })
+	holders, err := h.authz.WithTx(failingRoles{tx, &failing}).Holders(ctx, view, secret)
+	if !errors.Is(err, context.Canceled) || holders != nil {
+		t.Errorf("Holders = %+v, %v", holders, err)
+	}
+}
