@@ -4016,7 +4016,7 @@ func removing[T any](a *Authorizer, table, columns string, collect func(pgx.Rows
 // those a change is holding, and a membership one of whose places in groups a change holds, rather
 // than wait on it, so the next run removes them. It removes a batch at a time, on a pool each in a
 // transaction of its own, so none holds many locks, and on an error those it removed before stay
-// removed. With each batch it records the latest time a row it removes ended at, a membership's for
+// removed, and it returns how many they were. With each batch it records the latest time a row it removes ended at, a membership's for
 // the places it removes with one, which every check and change decides no earlier than, so none
 // reads a state its batches left that no moment held; as each ended by Config.Now and the
 // database's clock both, a host whose clock runs ahead, or one setting Config.Now wrong, can't have
