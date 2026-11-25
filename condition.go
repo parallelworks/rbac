@@ -167,6 +167,10 @@ const (
 	// read from the cache, whether or not it compiled, so this counts it cheaper: a check of
 	// conditions none of which is cached can take a few times what its budget implies.
 	compilePerByte = 8
+	// goneCost is the most a grant's condition can cost a check: rbac_grants has held none longer than
+	// 2,048 characters, so 8,192 bytes, each compiled at compilePerByte, and evaluating one costs at
+	// most maxCost. A check charges it for a grant gone before its condition was read (budget.gone).
+	goneCost = 4*2048*compilePerByte + maxCost
 	// maxDepth bounds how deeply a condition nests: checking its types takes time that grows much
 	// faster than its length with depth, which compilePerByte doesn't count.
 	maxDepth = 32
@@ -283,6 +287,17 @@ func cheapestFirst[T any](xs []T, expression func(T) string) {
 func (b Binding) expression() string { return b.Condition.Expression }
 
 func (b *budget) spend(cost uint64) { b.left -= min(cost, b.left) }
+
+// gone charges b for a grant gone since the statement that read it, whose condition the check never
+// reads: the most one can cost, before every other, as it sorted anywhere among them. Read as a
+// condition nothing meets, it cost 41 and sorted first, so the budget its own would have spent was
+// left for the others, and one past the budget at every moment allowed.
+func (b *budget) gone() {
+	if b.left < goneCost {
+		b.exhausted = true
+	}
+	b.spend(goneCost)
+}
 
 // conditions compiles conditions once and keeps the programs, bounded.
 type conditions struct {
