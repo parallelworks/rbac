@@ -1585,7 +1585,8 @@ func actorKey(p Principal) string {
 // that never was: on a pool, a REPEATABLE READ, READ ONLY transaction of its own, as on a DB that
 // wraps one, as isolated says; under WithTx, or on a DB whose Begin gives a savepoint, the host's
 // transaction, at its isolation. Constraints run before it, as their hooks may query the pool while
-// it holds a connection. A transaction that fails to commit answers nothing, as a failed read does.
+// it holds a connection. A transaction that fails to commit answers nothing, as a failed read does
+// on any DB.
 // Under WithTx at READ COMMITTED, each statement reads its own moment, so a grant read in one can be
 // gone by the time another reads its condition: read then runs again (reread).
 func snapshot[T any](ctx context.Context, a *Authorizer, read func(*Authorizer) (T, error)) (T, error) {
@@ -1605,13 +1606,15 @@ func snapshotOnce[T any](ctx context.Context, a *Authorizer, read func(*Authoriz
 	case ownTx:
 		err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, in)
 	case pgx.Tx:
-		return read(a)
+		v, err = read(a)
 	default:
 		var nested bool
 		if nested, err = isolated(ctx, conn, pgx.RepeatableRead, pgx.ReadOnly, in); nested {
-			return read(a)
+			v, err = read(a)
 		}
 	}
+	// On the host's transaction too, a read that fails answers nothing: what it had read by then,
+	// Explain's grants allowing or Reachable's scopes, is no answer the call gave.
 	if err != nil {
 		var none T
 		return none, err
