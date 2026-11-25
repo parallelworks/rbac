@@ -301,9 +301,6 @@ func (b *budget) owe(expr string) {
 	if owed <= b.owed {
 		return
 	}
-	if b.left < owed-b.owed {
-		b.exhausted = true
-	}
 	b.spend(owed - b.owed)
 	b.owed = owed
 }
