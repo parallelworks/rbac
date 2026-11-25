@@ -8875,6 +8875,240 @@ func TestAChangeToMembersReadsThePermissionsOfTheRolesOfTheActorsGrantsOnceWhate
 	}
 }
 
+// Nor does a change look up every role giving each permission it asks where one of the roles of
+// the actor's grants gives nothing it asks, which is never found among them: it looks among the
+// roles left to find where they are fewer.
+func TestAChangeLooksUpNoRolesGivingWhatItAsksForARoleGivingNothingItAsks(t *testing.T) {
+	const r, p = 20, 200
+	listed := rbac.RoleDefinition{ID: "cluster.listed", ResourceTypes: []string{"cluster"}}
+	for i := range p {
+		listed.Permissions = append(listed.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	// A role whose first permission is the power to grant, which the roles of the actor's grants
+	// don't give, so what they give of what it lists is looked up.
+	lister := rbac.RoleDefinition{ID: "cluster.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{listed.ID}}
+	odd := rbac.RoleDefinition{ID: "cluster.odd", Permissions: []rbac.Permission{"cluster:odd"}, ResourceTypes: []string{"cluster"}}
+	catalog := []rbac.RoleDefinition{listed, lister, odd}
+	for i := range r {
+		catalog = append(catalog, rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.giving", i)), Permissions: listed.Permissions, ResourceTypes: []string{"cluster"}})
+	}
+	h, granting, holding := endingSetup(t, catalog...)
+	h.seed(t, grant(rbac.TenantRoot("t1"), listed.ID, rbac.User, "ann"))
+	for _, role := range catalog[3:] {
+		holding(role.ID, 1, h.now.Add(3*time.Hour))
+	}
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	read := func(prefix string) int {
+		t.Helper()
+		entries = 0
+		granting(prefix, []rbac.Role{lister.ID})
+		return entries
+	}
+	without := read("a")
+	holding(odd.ID, 1, h.now.Add(3*time.Hour))
+	with := read("b")
+	t.Logf("read %d entries granting a role, and %d beside a grant of a role giving nothing it asks", without, with)
+	if with-without >= r*p {
+		t.Errorf("granting a role read %d entries of roles and what the constraints answered, and %d beside a grant of a role giving nothing it asks, ending after it, by an actor holding grants of %d roles giving the %d permissions it lists",
+			without, with, r, p)
+	}
+}
+
+// Nor does it look up, for each scope it reaches, every role giving each permission it asks where
+// one of the roles of the actor's grants gives nothing it asks: that role is never found among
+// them, so they were all walked. Adding a member to a group granted a role listing one of 1,000
+// permissions on 1,000 clusters, by an actor holding conditional grants of 300 roles giving them
+// and of one giving something else, all ending after, took 10.6 s, where one without that grant
+// took 1.6 s.
+func TestAChangeToMembersLooksUpTheRolesGivingWhatItAsksOnceWhateverScopesItReaches(t *testing.T) {
+	const r, p, s = 20, 200, 50
+	const cond = `resource.id != "z"`
+	listed := rbac.RoleDefinition{ID: "cluster.listed", ResourceTypes: []string{"cluster"}}
+	for i := range p {
+		listed.Permissions = append(listed.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	// A role whose first permission is the power to grant, which the roles of the actor's grants
+	// don't give, so what they give of what it lists is looked up.
+	lister := rbac.RoleDefinition{ID: "cluster.lister", Permissions: []rbac.Permission{grantC}, ResourceTypes: []string{"cluster"}, GrantableRoles: []rbac.Role{listed.ID}}
+	odd := rbac.RoleDefinition{ID: "cluster.odd", Permissions: []rbac.Permission{"cluster:odd"}, ResourceTypes: []string{"cluster"}}
+	catalog := []rbac.RoleDefinition{listed, lister, odd}
+	for i := range r {
+		catalog = append(catalog, rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.giving", i)), Permissions: listed.Permissions, ResourceTypes: []string{"cluster"}})
+	}
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), catalog...) })
+	ctx := t.Context()
+	mgr := h.as(t, "mgr")
+	h.join(t, "dan", "bob")
+	h.groups(t, "one", "many")
+	root := rbac.TenantRoot("t1")
+	gs := []rbac.Grant{grant(root, "group.members", rbac.User, "mgr"), grant(root, "cluster.admin", rbac.User, "mgr")}
+	for _, role := range catalog[2:] {
+		g := grant(root, role.ID, rbac.User, "mgr")
+		g.Condition = rbac.Condition{Expression: cond}
+		if role.ID == odd.ID {
+			g.Condition = rbac.Condition{Expression: `resource.id != "odd"`}
+		}
+		g.ExpiresAt = h.now.Add(3 * time.Hour)
+		gs = append(gs, g)
+	}
+	// "one" holds the lister on c0, and "many" on s clusters more, each until its own time, so no
+	// scope reads what another found for the same end.
+	for i := range s + 1 {
+		g := grant(rbac.Scope{Type: "cluster", ID: fmt.Sprint("c", i)}, lister.ID, rbac.Group, "many")
+		if i == 0 {
+			g.Principal.ID = "one"
+		}
+		g.Condition = rbac.Condition{Expression: cond}
+		g.ExpiresAt = h.now.Add(time.Hour + time.Duration(i)*time.Second)
+		gs = append(gs, g)
+	}
+	h.seed(t, gs...)
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	adding := func(group, id string) int {
+		t.Helper()
+		entries = 0
+		if err := h.authz.ChangeMembers(ctx, mgr, "t1", []rbac.Member{{Group: group, Principal: identity(id)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+	one, many := adding("one", "dan"), adding("many", "bob")
+	t.Logf("read %d entries adding a member to a group granted a role on one cluster, and %d to one granted it on %d", one, many, s)
+	if many-one >= s*p {
+		t.Errorf("adding a member to a group granted a role on one cluster read %d entries of roles and what the constraints answered, and %d to one granted it on %d, beside grants of %d roles giving the %d permissions it lists and of one giving none, ending after",
+			one, many, s, r, p)
+	}
+}
+
+// Nor does it read, for each scope it reaches, what each role a role it grants lists gives, to find
+// which of the roles of the actor's grants give what it asks: adding a member to a group granted a
+// role listing 64 roles of 1,000 permissions on 1,000 clusters, by an actor holding a conditional
+// grant, ending after, of a role giving one of them, took 3.6 s, where one without it took 0.2 s.
+func TestAChangeToMembersReadsWhatTheRolesItGrantsListOnceWhateverScopesItReaches(t *testing.T) {
+	const l, p, s = 16, 500, 50
+	const cond = `request.attributes.k == 1`
+	wide := rbac.RoleDefinition{ID: "cluster.wide", Permissions: []rbac.Permission{view}, ResourceTypes: []string{"cluster"}}
+	for i := range p {
+		wide.Permissions = append(wide.Permissions, rbac.Permission(fmt.Sprintf("cluster:p%03d", i)))
+	}
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), wide) })
+	ctx := t.Context()
+	mgr := h.as(t, "mgr")
+	h.join(t, "dan", "bob")
+	h.groups(t, "one", "many")
+	root := rbac.TenantRoot("t1")
+	h.seed(t, grant(root, "group.members", rbac.User, "mgr"), grant(root, "cluster.admin", rbac.User, "mgr"), grant(root, wide.ID, rbac.User, "mgr"))
+	// custom.r lists l roles giving what cluster.wide gives but view, its first permission, which
+	// the role of the actor's conditional grant doesn't give, so what it asks is looked up.
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) SELECT 't1', 'custom.l' || i, $2, '{cluster}' FROM generate_series(1, $1::int) AS i`, []any{l, wide.Permissions[1:]}},
+		{
+			`INSERT INTO rbac_roles (tenant, id, permissions, resource_types, grantable_roles)
+			VALUES ('t1', 'custom.r', '{cluster:view,cluster:grant}', '{cluster}', ARRAY(SELECT 'custom.l' || i FROM generate_series(1, $1::int) AS i))`,
+			[]any{l},
+		},
+		{`INSERT INTO rbac_roles (tenant, id, permissions, resource_types) VALUES ('t1', 'custom.x', '{cluster:p001}', '{cluster}')`, nil},
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			VALUES ('t1', 'tenant', 't1', 'user', 'mgr', 'custom.x', 'request.attributes.n == 1', $1)`,
+			[]any{h.now.Add(3 * time.Hour)},
+		},
+		// Each until its own time, so no scope reads what another found for the same end.
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'custom.r', $2, $3::timestamptz + i * interval '1 second'
+			FROM generate_series(0, $1::int) AS i`,
+			[]any{s, cond, h.now.Add(time.Hour)},
+		},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := 0
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	adding := func(group, id string) int {
+		t.Helper()
+		entries = 0
+		m := rbac.Member{Group: group, Principal: identity(id), ExpiresAt: h.now.Add(2 * time.Hour)}
+		if err := h.authz.ChangeMembers(ctx, mgr, "t1", []rbac.Member{m}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+	one, many := adding("one", "dan"), adding("many", "bob")
+	t.Logf("read %d entries adding a member to a group granted a role on one cluster, and %d to one granted it on %d", one, many, s)
+	if many-one >= 2*l*p {
+		t.Errorf("adding a member to a group granted a role listing %d roles of %d permissions on one cluster read %d entries of roles and what the constraints answered, and %d to one granted it on %d, beside a conditional grant of a role giving one of them, ending after",
+			l, p, one, many, s)
+	}
+}
+
+// Where the actor holds the same grants on every scope a change to members reaches, as all on the
+// tenant, it walks them, and asks what each gives, once for all those scopes, not once for each:
+// adding a member to a group granted a role under a condition on 5,000 clusters, by an actor holding
+// conditional grants of 300 roles giving it on the tenant, ending after, walked them for each,
+// twice, 5.9 s, where one without them took 0.4 s.
+func TestAChangeToMembersWalksTheActorsGrantsOnceWhateverScopesItReaches(t *testing.T) {
+	const r, s = 100, 50
+	const cond = `resource.id != "z"`
+	var catalog []rbac.RoleDefinition
+	for i := range r {
+		catalog = append(catalog, rbac.RoleDefinition{ID: rbac.Role(fmt.Sprint("cluster.giving", i)), Permissions: []rbac.Permission{rbac.Permission(fmt.Sprintf("cluster:p%03d", i)), login}, ResourceTypes: []string{"cluster"}})
+	}
+	h := grouped(t, func(c *rbac.Config) { c.Catalog = append(slices.Clone(c.Catalog), catalog...) })
+	ctx := t.Context()
+	mgr := h.as(t, "mgr")
+	h.join(t, "dan", "bob")
+	h.groups(t, "one", "many")
+	root := rbac.TenantRoot("t1")
+	power := grant(root, "cluster.admin", rbac.User, "mgr")
+	power.Condition = rbac.Condition{Expression: cond}
+	h.seed(t, grant(root, "group.members", rbac.User, "mgr"), power)
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'tenant', 't1', 'user', 'mgr', 'cluster.giving' || i, 'resource.id != "x' || i || '"', $2 FROM generate_series(0, $1::int - 1) AS i`,
+			[]any{r, h.now.Add(3 * time.Hour)},
+		},
+		{
+			`INSERT INTO rbac_grants (tenant, scope_type, scope_id, principal_kind, principal_id, role, condition, expires_at)
+			SELECT 't1', 'cluster', 'c' || i, 'group', CASE WHEN i = 0 THEN 'one' ELSE 'many' END, 'cluster.login', $2, $3 FROM generate_series(0, $1::int) AS i`,
+			[]any{s, cond, h.now.Add(time.Hour)},
+		},
+	} {
+		if _, err := h.pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walked, entries := 0, 0
+	rbac.SetWalkingGrants(t, func(k int) { walked += k })
+	rbac.SetReadingEntries(t, func(k int) { entries += k })
+	adding := func(group, id string) (int, int) {
+		t.Helper()
+		walked, entries = 0, 0
+		if err := h.authz.ChangeMembers(ctx, mgr, "t1", []rbac.Member{{Group: group, Principal: identity(id)}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		return walked, entries
+	}
+	one, oneRead := adding("one", "dan")
+	many, manyRead := adding("many", "bob")
+	t.Logf("walked %d grants and read %d entries adding a member to a group granted a role on one cluster, and %d and %d to one granted it on %d", one, oneRead, many, manyRead, s)
+	if many-one >= s*r || manyRead-oneRead >= s*r {
+		t.Errorf("adding a member to a group granted a role on one cluster walked %d grants and read %d entries of roles and what the constraints answered, and %d and %d to one granted it on %d, by an actor holding conditional grants of %d roles giving it on the tenant, ending after",
+			one, oneRead, many, manyRead, s, r)
+	}
+}
+
 // A change reads each condition it decides by once, before its transaction, not again under its
 // locks: a grant's condition never changes, as changing it stores a new grant. An actor whose power
 // to change grants is 2,000 conditional grants decides by all of them, and read them again in the
